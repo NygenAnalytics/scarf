@@ -700,7 +700,6 @@ def convert_local(
             "featureIdKey": manifest["featureIdKey"],
             "featureNameKey": manifest["featureNameKey"],
             "selectionDiagnostics": manifest["selectionDiagnostics"],
-            "storageDtypePolicy": "preserve_source",
             "assayName": "RNA",
             "storageProfile": "cloud",
         },
@@ -778,16 +777,11 @@ def convert_local(
         feature_ids_key=manifest["featureIdKey"],
         feature_name_key=manifest["featureNameKey"],
         embedding_roles=embedding_roles,
-        # Preserve losslessly without Scarf's separate full-matrix dtype scan.
-        dtype=source_dtype,
     )
     writer = None
     try:
         if progress is not None:
-            progress(
-                "converting",
-                message=f"Building RNA counts and countsT; preserving source dtype {source_dtype}",
-            )
+            progress("converting", message="Building RNA counts and countsT")
         writer = scarf.H5adToZarr(
             reader,
             zarr_loc=str(destination),

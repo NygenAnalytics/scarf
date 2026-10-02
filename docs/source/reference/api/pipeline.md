@@ -59,12 +59,9 @@ def run(
 The default recipe snapshots its inputs, filters cells, scores cell cycle, selects highly variable
 genes, normalizes, runs PCA, builds ANN, neighbour, and connectivity artifacts, initializes UMAP,
 runs UMAP, evaluates Leiden at `0.5`, `0.75`, `1.0`, and `1.25`, runs Paris, selects a clustering,
-scores doublets, and searches for markers. Stages start in a fixed order. UMAP runs on a worker
-thread beside the Leiden, Paris, and cluster-selection stages; doublet scoring and marker search
-plan their memory against the budget, so they start only after UMAP has finished. Each stage keeps
-its own wall time and artifact receipt; resident-memory figures are process-wide, so stages that
-overlap report a shared peak. Without a thread-safe Numba threading layer (TBB or OpenMP), every
-stage runs in sequence.
+scores doublets, and searches for markers. Stages run one at a time in this fixed order on the
+calling thread, so each stage keeps its own wall time, sampled resident memory, and artifact
+receipt.
 
 Harmony is enabled by a non-empty `harmony_batch_columns` sequence. The main graph then uses the
 Harmony coordinates. When doublet scoring is enabled, its graph branch still uses the uncorrected
@@ -338,10 +335,13 @@ def record_event(event: PipelineEvent) -> None:
 run = ds.pipeline.run(callback=record_event)
 ```
 
-Enabled stages emit `stage_started` followed by `stage_completed`, `stage_failed`, or
-`stage_interrupted`. A handled interruption also emits `pipeline_interrupted` after durable state is
-written. Skipped stages are present in the report but emit no callback. Callback errors are logged
-and cannot block durable status.
+Enabled stages emit `stage_started` once their record is written, then `stage_completed`,
+`stage_failed`, or `stage_interrupted` once their outcome is recorded, before the next stage starts.
+A handled interruption also emits `pipeline_interrupted` after durable state is written. A skipped
+stage is present in the report and emits no stage event, unless an error or interruption arrives
+between writing its record and recording it as skipped; it is then recorded as failed or interrupted
+and emits `stage_failed` or `stage_interrupted` without a preceding `stage_started`. Callback errors
+are logged and cannot block durable status.
 
 ## Public types
 

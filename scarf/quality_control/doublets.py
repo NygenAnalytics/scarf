@@ -83,12 +83,23 @@ def sum_doublet_pairs(
     left: NDArray[np.int64],
     right: NDArray[np.int64],
 ) -> csr_matrix:
-    """Add sampled count rows without overflowing integer counts."""
+    """Add the count rows of each sampled pair.
+
+    Integer sums are exact: bool counts add as uint8, integers narrower than 64
+    bits widen to twice their width, and 64-bit integer sums are checked against
+    the range of their dtype. Floating-point counts add in float64.
+
+    Raises:
+        OverflowError: If a 64-bit integer sum is outside the range of its
+            dtype.
+    """
     dtype = pool_counts.dtype
     if dtype.kind == "b":
         dtype = np.dtype("uint8")
     elif dtype.kind in "iu" and dtype.itemsize < 8:
         dtype = np.dtype(f"{dtype.kind}{dtype.itemsize * 2}")
+    elif dtype.kind == "f":
+        dtype = np.dtype(np.float64)
     first = pool_counts[left].astype(dtype, copy=False)
     second = pool_counts[right].astype(dtype, copy=False)
     if dtype.kind in "iu" and pool_counts.dtype.itemsize == 8 and first.nnz:

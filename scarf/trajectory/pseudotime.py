@@ -88,6 +88,10 @@ def select_pseudotime_component(
 ) -> tuple[np.ndarray, list[int]]:
     if component_policy not in {"largest", "error"}:
         raise ValueError("component_policy must be either 'largest' or 'error'")
+    if graph.shape[0] != graph.shape[1] or graph.shape[0] != len(selected_cell_indices):
+        raise ValueError(
+            "The graph must be square with one row per selected cell index"
+        )
 
     n_components, component_labels = connected_components(
         graph,

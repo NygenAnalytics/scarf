@@ -125,17 +125,12 @@ def _validate_normalization_identity(
     *,
     normalization_method: dict[str, str],
     size_factor: float | None,
-    normalization: dict[str, bool],
-    count_arithmetic: str | None,
     context: str,
 ) -> None:
     # The dataset fingerprint is resolved once per public call, so only the
     # live normalization settings can be rechecked while an operation runs.
     try:
         current_method = callable_identity(assay.normMethod)
-        current_count_arithmetic = assay._count_arithmetic(
-            "feature_batches", **normalization
-        )
     except ValueError as exc:
         raise ValueError(
             f"{context} normalization settings changed during computation"
@@ -155,11 +150,7 @@ def _validate_normalization_identity(
         raise ValueError(f"{context} normalization settings changed during computation")
     else:
         current_size_factor = float(raw_size_factor)
-    if (
-        current_method != normalization_method
-        or current_size_factor != size_factor
-        or current_count_arithmetic != count_arithmetic
-    ):
+    if current_method != normalization_method or current_size_factor != size_factor:
         raise ValueError(f"{context} normalization settings changed during computation")
 
 
@@ -200,8 +191,6 @@ def _resolve_feature_indices(
         assay.name,
         feature_selection,
     )
-    if len(feature_indices) == 0:
-        raise ValueError("Feature selection contains no active features")
     return feature_selection, feature_indices.astype(np.int64, copy=False)
 
 
@@ -276,17 +265,13 @@ def _normalization_guard(
     assay: Assay,
     validated_parameters: Mapping[str, Any],
     context: str,
-) -> tuple[Any, Callable[[], None]]:
-    """Return the count arithmetic and a check that the settings did not change."""
-    normalization = validated_parameters["normalization"]
-    count_arithmetic = assay._count_arithmetic("feature_batches", **normalization)
-    return count_arithmetic, partial(
+) -> Callable[[], None]:
+    """Return a check that the normalization settings did not change."""
+    return partial(
         _validate_normalization_identity,
         assay,
         normalization_method=validated_parameters["normalization_method"],
         size_factor=validated_parameters["size_factor"],
-        normalization=normalization,
-        count_arithmetic=count_arithmetic,
         context=context,
     )
 
@@ -393,10 +378,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             upper_only=False,
             use_k=None,
         )
-        if graph_matrix.shape != (n_cells, n_cells):
-            raise ValueError(
-                "Loaded graph shape does not match its stored cell selection"
-            )
         diff_op = bounded_diffusion_operator(
             graph_matrix,
             power,
@@ -716,6 +697,10 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             assay=None,
             table_path="cellData",
         )
+        if graph_matrix.shape[0] != len(selected_cell_indices):
+            raise ValueError(
+                "Graph cell count does not match its stored cell selection"
+            )
         retained_mask, component_sizes = _select_pseudotime_component_impl(
             graph_matrix,
             selected_cell_indices,
@@ -1005,23 +990,17 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             expected_valid=expected_valid,
         ):
             raise ValueError("Pseudotime artifact payload is invalid")
-        values, loaded_selection, values_missing = _load_cell_artifact_values(
+        # The validated payload has no missing masks and uses the recorded selection.
+        values, _, _ = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="pseudotime",
         )
-        valid, valid_selection, valid_missing = _load_cell_artifact_values(
+        valid, _, _ = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="valid",
         )
-        if (
-            loaded_selection != selection
-            or valid_selection != selection
-            or values_missing is not None
-            or valid_missing is not None
-        ):
-            raise ValueError("Pseudotime arrays do not match their stored selection")
         source_values, source_selection, source_missing = _load_cell_artifact_values(
             self.zw,
             source_sink,
@@ -1179,12 +1158,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             raise ValueError("Sink labels do not match the pseudotime cell selection")
         ptime = pseudotime_result.values
         ptime_valid = pseudotime_result.valid
-        if ptime.shape != ptime_valid.shape or sink_values.shape != ptime.shape:
-            raise ValueError("Pseudotime and sink labels must align")
-        if not ptime_valid.any():
-            raise ValueError("No cells were selected for fate mapping")
-        if graph_matrix.shape[0] != len(ptime_valid):
-            raise ValueError("Pseudotime does not align with its graph")
 
         arguments = FateMappingArguments(
             connectivity_map=graph_ref,
@@ -1252,21 +1225,17 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
         retained_ptime = ptime[ptime_valid]
         retained_sink_values = sink_values[ptime_valid]
-        retained_probabilities, retained_valid, computed_sink_labels = (
-            _compute_fate_probabilities_impl(
-                retained_graph,
-                retained_ptime,
-                retained_sink_values,
-                list(requested_sink_labels),
-                beta=beta,
-                solver_tol=solver_tol,
-                max_iterations=max_iterations,
-                # The graph was loaded for this call, so the solve may modify it.
-                _copy_graph=False,
-            )
+        retained_probabilities, retained_valid, _ = _compute_fate_probabilities_impl(
+            retained_graph,
+            retained_ptime,
+            retained_sink_values,
+            list(requested_sink_labels),
+            beta=beta,
+            solver_tol=solver_tol,
+            max_iterations=max_iterations,
+            # The graph was loaded for this call, so the solve may modify it.
+            _copy_graph=False,
         )
-        if computed_sink_labels != requested_sink_labels:
-            raise ValueError("Computed fate labels do not match requested sinks")
         probabilities = np.full(
             (len(ptime), len(requested_sink_labels)),
             np.nan,
@@ -1365,25 +1334,17 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             sink_labels=raw_sinks,
         ):
             raise ValueError("Fate-map artifact payload is invalid")
-        probabilities, loaded_selection, probabilities_missing = (
-            _load_cell_artifact_values(
-                self.zw,
-                ref,
-                value_name="probabilities",
-            )
+        # The validated payload has no missing masks and uses the recorded selection.
+        probabilities, _, _ = _load_cell_artifact_values(
+            self.zw,
+            ref,
+            value_name="probabilities",
         )
-        valid, valid_selection, valid_missing = _load_cell_artifact_values(
+        valid, _, _ = _load_cell_artifact_values(
             self.zw,
             ref,
             value_name="valid",
         )
-        if (
-            loaded_selection != selection
-            or valid_selection != selection
-            or probabilities_missing is not None
-            or valid_missing is not None
-        ):
-            raise ValueError("Fate-map arrays do not match their stored selection")
         return FateMappingResult(
             ref=ref,
             graph=graph,
@@ -1413,7 +1374,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
     def _pseudotime_feature_cells(
         self,
         assay: Assay,
-        identity: _FrozenFeatureIdentity,
         pseudotime: ArtifactRef,
         features: ArtifactRef,
     ) -> _PseudotimeFeatureCells:
@@ -1422,10 +1382,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             assay,
             features,
         )
-        if identity.names.shape != (assay.feats.N,) or identity.ids.shape != (
-            assay.feats.N,
-        ):
-            raise ValueError("Feature identities do not align with the assay")
         dataset_fingerprint = self._ensure_dataset_fingerprint(assay.name)
         ptime_result = self.load_pseudotime_scoring(pseudotime)
         selected_cell_indices = read_stored_selection_indices(
@@ -1478,7 +1434,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         try:
             parameters = validate_parameters(status.parameters or {})
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"{label} parameters are malformed") from exc
+            raise ValueError(
+                f"{label} parameters are malformed or come from an earlier "
+                f"release; rerun {operation} to recompute it"
+            ) from exc
         cell_selection = parse_artifact_ref(
             inputs.get("cell_selection"),
             f"{label} cell selection input",
@@ -1579,12 +1538,12 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         )
         resolved_norm_params = validated_parameters["normalization"]
         min_cells = validated_parameters["min_cells"]
-        count_arithmetic, check_normalization = _normalization_guard(
+        check_normalization = _normalization_guard(
             assay,
             validated_parameters,
             "Pseudotime marker search",
         )
-        axes = self._pseudotime_feature_cells(assay, identity, pseudotime, features)
+        axes = self._pseudotime_feature_cells(assay, pseudotime, features)
         feature_index = axes.feature_indices
         logger.info(
             f"Pseudotime markers: correlating features "
@@ -1606,7 +1565,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             adjustment_method=validated_parameters["adjustment_method"],
             adjustment_scope=validated_parameters["adjustment_scope"],
             min_cells=min_cells,
-            count_arithmetic=count_arithmetic,
             gene_batch_size=gene_batch_size,
             nthreads=int(
                 getattr(
@@ -1661,9 +1619,11 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             batch_size=gene_batch_size,
             **resolved_norm_params,
         ).reindex(feature_index)
+        # A feature the regression did not return is missing after the reindex.
         if markers["r_value"].isna().any():
             raise ValueError(
-                "Pseudotime marker results are not aligned to feature selection"
+                "Pseudotime marker correlations are missing or not finite for "
+                "some selected features"
             )
         with artifact_transaction(self.zw, planned) as marker_group:
             check_normalization()
@@ -1812,12 +1772,12 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         n_neighbours = validated_parameters["n_neighbours"]
         n_clusters = validated_parameters["n_clusters"]
         nan_cluster_value = validated_parameters["nan_cluster_value"]
-        count_arithmetic, check_normalization = _normalization_guard(
+        check_normalization = _normalization_guard(
             assay,
             validated_parameters,
             "Pseudotime aggregation",
         )
-        axes = self._pseudotime_feature_cells(assay, identity, pseudotime, features)
+        axes = self._pseudotime_feature_cells(assay, pseudotime, features)
         if len(axes.feature_indices) < 2:
             raise ValueError("At least two selected features are required")
         if n_neighbours >= len(axes.feature_indices):
@@ -1863,7 +1823,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             n_clusters=n_clusters,
             ann_params=resolved_ann_params,
             nan_cluster_value=nan_cluster_value,
-            count_arithmetic=count_arithmetic,
             batch_size=batch_size,
             nthreads=self.nthreads,
             invalidate_cache=invalidate_cache,

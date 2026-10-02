@@ -1,8 +1,6 @@
 import asyncio
-import functools
 import time
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -20,7 +18,6 @@ from ..storage.pipeline_runs import (
     load_pipeline_stage_record,
     start_pipeline_stage_record,
 )
-from ..utils.background import BackgroundTask
 from ..utils.logging import logger
 from ..utils.process import ProcessTreeRssMeasurement, sample_process_tree_rss
 from ..utils.shutdown import ShutdownRequested, shutdown_checkpoint
@@ -116,8 +113,8 @@ def _as_interruption(error: BaseException) -> BaseException:
     """Return the interruption that an exception group holds, else ``error``.
 
     Workers that fail together raise an exception group. A group that holds a
-    ``KeyboardInterrupt`` or ``ShutdownRequested`` leaf ends its stage as that
-    interruption.
+    handled interruption leaf (``ShutdownRequested``, ``KeyboardInterrupt``, or
+    ``asyncio.CancelledError``) ends its stage as the first such leaf.
     """
     if isinstance(error, BaseExceptionGroup):
         for inner in error.exceptions:
@@ -179,23 +176,15 @@ def _execute_stage(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _StartedStage:
-    stage: str
-    ordinal: int
-    task: BackgroundTask[_StageOutcome]
-
-
 class RunLedger:
-    """Record pipeline stages durably, in order, from the calling thread.
+    """Run pipeline stages one at a time and record each one durably.
 
-    Stages start in the persisted order. A stage started with ``overlapping``
-    runs on a worker thread while later stages run, and is recorded when its
-    block ends. Every record write and callback happens on the calling thread,
-    and background stages are recorded before the run becomes terminal.
+    Stages run on the calling thread in the persisted order, and each stage's
+    record is terminal before the next stage starts, so its wall time, sampled
+    memory, and artifact receipt describe that stage alone.
     """
 
-    __slots__ = ("background", "events", "ordinal", "root", "run_id")
+    __slots__ = ("events", "ordinal", "root", "run_id")
 
     def __init__(
         self,
@@ -207,7 +196,6 @@ class RunLedger:
         self.run_id = run_id
         self.ordinal = 0
         self.events = PipelineEventEmitter(callback)
-        self.background: list[_StartedStage] = []
 
     def _records(
         self,
@@ -245,25 +233,8 @@ class RunLedger:
             for plan in plans
         )
 
-    def _settle_background(self) -> None:
-        """Wait for and record every background stage before the run ends."""
-        while self.background:
-            started = self.background.pop()
-            try:
-                self._finish(started, end_run=False)
-            except Exception:
-                logger.exception(f"Could not record pipeline stage {started.stage}")
-
-    def _check_background(self) -> None:
-        """End the run at a stage boundary once a background stage has failed."""
-        for started in list(self.background):
-            if started.task.done() and started.task.result().error is not None:
-                self.background.remove(started)
-                self._finish(started)
-
     def terminate(self, error: BaseException) -> bool:
-        """Record background stages, then end the run unless it already ended."""
-        self._settle_background()
+        """End the run with ``error`` unless it already ended."""
         return end_pipeline_run(self.root, self.run_id, error)
 
     def interrupt_pending(self, error: BaseException, stage: str) -> None:
@@ -289,7 +260,6 @@ class RunLedger:
         error: BaseException,
         metrics: PipelineStageMetrics,
         plans: Sequence[PipelinePlanRecord] = (),
-        end_run: bool = True,
     ) -> None:
         interruption = interruption_record(error)
         if interruption is None:
@@ -305,11 +275,9 @@ class RunLedger:
                 metrics=metrics,
                 interruption=interruption,
             )
-        if end_run:
-            self.terminate(error)
+        self.terminate(error)
         self.events.emit("stage_interrupted", stage, error)
-        if end_run:
-            self.events.emit("pipeline_interrupted", stage, error)
+        self.events.emit("pipeline_interrupted", stage, error)
 
     def _finish_failed(
         self,
@@ -319,7 +287,6 @@ class RunLedger:
         error: Exception,
         metrics: PipelineStageMetrics,
         plans: Sequence[PipelinePlanRecord] = (),
-        end_run: bool = True,
     ) -> None:
         try:
             current_stage = load_pipeline_stage_record(self.root, self.run_id, ordinal)
@@ -334,13 +301,11 @@ class RunLedger:
                     error=error,
                 )
         finally:
-            if end_run:
-                self.terminate(error)
+            self.terminate(error)
         self.events.emit("stage_failed", stage, error)
 
     def skip(self, stage: str) -> None:
         shutdown_checkpoint()
-        self._check_background()
         wall_started = time.perf_counter()
         ordinal = self.ordinal
         stage_started = False
@@ -398,38 +363,7 @@ class RunLedger:
         stage: str,
         action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
     ) -> tuple[tuple[str, ArtifactRef], ...]:
-        return self._finish(self._start(stage, action, background=False))
-
-    @contextmanager
-    def overlapping(
-        self,
-        stage: str,
-        action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
-    ) -> Iterator[None]:
-        """Run ``stage`` on a worker thread while the block runs later stages.
-
-        Stages in the block must not read this stage's outputs, and the stage
-        must follow the threading rules of ``BackgroundTask``.
-        """
-        started = self._start(stage, action, background=True)
-        try:
-            yield
-        except BaseException:
-            self._settle_background()
-            raise
-        if started in self.background:
-            self.background.remove(started)
-            self._finish(started)
-
-    def _start(
-        self,
-        stage: str,
-        action: Callable[[], Sequence[tuple[str, ArtifactRef]]],
-        *,
-        background: bool,
-    ) -> _StartedStage:
         shutdown_checkpoint()
-        self._check_background()
         wall_started = time.perf_counter()
         ordinal = self.ordinal
         try:
@@ -445,28 +379,23 @@ class RunLedger:
         self.ordinal += 1
         logger.info(f"Running pipeline stage: {stage.replace('_', ' ')}")
         self.events.emit("stage_started", stage)
-        started = _StartedStage(
-            stage=stage,
-            ordinal=ordinal,
-            task=BackgroundTask(
-                functools.partial(_execute_stage, action, wall_started),
-                name=f"scarf-pipeline-{stage}",
-                inline=not background,
-            ),
-        )
-        if background:
-            self.background.append(started)
-        return started
+        return self._finish(stage, ordinal, _execute_stage(action, wall_started))
 
     def _finish(
         self,
-        started: _StartedStage,
-        *,
-        end_run: bool = True,
+        stage: str,
+        ordinal: int,
+        outcome: _StageOutcome,
     ) -> tuple[tuple[str, ArtifactRef], ...]:
-        """Record a started stage; unless ``end_run`` is False, end the run on error."""
-        outcome = started.task.result()
-        stage, ordinal = started.stage, started.ordinal
+        """Record a stage's outcome and return its outputs.
+
+        An ``Exception`` from the stage fails the stage and the run and raises
+        ``PipelineExecutionError``. A handled interruption, or the first one
+        that an exception group holds, ends the run as interrupted and is
+        raised; the stage is recorded completed if its action returned, else
+        interrupted. Any other ``BaseException``, such as ``SystemExit``, is
+        raised without recording the stage or ending the run.
+        """
         plan_records = self._plans(outcome.plans)
         caught = None if outcome.error is None else _as_interruption(outcome.error)
         if caught is None:
@@ -498,8 +427,6 @@ class RunLedger:
                 metrics=outcome.metrics,
             )
             self.events.emit("stage_completed", stage)
-            if not end_run:
-                return outcome.outputs
             self.interrupt_pending(caught, stage)
             raise caught
         if interruption is not None:
@@ -509,7 +436,6 @@ class RunLedger:
                 error=caught,
                 metrics=outcome.metrics,
                 plans=plan_records,
-                end_run=end_run,
             )
         elif isinstance(caught, Exception):
             self._finish_failed(
@@ -518,10 +444,6 @@ class RunLedger:
                 error=caught,
                 metrics=outcome.metrics,
                 plans=plan_records,
-                end_run=end_run,
             )
-            if end_run:
-                raise PipelineExecutionError(self.run_id, stage, caught) from caught
-        if end_run:
-            raise caught
-        return ()
+            raise PipelineExecutionError(self.run_id, stage, caught) from caught
+        raise caught

@@ -76,6 +76,43 @@ rewrite; the removed document is never translated into current lineage.
 An overwriting merge clears pipeline records and datastore-scoped artifacts in its destination
 workspace while preserving unrelated root siblings.
 
+(mounted_targets)=
+
+## Mounted targets
+
+`mount_datastore` creates a target whose root attribute `matrixSource` binds it to the source
+that owns the counts. The record holds exactly `location` (an absolute path or URI),
+`workspace`, and `assays`, and each assay entry holds exactly `datasetFingerprint`,
+`countsFingerprint`, and `requiresTranspose`. Every open checks the source against these
+identities. Any other shape, including a field that a later release adds, is rejected rather than
+ignored, and a source that is itself a mount is refused.
+
+The target holds copied cell and feature tables, its own artifacts, and its own pipeline runs.
+Opening it reopens the target root through a namespace that resolves keys in this order:
+
+1. Keys outside the artifact roots, `[workspace/]artifacts` and `[workspace/]{assay}/artifacts`
+   of the mounted assays, belong to the target alone. Cell and feature tables, counts, and
+   `pipeline/` never fall back to the source.
+2. A key inside an artifact group `{root}/{kind}/{id}` is read from the target when the target
+   holds the group's `zarr.json`, and otherwise from the source when the source holds it.
+3. Listings of an artifact root and of its kind directories are the union of both stores, and a
+   directory document that the target lacks is read from the source.
+
+Every write goes to the target. Writing or deleting inside a source group raises
+`PermissionError`, so the source is never modified. Artifact IDs are random 256-bit tokens, so a
+group that the source holds is exactly the artifact a copy in the target would be. The target
+lists, loads, traces, and reuses source artifacts with their identities unchanged, and a recipe
+whose provenance matches the published results creates nothing. Pipeline runs and their atomic
+label claims stay per store: open a source run on the source datastore and pass its refs to the
+mount.
+
+Refs, provenance, and run records never record a location, and nothing in the target records
+which store holds an artifact. Results that use source artifacts therefore need the source, as
+counts do, and a source artifact removed by an outside edit fails closed as a missing input. A
+target group opened directly with `zarr.open_group` shows only the target's own artifacts.
+`repack_zarr` reads a mount through the same namespace, so its output holds the artifacts of both
+stores, the target's runs, and copied counts, and no longer needs the source.
+
 ## Count arrays
 
 `counts` is the cell-major assay matrix (`n_cells` × `n_features`).
@@ -98,6 +135,59 @@ per-cell totals (`rowSums`), per-cell detected-feature counts (`rowPositive`), a
 detected-cell counts (`columnPositive`), and its `source_fingerprint` attribute names the counts
 it describes. Preparation reads these summaries instead of streaming the matrix. Summaries that are
 missing, malformed, or bound to other counts are an error; rebuild the store with `--data-only`.
+
+### Count dtype
+
+`counts` and `countsT` share one dtype, which `scarf.storage.count_dtype` resolves from the
+canonical (duplicate-summed) values of the assay. Counts are stored unsigned, in the narrowest of
+`uint8`, `uint16`, `uint32`, and `uint64` that holds the largest value, exactly when every value
+is a non-negative integer. Other counts keep their source dtype: `float32` or `float64`, or a
+signed integer dtype when values are negative. `float16` is not a count storage dtype. The dtype
+depends only on the assay's own values, not on the reader, source encoding, index order,
+orientation, memory budget, or the other assays of a source matrix, so the same counts imported
+from H5AD, 10x HDF5, Matrix Market, CSV, an in-memory sparse matrix, or a Seurat object give the
+same store identity. Imports that split one source matrix into assays (10x HDF5 and Matrix Market
+feature types, H5AD `assay_split_key`) resolve the dtype of each assay from its own features.
+Every import reads all its counts once before it creates the destination to find their ranges:
+readers of 10x HDF5, Matrix Market, and H5AD files report the range of each group of features
+over the selected cells (`count_value_ranges`), the CSV reader finds it in its first pass, and
+`SparseToZarr` and `SeuratToZarr` scan their sources. The scans sum duplicate coordinates as the
+writers do, integers exactly in 64 bits and floats in source order. No import takes a count dtype
+argument. Count matrices hold finite values: writers reject NaN and infinity, and every import
+rejects them before it creates the destination. Writers cast through a checked cast, so a count
+that the stored dtype cannot hold raises instead of wrapping.
+
+Writers that rebuild or combine existing counts follow their sources instead. Subset and repack
+keep the source dtype, because they rebuild an existing dataset whose identity and copied
+artifacts must stay valid. A merge stores the common type of its source count dtypes, widened so
+that features summed by name cannot overflow it; integer sources without a common integer dtype
+are rejected rather than stored as floats. Derived assays (grouped and melded) keep their
+`float64` values.
+
+### Count layout
+
+The layout policy (`unitBytes` and `chunkBytes`) is recorded in `scarf:countMatrixLayout`, and
+readers and `countsT` writers replay it. Every count writer (the H5AD, 10x HDF5, Matrix Market,
+CSV, sparse, and Seurat imports, subset, `repack_zarr`, merge, and `add_grouped_assay`) fits the
+policy to `mem_budget` before it creates its destination: when the default policy's counts write
+or `countsT` transpose does not fit, it halves `unitBytes` and `chunkBytes` together, keeping the
+chunks per shard, down to count shards of one row. Sparse writers admit the band writes of their
+sparse sources, and dense writers the dense row bands they write. Writers that choose their source
+batches (the sparse imports, the Seurat imports, and merge) admit batches of one destination row
+band, the batch their write starts from, so a fitted layout never leaves the write narrower
+batches than its bands. An explicit policy is used exactly or refused before the destination
+exists. `add_melded_assay` sizes its shards to the melding band that fits `mem_budget`. Writers
+that write their assays one at a time (Seurat, subset, repack, and merge) fit each assay on its
+own. A resumed merge keeps the layout persisted with its completed counts, so a budget change
+between attempts cannot block it, and fits the layout of the counts it rewrites. A store built
+with a small budget therefore has smaller shards and more objects. The layout never changes
+identity: `content_fingerprint`, the counts fingerprint, and the dataset fingerprint are computed
+from the stored values, so only the layout fingerprint differs between budgets.
+
+Existing stores are never rewritten under a new dtype or layout rule and keep their dtype, layout,
+and identity. A re-import of the same source can store a different dtype, and so get different
+fingerprints and artifact ids; mounts and mapping references bound to the replaced store fail
+closed.
 
 ## Opening an RNA assay
 
@@ -128,6 +218,7 @@ A Zarr v2 RNA store will not open as `RNAassay`.
 ## Memory controls
 
 `DataStore(..., mem_budget='8G')` bounds streaming and concurrency (blocks, concurrent work, feature batches).
+A Zarr read holds more than its result. A read of a sharded array, such as `counts` or `countsT`, fills a shard-level copy of its selection, holds the compressed bytes of every inner chunk it touches in a shard, and decodes those chunks next to them. Plans charge this through `ArrayGeometry.readBytes`, at the decoded size of the compressed bytes because a plan cannot know them before it reads: a `counts` row block of a whole shard reserves twice its bytes, the shard's chunks, and the one chunk that row-block streams decode at a time, and a `countsT` cell band reserves twice its bytes and two of each chunk it touches. An unsharded read, such as one of normalized data, is charged its result and the chunks it decodes; the compressed bytes of a chunk it decodes and a decoded chunk that a codec thread still holds after a read stay outside the plan.
 Environment variables used by the documentation executor (`SCARF_MEM_BUDGET`, `SCARF_WORKERS`, …) are also useful for local large runs.
 
 ## Related guides

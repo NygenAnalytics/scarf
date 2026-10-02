@@ -12,9 +12,11 @@ if TYPE_CHECKING:
 def embeddings(ds: "DataStore", *, assay: str = "RNA") -> dict[str, "ArtifactRef"]:
     """Map imported source keys to complete embedding artifacts in ``assay``.
 
-    Discovery uses the DataStore's artifact provenance, so it also works on a
-    local mount without a catalog connection. Multiple imports of the same key
-    are ambiguous and require choosing an explicit artifact reference.
+    Discovery uses the DataStore's artifact provenance and needs no catalog
+    connection. A mount also finds the embeddings imported into its source,
+    which it resolves read only. Multiple imports of the same key, including
+    one in the source and one in the mount, are ambiguous and require choosing
+    an explicit artifact reference.
     """
     found: dict[str, ArtifactRef] = {}
     for ref in ds.list_artifacts(

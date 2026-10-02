@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ..assay import RNAassay, _read_block, norm_lib_size
-from ..assay.normalization import recorded_count_arithmetic
+from ..assay.normalization import library_size_values
 from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import callable_identity
 from ..storage.budget import ResourceBudget
@@ -75,10 +75,7 @@ def _reference_means(values: Any, *, n_features: int) -> np.ndarray:
     raw = np.asarray(values)
     if raw.dtype.kind not in {"i", "u", "f"}:
         raise ValueError("Reference normalized means must be real numeric values")
-    try:
-        means = np.asarray(raw, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Reference normalized means must be numeric") from exc
+    means = np.asarray(raw, dtype=np.float64)
     if means.shape != (n_features,):
         raise ValueError(
             "Reference normalized means must have one value per reference feature"
@@ -102,19 +99,14 @@ def _normalization_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
             "Reference normalization parameters are missing: "
             + ", ".join(sorted(missing))
         )
-    # Library-size normalizations computed through ``normed`` from integer
-    # counts record their float64 count arithmetic. Those without subset
-    # renormalization over a selection with a zero-count cell record that its
-    # total is divided as 1.
-    unknown = set(values) - required - {"count_arithmetic", "zero_total_divisor"}
+    unknown = set(values) - required
     if unknown:
         raise ValueError(
             "Unsupported reference normalization parameters: "
             + ", ".join(sorted(unknown))
+            + ". Recompute the normalization with run_normalization, then PCA and "
+            "its descendants"
         )
-    recorded_count_arithmetic(values)
-    if values.get("zero_total_divisor", "one") != "one":
-        raise ValueError("zero_total_divisor must be 'one' when recorded")
 
     method = values["normalization_method"]
     supported_method = callable_identity(norm_lib_size)
@@ -169,12 +161,13 @@ def normalize_reference_counts(
         raise ValueError("Query normalization totals must be finite and non-negative")
     if np.any(denominator == 0):
         denominator = np.where(denominator == 0, 1, denominator)
-    normalized = raw.astype(np.float64, copy=True)
-    normalized *= size_factor
-    normalized /= denominator[:, None]
-    if log_transform:
-        np.log1p(normalized, out=normalized)
-    return normalized
+    return library_size_values(
+        raw,
+        denominator,
+        size_factor,
+        dtype=np.float64,
+        log_transform=log_transform,
+    )
 
 
 class AlignedFeatureStream:
@@ -245,17 +238,12 @@ class AlignedFeatureStream:
         self._query_assay = query_assay
         self._raw_backing = raw_data._backing
         self._source_geometry = array_geometry(self._raw_backing)
-        if self._source_geometry is not None and len(self._source_geometry.shape) != 2:
-            raise ValueError("Query raw count geometry must be two-dimensional")
 
+        # Preparation guarantees one identifier per count column.
         query_feature_ids = _feature_ids(
             query_assay.feats.fetch_all("ids"),
             name="Query feature identifiers",
         )
-        if len(query_feature_ids) != raw_data.shape[1]:
-            raise ValueError(
-                "Query feature identifiers do not match the raw count columns"
-            )
         query_lookup = {
             identifier: index for index, identifier in enumerate(query_feature_ids)
         }
@@ -299,25 +287,17 @@ class AlignedFeatureStream:
 
         self._cell_scalars: np.ndarray | None = None
         if not self.renormalize_subset:
+            # Preparation guarantees a numeric total for every cell.
             scalar_name = f"{query_assay.name}_nCounts"
-            try:
-                scalars = np.asarray(
-                    read_metadata_rows_chunkwise(
-                        query_assay.cells,
-                        scalar_name,
-                        self._query_cell_indices,
-                    ),
-                    dtype=np.float64,
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Query assay requires numeric {scalar_name!r} metadata"
-                ) from exc
-            if scalars.shape != (len(self._query_cell_indices),):
-                raise ValueError(
-                    f"Query assay {scalar_name!r} metadata has the wrong shape"
-                )
-            scalars = np.array(scalars, dtype=np.float64, copy=True)
+            scalars = np.array(
+                read_metadata_rows_chunkwise(
+                    query_assay.cells,
+                    scalar_name,
+                    self._query_cell_indices,
+                ),
+                dtype=np.float64,
+                copy=True,
+            )
             if not np.all(np.isfinite(scalars)) or np.any(scalars < 0):
                 raise ValueError(
                     f"Query assay {scalar_name!r} metadata must be finite "

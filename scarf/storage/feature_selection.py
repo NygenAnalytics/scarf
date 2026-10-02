@@ -726,13 +726,9 @@ def _validate_feature_selection(
             context=context,
         )
 
+    # The provenance check accepts only the operations of its contracts.
     operation = status.operation
-    if operation is None:
-        raise ArtifactResolutionError(
-            "Feature selection has no producing operation",
-            code="corrupt_payload",
-            context=context,
-        )
+    assert operation is not None
     parameters = status.parameters or {}
     if (
         operation == "set_feature_selection"
@@ -756,6 +752,12 @@ def _validate_feature_selection(
                 code="corrupt_payload",
                 context=context,
             )
+    if not mask.any():
+        raise ArtifactResolutionError(
+            "Feature selection must select at least one feature",
+            code="corrupt_payload",
+            context=context,
+        )
     return ValidatedFeatureSelection(
         ref=ref, values=values, operation=operation, mask=mask
     )
@@ -787,6 +789,5 @@ def read_feature_selection_indices(
         indices = np.flatnonzero(np.asarray(values[start:stop], dtype=bool))
         if len(indices):
             selected.append(indices.astype(np.intp, copy=False) + start)
-    if not selected:
-        return np.empty(0, dtype=np.intp)
+    # Validation rejects a selection without features, so one block selects some.
     return np.concatenate(selected)

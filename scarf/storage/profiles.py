@@ -2,6 +2,7 @@ import os
 from typing import Literal
 
 from zarr.abc.store import Store
+from zarr.storage import WrapperStore
 
 type StorageProfile = Literal["fast_local", "cloud"]
 type ZarrLocation = str | Store
@@ -31,8 +32,16 @@ def resolve_storage_profile(
         return "cloud"
     if env_profile == "fast_local":
         return "fast_local"
+    if env_profile:
+        raise ValueError(
+            f"Invalid SCARF_ZARR_PROFILE={env_profile!r}; expected 'fast_local' "
+            "or 'cloud'."
+        )
     if isinstance(location, str):
         return "cloud" if is_remote_zarr_location(location) else "fast_local"
+    # A wrapper, such as a mounted artifact namespace, writes to the store it wraps.
+    while isinstance(location, WrapperStore):
+        location = location._store
     if type(location).__name__ in {"LocalStore", "MemoryStore"}:
         return "fast_local"
     return "cloud"

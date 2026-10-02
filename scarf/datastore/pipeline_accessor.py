@@ -1,6 +1,5 @@
 import tempfile
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -465,84 +464,80 @@ class PipelineAccessor:
             artifacts["umap"] = ref
             return (("umap", ref),)
 
-        # UMAP runs beside the graph clustering stages. It neither scans thread
-        # pools nor loads extensions, and it finishes before the doublet and
-        # marker stages, which plan their memory against the budget.
-        umap: AbstractContextManager[None] = nullcontext()
         if recipe.umap:
-            umap = ledger.overlapping("umap", umap_stage)
+            ledger.run("umap", umap_stage)
         else:
             ledger.skip("umap")
-        with umap:
-            for key, resolution in recipe.leiden_partitions:
-                output_key = f"leiden_{key}"
 
-                def leiden_stage(
-                    output_key: str = output_key,
-                    resolution: float = resolution,
-                ) -> Sequence[tuple[str, ArtifactRef]]:
-                    ref = store._run_leiden_artifact(
-                        artifacts["connectivity_map"],
-                        resolution=resolution,
-                        **recipe.params_for("leiden"),
-                    )
-                    artifacts[output_key] = ref
-                    return ((output_key, ref),)
+        for key, resolution in recipe.leiden_partitions:
+            output_key = f"leiden_{key}"
 
-                ledger.run(output_key, leiden_stage)
-
-            if recipe.paris:
-
-                def paris_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                    ref = store._run_paris_artifact(
-                        artifacts["connectivity_map"], **recipe.params_for("paris")
-                    )
-                    artifacts["paris"] = ref
-                    return (("paris", ref),)
-
-                ledger.run("paris", paris_stage)
-            else:
-                ledger.skip("paris")
-
-            clustering_candidates = [
-                (f"leiden_{key}", artifacts[f"leiden_{key}"])
-                for key, _resolution in recipe.leiden_partitions
-            ]
-            if recipe.leiden_selected is not None:
-                # The requested resolution is the saved clustering; the other
-                # partitions stay available as candidates.
-                artifacts["clusters"] = artifacts[f"leiden_{recipe.leiden_selected}"]
-                ledger.skip("cluster_selection")
-            elif clustering_candidates:
-
-                def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                    decision, selected_key, selected_ref = run_cluster_selection(
-                        store,
-                        coordinates=coordinates,
-                        connectivity_map=artifacts["connectivity_map"],
-                        cell_selection=analysis_selection,
-                        candidates=clustering_candidates,
-                    )
-                    artifacts["cluster_selection"] = decision
-                    artifacts["clusters"] = selected_ref
-                    logger.info(f"Selected clustering candidate: {selected_key}")
-                    return (("cluster_selection", decision),)
-
-                ledger.run("cluster_selection", cluster_selection_stage)
-            else:
-                ledger.skip("cluster_selection")
-
-            def membership_strength_stage() -> Sequence[tuple[str, ArtifactRef]]:
-                ref = store.calc_membership_strength(
-                    artifacts["clusters"], artifacts["connectivity_map"]
+            def leiden_stage(
+                output_key: str = output_key,
+                resolution: float = resolution,
+            ) -> Sequence[tuple[str, ArtifactRef]]:
+                ref = store._run_leiden_artifact(
+                    artifacts["connectivity_map"],
+                    resolution=resolution,
+                    **recipe.params_for("leiden"),
                 )
-                artifacts["membership_strength"] = ref
-                return (("membership_strength", ref),)
+                artifacts[output_key] = ref
+                return ((output_key, ref),)
 
-            if recipe.membership_strength:
-                ledger.run("membership_strength", membership_strength_stage)
-            else:
-                ledger.skip("membership_strength")
+            ledger.run(output_key, leiden_stage)
+
+        if recipe.paris:
+
+            def paris_stage() -> Sequence[tuple[str, ArtifactRef]]:
+                ref = store._run_paris_artifact(
+                    artifacts["connectivity_map"], **recipe.params_for("paris")
+                )
+                artifacts["paris"] = ref
+                return (("paris", ref),)
+
+            ledger.run("paris", paris_stage)
+        else:
+            ledger.skip("paris")
+
+        clustering_candidates = [
+            (f"leiden_{key}", artifacts[f"leiden_{key}"])
+            for key, _resolution in recipe.leiden_partitions
+        ]
+        if recipe.leiden_selected is not None:
+            # The requested resolution is the saved clustering; the other
+            # partitions stay available as candidates.
+            artifacts["clusters"] = artifacts[f"leiden_{recipe.leiden_selected}"]
+            ledger.skip("cluster_selection")
+        elif clustering_candidates:
+
+            def cluster_selection_stage() -> Sequence[tuple[str, ArtifactRef]]:
+                decision, selected_key, selected_ref = run_cluster_selection(
+                    store,
+                    coordinates=coordinates,
+                    connectivity_map=artifacts["connectivity_map"],
+                    cell_selection=analysis_selection,
+                    candidates=clustering_candidates,
+                )
+                artifacts["cluster_selection"] = decision
+                artifacts["clusters"] = selected_ref
+                logger.info(f"Selected clustering candidate: {selected_key}")
+                return (("cluster_selection", decision),)
+
+            ledger.run("cluster_selection", cluster_selection_stage)
+        else:
+            ledger.skip("cluster_selection")
+
+        def membership_strength_stage() -> Sequence[tuple[str, ArtifactRef]]:
+            ref = store.calc_membership_strength(
+                artifacts["clusters"], artifacts["connectivity_map"]
+            )
+            artifacts["membership_strength"] = ref
+            return (("membership_strength", ref),)
+
+        if recipe.membership_strength:
+            ledger.run("membership_strength", membership_strength_stage)
+        else:
+            ledger.skip("membership_strength")
 
         def tsne_stage() -> Sequence[tuple[str, ArtifactRef]]:
             with tempfile.TemporaryDirectory(prefix="scarf-tsne-") as work_dir:
@@ -597,7 +592,6 @@ class PipelineAccessor:
                     clusters=clusters,
                     cluster_values=cluster_label_values(store.zw, clusters),
                     connectivity=doublet_graph,
-                    feature_names=frozen_feature_names,
                     feature_snapshot=feature_snapshot,
                     **recipe.params_for("doublets"),
                 )

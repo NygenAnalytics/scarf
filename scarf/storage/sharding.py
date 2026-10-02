@@ -1,8 +1,9 @@
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -46,6 +47,7 @@ from ..utils.arrays import (
     checked_sparse_cast,
     sparse_matrix_bytes,
 )
+from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from .identity import CountSummary
@@ -257,11 +259,10 @@ def _resolve_sparse_import_geometries(
             )
             band_requirements.append((geometry, dtype, band_values, band_sparse_bytes))
 
-    def reserve(width: int) -> int:
+    def producer_bytes(width: int, *, buffering: bool) -> int:
         source_values = max(0, int(maxWindowNnz(width)))
-        buffered_values = max(
-            0,
-            int(maxWindowNnz(width + maximum_shard_rows)),
+        buffered_values = (
+            max(0, int(maxWindowNnz(width + maximum_shard_rows))) if buffering else 0
         )
         return int(
             sparse_producer_peak_bytes(
@@ -274,7 +275,19 @@ def _resolve_sparse_import_geometries(
         )
 
     def admit(width: int) -> int:
-        producer_reserve = reserve(width)
+        # The producer is a generator in the writing process. It buffers rows
+        # and cuts a band while no band is written, and it is suspended,
+        # holding one source batch, while bands are written, so the two peaks
+        # never coexist and each phase is admitted on its own.
+        producer_reserve = producer_bytes(width, buffering=True)
+        admitted_worker_split(
+            resources,
+            nTasks=1,
+            residentBytes=max(0, int(residentBytes)) + producer_reserve,
+            taskBytes=lambda _: 1,
+            requested=1,
+        )
+        producer_held = producer_bytes(width, buffering=False)
         for (
             geometry,
             destination_dtype,
@@ -293,7 +306,7 @@ def _resolve_sparse_import_geometries(
                 resources,
                 nTasks=1,
                 residentBytes=(
-                    max(0, int(residentBytes)) + producer_reserve + band_sparse_bytes
+                    max(0, int(residentBytes)) + producer_held + band_sparse_bytes
                 ),
                 taskBytes=lambda inner: _row_band_task_peak(
                     sourceBytes=conversion_bytes,
@@ -304,27 +317,22 @@ def _resolve_sparse_import_geometries(
                 ),
                 requested=1,
             )
-        if not band_requirements:
-            admitted_worker_split(
-                resources,
-                nTasks=1,
-                residentBytes=max(0, int(residentBytes)) + producer_reserve,
-                taskBytes=lambda _: 1,
-                requested=1,
-            )
         return producer_reserve
 
+    preferred_rows = min(
+        rows,
+        min(geometry.axisShard(0) for geometry, _dtype in destination_list),
+    )
     if batchRows is not None:
-        resolved_rows = int(batchRows)
+        # A batch never holds more than one band of the shortest-band
+        # destination: a layout fit admits that batch, and a wider one only
+        # buffers more source rows.
+        resolved_rows = min(int(batchRows), max(1, preferred_rows))
         producer_reserve = admit(resolved_rows)
     elif rows == 0:
         resolved_rows = 1
         producer_reserve = admit(resolved_rows)
     else:
-        preferred_rows = min(
-            rows,
-            min(geometry.axisShard(0) for geometry, _dtype in destination_list),
-        )
 
         def fits(width: int) -> bool:
             try:
@@ -333,18 +341,17 @@ def _resolve_sparse_import_geometries(
                 return False
             return True
 
-        resolved_rows = affordable_width(fits, preferred_rows)
-        if resolved_rows < 1:
-            try:
-                admit(1)
-            except MemoryError as exc:
-                raise MemoryError(
-                    "Automatic sparse import cannot fit one source row and one "
-                    "complete destination row band. Increase mem_budget or use "
-                    "smaller target chunk and shard byte limits."
-                ) from exc
-            raise RuntimeError("Sparse import admission failed unexpectedly")
-        producer_reserve = reserve(resolved_rows)
+        # The widest fitting width is admitted again for its reserve. Only one
+        # row can fail here, when no width fits, and its MemoryError says why.
+        resolved_rows = max(1, affordable_width(fits, preferred_rows))
+        try:
+            producer_reserve = admit(resolved_rows)
+        except MemoryError as exc:
+            raise MemoryError(
+                "Automatic sparse import cannot fit one source row and one "
+                f"complete destination row band in {resources.memoryBytes} "
+                f"bytes. Increase mem_budget. {exc}"
+            ) from exc
 
     return SparseImportPlan(
         batchRows=resolved_rows,
@@ -368,13 +375,13 @@ def aligned_row_windows(
     base, extra = divmod(n_shards, windows)
     ranges: list[tuple[int, int]] = []
     shard_index = 0
+    # Every window holds at least one shard, as there are no more windows
+    # than shards.
     for window in range(windows):
         count = base + (1 if window < extra else 0)
         start = shard_index * shard
         shard_index += count
-        end = min(rows, shard_index * shard)
-        if start < end:
-            ranges.append((start, end))
+        ranges.append((start, min(rows, shard_index * shard)))
     return ranges
 
 
@@ -428,7 +435,10 @@ class SparseShardBuffer:
                 coo = canonicalize_sparse(coo, self.dtype)
             self._rows.append(np.asarray(coo.row, dtype=np.int64) + self.rows)
             self._columns.append(np.asarray(coo.col, dtype=np.int64))
-            self._data.append(np.asarray(coo.data))
+            # Every part holds the destination dtype, so joining the parts of
+            # a band never promotes them, as int64 and uint64 promote to
+            # float64.
+            self._data.append(checked_sparse_cast(np.asarray(coo.data), self.dtype))
         self.rows += int(coo.shape[0])
         while self._nextFlush <= self.rows:
             end = self._nextFlush
@@ -442,12 +452,11 @@ class SparseShardBuffer:
                 f"Sparse stream contains {self.rows} rows, expected {self.endRow}"
             )
         # An empty window never flushed, so its trailing band must not start
-        # before the window does.
+        # before the window does. Every flush took the coordinates before its
+        # end, so none remain when no rows follow the last one.
         trailing_start = max(self.startRow, self._nextFlush - self.shardRows)
         if trailing_start < self.rows:
             yield self._take(trailing_start, self.rows)
-        elif self._rows or self._columns or self._data:
-            raise RuntimeError("Sparse coordinates remain after the final row band")
 
     def _take(self, start: int, end: int) -> SparseRowBand:
         row, column, data = self._drain()
@@ -625,30 +634,34 @@ def _sparse_batch_plan(
     pending: deque[SparseWriteBand],
     resources: ResourceBudget,
     residentBytes: int,
-    producerReserveBytes: int,
     nTasks: int,
     io: StorageIoPolicy,
 ) -> OperationPlan:
+    """Plan writing the first ``nTasks`` pending bands at once.
+
+    Bands are written while the producer is suspended, so the writes share
+    memory with the bytes it holds at a yield, not with its buffering peak,
+    and with the sparse values of every pending band.
+    """
     sparse_bytes = sum(write.band.sparseBytes for write in pending)
     producer_bytes = max(write.producerBytes for write in pending)
+    batch = list(islice(pending, nTasks))
     geometries = [
         _band_geometry(write.destination, write.band.end - write.band.start)
-        for write in pending
+        for write in batch
     ]
     inner_bytes = max(geometry[1] for geometry in geometries)
     chunks = max(geometry[2] for geometry in geometries)
     unit = max(
         _sparse_task_working_bytes(write, 1) - geometry[1]
-        for write, geometry in zip(pending, geometries, strict=True)
+        for write, geometry in zip(batch, geometries, strict=True)
     )
     return plan_operation(
         resources,
         WorkShape(
             nUnits=nTasks,
             unitBytes=unit,
-            residentBytes=residentBytes
-            + max(producerReserveBytes, producer_bytes)
-            + sparse_bytes,
+            residentBytes=residentBytes + producer_bytes + sparse_bytes,
             innerReadBytes=inner_bytes,
             maxInnerReads=chunks,
             chunksPerShard=chunks,
@@ -656,6 +669,26 @@ def _sparse_batch_plan(
         ),
         policy=io,
     )
+
+
+def _writable_batch_plan(
+    pending: deque[SparseWriteBand],
+    resources: ResourceBudget,
+    residentBytes: int,
+    io: StorageIoPolicy,
+) -> OperationPlan:
+    """Plan the longest run of leading pending bands that fits in one batch.
+
+    A band of a wider destination can arrive after narrower bands and not fit
+    beside them. The earlier bands are then written first, which frees their
+    sparse values for it.
+    """
+    for size in range(len(pending), 1, -1):
+        try:
+            return _sparse_batch_plan(pending, resources, residentBytes, size, io)
+        except MemoryError:
+            continue
+    return _sparse_batch_plan(pending, resources, residentBytes, 1, io)
 
 
 def write_sparse_bands(
@@ -683,13 +716,16 @@ def write_sparse_bands(
 
         progress = tqdmbar(desc=msg, total=total)
 
-    def pull() -> SparseWriteBand:
+    def pull_bytes() -> int:
         sparse_bytes = sum(write.band.sparseBytes for write in pending)
         producer_bytes = max(
             producerReserveBytes,
             max((write.producerBytes for write in pending), default=0),
         )
-        reserved = residentBytes + producer_bytes + sparse_bytes
+        return residentBytes + producer_bytes + sparse_bytes
+
+    def pull() -> SparseWriteBand:
+        reserved = pull_bytes()
         if reserved > resources.memoryBytes:
             raise MemoryError(
                 f"Sparse producer needs about {reserved} bytes before a write "
@@ -706,16 +742,27 @@ def write_sparse_bands(
                 exhausted = True
                 return
         while not exhausted:
-            operation = _sparse_batch_plan(
-                pending,
-                resources,
-                residentBytes,
-                producerReserveBytes,
-                resources.workers,
-                resolved_io,
-            )
+            try:
+                operation = _sparse_batch_plan(
+                    pending,
+                    resources,
+                    residentBytes,
+                    resources.workers,
+                    resolved_io,
+                )
+            except MemoryError:
+                # Not every pending band fits in one batch, as after a band
+                # wider than the earlier ones; they are written first.
+                return
             capacity = min(operation.computeWorkers, operation.writeWorkers)
-            if len(pending) >= capacity:
+            # The producer buffers the next band beside the pending ones, and
+            # one band must still be writable after it; otherwise the pending
+            # bands are written first.
+            one_write = max(_sparse_task_working_bytes(write, 1) for write in pending)
+            if (
+                len(pending) >= capacity
+                or pull_bytes() + one_write > resources.memoryBytes
+            ):
                 return
             try:
                 pending.append(pull())
@@ -736,12 +783,10 @@ def write_sparse_bands(
     try:
         fill()
         while pending:
-            operation = _sparse_batch_plan(
+            operation = _writable_batch_plan(
                 pending,
                 resources,
                 residentBytes,
-                producerReserveBytes,
-                len(pending),
                 resolved_io,
             )
             admitted = min(operation.computeWorkers, operation.writeWorkers)
@@ -795,7 +840,11 @@ def write_dense_from_row_batches(
     residentBytes: int = 0,
     countSummary: "CountSummary | None" = None,
 ) -> int:
-    """Align source batches to destination row bands and write them in parallel."""
+    """Align source batches to destination row bands and write them in parallel.
+
+    Bands hold ``dtype``, the destination dtype by default. A value that an
+    integer ``dtype`` cannot hold raises OverflowError instead of wrapping.
+    """
     resources = resources or resolve_budget()
     source = iter(batches)
     if int(dst.shape[0]) == 0:
@@ -879,9 +928,12 @@ def write_dense_from_row_batches(
                         shard_rows - buffered_rows,
                         int(values.shape[0]) - source_start,
                     )
-                    buffer[buffered_rows : buffered_rows + copied] = values[
-                        source_start : source_start + copied
-                    ]
+                    rows = values[source_start : source_start + copied]
+                    if target_dtype.kind in "biu":
+                        # A value the integer dtype cannot hold raises instead
+                        # of wrapping.
+                        rows = checked_sparse_cast(rows, target_dtype)
+                    buffer[buffered_rows : buffered_rows + copied] = rows
                     buffered_rows += copied
                     source_start += copied
                     if buffered_rows == shard_rows:
@@ -1199,6 +1251,164 @@ def preflight_counts_t_spec(
     return plan.countsT
 
 
+def _band_rows(spec: ZarrArraySpec) -> int:
+    """Return the rows of one destination row band of a counts array."""
+    return max(1, int((spec.shards or spec.chunks)[0]))
+
+
+def sparse_counts_admission(
+    *,
+    nRows: int,
+    maxWindowNnz: Callable[[int], int],
+    sourceDtype: Any,
+    residentBytes: int = 0,
+    producerStagingBytes: Callable[[int], int] | None = None,
+    extraProducerBytes: Callable[[int], int] | None = None,
+) -> Callable[[tuple[ZarrArraySpec, ...], ResourceBudget], object]:
+    """Return the ``admitCounts`` of a sparse import for :func:`fit_count_layout`.
+
+    A layout is admitted when its counts write takes source batches of one
+    destination row band, the batch the write plans first. A fitted layout
+    therefore never leaves the write narrower batches than its bands; only
+    shards of one row get batches of one row. The arguments are those that
+    the write passes to :func:`resolve_sparse_import_batch`.
+    """
+
+    def admit(specs: tuple[ZarrArraySpec, ...], resources: ResourceBudget) -> object:
+        return resolve_sparse_import_spec(
+            specs,
+            nRows=nRows,
+            resources=resources,
+            maxWindowNnz=maxWindowNnz,
+            sourceDtype=sourceDtype,
+            batchRows=min([max(1, int(nRows)), *map(_band_rows, specs)]),
+            residentBytes=residentBytes,
+            producerStagingBytes=producerStagingBytes,
+            extraProducerBytes=extraProducerBytes,
+        )
+
+    return admit
+
+
+def dense_counts_admission(
+    residentBytes: int,
+    producerBytes: Callable[[int], int] = lambda _rows: 0,
+) -> Callable[[tuple[ZarrArraySpec, ...], ResourceBudget], object]:
+    """Return the ``admitCounts`` of a dense write for :func:`fit_count_layout`.
+
+    A layout is admitted when one worker writes one destination row band of
+    each counts array beside ``residentBytes``, while its producer holds
+    ``producerBytes`` of the band's rows.
+    """
+
+    def admit(specs: tuple[ZarrArraySpec, ...], resources: ResourceBudget) -> object:
+        for spec in specs:
+            plan_dense_write(
+                spec,
+                resources,
+                1,
+                residentBytes=residentBytes,
+                producerBytes=producerBytes(_band_rows(spec)),
+            )
+        return None
+
+    return admit
+
+
+def fit_count_layout(
+    assays: Mapping[str, tuple[int, Any]],
+    *,
+    nCells: int,
+    profile: StorageProfile,
+    memoryBytes: int,
+    transposed: Collection[str],
+    admitCounts: Callable[[tuple[ZarrArraySpec, ...], ResourceBudget], object],
+    requested: CountMatrixPolicy | None = None,
+    countsTResidentBytes: int = 0,
+) -> CountMatrixPolicy:
+    """Return the count-matrix layout an import writes within its budget.
+
+    An explicit ``requested`` policy is used exactly: when its writes do not
+    fit, the MemoryError is raised before the writer creates its destination.
+    Otherwise ``unitBytes`` and ``chunkBytes`` of the default policy are halved
+    together, keeping its chunks per shard, until the counts write of every
+    assay and the ``countsT`` transpose of every transposed assay fit.
+    Admission uses one worker, so the layout depends only on the budget, the
+    data, and the dtypes.
+
+    Args:
+        assays: Feature count and count storage dtype of each assay the import
+            writes.
+        nCells: Number of cells.
+        profile: Storage profile of the destination.
+        memoryBytes: Memory budget of the import.
+        transposed: Assays that also write ``countsT``.
+        admitCounts: Raises MemoryError when the ``counts`` arrays planned
+            with the given specifications cannot be written within the given
+            budget, such as :func:`sparse_counts_admission` and
+            :func:`dense_counts_admission` return.
+        requested: Explicit policy, or None to fit the default policy.
+        countsTResidentBytes: Bytes the writer holds while it writes
+            ``countsT``.
+
+    Raises:
+        MemoryError: If ``requested`` does not fit, or nothing fits, not even
+            count shards of one row.
+    """
+    resources = ResourceBudget(int(memoryBytes), 1)
+
+    def admit(policy: CountMatrixPolicy) -> None:
+        plans = {
+            name: plan_count_matrix_pair(
+                nCells, width, dtype, policy=policy, profile=profile
+            )
+            for name, (width, dtype) in assays.items()
+        }
+        admitCounts(tuple(plan.counts for plan in plans.values()), resources)
+        for name in transposed:
+            preflight_counts_t_spec(
+                plans[name].counts,
+                profile=profile,
+                resources=resources,
+                residentBytes=countsTResidentBytes,
+                policy=policy,
+            )
+
+    if requested is not None:
+        try:
+            admit(requested)
+        except MemoryError as error:
+            raise MemoryError(
+                "The requested count-matrix policy does not fit mem_budget. "
+                f"Increase mem_budget or leave policy unset. {error}"
+            ) from error
+        return requested
+    row_bytes = max(
+        [1, *(width * np.dtype(dtype).itemsize for width, dtype in assays.values())]
+    )
+    policy = DEFAULT_COUNT_MATRIX_POLICY
+    while True:
+        try:
+            admit(policy)
+        except MemoryError as error:
+            if policy.unitBytes < 2 * row_bytes:
+                raise MemoryError(
+                    "Count import does not fit mem_budget even with count shards "
+                    f"of one row. Increase mem_budget. {error}"
+                ) from error
+            policy = CountMatrixPolicy(
+                unitBytes=policy.unitBytes // 2,
+                chunkBytes=max(1, policy.chunkBytes // 2),
+            )
+            continue
+        if policy != DEFAULT_COUNT_MATRIX_POLICY:
+            logger.info(
+                f"Fitted the count layout to mem_budget: unitBytes={policy.unitBytes} "
+                f"chunkBytes={policy.chunkBytes}"
+            )
+        return policy
+
+
 def write_counts_t(
     counts: zarr.Array,
     group: zarr.Group,
@@ -1206,7 +1416,6 @@ def write_counts_t(
     profile: StorageProfile | None = None,
     resources: ResourceBudget | None = None,
     residentBytes: int = 0,
-    policy: CountMatrixPolicy | None = None,
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
     overwrite: bool = False,
@@ -1214,17 +1423,15 @@ def write_counts_t(
 ) -> zarr.Array:
     """Write paired rotateOnce feature-major ``countsT``.
 
-    Each index set in ``featureSets`` also gets its per-cell count total, taken
-    from the decoded source blocks and saved next to the count summaries.
+    The layout replays the policy persisted with ``counts``. Each index set in
+    ``featureSets`` also gets its per-cell count total, taken from the decoded
+    source blocks and saved next to the count summaries.
     """
     if _group_zarr_format(group) < 3:
         raise ValueError("paired countsT requires Zarr format 3")
     resources = resources or resolve_budget()
     resolved_profile = profile or resolve_storage_profile(group.store)
-    if policy is None:
-        resolved_policy = policy_from_payload(load_count_matrix_plan(counts))
-    else:
-        resolved_policy = policy
+    resolved_policy = policy_from_payload(load_count_matrix_plan(counts))
     resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     plan = plan_count_matrix_pair(
         int(counts.shape[0]),
@@ -1363,8 +1570,6 @@ def write_counts_t(
         "sourceReadGroups": 0,
         "sourceLogicalBytes": 0,
         "sourceDecodeBytes": 0,
-        "sourceRepeatedDecodeCount": 0,
-        "sourceRepeatedDecodeBytes": 0,
         "destinationCommits": 0,
         "destinationLogicalBytes": 0,
         "destinationOwners": 0,
@@ -1373,7 +1578,6 @@ def write_counts_t(
         "destinationWorkingBytes": working_bytes,
         "kind": "observed",
     }
-    seen_source_chunks: set[tuple[int, int]] = set()
 
     def _chunk_starts(start: int, stop: int, chunk: int) -> range:
         return range((start // chunk) * chunk, stop, chunk)
@@ -1457,23 +1661,11 @@ def write_counts_t(
                     observed["sourceLogicalBytes"] = int(
                         observed["sourceLogicalBytes"]
                     ) + int(payload.nbytes)
-                    chunk_key = (
-                        source_cell_start // source_cell_chunk,
-                        source_feat_start // source_feat_chunk,
-                    )
-                    decode_bytes = source_cell_chunk * source_feat_chunk * itemsize
-                    observed["sourceDecodeBytes"] = (
-                        int(observed["sourceDecodeBytes"]) + decode_bytes
-                    )
-                    if chunk_key in seen_source_chunks:
-                        observed["sourceRepeatedDecodeCount"] = (
-                            int(observed["sourceRepeatedDecodeCount"]) + 1
-                        )
-                        observed["sourceRepeatedDecodeBytes"] = (
-                            int(observed["sourceRepeatedDecodeBytes"]) + decode_bytes
-                        )
-                    else:
-                        seen_source_chunks.add(chunk_key)
+                    # Paired destination shards hold whole source chunks, so
+                    # every source chunk is decoded exactly once.
+                    observed["sourceDecodeBytes"] = int(
+                        observed["sourceDecodeBytes"]
+                    ) + (source_cell_chunk * source_feat_chunk * itemsize)
 
                 pending: set[asyncio.Task[None]] = set()
                 async with asyncio.TaskGroup() as read_tasks:

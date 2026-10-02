@@ -8,12 +8,7 @@ from numba import njit, prange
 
 from ..matrix import ChunkedArray
 from ..storage.budget import ResourceBudget
-from ..storage.execution import WorkShape, plan_operation
-from ..storage.feature_stream import (
-    FeatureCellBand,
-    map_feature_cell_bands,
-    persisted_read_group,
-)
+from ..storage.feature_stream import FeatureCellBand, map_feature_cell_bands
 from ..storage.geometry import array_geometry
 from ..storage.io_policy import DEFAULT_STORAGE_IO_POLICY, StorageIoPolicy
 
@@ -62,54 +57,19 @@ def aggregate_rna_groups(
     geometry = array_geometry(counts_t)
     assert geometry is not None
     n_features = int(counts_t.shape[0])
-    # Raw sums keep the dtype NumPy gives a sum of the counts; floating counts
-    # accumulate in float64 because float32 stops adding unit counts at 2**24.
-    dtype = (
-        np.dtype(np.float64)
-        if scalars is not None
-        else np.empty(0, dtype=counts_t.dtype).sum().dtype
-    )
-    accumulator_dtype = np.dtype(np.float64) if dtype.kind == "f" else dtype
-    cast_itemsize = 0 if accumulator_dtype == dtype else dtype.itemsize
-    feature_width, _ = persisted_read_group(counts_t)
-    band_features = min(n_features, max(feature_width, geometry.axisChunk(0)))
+    # Raw sums are exact: integer counts add in the integer dtype NumPy gives
+    # their sum, floating counts in float64. Means are float64.
+    dtype = np.empty(0, dtype=counts_t.dtype).sum().dtype
+    if scalars is not None or dtype.kind == "f":
+        dtype = np.dtype(np.float64)
     band_cells = min(int(counts_t.shape[1]), geometry.axisChunk(1))
-    band_elements = band_features * band_cells
-    output_bytes = (
-        n_features
-        * n_groups
-        * (accumulator_dtype.itemsize + cast_itemsize + 8 * return_fraction)
-    )
+    output_bytes = n_features * n_groups * (dtype.itemsize + 8 * return_fraction)
     # Include DataFrame construction/filter copies and selected-cell bookkeeping.
     resident_bytes = 4 * output_bytes + 64 * len(cell_indices) + 16 * n_groups
     # Reserve band-local group codes and normalization scalars.
     scratch_bytes = resident_bytes + min(len(cell_indices), band_cells) * (
         group_codes.dtype.itemsize + (0 if scalars is None else scalars.dtype.itemsize)
     )
-    stream_io = replace(io or DEFAULT_STORAGE_IO_POLICY, computeWorkers=1)
-    decode_bytes = (
-        max(1, -(-band_features // geometry.axisChunk(0)))
-        * geometry.nominalChunkBytes()
-    )
-    plan = plan_operation(
-        resources,
-        WorkShape(
-            nUnits=max(1, -(-n_features // geometry.axisChunk(0)))
-            * max(1, -(-int(counts_t.shape[1]) // geometry.axisChunk(1))),
-            unitBytes=max(1, band_elements * geometry.itemsize),
-            decodeBytes=decode_bytes,
-            scratchBytes=scratch_bytes,
-            ordered=True,
-        ),
-        stream_io,
-    )
-    stream_io = replace(stream_io, readWorkers=plan.readWorkers)
-    scratch_bytes += plan.readWorkers * decode_bytes
-    values = np.zeros((n_groups, n_features), dtype=accumulator_dtype)
-    fractions = (
-        np.zeros((n_groups, n_features), dtype=np.float64) if return_fraction else None
-    )
-    group_sizes = np.bincount(group_codes, minlength=n_groups)
 
     def accumulate(band: FeatureCellBand) -> None:
         columns = slice(band.featStart, band.featEnd)
@@ -123,26 +83,31 @@ def aggregate_rna_groups(
             None if fractions is None else fractions[:, columns].T,
         )
 
-    for _ in map_feature_cell_bands(
+    # The stream plans when it is created, so a budget that cannot also hold
+    # the output fails before the output is allocated.
+    bands = map_feature_cell_bands(
         counts_t,
         accumulate,
         cell_idx=cell_indices,
         resources=resources,
-        io=stream_io,
+        io=replace(io or DEFAULT_STORAGE_IO_POLICY, computeWorkers=1),
         progress="Aggregating RNA groups",
         scratchBytes=scratch_bytes,
         orderedCompute=True,
-    ):
+    )
+    values = np.zeros((n_groups, n_features), dtype=dtype)
+    fractions = (
+        np.zeros((n_groups, n_features), dtype=np.float64) if return_fraction else None
+    )
+    group_sizes = np.bincount(group_codes, minlength=n_groups)
+    for _ in bands:
         pass
     denominators = np.maximum(group_sizes, 1)[:, None]
     if scalars is not None:
         values /= denominators
     if fractions is not None:
         fractions /= denominators
-    return (
-        values.T.astype(dtype, copy=False),
-        None if fractions is None else fractions.T,
-    )
+    return values.T, None if fractions is None else fractions.T
 
 
 def aggregate_normalized_groups(
@@ -174,14 +139,26 @@ def aggregate_normalized_groups(
     ):
         raise ValueError("Bulk group codes must align with normalized rows")
     sums = np.zeros((n_groups, normalized.shape[1]), dtype=np.float64)
+    rows, n_features = normalized.chunksize
+    # The sums stay for the whole pass. A block is copied to float64 unless it
+    # already is, and once more for the rows of one group at a time.
+    block_copies = 1 if normalized.dtype == np.float64 else 2
     start = 0
-    for block in normalized.stream_blocks(
-        nthreads=nthreads, msg="Aggregating normalized groups"
+    for block in normalized._stream_blocks(
+        nthreads=nthreads,
+        msg="Aggregating normalized groups",
+        prefetch=None,
+        row_mask=None,
+        resident_bytes=sums.nbytes + (block_copies * rows + 1) * n_features * 8,
     ):
         values = np.asarray(block, dtype=np.float64)
+        del block
         block_codes = codes[start : start + len(values)]
         for code in np.unique(block_codes[block_codes >= 0]):
             sums[code] += values[block_codes == code].sum(axis=0)
         start += len(values)
+        # The stream only reserves the blocks it reads, not one kept here.
+        del values
     sizes = np.bincount(codes[codes >= 0], minlength=n_groups)
-    return (sums / np.maximum(sizes, 1)[:, None]).T
+    sums /= np.maximum(sizes, 1)[:, None]
+    return sums.T

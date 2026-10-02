@@ -1,12 +1,15 @@
-"""Readers for persisted marker statistics."""
+"""Rank marker results and the readers of their persisted statistics."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import zarr
+from scipy.special import ndtr
 
+from ..statistical import adjust_pvalues
 from .rank import sort_marker_results
 from ...utils.arrays import has_duplicates
 
@@ -38,8 +41,183 @@ _MARKER_METADATA = {
 
 __all__ = [
     "MARKER_STAT_COLUMNS",
+    "RankMarkerResult",
     "load_marker_table",
 ]
+
+# The rank kernels compute every stored column except ``p_value_adjusted``,
+# with the Mann-Whitney z statistic in place of ``p_value``.
+_RANK_COLUMNS = len(MARKER_STAT_COLUMNS) - 1
+_P_VALUE = MARKER_STAT_COLUMNS.index("p_value")
+
+
+def stored_table_bytes(n_features: int) -> int:
+    """Return a bound on what finishing and writing one group's table holds.
+
+    While a table is finished, the intermediates of its p-values and their
+    adjustment take at most one more table's size; while it is written, the
+    bytes Zarr encodes and compresses from it take at most two.
+    """
+    table = max(0, int(n_features)) * len(MARKER_STAT_COLUMNS)
+    return 3 * table * np.dtype(np.float64).itemsize
+
+
+def _validate_rank_marker_groups(group_sizes: np.ndarray) -> None:
+    """Refuse groups that a stored marker table cannot hold.
+
+    A stored group and its one-versus-rest complement each need at least two
+    cells, which at least two groups of at least two cells give.
+    """
+    if group_sizes.size < 2:
+        raise ValueError("Rank markers require at least two populated groups")
+    if np.any(group_sizes < 2):
+        raise ValueError("Rank markers require at least two cells in every group")
+
+
+def _ranked_table(
+    stats: np.ndarray,
+    columns: Sequence[str],
+    feature_index: np.ndarray,
+    feature_names: np.ndarray,
+    group_id: Any,
+) -> pd.DataFrame:
+    """Name and rank one group's stored statistics for display."""
+    names = np.asarray(feature_names, dtype=object)
+    if names.ndim != 1:
+        raise ValueError("Feature names must be one-dimensional")
+    frame = pd.DataFrame(stats, columns=list(columns))
+    frame["group_id"] = group_id
+    frame["feature_name"] = names[feature_index]
+    frame["feature_index"] = feature_index
+    return sort_marker_results(
+        frame[["group_id", "feature_name", "feature_index", *MARKER_STAT_COLUMNS]]
+    )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class RankMarkerResult:
+    """Rank marker statistics of every group, as the rank kernels compute them.
+
+    ``statistics`` holds, for each tested feature and group, the first eight
+    ``MARKER_STAT_COLUMNS`` with the continuity- and tie-corrected
+    Mann-Whitney z statistic in place of ``p_value``. ``stored_statistics``
+    finishes one group into the table that a marker artifact stores, and
+    ``table`` into the ranked table that such an artifact reads back.
+
+    Attributes:
+        group_ids: Sorted unique group labels, at least two.
+        group_sizes: Number of cells in each group, at least two.
+        feature_index: Ascending assay indices of the tested features, at
+            least one.
+        statistics: Features-by-groups-by-8 rank statistics.
+    """
+
+    group_ids: np.ndarray = field(repr=False)
+    group_sizes: np.ndarray = field(repr=False)
+    feature_index: np.ndarray = field(repr=False)
+    statistics: np.ndarray = field(repr=False)
+
+    def __post_init__(self) -> None:
+        group_ids = np.asarray(self.group_ids)
+        group_sizes = np.asarray(self.group_sizes)
+        feature_index = np.asarray(self.feature_index)
+        statistics = np.asarray(self.statistics)
+        if (
+            group_ids.ndim != 1
+            or has_duplicates(group_ids)
+            or group_sizes.shape != group_ids.shape
+            or group_sizes.dtype.kind not in {"i", "u"}
+        ):
+            raise ValueError(
+                "Rank marker groups must be unique labels aligned with integer sizes"
+            )
+        _validate_rank_marker_groups(group_sizes)
+        # Neighbor comparisons, unlike differences, do not wrap for unsigned
+        # indices.
+        if (
+            feature_index.ndim != 1
+            or feature_index.size == 0
+            or feature_index.dtype.kind not in {"i", "u"}
+            or np.any(feature_index[1:] <= feature_index[:-1])
+            or feature_index[0] < 0
+        ):
+            raise ValueError(
+                "Rank marker feature_index must hold one or more ascending "
+                "unique non-negative indices"
+            )
+        if statistics.dtype != np.float64 or statistics.shape != (
+            feature_index.size,
+            group_ids.size,
+            _RANK_COLUMNS,
+        ):
+            raise ValueError(
+                "Rank marker statistics must be float64 with one row per feature "
+                f"and {_RANK_COLUMNS} statistics per group"
+            )
+        for name, value in (
+            ("group_ids", group_ids),
+            ("group_sizes", group_sizes),
+            ("feature_index", feature_index),
+            ("statistics", statistics),
+        ):
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    def _position(self, group_id: Any) -> int:
+        matches = np.flatnonzero(self.group_ids == group_id)
+        if matches.size != 1:
+            raise ValueError(f"Rank marker result has no group {group_id!r}")
+        return int(matches[0])
+
+    def stored_statistics(self, group_id: Any) -> np.ndarray:
+        """Return one group's marker statistics as a marker artifact stores them.
+
+        Rows follow ``feature_index`` and columns ``MARKER_STAT_COLUMNS``. The
+        z statistic becomes its two-sided p-value, every other statistic is
+        rounded to five decimals, and ``p_value_adjusted`` holds the
+        Benjamini-Hochberg values of the unrounded p-values over every tested
+        feature.
+
+        Args:
+            group_id: One of ``group_ids``.
+
+        Raises:
+            ValueError: If ``group_id`` is not a group of the result, or a
+                statistic is not finite.
+        """
+        rank = self.statistics[:, self._position(group_id)]
+        stored = np.empty((rank.shape[0], len(MARKER_STAT_COLUMNS)), dtype=np.float64)
+        np.round(rank, 5, out=stored[:, :_RANK_COLUMNS])
+        p_values = 2.0 * ndtr(-np.abs(rank[:, _P_VALUE]))
+        stored[:, _P_VALUE] = p_values
+        stored[:, -1] = adjust_pvalues(p_values, "fdr_bh")
+        if not np.isfinite(stored).all():
+            raise ValueError("Marker statistics must all be finite")
+        return stored
+
+    def table(self, group_id: Any, feature_names: np.ndarray) -> pd.DataFrame:
+        """Return one group's ranked marker table.
+
+        The table equals the one read back from a marker artifact written from
+        this result, before ``get_markers`` filters it: ``group_id``,
+        ``feature_name``, and ``feature_index`` columns followed by
+        ``MARKER_STAT_COLUMNS``, by descending score, then p-value, then
+        feature name.
+
+        Args:
+            group_id: One of ``group_ids``; the table's ``group_id`` column
+                holds the string form of that label, which names the group in
+                a marker artifact.
+            feature_names: Names of every feature of the assay, indexed by
+                ``feature_index``.
+        """
+        return _ranked_table(
+            self.stored_statistics(group_id),
+            MARKER_STAT_COLUMNS,
+            self.feature_index.astype(np.int64, copy=False),
+            feature_names,
+            str(self.group_ids[self._position(group_id)]),
+        )
 
 
 def _array_values(group: zarr.Group, name: str) -> np.ndarray:
@@ -202,13 +380,4 @@ def load_marker_table(
     """Read one canonical marker group into a named, ranked table."""
     columns, feature_index = _canonical_slot(slot_group, len(feature_names))
     stats = _canonical_cluster_stats(cluster_group, columns, feature_index.shape[0])
-    names = np.asarray(feature_names, dtype=object)
-    if names.ndim != 1:
-        raise ValueError("Feature names must be one-dimensional")
-    frame = pd.DataFrame(stats, columns=columns)
-    frame["group_id"] = group_id
-    frame["feature_name"] = names[feature_index]
-    frame["feature_index"] = feature_index
-    return sort_marker_results(
-        frame[["group_id", "feature_name", "feature_index", *MARKER_STAT_COLUMNS]]
-    )
+    return _ranked_table(stats, columns, feature_index, feature_names, group_id)

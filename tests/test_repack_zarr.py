@@ -689,3 +689,60 @@ def test_main_keeps_remote_uris_and_storage_options(monkeypatch):
     assert captured["mem_budget"] == "8G"
     assert captured["nthreads"] == 4
     assert captured["storage_options"] == {"skip_signature": True}
+
+
+def test_repack_that_fails_after_creating_the_destination_removes_it(tmp_path):
+    import hashlib
+
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    from scarf import DataStore
+    from tests.storage_helpers import write_count_store
+
+    source = tmp_path / "source.zarr"
+    counts = np.random.default_rng(0).poisson(2.0, size=(12, 6)).astype(np.uint32)
+    write_count_store(str(source), {"RNA": counts}, np.uint32)
+    DataStore(str(source), default_assay="RNA", min_features_per_cell=1)
+    root = zarr.open_group(str(source), mode="r+")
+    run = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label="alpha",
+        assay="RNA",
+        config={},
+        stage_order=("one",),
+        scarf_version="1.0.0",
+    )
+    start_pipeline_stage_record(root, run_id=run.run_id, ordinal=0, stage="one")
+    finish_pipeline_stage_record(
+        root,
+        run_id=run.run_id,
+        ordinal=0,
+        status="completed",
+        metrics=PipelineStageMetrics(
+            wall_seconds=0.1,
+            rss_baseline_bytes=None,
+            rss_peak_bytes=None,
+            rss_incremental_peak_bytes=None,
+            sample_interval_seconds=0.1,
+            sample_count=0,
+            sampling_error_count=0,
+            rss_unavailable_reason="test",
+        ),
+    )
+    complete_pipeline_run_record(root, run_id=run.run_id, outputs=(), fields=())
+    # Label claims are copied last, after the destination holds everything
+    # else; an unreadable one fails the copy.
+    assert "0" * 64 < hashlib.sha256(b"alpha").hexdigest()
+    sync(
+        root.store.set(
+            f"pipeline/runs/.label-claims/{'0' * 64}/head.json",
+            default_buffer_prototype().buffer.from_bytes(b"not a claim"),
+        )
+    )
+    output = tmp_path / "repacked.zarr"
+    with pytest.raises(ValueError, match="Pipeline label claim is invalid"):
+        repack_store(str(source), str(output))
+    # No destination is left that could open as a complete store.
+    assert not output.exists()

@@ -14,14 +14,13 @@ prepare / run / run-all / run-local / run-e2e spawn and return immediately.
 run-all fans out one size pipeline per container (stages stay sequential on R2).
 run-e2e and run-local run one funnel in one container, with the Zarr store on R2
 or on the container's ephemeral disk (fast_local). Like DataStore.pipeline, the
-funnel runs UMAP beside Leiden.
+funnel runs its stages one at a time.
 Watch progress with:
   uv run --group profiling modal app logs scarf-profiling --env scarf_profiling
 """
 
 import argparse
 import dataclasses
-import functools
 import os
 import shutil
 import time
@@ -31,7 +30,6 @@ from uuid import uuid4
 
 import modal
 from scarf.storage import ArtifactRef
-from scarf.utils.background import BackgroundTask
 
 from profiling.config import (
     ALL_STAGE_CHOICES,
@@ -526,14 +524,6 @@ def run_stage_job(
         release_stage_claim(config, nRows, stage, submissionId)
 
 
-# Mirrors DataStore.pipeline: each key runs on a worker thread beside the
-# listed later stages, and any other stage waits for it first. A background
-# stage must follow the threading rules of scarf's BackgroundTask.
-BACKGROUND_OVERLAPS: dict[StageName, frozenset[StageName]] = {
-    "runUmap": frozenset({"runLeiden"}),
-}
-
-
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=MAX_TIMEOUT_SECONDS,
@@ -554,10 +544,9 @@ def run_funnel_job(
     """Run one funnel in one container and persist its summary to R2.
 
     The store lives on R2 (run-e2e) or on the container's ephemeral disk
-    (run-local). The create-only runTag claim makes the funnel exclusive, and
-    stage jobs refuse a runTag it holds. Stages in ``BACKGROUND_OVERLAPS``
-    overlap later stages; their CPU and memory figures then share a window,
-    and each result lists the stages it ran beside in ``concurrentStages``.
+    (run-local), and the stages run one at a time in order. The create-only
+    runTag claim makes the funnel exclusive, and stage jobs refuse a runTag it
+    holds.
     """
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
@@ -620,52 +609,34 @@ def run_funnel_job(
     download_seconds: float | None = None
     funnel_seconds: float | None = None
     payloads: dict[StageName, dict[str, Any]] = {}
-    windows: dict[StageName, tuple[float, float | None]] = {}
-    pending: dict[StageName, BackgroundTask[StageRunResult]] = {}
     status = "ok"
     error: str | None = None
     failed_stage: StageName | None = None
     session: dict[str, Any] = {}
 
     def execute(stage: StageName) -> StageRunResult:
-        windows[stage] = (time.perf_counter(), None)
-        try:
-            stage_work = work / stage
-            stage_work.mkdir(parents=True, exist_ok=True)
-            return run_stage(
-                stage,
-                submissionId=submissionId,
-                nRows=nRows,
-                storeUri=store_uri,
-                workflow=workflow,
-                resources=config.resourcesFor(stage),
-                localH5adPath=local_h5ad if stage == "createStore" else None,
-                countMatrix=config.countMatrix,
-                storageIo=config.storageIo,
-                workDir=stage_work,
-                containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
-                containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
-                containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
-                resetCgroupPeak=False,
-                # The session probe is reset per stage; a background stage
-                # would read the counts of the stages beside it.
-                recordStoreOperations=stage not in BACKGROUND_OVERLAPS,
-                clientProvenance=config.clientProvenance,
-                session=session,
-            )
-        finally:
-            windows[stage] = (windows[stage][0], time.perf_counter())
+        stage_work = work / stage
+        stage_work.mkdir(parents=True, exist_ok=True)
+        return run_stage(
+            stage,
+            submissionId=submissionId,
+            nRows=nRows,
+            storeUri=store_uri,
+            workflow=workflow,
+            resources=config.resourcesFor(stage),
+            localH5adPath=local_h5ad if stage == "createStore" else None,
+            countMatrix=config.countMatrix,
+            storageIo=config.storageIo,
+            workDir=stage_work,
+            containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
+            containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
+            containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
+            resetCgroupPeak=False,
+            clientProvenance=config.clientProvenance,
+            session=session,
+        )
 
     def record(stage: StageName, result: StageRunResult) -> bool:
-        begin, end = windows[stage]
-        concurrent = [
-            other
-            for other, (other_begin, other_end) in windows.items()
-            if other != stage
-            and other_begin < (end or time.perf_counter())
-            and (other_end is None or other_end > begin)
-        ]
-        result = dataclasses.replace(result, concurrentStages=concurrent or None)
         if stage == "createStore" and download is not None:
             result = dataclasses.replace(
                 result, **_dataset_fields(config, nRows, download)
@@ -681,18 +652,6 @@ def run_funnel_job(
         )
         return result.status == "ok"
 
-    def join_background(names: list[StageName]) -> None:
-        nonlocal failed_stage, error
-        for name in names:
-            try:
-                result = pending.pop(name).result()
-            except Exception as exc:  # noqa: BLE001 - keep the first failure
-                failed_stage = failed_stage or name
-                error = error or f"{type(exc).__name__}: {exc}"
-                continue
-            if not record(name, result):
-                failed_stage = failed_stage or name
-
     try:
         download_started = time.perf_counter()
         print(f"{label} dataset download start: {config.datasetUri(nRows)}", flush=True)
@@ -704,37 +663,19 @@ def run_funnel_job(
         )
         funnel_started = time.perf_counter()
         for stage in selected:
-            join_background(
-                [name for name in pending if stage not in BACKGROUND_OVERLAPS[name]]
-            )
-            if failed_stage is not None:
-                break
             print(f"{label} stage start: {stage}", flush=True)
-            if stage in BACKGROUND_OVERLAPS:
-                pending[stage] = BackgroundTask(
-                    functools.partial(execute, stage),
-                    name=f"profile-{stage}",
-                )
-            elif not record(stage, execute(stage)):
+            if not record(stage, execute(stage)):
                 failed_stage = stage
                 break
-        # The funnel ends when its last background stage does.
-        join_background(list(pending))
         funnel_seconds = time.perf_counter() - funnel_started
     except Exception as exc:  # noqa: BLE001 - persist a durable failure summary
         status = "error"
         error = f"{type(exc).__name__}: {exc}"
     finally:
-        # Record background stages even when a later stage failed.
-        try:
-            join_background(list(pending))
-        except Exception as exc:  # noqa: BLE001 - keep the first failure
-            status = "error"
-            error = error or f"{type(exc).__name__}: {exc}"
         measurement = sampler.stop()
     if failed_stage is not None:
         status = "error"
-        error = error or payloads[failed_stage].get("error") or f"{failed_stage} failed"
+        error = payloads[failed_stage].get("error") or f"{failed_stage} failed"
 
     outcomes = [payloads[stage] for stage in selected if stage in payloads]
     summary: dict[str, Any] = {

@@ -17,13 +17,17 @@ from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
 from .base import Assay
 from .normalization import (
-    NormalizedValueSource,
     _feature_group_positions,
     lib_size_feature_stream_eligible,
     norm_lib_size,
     norm_lib_size_log,
-    normalizer_count_arithmetic,
 )
+
+# The Python objects that keep one band's partial feature statistics: three
+# array headers, the tuple that holds them, and its list slot.
+_BAND_PARTIAL_BYTES = 512
+# Four int64 index arrays and one mask over the feature rows of a band.
+_BAND_ROW_INDEX_BYTES = 4 * 8 + 1
 
 
 def _read_facade_block(
@@ -191,20 +195,17 @@ class RNAassay(Assay):
         if msg is None:
             msg = ""
 
+        # Eligibility requires a size factor.
         sf = self.sf
-        if sf is None:
-            raise ValueError("RNA library-size normalization requires a size factor")
+        assert sf is not None
         if feat_idx.size == 0:
             return
         scalar = self._cell_count_totals(cell_idx)
         log_transform = bool(norm_params.get("log_transform", False))
         counts_t = self.rawDataT
-        if counts_t is None:
-            raise ValueError(
-                f"RNA assay {self.name!r} requires sharded countsT "
-                "for feature-wise streaming"
-            )
-        scalar_values = np.asarray(scalar, dtype=np.float32)
+        # An RNAassay cannot be constructed without a complete countsT.
+        assert counts_t is not None
+        scalar_values = np.asarray(scalar, dtype=np.float64)
         scalar_values[scalar_values == 0] = 1
         n_feats = int(counts_t.shape[0])
         dest_of = np.full(n_feats, -1, dtype=np.int64)
@@ -213,33 +214,24 @@ class RNAassay(Assay):
         from ..storage.feature_stream import (
             map_feature_read_groups,
             persisted_read_group,
+            read_group_stream_floor,
         )
 
         n_cells = int(cell_idx.shape[0])
-        float32_size = int(np.dtype(np.float32).itemsize)
         float64_size = int(np.dtype(np.float64).itemsize)
         raw_size = int(np.dtype(counts_t.dtype).itemsize)
         # Per emitted value: the float64 batch being filled plus, while it is
-        # filled, the previous batch still held by the caller, one raw copy,
-        # and the float32 normalization buffer. While the caller processes a
-        # batch it needs the batch and its declared scratch instead.
-        item_bytes = float64_size + max(
-            float64_size + raw_size + float32_size,
-            scratch_itemsize,
-        )
-        feature_width, read_group_bytes = persisted_read_group(counts_t)
-        geometry = array_geometry(counts_t)
-        assert geometry is not None
-        # The reader keeps at least one read group and one inner read of a
-        # cell chunk, as its plan requires.
-        inner_read_bytes = (
-            min(n_feats, max(feature_width, geometry.axisChunk(0)))
-            * min(geometry.axisChunk(1), int(counts_t.shape[1]))
-            * raw_size
-        )
+        # filled, the previous batch still held by the caller and one raw
+        # copy. While the caller processes a batch it needs the batch and its
+        # declared scratch instead.
+        item_bytes = float64_size + max(float64_size + raw_size, scratch_itemsize)
+        feature_width, _ = persisted_read_group(counts_t)
         resident = resident_bytes + scalar_values.nbytes + dest_of.nbytes
+        # The stream keeps at least one read group and one band read.
         available = (
-            self.resources.memoryBytes - resident - read_group_bytes - inner_read_bytes
+            self.resources.memoryBytes
+            - resident
+            - read_group_stream_floor(counts_t, cell_idx=cell_idx, feat_idx=feat_idx)
         )
         affordable = max(0, available) // max(1, n_cells * item_bytes)
         if batch_size is None:
@@ -263,7 +255,6 @@ class RNAassay(Assay):
             progress=msg or None,
             io=getattr(self, "storageIo", None),
             scratchBytes=resident + width * n_cells * item_bytes,
-            orderedCompute=True,
         )
 
         def emit(
@@ -288,13 +279,14 @@ class RNAassay(Assay):
                     filled = 0
                 take = min(width - filled, int(rows.size) - start)
                 piece = rows[start : start + take]
-                normalized = group.values[piece].astype(np.float32)
-                normalized *= float(sf)
-                normalized /= scalar_values
+                # The float64 arithmetic of ``normed``, written into the batch.
+                target = block[filled : filled + take]
+                np.multiply(
+                    group.values[piece], float(sf), out=target, dtype=np.float64
+                )
+                target /= scalar_values
                 if log_transform:
-                    np.log1p(normalized, out=normalized)
-                block[filled : filled + take] = normalized
-                del normalized
+                    np.log1p(target, out=target)
                 block_labels[filled : filled + take] = feat_labels[local_dest[piece]]
                 filled += take
                 start += take
@@ -304,36 +296,10 @@ class RNAassay(Assay):
             if batch_size is None and block is not None:
                 yield emit(block[:filled], block_labels[:filled])
                 block = None
+            # The stream frees a read group once the next one is requested.
+            del group
         if block is not None:
             yield emit(block[:filled], block_labels[:filled])
-
-    def _count_arithmetic(
-        self,
-        values: NormalizedValueSource,
-        *,
-        log_transform: bool = False,
-        renormalize_subset: bool = False,
-    ) -> Literal["float64"] | None:
-        """Return the count-arithmetic marker of an artifact of these values.
-
-        The subset-renormalized payload uses its own float64 kernel, eligible
-        feature batches stream ``countsT`` in floating point, and library-size
-        feature scores and summaries accumulate in float64. None of them calls
-        ``normed``, so none records the marker.
-        """
-        if values == "payload" and renormalize_subset:
-            return None
-        if (
-            values in ("feature_scores", "feature_summary")
-            and self.normMethod is norm_lib_size
-        ):
-            return None
-        if values == "feature_batches" and lib_size_feature_stream_eligible(
-            self, renormalize_subset=renormalize_subset
-        ):
-            return None
-        method = norm_lib_size_log if log_transform else self.normMethod
-        return normalizer_count_arithmetic(self, method)
 
     def _write_normalized_payload(
         self,
@@ -411,7 +377,7 @@ class RNAassay(Assay):
         method = norm_lib_size_log if log_transform else self.normMethod
         if renormalize_subset:
             scalar = compute_with_progress(
-                counts.sum(axis=1),
+                counts.sum(axis=1, dtype=np.float64),
                 "Normalizing with feature subset",
                 self.nthreads,
             )
@@ -429,25 +395,10 @@ class RNAassay(Assay):
             finally:
                 self.scalar = scalar_cache
 
-    def _has_zero_total_cells(self, cell_idx: np.ndarray) -> bool:
-        """Return whether a selected cell has no counts in this assay.
-
-        ``normed`` without subset renormalization divides such a cell's counts
-        by 1, so its normalized values are zeros rather than NaN.
-        """
-        return bool(np.any(self._cell_count_totals(cell_idx) == 0))
-
-    def _raw_feature_stream_source(self) -> tuple[zarr.Array, int, int]:
-        """Return the preferred raw array and its feature and cell axes."""
-        if self.rawDataT is not None:
-            return self.rawDataT, 0, 1
-        return cast(zarr.Array, self.rawData._backing), 1, 0
-
     def _mean_normed_feature_groups(
         self,
         cell_idx: np.ndarray,
         feature_groups: dict[str, np.ndarray],
-        block_rows: int | None = None,
         *,
         log_transform: bool = False,
     ) -> dict[str, np.ndarray]:
@@ -484,7 +435,6 @@ class RNAassay(Assay):
             union,
             local_pos,
             sf=sf,
-            block_rows=block_rows,
             log_transform=log_transform,
             resident_bytes=(
                 scalar.nbytes
@@ -501,7 +451,6 @@ class RNAassay(Assay):
         local_pos: Mapping[str, np.ndarray],
         *,
         sf: float,
-        block_rows: int | None,
         log_transform: bool,
         resident_bytes: int,
     ) -> dict[str, np.ndarray]:
@@ -509,7 +458,8 @@ class RNAassay(Assay):
 
         ``scalar`` holds the nonzero total of each cell in ``cell_idx``.
         ``resident_bytes`` counts the arrays the caller holds for the call,
-        including ``scalar``, ``union``, and ``local_pos``.
+        including ``scalar``, ``union``, and ``local_pos``. Cells are read in
+        blocks of one on-disk row chunk.
         """
         from ..storage.parallel import stream_shards
 
@@ -520,9 +470,7 @@ class RNAassay(Assay):
             return out
 
         geometry = array_geometry(zarr_arr)
-        if block_rows is None:
-            block_rows = row_band(geometry, unit="chunk", fallback=n_cells)
-        block_rows = max(1, int(block_rows))
+        block_rows = row_band(geometry, unit="chunk", fallback=n_cells)
 
         starts = range(0, n_cells, block_rows)
 
@@ -592,7 +540,6 @@ class RNAassay(Assay):
                 union,
                 keyed,
                 sf=float(self.sf),
-                block_rows=None,
                 log_transform=False,
                 resident_bytes=resident_bytes,
             )
@@ -613,7 +560,11 @@ class RNAassay(Assay):
         """
         import time
 
-        from ..storage.feature_stream import map_feature_cell_bands
+        from ..storage.feature_stream import (
+            map_feature_cell_bands,
+            persisted_read_group,
+            selected_feature_chunk_starts,
+        )
         from ..utils.process import process_rss_mb
 
         cell_idx = np.asarray(cell_idx)
@@ -623,9 +574,9 @@ class RNAassay(Assay):
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = self._cell_count_totals(cell_idx)
-        scalar[scalar == 0] = 1
-        inv_scalar = 1.0 / scalar
+        inv_scalar = self._cell_count_totals(cell_idx)
+        inv_scalar[inv_scalar == 0] = 1
+        np.reciprocal(inv_scalar, out=inv_scalar)
 
         n_features = len(feat_idx)
         n_cells = len(cell_idx)
@@ -635,12 +586,9 @@ class RNAassay(Assay):
         if n_cells == 0 or n_features == 0:
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
+        # An RNA assay opens only with a complete countsT.
         counts_t = self.rawDataT
-        if counts_t is None:
-            raise ValueError(
-                f"RNA assay {self.name!r} requires sharded countsT "
-                "for feature statistics"
-            )
+        assert counts_t is not None
         n_feats = int(counts_t.shape[0])
         dest_of = np.full(n_feats, -1, dtype=np.int64)
         dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
@@ -648,6 +596,30 @@ class RNAassay(Assay):
             f"({self.name}) feature stats consume "
             f"workers={self.resources.workers} "
             f"memoryBytes={self.resources.memoryBytes}"
+        )
+        feat_chunk, cell_chunk = (int(extent) for extent in counts_t.chunks)
+        group_starts = selected_feature_chunk_starts(counts_t, feat_idx)
+        group_rows = sum(min(feat_chunk, n_feats - start) for start in group_starts)
+        n_bands = min(n_cells, -(-int(counts_t.shape[1]) // cell_chunk))
+        widest = min(n_feats, max(feat_chunk, persisted_read_group(counts_t)[0]))
+        # The inverse totals, the feature destinations, and the outputs stay for
+        # the whole stream, and every band keeps three float64 partial
+        # statistics per feature row of its group until the stream ends. Each
+        # compute worker also gathers the inverse totals of a band's cells and
+        # indexes its feature rows.
+        scratch_bytes = (
+            inv_scalar.nbytes
+            + dest_of.nbytes
+            + nz.nbytes
+            + s1.nbytes
+            + s2.nbytes
+            + n_bands
+            * (3 * nz.itemsize * group_rows + len(group_starts) * _BAND_PARTIAL_BYTES)
+            + self.resources.workers
+            * (
+                min(cell_chunk, n_cells) * inv_scalar.itemsize
+                + widest * _BAND_ROW_INDEX_BYTES
+            )
         )
 
         from collections import defaultdict
@@ -659,13 +631,12 @@ class RNAassay(Assay):
             list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
         ] = defaultdict(list)
 
+        # Every feature group holds a selected feature, so every band does.
         def process_band(
             band: Any,
-        ) -> tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray] | None:
+        ) -> tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray]:
             rows = band.featureRows()
             destinations = dest_of[band.featStart + rows]
-            if not np.any(destinations >= 0):
-                return None
             n_local = int(band.featEnd - band.featStart)
             local_nz = np.zeros(n_local, dtype=np.float64)
             local_s1 = np.zeros(n_local, dtype=np.float64)
@@ -702,25 +673,28 @@ class RNAassay(Assay):
             )
 
         consume_metrics: dict[str, object] = {}
+        # The stream fills the metrics when it is created, so every stream
+        # that starts is logged however it ends.
+        bands = map_feature_cell_bands(
+            counts_t,
+            process_band,
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            resources=self.resources,
+            progress="Calculating feature statistics",
+            io=getattr(self, "storageIo", None),
+            metrics=consume_metrics,
+            scratchBytes=scratch_bytes,
+            orderedCompute=False,
+        )
         try:
-            for item in map_feature_cell_bands(
-                counts_t,
-                process_band,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                resources=self.resources,
-                progress="Calculating feature statistics",
-                io=getattr(self, "storageIo", None),
-                metrics=consume_metrics,
-                orderedCompute=False,
-            ):
-                if item is None:
-                    continue
+            for item in bands:
                 unit_index, feat_start, feat_end, local_nz, local_s1, local_s2 = item
                 partials[(feat_start, feat_end)].append(
                     (unit_index, local_nz, local_s1, local_s2)
                 )
-            for (feat_start, feat_end), items in partials.items():
+            while partials:
+                (feat_start, feat_end), items = partials.popitem()
                 items.sort(key=lambda row: row[0])
                 merged = pairwise_merge_tree(
                     [(row[1], row[2], row[3]) for row in items],
@@ -732,14 +706,13 @@ class RNAassay(Assay):
                 s1[destinations[keep]] = merged[1][keep]
                 s2[destinations[keep]] = merged[2][keep]
         finally:
-            if consume_metrics:
-                logger.info(
-                    f"({self.name}) feature stats execution "
-                    f"read={consume_metrics.get('actualReadWorkers')} "
-                    f"compute={consume_metrics.get('actualComputeWorkers')} "
-                    f"fetch={consume_metrics.get('fetchSeconds')}s "
-                    f"computeSec={consume_metrics.get('computeSeconds')}s"
-                )
+            logger.info(
+                f"({self.name}) feature stats execution "
+                f"read={consume_metrics.get('actualReadWorkers')} "
+                f"compute={consume_metrics.get('actualComputeWorkers')} "
+                f"fetch={consume_metrics.get('fetchSeconds')}s "
+                f"computeSec={consume_metrics.get('computeSeconds')}s"
+            )
 
         mean = s1 / n_cells
         sigmas = s2 / n_cells - np.square(mean)
@@ -812,10 +785,15 @@ class RNAassay(Assay):
         lowess_frac: float,
         blacklist: str,
         keep_bounds: bool,
+        feature_names: np.ndarray,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
-        feature_names: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return an HVG mask and corrected variance from sufficient stats."""
+        """Return an HVG mask and corrected variance from sufficient stats.
+
+        ``summary`` is a feature summary of this assay and ``feature_names``
+        holds one name per feature; ``select_highly_variable_features``
+        rejects inputs of any other length.
+        """
         from ..features.variability import (
             fit_lowess,
             select_highly_variable_features,
@@ -824,11 +802,6 @@ class RNAassay(Assay):
         normed_tot = np.asarray(summary["normed_tot"], dtype=np.float64)
         normed_n = np.asarray(summary["normed_n"], dtype=np.float64)
         sigmas = np.asarray(summary["sigmas"], dtype=np.float64)
-        expected = (self.feats.N,)
-        if any(values.shape != expected for values in (normed_tot, normed_n, sigmas)):
-            raise ValueError(
-                f"RNA feature-summary arrays must all have shape {expected}"
-            )
         avg = (
             normed_tot / n_selected
             if n_selected > 0
@@ -850,22 +823,12 @@ class RNAassay(Assay):
                 lowess_frac,
                 bin_strategy=bin_strategy,
             )
-        resolved_feature_names = (
-            np.asarray(self.feats.fetch_all("names"))
-            if feature_names is None
-            else np.asarray(feature_names)
-        )
-        if resolved_feature_names.shape != expected:
-            raise ValueError(
-                f"RNA feature names must have shape {expected}, got "
-                f"{resolved_feature_names.shape}"
-            )
         values = select_highly_variable_features(
             corrected_variance=corrected_variance,
             normalized_cell_counts=normed_n,
             mean_nonzero=nz_mean,
             active_features=np.ones(self.feats.N, dtype=bool),
-            feature_names=resolved_feature_names,
+            feature_names=np.asarray(feature_names),
             min_cells=min_cells,
             max_cells=max_cells,
             top_n=top_n,

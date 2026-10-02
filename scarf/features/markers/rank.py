@@ -7,9 +7,9 @@ __all__ = [
     "_batch_stats",
     "_marker_stats_batch",
     "_marker_stats_gene_major",
+    "batch_rank_scratch_bytes",
     "gene_major_rank_scratch_bytes",
     "mannwhitneyu_from_ranks",
-    "set_two_sided_p_values",
     "sort_marker_results",
     "tie_sum",
 ]
@@ -45,11 +45,6 @@ def tie_sum(values: np.ndarray) -> float:
     _, counts = np.unique(np.asarray(values), return_counts=True)
     tied = counts[counts > 1].astype(np.float64)
     return float(np.sum(tied**3 - tied))
-
-
-def set_two_sided_p_values(stats: np.ndarray) -> None:
-    """Replace the z statistics in column 6 of marker stats with p-values."""
-    stats[:, :, 6] = 2.0 * ndtr(-np.abs(stats[:, :, 6]))
 
 
 def mannwhitneyu_from_ranks(
@@ -97,7 +92,7 @@ def _write_group_statistics(
     rank_g: np.ndarray,
     drank_g: np.ndarray,
     group_counts: np.ndarray,
-    n_total: np.float32,
+    n_total: float,
     tie_total: float,
 ) -> None:
     """Write one feature's groups-by-statistics row from its group sums.
@@ -260,104 +255,179 @@ def _argsort_positive(
 
 
 @njit(cache=True, nogil=True)
-def _marker_stats_gene_major(
-    raw: np.ndarray,
-    scalar: np.ndarray,
-    size_factor: np.float32,
+def _gene_major_feature(
+    counts: np.ndarray,
+    totals: np.ndarray,
+    size_factor: float,
     log_transform: bool,
     int_indices: np.ndarray,
     group_counts: np.ndarray,
-    n_total: np.float32,
-    destination_rows: np.ndarray,
+    n_total: float,
     out: np.ndarray,
-) -> None:
-    """Compute marker statistics from non-negative feature-major raw counts."""
-    n_genes = raw.shape[0]
+    nz_values: np.ndarray,
+    nz_cells: np.ndarray,
+    order: np.ndarray,
+    order_scratch: np.ndarray,
+    buckets: np.ndarray,
+    zero_g: np.ndarray,
+) -> bool:
+    """Write one feature's library-size statistics from its raw counts.
+
+    Each value is computed in float64 and ranked and summed as its float32
+    rounding. Zero counts share the lowest rank, so only nonzero values are
+    sorted, which holds only while no value is negative. Returns False,
+    leaving ``out`` unwritten, when a value is negative or not finite.
+    """
+    n_cells = counts.shape[0]
+    n_groups = group_counts.shape[0]
+    sum_g = np.zeros(n_groups)
+    nz_g = np.zeros(n_groups)
+    rank_g = np.zeros(n_groups)
+    drank_g = np.zeros(n_groups)
+    n_nz = 0
+    for c in range(n_cells):
+        count = counts[c]
+        if count == 0:
+            continue
+        exact = size_factor * np.float64(count) / totals[c]
+        if log_transform:
+            exact = np.log1p(exact)
+        value = np.float32(exact)
+        if value > 0.0:
+            grp = int_indices[c]
+            nz_values[n_nz] = value
+            nz_cells[n_nz] = c
+            n_nz += 1
+            sum_g[grp] += value
+            nz_g[grp] += 1.0
+        elif value != 0.0:
+            # Negative or NaN; a positive value that rounds to zero is a zero.
+            return False
+    for x in range(n_groups):
+        # Only an infinite value makes a sum of positive float32 values infinite.
+        if not sum_g[x] < np.inf:
+            return False
+        zero_g[x] = group_counts[x] - nz_g[x]
+
+    n_zero = n_cells - n_nz
+    tie_total = 0.0
+    if n_zero > 0:
+        zero_rank = (n_zero + 1.0) / 2.0
+        zero_t = float(n_zero)
+        if n_zero > 1:
+            tie_total += zero_t * zero_t * zero_t - zero_t
+        for x in range(n_groups):
+            rank_g[x] = zero_g[x] * zero_rank
+            drank_g[x] = zero_g[x]
+
+    _argsort_positive(nz_values, n_nz, order, order_scratch, buckets)
+    i = 0
+    dense_rank = 1.0 if n_zero > 0 else 0.0
+    while i < n_nz:
+        j = i
+        value = nz_values[order[i]]
+        while j + 1 < n_nz and nz_values[order[j + 1]] == value:
+            j += 1
+        dense_rank += 1.0
+        average_rank = n_zero + (i + j + 2.0) / 2.0
+        tied = j - i + 1
+        tied_float = float(tied)
+        if tied > 1:
+            tie_total += tied_float * tied_float * tied_float - tied_float
+        for k in range(i, j + 1):
+            cell = nz_cells[order[k]]
+            grp = int_indices[cell]
+            rank_g[grp] += average_rank
+            drank_g[grp] += dense_rank
+        i = j + 1
+
+    _write_group_statistics(
+        out,
+        sum_g,
+        nz_g,
+        rank_g,
+        drank_g,
+        group_counts,
+        n_total,
+        tie_total,
+    )
+    return True
+
+
+@njit(parallel=True, cache=True, nogil=True)
+def _marker_stats_gene_major(
+    raw: np.ndarray,
+    totals: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: float,
+    destination_rows: np.ndarray,
+    threads: int,
+    out: np.ndarray,
+) -> int:
+    """Write library-size marker statistics from feature-major raw counts.
+
+    Raw counts of any dtype are normalized by the float64 cell ``totals``.
+    Up to ``threads`` slots each own one set of per-cell scratch arrays and
+    take every slot-count-th selected row, and every row is computed alone,
+    so results do not depend on ``threads``. Rows with a negative
+    ``destination_rows`` entry are skipped. Returns the local row of the first
+    feature with a negative or non-finite normalized value, or -1 when every
+    value is valid.
+    """
+    rows = np.flatnonzero(destination_rows >= 0)
+    n_rows = rows.shape[0]
+    n_slots = min(max(1, threads), n_rows)
     n_cells = raw.shape[1]
     n_groups = group_counts.shape[0]
-    nz_values = np.empty(n_cells, dtype=np.float32)
-    nz_cells = np.empty(n_cells, dtype=np.int64)
-    order = np.empty(n_cells, dtype=np.int64)
-    order_scratch = np.empty(n_cells, dtype=np.int64)
-    buckets = np.empty(2048, dtype=np.int64)
-    zero_g = np.zeros(n_groups)
-    for g in range(n_genes):
-        row = destination_rows[g]
-        if row < 0:
-            continue
-        sum_g = np.zeros(n_groups)
-        nz_g = np.zeros(n_groups)
-        rank_g = np.zeros(n_groups)
-        drank_g = np.zeros(n_groups)
-        n_nz = 0
-        for c in range(n_cells):
-            count = raw[g, c]
-            if count == 0:
-                continue
-            value = (size_factor * np.float32(count)) / scalar[c]
-            if log_transform:
-                value = np.log1p(value)
-            if value > 0.0:
-                grp = int_indices[c]
-                nz_values[n_nz] = value
-                nz_cells[n_nz] = c
-                n_nz += 1
-                sum_g[grp] += value
-                nz_g[grp] += 1.0
-        for x in range(n_groups):
-            zero_g[x] = group_counts[x] - nz_g[x]
-
-        n_zero = n_cells - n_nz
-        tie_total = 0.0
-        if n_zero > 0:
-            zero_rank = (n_zero + 1.0) / 2.0
-            zero_t = float(n_zero)
-            if n_zero > 1:
-                tie_total += zero_t * zero_t * zero_t - zero_t
-            for x in range(n_groups):
-                rank_g[x] = zero_g[x] * zero_rank
-                drank_g[x] = zero_g[x]
-
-        _argsort_positive(nz_values, n_nz, order, order_scratch, buckets)
-        i = 0
-        dense_rank = 1.0 if n_zero > 0 else 0.0
-        while i < n_nz:
-            j = i
-            value = nz_values[order[i]]
-            while j + 1 < n_nz and nz_values[order[j + 1]] == value:
-                j += 1
-            dense_rank += 1.0
-            average_rank = n_zero + (i + j + 2.0) / 2.0
-            tied = j - i + 1
-            tied_float = float(tied)
-            if tied > 1:
-                tie_total += tied_float * tied_float * tied_float - tied_float
-            for k in range(i, j + 1):
-                cell = nz_cells[order[k]]
-                grp = int_indices[cell]
-                rank_g[grp] += average_rank
-                drank_g[grp] += dense_rank
-            i = j + 1
-
-        _write_group_statistics(
-            out[row],
-            sum_g,
-            nz_g,
-            rank_g,
-            drank_g,
-            group_counts,
-            n_total,
-            tie_total,
-        )
+    first_invalid = np.full(max(1, n_slots), n_rows, dtype=np.int64)
+    for slot in prange(n_slots):
+        nz_values = np.empty(n_cells, dtype=np.float32)
+        nz_cells = np.empty(n_cells, dtype=np.int64)
+        order = np.empty(n_cells, dtype=np.int64)
+        order_scratch = np.empty(n_cells, dtype=np.int64)
+        buckets = np.empty(2048, dtype=np.int64)
+        zero_g = np.zeros(n_groups)
+        for position in range(slot, n_rows, n_slots):
+            row = rows[position]
+            if not _gene_major_feature(
+                raw[row],
+                totals,
+                size_factor,
+                log_transform,
+                int_indices,
+                group_counts,
+                n_total,
+                out[destination_rows[row]],
+                nz_values,
+                nz_cells,
+                order,
+                order_scratch,
+                buckets,
+                zero_g,
+            ):
+                # Rows run in increasing order, so the smallest recorded
+                # position over all threads is the first invalid feature.
+                first_invalid[slot] = position
+                break
+    first = int(first_invalid.min())
+    return int(rows[first]) if first < n_rows else -1
 
 
 def gene_major_rank_scratch_bytes(
     *,
     n_cells: int,
     n_groups: int,
+    n_features: int,
     nthreads: int,
 ) -> int:
-    """Return the worst-case scratch owned by active gene workers."""
+    """Return the scratch of one gene-major call over ``n_features`` rows.
+
+    Each of its ``nthreads`` threads holds the nonzero values, their cells,
+    and the radix sort's order arrays for every cell.
+    """
     cells = max(0, int(n_cells))
     groups = max(0, int(n_groups))
     threads = max(1, int(nthreads))
@@ -368,7 +438,32 @@ def gene_major_rank_scratch_bytes(
         + 2048 * int64
         + groups * 6 * np.dtype(np.float64).itemsize
     )
-    return threads * per_thread
+    # The selected rows and each thread's first invalid row.
+    per_call = (max(0, int(n_features)) + threads) * int64
+    return per_call + threads * per_thread
+
+
+def batch_rank_scratch_bytes(
+    *,
+    n_cells: int,
+    n_groups: int,
+    n_features: int,
+    nthreads: int,
+) -> int:
+    """Return the scratch of one dense rank call over ``n_features`` features.
+
+    The call returns eight statistics per feature and group, and each of its
+    ``nthreads`` threads ranks one feature at a time.
+    """
+    cells = max(0, int(n_cells))
+    groups = max(0, int(n_groups))
+    float64 = np.dtype(np.float64).itemsize
+    # The argsort order and the average and dense ranks of every cell.
+    per_thread = cells * (np.dtype(np.int64).itemsize + 2 * float64) + (
+        groups * 5 * float64
+    )
+    statistics = max(0, int(n_features)) * groups * 8 * float64
+    return statistics + max(1, int(nthreads)) * per_thread
 
 
 def _batch_stats(
@@ -378,7 +473,10 @@ def _batch_stats(
     n_total: int,
     feature_labels: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Run the marker kernel and convert z statistics to p-values."""
+    """Run the dense marker kernel over cells-by-features normalized values.
+
+    Column 6 of the result holds the Mann-Whitney z statistic.
+    """
     values = np.asarray(data)
     if values.ndim != 2:
         raise ValueError("Marker data must be a two-dimensional array")
@@ -398,8 +496,7 @@ def _batch_stats(
     out = _marker_stats_batch(
         np.ascontiguousarray(values, dtype=kernel_dtype),
         int_indices,
-        group_counts.astype(np.float32),
-        np.float32(n_total),
+        group_counts.astype(np.float64),
+        float(n_total),
     )
-    set_two_sided_p_values(out)
     return np.asarray(out)
