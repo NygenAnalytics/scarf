@@ -138,19 +138,21 @@ time in recipe order on the calling thread. DataStore-owned plotting, marker
 loading, and export consume narrow frozen-run views. Completed runs can be reopened by their
 immutable label or exact run ID.
 
-`agent/` owns the optional single-RNA workflow. Its lazy root facade exposes `analyze_rna`,
-`AutomatedWorkflowResult`, and `AnalysisError`. Standalone scientific agent contracts and runners
-remain in their concrete packages: `data_enrichment`, `experimental_context`, and
-`biological_interpretation`. `parameter_tuning` has no standalone runner; it owns the candidate
-contracts, execution, diagnostics, and selection checks used by the orchestrator's RNA tuning
-stage. Internal modules import concrete owners rather than the root facade. `agent/tools/`
-contains only infrastructure shared by more than one agent.
+`agent/` owns the optional bounded single-RNA workflow. Its lazy facade exposes `analyze_rna`,
+`resume_rna`, their asynchronous counterparts, `open_analysis`, `AnalysisRun`, `Study`,
+`AnalysisConfig`, and `RuntimeConfig`. `workflow.py` defines fixed stages and calls existing
+`DataStore.pipeline` operations through `execution.py`. Agent-local evidence, diagnostics,
+pure choice validators, prompts, and structured provider requests remain separate from core
+numerical ownership. Prototype orchestrator and standalone-agent packages are retired.
 
-The orchestration stage history is the sole owner of the immutable request, scientific evidence,
-choices, checks, work reservations, recovery, and final artifact references. Checkpoints belong
-to their exact stage inputs; they do not create a second workflow lifecycle. The result is a small
-address that resolves this history. `report/` renders one replaceable analysis page from saved
-evidence. It does not call a provider or recompute scientific results.
+`records.py` owns the external immutable request, events, measured evidence, visible decisions,
+validation outcomes, and recovery references. The default directory is
+`Path.cwd() / "agent_runs" / <runId>`; callers may choose another new external location.
+`compact_result.py` publishes one immutable agent-owned summary under the local store's
+`agent_results/<runId>`, linking the verified final core pipeline/configuration to the external
+audit. It neither adds a core artifact type nor duplicates the stage history. `result.py`
+exposes the saved analysis, and `rendering.py` derives reports for complete and incomplete
+outcomes without provider calls or numerical recomputation.
 
 ### Presentation
 
@@ -159,10 +161,10 @@ It has no import dependency on `datastore`.
 The removed `scarf.plots`, `scarf.plotting._legacy`, and `DataStore.plot_*` APIs must not be restored.
 New plots should return the established plotting result types, accept documented data contracts, and use narrow adapters instead of adding storage-path knowledge.
 
-The single-RNA agent keeps its bounded final-map display in `agent/_plots.py`. This limited report
-view reads exact final artifact references, samples only displayed coordinates and labels, and
-returns the existing public `PlotResult` and provenance types. It introduces no core plotting API
-or module-load dependency from plotting to datastore.
+The single-RNA agent uses the core embedding accessor for the exact final UMAP.
+`agent/plots.py` adds a bounded marker panel from saved final marker statistics, with no count
+matrix reads. These views return existing public `PlotResult` and provenance types. They
+introduce no core plotting API or module-load dependency from plotting to datastore.
 
 `DataStore.plots` is a thin, store-bound accessor over the canonical store-first functions in `scarf.plotting`.
 The accessor imports concrete plot implementations only when a method is called, so this convenience namespace does not reverse the dependency from plotting to datastore.

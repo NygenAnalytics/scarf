@@ -5,6 +5,33 @@ live in `tests/test_agent_*.py` and participate in normal repository discovery.
 The test relocation and prototype-test cleanup were separately authorized after
 the initial implementation. Core Scarf and external skills remain unchanged.
 
+## External audit and compact result documentation
+
+The storage contract keeps the full readable audit outside the numerical store.
+Omitting `run_dir` selects `Path.cwd() / "agent_runs" / <runId>`; an explicit new
+external directory remains supported. The same ID identifies the immutable
+manifest and the compact completed result under local Zarr
+`agent_results/<runId>`.
+
+That compact attribute record links the exact final core pipeline and its
+configuration to the selected candidate, measured HVG count when available,
+selection rationale, workspace, source/procedure identities, and external audit
+locator. A `null` workspace means the default; an explicit workspace name keeps
+nondefault core pipeline references reopenable.
+It does not move or remove events, prompts, measured evidence, annotations,
+or reports. `AnalysisRun.compact_result` reads the record after source/final-run
+verification and never creates or migrates it. Publication failures remain
+separate from scientific completion; a completed explicit resume can retry.
+Relocation preserves published payloads and treats the external locator as
+advisory. Core pipeline/artifact formats are unchanged.
+
+The agent tutorial, API reference, and relevant analysis-guide sections now use
+the replacement public API. The executable teaching fixture uses a small
+synthetic prepared store and a local `FunctionModel`, exercises the four native
+representations, and leaves synthetic identities unassigned. It requires no
+download or model credentials. Documentation execution and build results for this
+revision are recorded separately from the earlier test results below.
+
 ## Test organization
 
 - Nine replacement test modules moved out of the installed agent package, with
@@ -274,24 +301,23 @@ are historical results; the relocated suite is validated independently above.
 
 ## External documentation and callers
 
-These findings came from read-only source searches. They were not rewritten or
-executed. Archived reports remain historical evidence, rather than migration
-work items.
+The original inventory came from read-only source searches. The current
+documentation update migrates the three agent-facing pages listed below; old
+validation counts above remain historical. Archived reports remain historical
+evidence, rather than migration work items.
 
 | Existing consumer | Incompatibility and required later migration |
 | --- | --- |
 | [Cytebase launcher](../../cytebase_analysis/run_cytebase_agent.py), imports around lines 27 and 127; execution around line 244 | Uses `AutomatedWorkflowResult`, `AutomatedWorkflowConfig`, `FinalAnalysisHandoff`, the retired ingestion helper, and `AgentOrchestrator`. Replace launch/configuration/result/export handling with the new public API and prepared-store requirement. |
 | [Study-specific launcher](../../cytebase_analysis/run_cytebase_agent_wilk2020.py), line 11 | Imports the old launcher's `main`; inherits that migration requirement. |
-| [Agent API reference](../../docs/source/reference/api/agent.md), lines 4-12 and 78 | Documents the old three-export facade, retired result/error types, old `analyze_rna` arguments, and advanced orchestrator. Rewrite around the new entry points, typed inputs, statuses, and `AnalysisRun`. |
-| [Agent analysis guide](../../docs/source/analysis_with_agents.md), lines 100-131 and 215-224 | Describes the retired orchestration journal, old facade, and standalone agent packages. Update procedure, recovery, and result ownership. |
-| [Agent tutorial](../../docs/source/tutorials/agent_workflow.md), lines 57, 175, 213-223, and 671 | Calls old analysis signatures and imports removed enrichment/context/ingestion packages. Rewrite its executable examples before refreshing documentation. |
-| [Architecture guide](../../docs/source/developers/architecture.md), lines 143 and 491 | Names retired public types and `AgentOrchestrator.initialize_request`. Update placement and lifecycle descriptions. |
-| [API overview](../../docs/source/reference/api.md), line 15 | Describes analysis as returning only a completed result. Explain the persisted incomplete statuses and explicit resume. |
+| [Agent API reference](../../docs/source/reference/api/agent.md) | Migrated to typed inputs, status/result access, explicit resume, optional external run directory, compact store result, and current provider limits. |
+| [Agent analysis guide](../../docs/source/analysis_with_agents.md) | Migrated its automated-agent section to fixed full-cohort exploration, opt-in correction evidence, conservative policies, and current persistence. General guidance for agents using granular Scarf APIs remains distinct. |
+| [Agent tutorial](../../docs/source/tutorials/agent_workflow.md) | Replaced prototype calls and inline retired-provider fixture with the current API and an offline synthetic numerical example. |
+| [Architecture guide](../../docs/source/developers/architecture.md) | Updated the current facade, fixed pipeline orchestration, external audit, compact local result, and plotting ownership. Historical removed-symbol notes remain historical. |
+| [API overview](../../docs/source/reference/api.md) | Updated the public surface to include explicit resume and inspectable incomplete statuses. |
 
-No separately maintained source `.ipynb` notebook was found by the targeted
-search outside documentation execution/build caches. Cached notebooks were not
-executed or rewritten.
-
-These external consumers were not migrated as part of the test cleanup. No
-documentation build or publication was performed. Scripted-provider tests do not
-validate live-provider reliability or biological annotation quality.
+The earlier targeted search found no separately maintained source `.ipynb`
+notebook outside documentation execution/build caches. The later notebook and
+documentation update is separately authorized from that original test cleanup.
+Remaining prototype launchers need explicit migration. Scripted-provider tests
+do not establish live-provider reliability or biological annotation quality.

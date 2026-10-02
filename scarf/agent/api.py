@@ -28,13 +28,13 @@ def _sync(coroutine: Coroutine[Any, Any, AnalysisRun]) -> AnalysisRun:
 def analyze_rna(
     source: str | Path,
     *,
-    run_dir: str | Path,
+    run_dir: str | Path | None = None,
     model: Any,
     study: Study | dict[str, Any],
     config: AnalysisConfig | None = None,
     runtime: RuntimeConfig | None = None,
 ) -> AnalysisRun:
-    """Start one explicit analysis in a new directory; never infer a resume."""
+    """Start a new analysis, by default in ./agent_runs/<agentRunId>."""
     return _sync(
         analyze_rna_async(
             source,
@@ -50,7 +50,7 @@ def analyze_rna(
 async def analyze_rna_async(
     source: str | Path,
     *,
-    run_dir: str | Path,
+    run_dir: str | Path | None = None,
     model: Any,
     study: Study | dict[str, Any],
     config: AnalysisConfig | None = None,
@@ -66,7 +66,12 @@ async def analyze_rna_async(
         )
     operational = runtime or RuntimeConfig()
     location = Path(source).expanduser().resolve()
-    destination = Path(run_dir).expanduser().resolve()
+    run_id = uuid4().hex[:16]
+    destination = (
+        Path.cwd() / "agent_runs" / run_id
+        if run_dir is None
+        else Path(run_dir).expanduser()
+    ).resolve()
     if not location.is_dir():
         raise ValueError("source must be an existing prepared local Scarf store")
     if destination == location or destination.is_relative_to(location):
@@ -81,7 +86,7 @@ async def analyze_rna_async(
             {
                 "format": "scarf-rna-analysis",
                 "procedure": "bounded-rna",
-                "runId": uuid4().hex[:16],
+                "runId": run_id,
                 "procedureIdentity": procedure_identity(),
                 "inputEvidence": "evidence/inspect.json",
                 "frozenPolicy": "evidence/preprocess.json",
@@ -103,6 +108,7 @@ async def analyze_rna_async(
                 records, location, model, supplied, scientific, operational
             )
         finally:
+            _publish_result(result, records)
             _report(result, records)
         return result
 
@@ -216,6 +222,7 @@ async def resume_rna_async(
                     fingerprint=inspected["fingerprint"],
                 )
             if result.status == "completed":
+                _publish_result(result, records)
                 _report(result, records)
                 return result
             try:
@@ -232,6 +239,7 @@ async def resume_rna_async(
                             source=os.path.relpath(result.source, destination),
                             fingerprint=inspected["fingerprint"],
                         )
+                _publish_result(result, records)
                 _report(result, records)
         return result
 
@@ -269,6 +277,21 @@ def open_analysis(
 ) -> AnalysisRun:
     """Inspect saved outcomes without opening a provider or numerical store."""
     return AnalysisRun(run_dir, source=source)
+
+
+def _publish_result(result: AnalysisRun, records: RunRecords) -> None:
+    if result.status != "completed":
+        return
+    from .compact_result import publish_result
+
+    try:
+        publish_result(result)
+    except Exception as error:
+        records.append(
+            "resultPublicationError",
+            errorType=type(error).__name__,
+            message="Compact result publication failed; completed science is unchanged. Resume to retry.",
+        )
 
 
 def _report(result: AnalysisRun, records: RunRecords) -> None:

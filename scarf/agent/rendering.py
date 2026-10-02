@@ -118,7 +118,13 @@ def summary(records: RunRecords) -> dict[str, Any]:
         }
         for event in events
         if event["kind"]
-        in {"pipelineFailed", "modelFailure", "decisionRejected", "reportError"}
+        in {
+            "pipelineFailed",
+            "modelFailure",
+            "decisionRejected",
+            "reportError",
+            "resultPublicationError",
+        }
         or event["kind"] == "status"
         and event.get("status") in {"failed", "interrupted"}
     ]

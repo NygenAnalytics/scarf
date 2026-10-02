@@ -140,6 +140,13 @@ class AnalysisRun:
         return dict(self.pipeline)
 
     @property
+    def compact_result(self) -> dict[str, Any] | None:
+        """Read the verified local-store summary; absent summaries stay absent."""
+        from .compact_result import read_result
+
+        return read_result(self)
+
+    @property
     def annotations(self) -> list[dict[str, Any]]:
         return annotations(self._records)
 

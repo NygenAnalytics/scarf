@@ -64,8 +64,12 @@ print(run.status)
 print(run.report())
 ```
 
-Choose a new `run_dir` outside the numerical store. An existing directory is
-rejected, even if empty. Resuming is a separate, explicit operation.
+`run_dir` is optional. Omit it to create `agent_runs/<runId>` under the current
+working directory, using the same generated run ID as the saved manifest.
+Supply a new path outside the numerical store to select another location.
+An existing directory is rejected, even if empty. Resuming is a separate,
+explicit operation. The external directory always retains the complete audit;
+it is not a disposable cache.
 
 `Study` also accepts `technicalBatchColumns`, `protectedColumns`, `sampleColumn`,
 `captureColumn`, `featureExclusions`, `referenceFiles`, and
@@ -304,8 +308,34 @@ with model/software identity and a safe subset of effective settings.
 
 Events are immutable, numbered, and integrity-checked. Evidence and visible model
 exchanges are written atomically and referenced by events. Reports and CSV files
-are derived outputs that can be regenerated. No agent state is stored in a new
-private Zarr namespace.
+are derived outputs that can be regenerated.
+
+Completed analyses also publish one compact attribute record at
+`agent_results/<runId>` in the local Zarr store. The `agent_results` root is marked
+as owned by `scarf.agent`; this is an agent result summary, not a core numerical
+artifact or another copy of the event history. It records the agent run ID,
+final core pipeline ID, assay, workspace, source fingerprint, procedure identity, selected
+parameters, selection rationale, and a relative locator for the full external
+audit. Selected parameters include the exact final core `pipelineConfig`,
+candidate ID, resolution, requested HVG count, PCs, neighbors, Harmony flag, and
+actual selected HVG count when measured.
+
+The workspace field is `null` for the default workspace or its explicit name,
+so the referenced core run can be reopened in a nondefault workspace.
+
+The compact record is immutable and idempotent, with no mutable latest pointer.
+Core artifacts and pipeline records remain authoritative for numerical results.
+Read the summary through `run.compact_result` after completion; this read-only
+property verifies the source and exact final pipeline. A missing record returns
+`None`. Opening, reporting, or reading an older run never publishes or migrates it.
+Publication errors record `resultPublicationError` without downgrading completed
+scientific work; explicit completed-run resume retries publication.
+
+The external locator is advisory rather than scientific identity. Relocating a
+completed store preserves the original compact payload and can record
+`resultLocatorStale`; retain the known external directory to reopen or rebind the
+run. Archive the numerical store and external audit together. Summaries do not
+contain transcripts, annotations, full evidence, or credentials.
 
 | Operational setting | Default |
 | --- | --- |
@@ -444,6 +474,7 @@ report_path = run.report()  # Return report.html after regenerating reports/CSV.
 
 pipeline = run.pipeline  # Verified, read-only final core PipelineRun.
 print(run.artifacts)  # Exact final core ArtifactRef objects.
+print(run.compact_result)  # Verified compact store summary, or None if absent.
 markers = run.get_markers(min_score=0.25, min_frac_exp=0.2)
 plot = run.plot_embedding(show=False)
 plot.close()
@@ -543,7 +574,8 @@ directory for a fresh attempt.
 ### Side effects and boundaries
 
 Analysis and resume create ordinary core pipeline runs and immutable artifacts
-inside the selected writable store. They do not change live `I`, feature
+inside the selected writable store, plus the compact completed agent result.
+They do not change live `I`, feature
 metadata, or annotation columns. Numerical access through `AnalysisRun` opens the
 source read-only. The external run directory contains supplied study text,
 metadata summaries, references, decisions, and results; nothing is committed or
@@ -571,7 +603,8 @@ defines inputs and structured choices. `evidence.py`, `choices.py`, and
 and public artifacts.
 `provider.py` handles model calls; `prompts.py` contains their instructions.
 `records.py` persists local history. `result.py` and `rendering.py` expose results
-and derived outputs.
+and derived outputs. The compact store summary links the selected core pipeline
+to the complete external audit without changing the core artifact model.
 
 This is a clean break from the prototype. `AgentOrchestrator`,
 `AutomatedWorkflowResult`, `AnalysisError`, old `orchestrator.*` imports, and old
@@ -586,8 +619,10 @@ by this implementation. Their numerical artifacts remain accessible through core
 Scarf. The replacement tests now live in `tests/test_agent_*.py`; prototype-only
 tests and their unused helpers were removed. Independent core coverage from old
 agent test files was retained in the corresponding core test modules. Existing
-external launchers, notebooks, documentation, and CI configuration were not
-rewritten. Consumers of removed prototype APIs need a separate migration.
+external launchers and CI configuration were not rewritten. The agent tutorial,
+API reference, and analysis guide now describe this interface, and the worked
+tutorial uses an offline scripted provider. Remaining consumers of removed
+prototype APIs need a separate migration.
 The [validation and migration inventory](VALIDATION.md) lists the observed
 validation results and affected external consumers.
 
