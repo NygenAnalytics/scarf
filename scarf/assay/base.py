@@ -1,6 +1,6 @@
 import threading
 from collections.abc import Generator, Iterator, Sequence
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -17,14 +17,11 @@ from ..utils.arrays import array_digest, regex_match_mask
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from .normalization import (
-    NormalizedValueSource,
     NormMethod,
     iter_feature_group_means,
     norm_dummy,
     norm_lib_size,
-    normalizer_count_arithmetic,
 )
-from ..utils.arrays import has_duplicates
 
 type PercentFeatures = dict[str, str]
 
@@ -195,7 +192,6 @@ class Assay:
 
     def prepare(self, percent_patterns: dict[str, str | None]) -> None:
         from ..storage.identity import (
-            REBUILD_REQUIRED,
             clear_column,
             fresh_group,
             load_count_summaries,
@@ -226,9 +222,9 @@ class Assay:
                         "run_feature_percentage and an explicit feature selection."
                     )
             return
-        if state is not False or self.z.read_only:
-            raise ValueError(f"Assay {self.name!r} is not prepared. {REBUILD_REQUIRED}")
-
+        # Only unprepared assays of writable stores get here: DataStore
+        # rejects other states when it opens a store, and repack_store
+        # prepares the assays it has just marked unprepared in a new store.
         # First preparation derives every percentage from the counts, so any
         # imported column with a percentage name is replaced, never trusted.
         for name in sorted(set(percent_patterns) | set(self._percent_features())):
@@ -281,7 +277,9 @@ class Assay:
         """Sum each feature set per cell, reading only the selected features.
 
         Sums saved while ``countsT`` was written are reused when they cover
-        exactly the same features of the same counts.
+        exactly the same features of the same counts. Other sums are read from
+        ``countsT``: only RNA assays define percentages, and they always have
+        ``countsT``.
         """
         from ..storage.execution import WorkShape, plan_operation
         from ..storage.identity import load_feature_sums
@@ -303,17 +301,8 @@ class Assay:
             name: np.searchsorted(wanted, values) for name, values in indices.items()
         }
         totals = {name: np.zeros(self.cells.N, dtype=np.float64) for name in indices}
-        if self.rawDataT is None:
-            offset = 0
-            for block in self.rawData[:, wanted].stream_blocks(nthreads=self.nthreads):
-                values = np.asarray(block, dtype=np.float64)
-                for name, position in positions.items():
-                    totals[name][offset : offset + len(values)] = values[
-                        :, position
-                    ].sum(axis=1)
-                offset += len(values)
-            return {**found, **totals}
         source = self.rawDataT
+        assert source is not None
         cell_chunk = max(1, int(source.chunks[1]))
         column_bytes = 2 * len(wanted) * np.dtype(np.float64).itemsize
         target = min(64 * 1024**2, self.resources.memoryBytes // 4)
@@ -400,10 +389,8 @@ class Assay:
         *,
         feat_pattern: str,
         feature_fingerprint: str,
-        n_counts: np.ndarray | None = None,
+        n_counts: np.ndarray,
     ) -> None:
-        if n_counts is None:
-            n_counts = self.cells.fetch_all(self.name + "_nCounts")
         self.cells.insert(name, _percentage(total, n_counts), overwrite=False)
         self.cells._get_array(name).attrs["feature_selection_fingerprint"] = (
             feature_fingerprint
@@ -418,7 +405,10 @@ class Assay:
         cell_index: np.ndarray,
         feature_index: np.ndarray,
     ) -> np.ndarray:
-        """Compute selected-feature count percentages in bounded row blocks."""
+        """Compute selected-feature count percentages in bounded row blocks.
+
+        Both totals accumulate in float64 for every count dtype.
+        """
         values = np.empty(len(cell_index), dtype=np.float64)
         offset = 0
         selected = self.rawData[cell_index, :]
@@ -427,19 +417,11 @@ class Assay:
             msg=f"({self.name}) Computing selected-feature percentages",
         ):
             counts = np.asarray(block)
-            denominator = np.asarray(counts.sum(axis=1), dtype=np.float64)
-            numerator = np.asarray(
-                counts[:, feature_index].sum(axis=1),
-                dtype=np.float64,
-            )
+            denominator = counts.sum(axis=1, dtype=np.float64)
+            numerator = counts[:, feature_index].sum(axis=1, dtype=np.float64)
             stop = offset + len(counts)
             values[offset:stop] = _percentage(numerator, denominator)
             offset = stop
-        if offset != len(values):
-            raise RuntimeError(
-                f"({self.name}) Percentage-feature stream produced {offset} rows; "
-                f"expected {len(values)}"
-            )
         return values
 
     def _get_cell_idx(self, cell_key: str) -> np.ndarray:
@@ -449,22 +431,6 @@ class Assay:
                 f"ERROR: Either {cell_key} does not exist or is not bool type"
             )
         return self.cells.active_index(cell_key)
-
-    def _count_arithmetic(
-        self,
-        values: NormalizedValueSource,
-        *,
-        log_transform: bool = False,
-        renormalize_subset: bool = False,
-    ) -> Literal["float64"] | None:
-        """Return the count-arithmetic marker of an artifact of these values.
-
-        ``values`` names what the artifact reads: ``normed`` itself, the
-        ``run_normalization`` payload, ``iter_normed_feature_wise`` batches,
-        or feature scores. This assay computes all of them with ``normed``,
-        which ignores the normalization flags.
-        """
-        return normalizer_count_arithmetic(self, self.normMethod)
 
     def _iter_feature_group_means(
         self,
@@ -486,19 +452,14 @@ class Assay:
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Validate the ordered cell and feature indices of a payload."""
-        cell_idx = np.asarray(cell_idx, dtype=np.int64)
-        feat_idx = np.asarray(feat_idx, dtype=np.int64)
-        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
-            raise ValueError("cell_idx and feat_idx must be one-dimensional")
-        if (
-            np.any(cell_idx < 0)
-            or np.any(cell_idx >= self.cells.N)
-            or np.any(feat_idx < 0)
-            or np.any(feat_idx >= self.feats.N)
-        ):
-            raise IndexError("cell_idx or feat_idx contains an out-of-range index")
-        return cell_idx, feat_idx
+        """Return the ordered cell and feature indices of a payload as int64.
+
+        ``run_normalization`` passes the positions of validated selections.
+        """
+        return (
+            np.asarray(cell_idx, dtype=np.int64),
+            np.asarray(feat_idx, dtype=np.int64),
+        )
 
     def _write_normalized_payload(
         self,
@@ -631,38 +592,16 @@ class Assay:
         int,
         list[str],
     ]:
+        """Cap the window and bin count at the cell count and hash the inputs.
+
+        ``run_pseudotime_aggregation`` passes the unique, in-range indices of
+        stored selections, a validated ordering aligned with the cells, and
+        positive integer sizes.
+        """
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         cell_ordering = np.asarray(cell_ordering, dtype=float)
-        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
-            raise ValueError("cell_idx and feat_idx must be one-dimensional")
-        if len(cell_idx) == 0 or len(feat_idx) == 0:
-            raise ValueError("Aggregation requires non-empty cell and feature indices")
-        if (
-            np.any(cell_idx < 0)
-            or np.any(cell_idx >= self.cells.N)
-            or has_duplicates(cell_idx)
-            or np.any(feat_idx < 0)
-            or np.any(feat_idx >= self.feats.N)
-            or has_duplicates(feat_idx)
-        ):
-            raise ValueError("Aggregation indices are invalid")
         n_cells = cell_ordering.shape[0]
-        if cell_ordering.ndim != 1 or n_cells == 0:
-            raise ValueError("Cell ordering must be a non-empty one-dimensional array")
-        if not np.isfinite(cell_ordering).all():
-            raise ValueError("Cell ordering must contain only finite values")
-        if n_cells != len(cell_idx):
-            raise ValueError("Cell ordering must align with cell_idx")
-        if not isinstance(window_size, int) or isinstance(window_size, bool):
-            raise TypeError("window_size must be an integer")
-        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
-            raise TypeError("chunk_size must be an integer")
-        if window_size <= 0:
-            raise ValueError("window_size must be greater than zero")
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be greater than zero")
-
         effective_window = min(window_size, n_cells)
         effective_bins = min(chunk_size, n_cells)
         if effective_window != window_size:
@@ -748,8 +687,6 @@ class Assay:
             feature_indices[offset:stop] = labels
             valid[offset:stop] = batch_valid
             offset = stop
-        if offset != n_features:
-            raise ValueError("Normalized features do not cover the selected features")
         return data, feature_indices, valid
 
     def _write_aggregated_ordering_group(
@@ -845,7 +782,9 @@ class Assay:
                 feat_idx=np.arange(self.feats.N, dtype=np.int64),
             )
             if log_transform:
-                values = cast(ChunkedArray, np.log1p(values))
+                # NumPy logs uint8 in float16 and uint16 in float32, so the
+                # logarithms are computed in float64 for every count dtype.
+                values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
             obs_avg = np.asarray(values.mean(axis=0).compute(), dtype=np.float64)
         else:
             obs_avg = np.zeros(self.feats.N, dtype=np.float64)
@@ -857,16 +796,6 @@ class Assay:
             n_bins=n_bins,
             rand_seed=rand_seed,
             log_transform=log_transform,
-        )
-
-    def _compute_feature_summary(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        """Compute full-axis sufficient statistics for supported assay types."""
-        raise TypeError(
-            "Feature summaries are supported only for RNAassay and ATACassay"
         )
 
     def _score_feature_indices(
@@ -887,8 +816,6 @@ class Assay:
         feature_idx = np.asarray(feature_idx, dtype=np.int64)
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feature_avg = np.asarray(feature_avg, dtype=np.float64)
-        if feature_idx.ndim != 1 or len(feature_idx) == 0:
-            raise ValueError("feature_idx must be a non-empty one-dimensional array")
         if feature_avg.shape != (self.feats.N,):
             raise ValueError(
                 f"feature_avg must have shape ({self.feats.N},), got "
@@ -919,11 +846,15 @@ class Assay:
                 log_transform=log_transform,
             )
             return np.asarray(means["target"] - means["control"])
+        if len(cell_idx) == 0:
+            # An empty selection has no scores and is not normalized, because
+            # CLR would divide by its zero cell count.
+            return np.zeros(0, dtype=np.float64)
 
         def calc_mean(index: np.ndarray) -> np.ndarray:
             values = self.normed(cell_idx=cell_idx, feat_idx=np.sort(index))
             if log_transform:
-                values = cast(ChunkedArray, np.log1p(values))
+                values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
             return np.asarray(values.mean(axis=1).compute())
 
         return np.asarray(calc_mean(feature_idx) - calc_mean(control_idx))

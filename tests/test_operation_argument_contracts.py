@@ -139,9 +139,6 @@ _CONTRACTS = (
                 "normalization_method",
                 "size_factor",
             ),
-            **_classified(
-                "algorithm_version", "count_arithmetic", "zero_total_divisor"
-            ),
         },
     ),
     OperationContract(
@@ -183,8 +180,7 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "feature_summary",
-        )
-        | _classified("algorithm_version", "count_arithmetic"),
+        ),
         signature_only=_classified("routing", "from_assay"),
     ),
     OperationContract(
@@ -195,10 +191,7 @@ _CONTRACTS = (
             "graph": "connectivity_map",
         },
         signature_only=_classified("routing", "from_assay"),
-        model_only={
-            **_classified("resolved_input", "neighbors"),
-            **_classified("algorithm_version", "count_arithmetic"),
-        },
+        model_only=_classified("resolved_input", "neighbors"),
     ),
     OperationContract(
         DataStore.run_fate_mapping,
@@ -250,8 +243,7 @@ _CONTRACTS = (
             "continuity_correction",
             "adjustment_method",
             "adjustment_scope",
-        )
-        | _classified("algorithm_version", "count_arithmetic"),
+        ),
     ),
     OperationContract(
         DataStore.calc_membership_strength,
@@ -296,8 +288,7 @@ _CONTRACTS = (
             "normalization_method",
             "size_factor",
         )
-        | _classified("execution", "nthreads")
-        | _classified("algorithm_version", "count_arithmetic"),
+        | _classified("execution", "nthreads"),
     ),
     OperationContract(
         DataStore.run_pseudotime_marker_search,
@@ -322,8 +313,7 @@ _CONTRACTS = (
             "adjustment_method",
             "adjustment_scope",
         )
-        | _classified("execution", "nthreads")
-        | _classified("algorithm_version", "count_arithmetic"),
+        | _classified("execution", "nthreads"),
     ),
     OperationContract(
         DataStore.run_pseudotime_scoring,
@@ -372,7 +362,7 @@ _CONTRACTS = (
             **_classified("execution", "skip_save"),
         },
         model_only={
-            **_classified("algorithm_version", "p_value_policy", "count_arithmetic"),
+            **_classified("algorithm_version", "p_value_policy"),
             **_classified(
                 "resolved_input",
                 "group_field",

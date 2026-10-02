@@ -41,6 +41,27 @@ class ArrayGeometry:
             elements *= max(1, extent)
         return elements * self.itemsize
 
+    def readBytes(
+        self, resultBytes: int, chunks: int = 1, decodes: int | None = None
+    ) -> int:
+        """Return the bytes one Zarr read holds while it runs.
+
+        A sharded read fills a shard-level copy of the selection before it
+        copies that into the result, and holds the compressed bytes of every
+        inner chunk it touches in a shard, which never exceed the decoded
+        chunk, while it decodes them. An unsharded read counts its result and
+        the chunks it decodes, but not the compressed bytes of a chunk while
+        it decodes. ``chunks`` counts the inner chunks the read touches in one
+        shard and ``decodes`` the chunks Zarr decodes at once, all of them
+        unless given.
+        """
+        touched = max(1, int(chunks))
+        decoding = touched if decodes is None else min(touched, max(1, int(decodes)))
+        result = max(0, int(resultBytes))
+        if self.shards is None:
+            return result + decoding * self.nominalChunkBytes()
+        return 2 * result + (touched + decoding) * self.nominalChunkBytes()
+
     def binOf(self, axis: int, indices: np.ndarray) -> np.ndarray:
         """Map indices along one axis to the chunk they live in."""
         return np.asarray(indices, dtype=np.int64) // self.axisChunk(axis)

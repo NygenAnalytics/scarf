@@ -123,7 +123,6 @@ class DoubletScoreArguments(OperationArguments):
     save_k: int = parameter()
     smoothing_t: int = parameter()
     normalize_scores: bool = parameter()
-    count_arithmetic: Literal["checked_integer_sum"] = parameter()
     random_seed: int = parameter()
     invalidate_cache: bool = execution()
 
@@ -142,7 +141,6 @@ class CellCycleArguments(OperationArguments):
     n_bins: int = parameter()
     rand_seed: int = parameter()
     invalidate_cache: bool = execution()
-    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +162,6 @@ class MarkerTableArguments(OperationArguments):
     adjustment_scope: str = parameter()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
-    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +219,6 @@ class PseudotimeMarkerArguments(OperationArguments):
     gene_batch_size: int | None = execution()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
-    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +247,6 @@ class PseudotimeAggregationArguments(OperationArguments):
     batch_size: int | None = execution()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
-    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,7 +366,6 @@ class StatisticalTestingArguments(OperationArguments):
     key_labels: tuple[str, ...] = parameter()
     from_assay: str | None = execution()
     invalidate_cache: bool = execution()
-    count_arithmetic: Literal["float64"] | None = parameter(None, omit_if_none=True)
     # Only Mann-Whitney records carry its p-value policy, so other tests keep
     # their identities.
     p_value_policy: str | None = parameter(None, omit_if_none=True)

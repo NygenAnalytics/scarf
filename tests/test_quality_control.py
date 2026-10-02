@@ -60,7 +60,8 @@ def test_doublet_pair_counts_reject_unrepresentable_integer_sums(dtype, left, ri
         ("int64", [[-(2**63), 2**63 - 1], [0, -(2**63)]], [[-(2**63), -1]], "int64"),
         ("uint64", [[0, 0], [1, 2]], [[1, 2]], "uint64"),
         ("int8", [[100, -100], [100, -100]], [[200, -200]], "int16"),
-        ("float32", [[1.5, 0], [2.25, 3.5]], [[3.75, 3.5]], "float32"),
+        ("float32", [[1.5, 0], [2.25, 3.5]], [[3.75, 3.5]], "float64"),
+        ("float32", [[2.0**24, 0], [1.0, 0]], [[2.0**24 + 1, 0]], "float64"),
         ("bool", [[True, False], [True, True]], [[2, 1]], "uint8"),
     ],
 )
@@ -517,36 +518,6 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
     datastore = analyzed_datastore_ephemeral
     selected_connectivity = _fixture_graph(datastore)
     clusters = _doublet_clusters(datastore, selected_connectivity)
-    lineage = resolve_native_graph_inputs(datastore.zw, selected_connectivity)
-    n_cells = artifact_group(datastore.zw, clusters)["values"].shape[0]
-    previous = plan_cell_data_artifact(
-        datastore.zw,
-        scope="assay",
-        assay="RNA",
-        kind="doublet_score",
-        operation="run_doublet_detection",
-        parameters={
-            "cluster_sample_fraction": 0.01,
-            "max_cells_per_cluster": 2,
-            "simulation_ratio": 0.01,
-            "heterotypic_fraction": 0.8,
-            "save_k": 3,
-            "smoothing_t": 1,
-            "normalize_scores": True,
-            "random_seed": 19,
-        },
-        inputs={
-            "clusters": clusters,
-            "connectivity_map": selected_connectivity,
-            "neighbors": lineage.neighbors,
-        },
-        execution_options={},
-        cell_selection=lineage.cell_selection,
-        arrays={"values": ((n_cells,), "f")},
-    )
-    write_cell_data_artifact(
-        datastore.zw, previous, {"values": np.full(n_cells, np.nan)}
-    )
     metadata_before = _snapshot_store(str(Path(datastore.zarr_loc) / "cellData"))
     reference_projections = set(
         datastore.list_artifacts(
@@ -577,10 +548,18 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
         random_seed=19,
     )
 
-    assert score_ref != previous.ref
-    assert datastore.inspect_artifact(score_ref).parameters["count_arithmetic"] == (
-        "checked_integer_sum"
-    )
+    # The record holds the scoring parameters only; it carries no
+    # arithmetic salt.
+    assert set(datastore.inspect_artifact(score_ref).parameters) == {
+        "cluster_sample_fraction",
+        "max_cells_per_cluster",
+        "simulation_ratio",
+        "heterotypic_fraction",
+        "save_k",
+        "smoothing_t",
+        "normalize_scores",
+        "random_seed",
+    }
     assert (
         set(
             datastore.list_artifacts(

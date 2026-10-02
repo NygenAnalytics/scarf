@@ -15,6 +15,7 @@ if TYPE_CHECKING:
         get_ranges as get_ranges,
     )
     from .markers import (
+        RankMarkerResult as RankMarkerResult,
         find_markers_by_rank as find_markers_by_rank,
         find_markers_by_regression as find_markers_by_regression,
         mannwhitneyu_from_ranks as mannwhitneyu_from_ranks,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 __all__ = [
     "EnrichmentResult",
     "GroupComparisonResult",
+    "RankMarkerResult",
     "StatisticalTestResult",
     "adjust_pvalues",
     "aggregate_samples",
@@ -62,6 +64,7 @@ __getattr__, __dir__ = _lazy_facade(
     {
         "EnrichmentResult": ".enrichment",
         "GroupComparisonResult": ".statistical",
+        "RankMarkerResult": ".markers",
         "StatisticalTestResult": ".statistical",
         "adjust_pvalues": ".statistical",
         "aggregate_samples": ".statistical",

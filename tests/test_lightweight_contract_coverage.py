@@ -27,8 +27,10 @@ class _ReductionParent:
         axis: int | None,
         nthreads: int | None,
         msg: str | None,
+        *,
+        dtype: np.dtype | None = None,
     ) -> np.ndarray:
-        self.calls.append((op, axis, nthreads, msg))
+        self.calls.append((op, axis, nthreads, msg, dtype))
         return np.array([1.0, 2.0, 4.0])
 
 
@@ -64,7 +66,7 @@ def test_reduction_array_protocol_and_cached_collection_behavior() -> None:
 
     np.testing.assert_array_equal(reduction.compute(3, "sum"), [1.0, 2.0, 4.0])
     np.testing.assert_array_equal(reduction.compute(9, "ignored"), [1.0, 2.0, 4.0])
-    assert parent.calls == [("sum", 0, 3, "sum")]
+    assert parent.calls == [("sum", 0, 3, "sum", None)]
     assert np.asarray(reduction, dtype=np.float32).dtype == np.float32
     assert reduction.shape == (3,)
     assert len(reduction) == 3

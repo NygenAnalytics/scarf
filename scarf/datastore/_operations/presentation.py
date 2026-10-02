@@ -347,9 +347,10 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         common cluster label.
 
         Args:
-            clusters: Explicit axis-aligned cluster-label artifact with a label
-                for every cell. Labels that its linked missing mask flags
-                raise ``ValueError``.
+            clusters: Explicit axis-aligned cluster-label artifact over the
+                cell selection of ``graph``, with a label for every cell.
+                Labels that its linked missing mask flags raise
+                ``ValueError``.
             graph: Explicit connectivity-map or integrated-graph artifact.
 
         Returns:
@@ -379,12 +380,20 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        resolved_clusters = resolve_complete_labels(self.zw, clusters, name="clusters")
+        resolved_clusters = resolve_complete_labels(
+            self.zw,
+            clusters,
+            name="clusters",
+            remedy=(
+                "Freeze the labels over the graph's cell selection with "
+                "snapshot_cluster_labels(clusters, cell_selection=...). If some "
+                "graph cells have no label, first build the graph over "
+                "select_cells(clusters, include=[...])"
+            ),
+        )
         cluster_values = resolved_clusters.values
         if resolved_clusters.source_cell_selection != selection:
             raise ValueError("Cluster labels do not match the graph cell selection")
-        if cluster_values.shape != (n_cells,):
-            raise ValueError("Cluster labels do not align with graph rows")
         arguments = MembershipStrengthArguments(
             connectivity_map=graph_ref,
             clusters=clusters,
@@ -460,9 +469,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         suffixes: 'a' to 'z', then 'aa', 'ab', and so on. The suffixes are
         ordered based on where the largest fraction of the B label lies. If one
         label from A takes up multiple labels from B then all the labels from B
-        are included, and they are delimited by hyphens. Both artifacts need a
-        label for every cell; labels that a linked missing mask flags raise
-        ``ValueError``.
+        are included, and they are delimited by hyphens. Both artifacts need
+        one cell selection and a label for every cell; labels that a linked
+        missing mask flags raise ``ValueError``.
 
         Args:
             to_relabel: Explicit axis-aligned label artifact to relabel.
@@ -477,17 +486,22 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             PermissionError: If no matching result exists and the store is
                 not opened with ``zarr_mode='r+'``.
         """
-        relabelled = resolve_complete_labels(self.zw, to_relabel, name="to_relabel")
-        base = resolve_complete_labels(self.zw, base_label, name="base_label")
+        remedy = (
+            "Select the cells labelled in both artifacts with select_cells(..., "
+            "include=[...]) and freeze both over that selection with "
+            "snapshot_cluster_labels(..., cell_selection=...)"
+        )
+        relabelled = resolve_complete_labels(
+            self.zw, to_relabel, name="to_relabel", remedy=remedy
+        )
+        base = resolve_complete_labels(
+            self.zw, base_label, name="base_label", remedy=remedy
+        )
         values_to_relabel = relabelled.values
         base_values = base.values
         selection = relabelled.source_cell_selection
         if base.source_cell_selection != selection:
             raise ValueError("Label artifacts must share one cell selection")
-        if base_values.shape != values_to_relabel.shape:
-            raise ValueError(
-                "Label artifacts must have matching one-dimensional shapes"
-            )
         arguments = SmartLabelArguments(
             values=to_relabel,
             base_labels=base_label,

@@ -109,15 +109,16 @@ local path. Keep its adjacent
 Mounting keeps counts remote and requires network access for subsequent reads. See
 {doc}`../../tutorials/remote_stores` for working with remote matrices and local results.
 
-A fresh mount copies cell and feature metadata, but does not copy the source analysis artifacts.
-Plot imported source embeddings through the read-only datastore; new analysis artifacts belong
-to the writable mount. Embedding helpers inspect only the datastore passed to them.
+A mount copies cell and feature metadata and resolves the published source artifacts, such as
+imported embeddings, read only. The embedding helpers and plots therefore work on the mount as
+on the read-only datastore. New analysis artifacts are written to the mount.
 
 ## Resolve imported embeddings
 
 `cytebase.embeddings(ds, *, assay="RNA")` maps imported source embedding keys to exact
 `ArtifactRef` values in the open datastore. `cytebase.embedding(ds, key="X_umap", *, assay="RNA")`
-selects one of these references. These helpers inspect the datastore's imported artifacts.
+selects one of these references. These helpers inspect the imported artifacts the datastore
+resolves, which on a mount include its source's.
 
 `cytebase.embedding_coordinates(ds, ref)` returns a DataFrame of the complete referenced
 embedding, indexed by cell ID. Row alignment follows the artifact's frozen cell selection,

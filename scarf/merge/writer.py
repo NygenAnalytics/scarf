@@ -10,16 +10,16 @@ from ..storage.budget import ResourceBudget
 from ..storage.identity import CountSummary, finalize_counts, load_count_summaries
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
-from ..storage.layout import ZarrArraySpec
 from ..storage.profiles import StorageProfile
 from ..storage.schema import _assay_paths, create_zarr_count_assay, load_count_array
 from ..storage.sharding import (
     accumulate_sparse_to_shards,
+    fit_count_layout,
     resolve_sparse_import_batch,
-    resolve_sparse_import_spec,
+    sparse_counts_admission,
     write_counts_t,
 )
-from ..storage.types import array_metadata_shards, as_zarr_array, as_zarr_group
+from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import canonicalize_sparse, max_window_nnz
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
@@ -61,20 +61,16 @@ def remap_block_to_coo(
     order_map: np.ndarray,
     n_feats: int,
     nthreads: int,
-    destination_dtype: np.dtype[Any] | None = None,
+    destination_dtype: np.dtype[Any],
 ) -> coo_matrix:
     """Dense-or-chunked block to COO with feature remapping and summation."""
     computed = controlled_compute(block, nthreads)
-    if order_map.shape[0] != computed.shape[1]:
-        raise ValueError("Feature order does not match the source matrix width")
     source = coo_matrix(computed)
     mapped = coo_matrix(
         (source.data, (source.row, order_map[source.col])),
         shape=(computed.shape[0], n_feats),
     )
-    if not bool(mapped.has_canonical_format):
-        mapped = canonicalize_sparse(mapped, destination_dtype)
-    return mapped
+    return canonicalize_sparse(mapped, destination_dtype)
 
 
 def empty_block_coo(n_rows: int, n_feats: int) -> coo_matrix:
@@ -90,7 +86,7 @@ def create_assay_counts(
     dtype: str,
     *,
     profile: StorageProfile,
-    policy: CountMatrixPolicy | None,
+    policy: CountMatrixPolicy,
 ) -> zarr.Array:
     counts = create_zarr_count_assay(
         z=root,
@@ -232,32 +228,48 @@ def _merge_import_requirements(
     )
 
 
-def preflight_assay_counts(
-    spec: ZarrArraySpec,
+def fit_assay_counts_layout(
     assays: list[Any | None],
     row_plan: RowPlan,
     alignment: FeatureAlignment,
+    dtype: str,
     *,
+    profile: StorageProfile,
     resources: ResourceBudget,
+    writeCountsT: bool,
     additionalResidentBytes: int = 0,
-) -> None:
-    """Admit a merge counts write before creating its destination arrays."""
+    countsTResidentBytes: int = 0,
+    requested: CountMatrixPolicy | None = None,
+) -> CountMatrixPolicy:
+    """Return the layout of merged counts whose write and ``countsT`` fit.
+
+    ``requested`` is used exactly. Otherwise the default layout is fitted to
+    the budget, before the destination arrays are created.
+    """
     requirements = _merge_import_requirements(
         assays,
         row_plan,
         alignment,
-        spec.dtype,
+        dtype,
         resources=resources,
         additionalResidentBytes=additionalResidentBytes,
     )
-    resolve_sparse_import_spec(
-        (spec,),
-        nRows=row_plan.nCells,
-        resources=resources,
-        maxWindowNnz=requirements.maxWindowNnz,
-        sourceDtype=requirements.sourceDtype,
-        residentBytes=requirements.residentBytes,
-        extraProducerBytes=requirements.extraProducerBytes,
+
+    return fit_count_layout(
+        {"counts": (alignment.nFeats, dtype)},
+        nCells=row_plan.nCells,
+        profile=profile,
+        memoryBytes=resources.memoryBytes,
+        transposed=("counts",) if writeCountsT else (),
+        admitCounts=sparse_counts_admission(
+            nRows=row_plan.nCells,
+            maxWindowNnz=requirements.maxWindowNnz,
+            sourceDtype=requirements.sourceDtype,
+            residentBytes=requirements.residentBytes,
+            extraProducerBytes=requirements.extraProducerBytes,
+        ),
+        requested=requested,
+        countsTResidentBytes=countsTResidentBytes,
     )
 
 
@@ -340,11 +352,6 @@ def write_assay_counts(
         io=io,
         countSummary=summary,
     )
-    if counter != row_plan.nCells:
-        raise AssertionError(
-            "ERROR: Mismatch in number of cells in the merged assay. "
-            "Please report this issue."
-        )
     matrix_path = _matrix_group_path(assay_name, workspace)
     matrix_group = as_zarr_group(root[matrix_path], name=matrix_path)
     finalize_counts(destination, summary=summary)
@@ -360,18 +367,12 @@ def write_assay_counts_t(
     profile: StorageProfile,
     resources: ResourceBudget,
     residentBytes: int = 0,
-    policy: CountMatrixPolicy | None = None,
     io: StorageIoPolicy | None = None,
 ) -> zarr.Array:
+    """Write ``countsT``, which replays the layout persisted with the counts."""
     counts = load_count_array(root, assay_name, workspace)
     group_path = _matrix_group_path(assay_name, workspace)
     group = as_zarr_group(root[group_path], name=group_path)
-    from ..storage.layout import _group_zarr_format
-
-    if _group_zarr_format(group) < 3:
-        raise ValueError(
-            "countsT requires a Zarr v3 destination. Repack the store to Zarr v3."
-        )
     from ..assay.classification import default_feature_sets
 
     metadata_path = _assay_metadata_path(assay_name, workspace)
@@ -381,7 +382,6 @@ def write_assay_counts_t(
         profile=profile,
         resources=resources,
         residentBytes=residentBytes,
-        policy=policy,
         io=io,
         overwrite=True,
         featureSets=default_feature_sets(
@@ -399,18 +399,7 @@ def matrix_group_complete(
     if path not in root:
         return False
     group = as_zarr_group(root[path], name=path)
-    return bool(group.attrs.get("complete", False))
-
-
-def counts_t_complete(root: zarr.Group, assay_name: str, workspace: str | None) -> bool:
-    path = _matrix_group_path(assay_name, workspace)
-    if path not in root:
-        return False
-    group = as_zarr_group(root[path], name=path)
-    if "countsT" not in group:
-        return False
-    counts_t = group["countsT"]
-    return bool(getattr(counts_t, "attrs", {}).get("complete", False))
+    return group.attrs.get("complete") is True
 
 
 def validate_assay_counts(
@@ -422,20 +411,16 @@ def validate_assay_counts(
     alignment: FeatureAlignment,
     dtype: str,
     chunks: tuple[int, int],
-    shards: tuple[int, int] | None,
 ) -> str | None:
-    """Return why a completed counts component cannot be reused."""
+    """Return why a completed counts component cannot be reused.
+
+    The matrix group is complete, and its assay metadata group exists: merge
+    containment refuses a workspace matrix that the workspace does not claim.
+    """
     assay_path = _assay_metadata_path(assay_name, workspace)
     matrix_path = _matrix_group_path(assay_name, workspace)
-    if assay_path not in root:
-        return f"assay metadata group {assay_path!r} is missing"
-    if matrix_path not in root:
-        return f"matrix group {matrix_path!r} is missing"
-
     assay_group = as_zarr_group(root[assay_path], name=assay_path)
     matrix_group = as_zarr_group(root[matrix_path], name=matrix_path)
-    if matrix_group.attrs.get("complete") is not True:
-        return f"matrix group {matrix_path!r} is not complete"
     if "counts" not in matrix_group:
         return f"counts array is missing from {matrix_path!r}"
     counts = as_zarr_array(matrix_group["counts"], name=f"{matrix_path}/counts")
@@ -456,20 +441,12 @@ def validate_assay_counts(
             f"counts dtype for {assay_name!r} is {np.dtype(counts.dtype)}, "
             f"expected {np.dtype(dtype)}"
         )
+    # The validated layout replays the shards from the chunks, shape, and dtype.
     actual_chunks = tuple(int(value) for value in counts.chunks)
     if actual_chunks != tuple(chunks):
         return (
             f"counts chunks for {assay_name!r} are {actual_chunks}, "
             f"expected {tuple(chunks)}"
-        )
-    actual_shards = array_metadata_shards(counts)
-    normalized_shards = (
-        None if actual_shards is None else tuple(int(value) for value in actual_shards)
-    )
-    if normalized_shards != shards:
-        return (
-            f"counts shards for {assay_name!r} are {normalized_shards}, "
-            f"expected {shards}"
         )
 
     if "featureData" not in assay_group:

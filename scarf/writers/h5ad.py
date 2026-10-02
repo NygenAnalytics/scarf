@@ -1,7 +1,7 @@
 import hashlib
 import math
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, cast
@@ -14,6 +14,7 @@ from ..readers import H5adReader
 from ..readers.h5ad import _H5adAssayFeatures
 from ..storage import ArtifactRef
 from ..storage.budget import ResourceBudget
+from ..storage.count_dtype import count_storage_dtype
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
@@ -81,6 +82,16 @@ def _finished_count_bands(
         for band in buffer.finish():
             producer_bytes = sum(item.residentBytes for item in buffers.values())
             yield assay_name, band, producer_bytes
+
+
+def _producer_process_bytes(producers: int, reserveBytes: int) -> int:
+    """Return the bytes that producer processes hold while the parent writes.
+
+    A single producer is a generator in the writing process and is suspended
+    while bands are written. Several producers run in their own processes and
+    keep buffering during the writes, so each holds its whole reserve.
+    """
+    return int(producers) * int(reserveBytes) if int(producers) > 1 else 0
 
 
 def _run_worker(
@@ -377,10 +388,8 @@ class _H5adCellIdSource(Sequence[str | bytes]):
             if step != 1:
                 raise ValueError("H5AD cell IDs support only contiguous reads")
             return self._reader._cell_ids_block(start, stop)
-        resolved = index if index >= 0 else len(self) + index
-        if resolved < 0 or resolved >= len(self):
-            raise IndexError(index)
-        return self._reader._cell_ids_block(resolved, resolved + 1)[0]
+        position = range(len(self))[index]
+        return self._reader._cell_ids_block(position, position + 1)[0]
 
 
 class H5adToZarr:
@@ -400,8 +409,11 @@ class H5adToZarr:
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
-        policy: Count-matrix geometry policy. When None, the default
-                unitBytes and chunkBytes plan is used.
+        policy: Count-matrix geometry policy, used exactly. When None, the
+                default policy is used with unitBytes and chunkBytes halved
+                together until the counts write and the countsT transpose
+                fit ``mem_budget``. Either way, an import that does not fit
+                raises MemoryError before the destination is created.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
         analysis_assay: Imported assay that owns explicitly selected H5AD
@@ -411,10 +423,17 @@ class H5adToZarr:
                     assay whose name is not a preset. When None, the assay
                     name decides the type. Not allowed with ``assay_split_key``.
 
+    Each assay stores its counts in the dtype that
+    :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
+    canonical source values of its own features, so the same counts import
+    identically from every H5AD encoding.
+
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
         assayName: The Zarr hierarchy (array or group).
         z: The Zarr hierarchy (array or group).
+        storageDtypes: Count storage dtype of each imported assay.
+        policy: Count-matrix layout policy of every imported assay.
     """
 
     def __init__(
@@ -496,12 +515,28 @@ class H5adToZarr:
         )
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.policy = policy
         self.io = io
         self._sourceDigest = self._hash_source() if has_analysis else None
-        self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
+        self._projection = (
+            None
+            if self.assayFeatures is None
+            else self._assay_feature_projection(self.assayFeatures)
+        )
+        self.storageDtypes = {
+            name: count_storage_dtype(self.h5ad.sourceMatrixDtype, value_range)
+            for name, value_range in zip(
+                self.assayNames,
+                self.h5ad.count_value_ranges(
+                    self.resources.memoryBytes,
+                    None if self._projection is None else self._projection[0],
+                ),
+                strict=True,
+            )
+        }
+        logger.debug(f"Resolved H5AD count storage dtypes={self.storageDtypes}")
         self.h5ad.materialize_csc(self.resources.memoryBytes)
-        self.storageDtype = self.h5ad.storageDtype
+        # A layout that does not fit fails here, before the destination exists.
+        self.policy = self._fit_count_layout(policy)
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         for resolved_assay_name in self.assayNames:
@@ -519,9 +554,9 @@ class H5adToZarr:
                 n_cells=self.h5ad.nCells,
                 feat_ids=feature_ids,
                 feat_names=feature_names,
-                dtype=self.storageDtype,
+                dtype=self.storageDtypes[resolved_assay_name],
                 profile=self.profile,
-                policy=policy,
+                policy=self.policy,
             )
         self._ini_feature_data()
         self.root = (
@@ -610,11 +645,11 @@ class H5adToZarr:
         """Write h5ad matrix data into Zarr ``counts`` and RNA ``countsT``.
 
         Args:
-            batch_size: Number of source cells per batch. By default, a
-                        destination-aligned value is selected within the memory budget.
+            batch_size: Number of source cells per batch, at most one
+                        destination row band, which is the default.
 
         Raises:
-            AssertionError: If written cell count does not match expected nCells.
+            ValueError: If ``batch_size`` is not positive.
 
         Returns:
             Explicit selection, embedding, and cluster artifact references.
@@ -629,7 +664,6 @@ class H5adToZarr:
             assay_types=self.assayTypes,
             resources=self.resources,
             profile=self.profile,
-            policy=self.policy,
             io=self.io,
         )
         cell_selection = self._write_cell_selection()
@@ -684,8 +718,8 @@ class H5adToZarr:
 
         if not self.h5ad.embeddingRoles:
             return {}
-        if self.analysisAssay is None or self._sourceDigest is None:
-            raise RuntimeError("H5AD analytical import was not initialized")
+        # Construction resolves both whenever the reader selected an output.
+        assert self.analysisAssay is not None and self._sourceDigest is not None
 
         from ._store import fingerprint_row_blocks, floating_payload_dtype
 
@@ -752,11 +786,8 @@ class H5adToZarr:
         key: str,
         block_rows: int,
     ) -> tuple[np.dtype[Any], bool]:
+        # The reader admits only boolean, numeric, and text cluster keys.
         source_dtype = self.h5ad._cell_column_value_dtype(key)
-        if source_dtype.kind not in "biufOSU":
-            raise TypeError(
-                f"Cluster key {key!r} uses unsupported dtype {source_dtype}"
-            )
         has_missing = False
         if source_dtype.kind not in "OSU":
             for start in range(0, self.h5ad.nCells, block_rows):
@@ -792,8 +823,6 @@ class H5adToZarr:
         raw_values, raw_missing = self.h5ad._cell_column_block(key, start, stop)
         values = np.asarray(raw_values)
         missing = np.asarray(raw_missing, dtype=bool).copy()
-        if values.ndim != 1 or missing.shape != values.shape:
-            raise ValueError(f"Cluster key {key!r} did not return aligned row values")
         if values.dtype.kind == "O":
             for index, value in enumerate(values):
                 if self._value_is_missing(value):
@@ -811,8 +840,7 @@ class H5adToZarr:
 
         normalized = np.zeros(values.shape, dtype=dtype)
         valid = ~missing
-        if bool(valid.any()):
-            normalized[valid] = np.asarray(values[valid], dtype=dtype)
+        normalized[valid] = np.asarray(values[valid], dtype=dtype)
         if dtype.kind == "f":
             nonfinite = ~np.isfinite(normalized)
             missing |= nonfinite
@@ -838,8 +866,8 @@ class H5adToZarr:
 
         if not self.h5ad.clusterKeys:
             return {}
-        if self.analysisAssay is None or self._sourceDigest is None:
-            raise RuntimeError("H5AD analytical import was not initialized")
+        # Construction resolves both whenever the reader selected an output.
+        assert self.analysisAssay is not None and self._sourceDigest is not None
 
         artifacts: dict[str, ArtifactRef] = {}
         block_rows = self._analysis_block_rows(requested_rows, row_bytes=64)
@@ -894,7 +922,7 @@ class H5adToZarr:
                             missing if has_missing else None,
                         )
 
-                values = create_streamed_metadata_column(
+                create_streamed_metadata_column(
                     group,
                     "values",
                     shape=self.h5ad.nCells,
@@ -907,12 +935,94 @@ class H5adToZarr:
                     hasMissing=has_missing,
                     profile=self.profile,
                 )
-                if has_missing and values.attrs.get("missing_mask") != (
-                    f"{MISSING_MASK_PREFIX}values"
-                ):
-                    raise RuntimeError("Cluster-label missing-mask link is malformed")
             artifacts[key] = planned.ref
         return artifacts
+
+    def _assay_widths(self) -> dict[str, int]:
+        """Return the feature count of each imported assay."""
+        if self.assayFeatures is None:
+            return {name: int(self.h5ad.nFeatures) for name in self.assayNames}
+        return {
+            name: int(self.assayFeatures[name].featureIndexes.size)
+            for name in self.assayNames
+        }
+
+    def _count_import_requirements(self) -> tuple[int, Callable[[int], int]]:
+        """Return the resident and extra producer bytes of the counts write.
+
+        The layout fit and the write plan the same import from these.
+        """
+        from ..storage.identity import CountSummary
+
+        self.h5ad._prepare_sparse_import()
+        resident = (
+            self.h5ad.materialized_csr_bytes()
+            + max(0, int(self.h5ad._sparse_import_resident_bytes()))
+            + sum(
+                CountSummary.nbytes_for(self.h5ad.nCells, width)
+                for width in self._assay_widths().values()
+            )
+        )
+        if self.assayFeatures is not None:
+            resident += sum(
+                assay.featureIndexes.nbytes for assay in self.assayFeatures.values()
+            )
+        if self._projection is not None:
+            resident += sum(array.nbytes for array in self._projection)
+        source_itemsize = self.h5ad.consumeDtype.itemsize
+        projection_value_bytes = max(
+            [
+                source_itemsize,
+                *(dtype.itemsize for dtype in self.storageDtypes.values()),
+            ]
+        )
+
+        def extra_producer_bytes(rows: int) -> int:
+            source_rows = min(rows, self.h5ad.nCells)
+            extra = (
+                source_rows * self.h5ad.nFeatures * source_itemsize
+                if self.h5ad.matrixOrientation == "dense"
+                else 0
+            )
+            if self.assayFeatures is not None:
+                source_values = max(0, int(self.h5ad.max_batch_nnz(rows)))
+                extra += source_values * (
+                    projection_value_bytes
+                    + 4 * np.dtype(np.int64).itemsize
+                    + np.dtype(np.bool_).itemsize
+                )
+            return extra
+
+        return resident, extra_producer_bytes
+
+    def _fit_count_layout(
+        self, requested: CountMatrixPolicy | None
+    ) -> CountMatrixPolicy:
+        """Return the count layout whose import and ``countsT`` fit the budget."""
+        from ..storage.sharding import fit_count_layout, sparse_counts_admission
+        from .counts_t import counts_t_assays
+
+        resident, extra_producer_bytes = self._count_import_requirements()
+        widths = self._assay_widths()
+        return fit_count_layout(
+            {
+                name: (widths[name], self.storageDtypes[name])
+                for name in self.assayNames
+            },
+            nCells=self.h5ad.nCells,
+            profile=self.profile,
+            memoryBytes=self.resources.memoryBytes,
+            transposed=counts_t_assays(self.assayNames, self.assayTypes),
+            admitCounts=sparse_counts_admission(
+                nRows=self.h5ad.nCells,
+                maxWindowNnz=self.h5ad.max_batch_nnz,
+                sourceDtype=self.h5ad.consumeDtype,
+                residentBytes=resident,
+                producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
+                extraProducerBytes=extra_producer_bytes,
+            ),
+            requested=requested,
+        )
 
     def _write_counts(self, batch_size: int | None = None) -> None:
         """Write and finalize cell-major ``counts`` (profiling stage split helper)."""
@@ -945,50 +1055,15 @@ class H5adToZarr:
             f"Writing counts with up to {self.resources.workers} row-band writer(s)"
         )
         started = time.perf_counter()
-        resident_source_bytes = self.h5ad.materialized_csr_bytes()
-        if self.assayFeatures is None:
-            feature_index_bytes = 0
-        else:
-            feature_index_bytes = sum(
-                assay.featureIndexes.nbytes for assay in self.assayFeatures.values()
-            )
-        projection = (
-            None if self.assayFeatures is None else self._assay_feature_projection()
-        )
-        if projection is not None:
-            resident_source_bytes += sum(array.nbytes for array in projection)
-        resident_source_bytes += feature_index_bytes
-        resident_source_bytes += sum(summary.nbytes for summary in summaries.values())
-        self.h5ad._prepare_sparse_import()
-        resident_source_bytes += max(0, int(self.h5ad._sparse_import_resident_bytes()))
-        source_itemsize = np.dtype(self.h5ad.sourceMatrixDtype).itemsize
-        projection_value_bytes = max(
-            source_itemsize,
-            *(destination.dtype.itemsize for destination in destinations.values()),
-        )
-
-        def extra_producer_bytes(rows: int) -> int:
-            source_rows = min(rows, self.h5ad.nCells)
-            extra = (
-                source_rows * self.h5ad.nFeatures * source_itemsize
-                if self.h5ad.matrixOrientation == "dense"
-                else 0
-            )
-            if self.assayFeatures is not None:
-                source_values = max(0, int(self.h5ad.max_batch_nnz(rows)))
-                extra += source_values * (
-                    projection_value_bytes
-                    + 4 * np.dtype(np.int64).itemsize
-                    + np.dtype(np.bool_).itemsize
-                )
-            return extra
+        projection = self._projection
+        resident_source_bytes, extra_producer_bytes = self._count_import_requirements()
 
         plan = resolve_sparse_import_batch(
             tuple(destinations.values()),
             nRows=self.h5ad.nCells,
             resources=self.resources,
             maxWindowNnz=self.h5ad.max_batch_nnz,
-            sourceDtype=self.h5ad.sourceMatrixDtype,
+            sourceDtype=self.h5ad.consumeDtype,
             batchRows=batch_size,
             residentBytes=resident_source_bytes,
             producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
@@ -1017,14 +1092,12 @@ class H5adToZarr:
         n_producers = 1
         process_resources: ResourceBudget | None = None
         process_plan = None
-        for candidate in range(available_windows, 0, -1):
-            direct_candidate = candidate > 1 and isinstance(
-                self._parallelWriteLocation, str
-            )
+        # One producer writes with the plan above, so only wider splits are
+        # planned. A split whose budget cannot hold it fails admission.
+        for candidate in range(available_windows, 1, -1):
+            direct_candidate = isinstance(self._parallelWriteLocation, str)
             if direct_candidate:
                 available_memory = self.resources.memoryBytes - resident_source_bytes
-                if available_memory < candidate:
-                    continue
                 candidate_resources = ResourceBudget(
                     available_memory // candidate,
                     max(1, int(self.resources.workers) // candidate),
@@ -1043,9 +1116,9 @@ class H5adToZarr:
                 candidate_batch_rows = None
             else:
                 candidate_resources = self.resources
-                candidate_resident = resident_source_bytes + max(
-                    0, candidate - 1
-                ) * int(plan.producerReserveBytes)
+                candidate_resident = resident_source_bytes + _producer_process_bytes(
+                    candidate, plan.producerReserveBytes
+                )
                 candidate_batch_rows = resolved_batch_rows
             try:
                 candidate_plan = resolve_sparse_import_batch(
@@ -1053,7 +1126,7 @@ class H5adToZarr:
                     nRows=self.h5ad.nCells,
                     resources=candidate_resources,
                     maxWindowNnz=self.h5ad.max_batch_nnz,
-                    sourceDtype=self.h5ad.sourceMatrixDtype,
+                    sourceDtype=self.h5ad.consumeDtype,
                     batchRows=candidate_batch_rows,
                     residentBytes=candidate_resident,
                     producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
@@ -1069,7 +1142,7 @@ class H5adToZarr:
                         nRows=self.h5ad.nCells,
                         resources=candidate_resources,
                         maxWindowNnz=self.h5ad.max_batch_nnz,
-                        sourceDtype=self.h5ad.sourceMatrixDtype,
+                        sourceDtype=self.h5ad.consumeDtype,
                         batchRows=resolved_batch_rows,
                         residentBytes=candidate_resident,
                         producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
@@ -1127,8 +1200,8 @@ class H5adToZarr:
                 summaries=summaries,
             )
         else:
-            extra_producer_resident = max(0, n_producers - 1) * int(
-                plan.producerReserveBytes
+            extra_producer_resident = _producer_process_bytes(
+                n_producers, plan.producerReserveBytes
             )
             write_sparse_bands(
                 self._count_shard_tasks(
@@ -1149,21 +1222,6 @@ class H5adToZarr:
                 },
             )
         counts_seconds = time.perf_counter() - started
-
-        covered = sum(end - start for start, end in windows)
-        if n_producers <= 1:
-            for assay_name, buffer in buffers.items():
-                if buffer.rows != self.h5ad.nCells:
-                    raise AssertionError(
-                        "ERROR: This is a bug in H5adToZarr. All cells might not have "
-                        f"been successfully written into the {assay_name} counts "
-                        "array. Please report this issue"
-                    )
-        elif covered != self.h5ad.nCells:
-            raise AssertionError(
-                "ERROR: This is a bug in H5adToZarr. Parallel producers covered "
-                f"{covered} cells, expected {self.h5ad.nCells}"
-            )
         # counts is the durable physical orientation for H5AD imports. Public
         # dump() always finalizes paired RNA countsT after this step.
         logger.debug(f"Counts written in {counts_seconds:.1f}s")
@@ -1189,8 +1247,6 @@ class H5adToZarr:
 
         from ..storage.execution import record_execution_report
 
-        if not isinstance(self._parallelWriteLocation, str):
-            raise RuntimeError("Parallel H5AD writes require a reopenable location")
         context = get_context("spawn")
         stop = context.Event()
         connections: dict[Any, int] = {}
@@ -1225,11 +1281,10 @@ class H5adToZarr:
                 connections[parent_connection] = index
                 workers.append(worker)
 
-            for index, kind, payload in _worker_messages(
+            # A writer sends only its done message; its errors raise here.
+            for _index, _kind, payload in _worker_messages(
                 connections, workers, "writer"
             ):
-                if kind != "done":
-                    raise RuntimeError(f"H5AD writer {index} sent an unknown message")
                 reports, summary_windows = payload
                 for report in reports:
                     record_execution_report(report)
@@ -1244,7 +1299,7 @@ class H5adToZarr:
         buffers: dict[str, Any],
         destinations: dict[str, Any],
         projection: tuple[np.ndarray, np.ndarray] | None,
-        windows: list[tuple[int, int]] | None = None,
+        windows: list[tuple[int, int]],
     ) -> Iterator[Any]:
         """Yield complete row-band writes from disjoint H5AD producers."""
         ranges = windows or [(0, self.h5ad.nCells)]
@@ -1255,8 +1310,8 @@ class H5adToZarr:
                 buffers,
                 destinations,
                 projection,
-                row_start=ranges[0][0] if ranges else 0,
-                row_end=ranges[0][1] if ranges else 0,
+                row_start=ranges[0][0],
+                row_end=ranges[0][1],
             )
             return
         yield from self._parallel_count_bands(
@@ -1286,8 +1341,8 @@ class H5adToZarr:
         destination_specs: dict[str, ZarrArraySpec] = {}
         for assay_name, destination in destinations.items():
             geometry = array_geometry(destination)
-            if geometry is None:
-                raise ValueError("H5AD destination has no stored chunk geometry")
+            # Count arrays are always chunked.
+            assert geometry is not None
             destination_specs[assay_name] = ZarrArraySpec(
                 shape=geometry.shape,
                 chunks=geometry.chunks,
@@ -1319,13 +1374,12 @@ class H5adToZarr:
                 connections[parent_connection] = index
                 workers.append(worker)
 
-            for index, kind, payload in _worker_messages(
+            # A producer sends bands and then done; its errors raise here.
+            for _index, kind, payload in _worker_messages(
                 connections, workers, "producer"
             ):
                 if kind == "done":
                     continue
-                if kind != "band":
-                    raise RuntimeError(f"H5AD producer {index} sent an unknown message")
                 assay_name, band, producer_bytes = payload
                 yield SparseWriteBand(
                     destinations[assay_name],
@@ -1398,14 +1452,15 @@ class H5adToZarr:
                 producer_bytes,
             )
 
-    def _assay_feature_projection(self) -> tuple[np.ndarray, np.ndarray]:
+    def _assay_feature_projection(
+        self,
+        assay_features: dict[str, _H5adAssayFeatures],
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Map each source feature to its assay code and assay-local column."""
-        if self.assayFeatures is None:
-            raise RuntimeError("Multi-assay features have not been initialized")
         codes = np.full(int(self.h5ad.nFeatures), -1, dtype=np.int64)
         columns = np.zeros(int(self.h5ad.nFeatures), dtype=np.int64)
         for code, assay_name in enumerate(self.assayNames):
-            indexes = self.assayFeatures[assay_name].featureIndexes
+            indexes = assay_features[assay_name].featureIndexes
             codes[indexes] = code
             columns[indexes] = np.arange(indexes.size, dtype=np.int64)
         return codes, columns

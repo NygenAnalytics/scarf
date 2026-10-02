@@ -309,9 +309,11 @@ def test_count_assays_require_zarr_v3(empty: bool) -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
     with pytest.raises(ValueError, match="Zarr format 3"):
         if empty:
-            create_empty_zarr_count_assay(root, "RNA", None, 3, 4, "U10", "U10")
+            create_empty_zarr_count_assay(
+                root, "RNA", None, 3, 4, "U10", "U10", np.uint8
+            )
         else:
-            create_zarr_count_assay(root, "RNA", None, 8, ["f0"], ["g0"])
+            create_zarr_count_assay(root, "RNA", None, 8, ["f0"], ["g0"], np.uint8)
 
 
 def test_normed_plan_respects_codec_limit():
@@ -442,6 +444,34 @@ def test_dense_row_batches_flush_at_shard_boundaries():
     np.testing.assert_array_equal(destination[:], expected.astype(np.uint16))
 
 
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (300, "exceed the destination dtype"),
+        (-1, "exceed the destination dtype"),
+        (2.5, "cannot be represented"),
+    ],
+)
+def test_dense_row_batches_reject_values_an_integer_dtype_cannot_hold(value, message):
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts", shape=(4, 2), chunks=(2, 2), shards=(4, 2), dtype=np.uint8
+    )
+    batch = np.array([[1, 2], [3, 4], [5, value], [7, 8]])
+    with pytest.raises(OverflowError, match=message):
+        write_dense_from_row_batches(
+            destination,
+            iter([batch]),
+            resources=ResourceBudget(1024**2, 1),
+        )
+    # A count the dtype holds is written unchanged.
+    batch[2, 1] = 255
+    write_dense_from_row_batches(
+        destination, iter([batch]), resources=ResourceBudget(1024**2, 1)
+    )
+    np.testing.assert_array_equal(destination[:], batch.astype(np.uint8))
+
+
 def test_dense_shard_summaries_are_merged_incrementally():
     root = zarr.open_group(store=MemoryStore(), mode="w")
     destination = root.create_array(
@@ -504,6 +534,49 @@ def test_sparse_batches_write_complete_shards():
     )
     assert rows == len(expected)
     np.testing.assert_array_equal(destination[:], expected)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "duplicates"),
+    [
+        (np.uint16, True),
+        (np.int32, True),
+        (np.float32, False),
+        (np.float32, True),
+        (np.float64, True),
+    ],
+)
+def test_canonical_sparse_batches_match_source_order_sums(dtype, duplicates):
+    from scipy.sparse import coo_matrix
+
+    from scarf.utils.arrays import canonicalize_sparse
+
+    rng = np.random.default_rng(5)
+    shape = (300, 40)
+    if duplicates:
+        row = rng.integers(0, shape[0], 20_000)
+        column = rng.integers(0, shape[1], 20_000)
+    else:
+        cells = rng.choice(shape[0] * shape[1], 5_000, replace=False)
+        row, column = np.divmod(cells, shape[1])
+    data = (rng.random(row.size) * 50).astype(dtype)
+    if np.dtype(dtype).kind == "f":
+        # Fractional duplicates make float sums depend on their order.
+        data += np.asarray(0.1, dtype=dtype)
+    expected = coo_matrix(
+        (
+            data.astype(np.int64) if np.dtype(dtype).kind in "iu" else data,
+            (row, column),
+        ),
+        shape=shape,
+    )
+    expected.sum_duplicates()
+
+    canonical = canonicalize_sparse(coo_matrix((data, (row, column)), shape=shape))
+    assert canonical.has_canonical_format
+    np.testing.assert_array_equal(canonical.row, expected.row)
+    np.testing.assert_array_equal(canonical.col, expected.col)
+    np.testing.assert_array_equal(canonical.data, expected.data)
 
 
 @pytest.mark.parametrize(

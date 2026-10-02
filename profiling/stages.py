@@ -202,8 +202,6 @@ class StageRunResult:
     utilization: dict[str, float | None] | None = None
     details: dict[str, Any] | None = None
     provenance: dict[str, Any] | None = None
-    # Stages that ran at the same time; CPU and memory then share a window.
-    concurrentStages: list[str] | None = None
     # The downloaded input H5AD of a createStore stage.
     datasetUri: str | None = None
     datasetETag: str | None = None
@@ -513,23 +511,23 @@ def _write_counts_t(
     *,
     storeUri: str,
     assayName: str,
-    countMatrix: CountMatrixConfig | None = None,
     storageIo: StorageIoConfig | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    from scarf.storage.count_matrix import plan_count_matrix_pair
+    from scarf.storage.count_matrix import (
+        load_count_matrix_plan,
+        replay_count_matrix_plan,
+    )
     from scarf.storage.sharding import write_counts_t
     from scarf.assay.classification import default_feature_sets
 
     profile = _storage_profile(storeUri)
-    policy = _count_matrix_policy(countMatrix)
-    pair_kwargs: dict[str, Any] = {"profile": profile}
-    if policy is not None:
-        pair_kwargs["policy"] = policy
-    pair = plan_count_matrix_pair(
-        int(context.counts.shape[0]),
-        int(context.counts.shape[1]),
-        context.counts.dtype,
-        **pair_kwargs,
+    # countsT replays the layout persisted with the counts.
+    pair = replay_count_matrix_plan(
+        load_count_matrix_plan(context.counts),
+        nCells=int(context.counts.shape[0]),
+        nFeats=int(context.counts.shape[1]),
+        dtype=context.counts.dtype,
+        profile=profile,
     )
     writer_metrics: dict[str, Any] = {}
     counts_t = write_counts_t(
@@ -538,7 +536,6 @@ def _write_counts_t(
         profile=profile,
         resources=context.budget,
         residentBytes=int(process_rss_mb() * 1024**2),
-        policy=policy,
         io=_storage_io_policy(storageIo),
         metrics=writer_metrics,
         overwrite=True,
@@ -866,7 +863,6 @@ def run_stage(
                             counts_context,
                             storeUri=storeUri,
                             assayName=workflow.assayName,
-                            countMatrix=countMatrix,
                             storageIo=storageIo,
                         )
                     with timer.validationPersistence():

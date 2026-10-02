@@ -155,7 +155,7 @@ class ATACassay(Assay):
         counts: ChunkedArray | None = None,
         renormalize_subset: bool = False,
     ) -> np.ndarray:
-        """Return total ATAC counts used as each cell's TF denominator."""
+        """Return the float64 total ATAC counts used as each cell's TF denominator."""
         if renormalize_subset:
             if counts is None:
                 raise ValueError(
@@ -164,13 +164,10 @@ class ATACassay(Assay):
             if len(cell_idx) == 0:
                 terms = np.zeros(0, dtype=np.float64)
             else:
-                terms = np.asarray(
-                    compute_with_progress(
-                        counts.sum(axis=1),
-                        f"({self.name}) Recomputing counts across selected peaks",
-                        self.nthreads,
-                    ),
-                    dtype=np.float64,
+                terms = compute_with_progress(
+                    counts.sum(axis=1, dtype=np.float64),
+                    f"({self.name}) Recomputing counts across selected peaks",
+                    self.nthreads,
                 )
         else:
             terms = self._cell_count_totals(cell_idx)
@@ -237,16 +234,11 @@ class ATACassay(Assay):
         prevalence: np.ndarray,
         top_n: int,
     ) -> np.ndarray:
+        """Mark the ``top_n`` most prevalent peaks.
+
+        ``select_prevalent_peaks`` passes the full-axis prevalence of a
+        feature summary and a ``top_n`` from 1 to one fewer than the peaks.
+        """
         prevalence = np.asarray(prevalence, dtype=np.float64)
-        if prevalence.shape != (self.feats.N,):
-            raise ValueError(
-                f"prevalence must have shape ({self.feats.N},), got {prevalence.shape}"
-            )
-        if top_n >= self.feats.N:
-            raise ValueError(
-                f"ERROR: n_top should be less than total number of features ({self.feats.N})]"
-            )
-        if isinstance(top_n, int) is False or top_n < 1:
-            raise TypeError("ERROR: n_top must a positive integer value")
         idx = pd.Series(prevalence).sort_values(ascending=False).index.values[:top_n]
         return np.asarray(self.feats.index_to_bool(idx), dtype=bool)

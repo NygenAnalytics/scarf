@@ -111,8 +111,9 @@ def simplicial_set_embedding(
         .randint(np.iinfo(np.int32).min + 1, np.iinfo(np.int32).max - 1, 3)
         .astype(np.int64)
     )
-    if numba.config.NUMBA_NUM_THREADS > nthreads:
-        numba.set_num_threads(nthreads)
+    # The calling thread's count may be below the request, so always set it,
+    # capped at the pool size that Numba cannot exceed.
+    numba.set_num_threads(min(nthreads, numba.config.NUMBA_NUM_THREADS))
 
     if densmap_kwds != {}:
         with process_thread_limit(nthreads):
@@ -130,11 +131,10 @@ def simplicial_set_embedding(
 
     tqdm_params = dict(default_tqdm_params)
     tqdm_params["desc"] = "Training UMAP"
-    if "disable" not in tqdm_params:
-        tqdm_params["disable"] = not verbose
+    tqdm_params["disable"] = not verbose
 
     # Numba's thread count is per thread, so the layout needs no process-wide
-    # BLAS limit and can run beside other pipeline stages.
+    # BLAS limit.
     embedding = optimize_layout_euclidean(
         head_embedding=embedding,
         tail_embedding=embedding,

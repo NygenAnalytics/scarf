@@ -7,7 +7,6 @@ import textwrap
 _WORKQUEUE_CHILD = textwrap.dedent(
     """
     import numpy as np
-    import pandas as pd
     import zarr
     from numba import threading_layer
     from zarr.storage import MemoryStore
@@ -52,6 +51,7 @@ _WORKQUEUE_CHILD = textwrap.dedent(
         n_cells,
         feature_ids,
         feature_ids,
+        np.uint32,
         profile="fast_local",
         policy=policy,
     )
@@ -65,7 +65,6 @@ _WORKQUEUE_CHILD = textwrap.dedent(
         None,
         resources=ResourceBudget(128 * 1024**2, 4),
         profile="fast_local",
-        policy=policy,
     )
 
     def open_store(workers):
@@ -106,8 +105,12 @@ _WORKQUEUE_CHILD = textwrap.dedent(
     for method in (norm_lib_size, norm_dummy):
         expected_markers = marker_results(single, method, 1)
         actual_markers = marker_results(parallel, method, 4)
-        for group, expected in expected_markers.items():
-            pd.testing.assert_frame_equal(actual_markers[group], expected)
+        np.testing.assert_array_equal(
+            actual_markers.group_ids, expected_markers.group_ids
+        )
+        np.testing.assert_array_equal(
+            actual_markers.statistics, expected_markers.statistics
+        )
 
     assert threading_layer() == "workqueue"
     print("WORKQUEUE_OK")
@@ -139,30 +142,3 @@ def test_numba_workqueue_feature_and_marker_streams_do_not_abort() -> None:
         f"stderr:\n{completed.stderr}"
     )
     assert "WORKQUEUE_OK" in completed.stdout
-
-
-def test_background_tasks_run_inline_on_the_workqueue_layer() -> None:
-    child = textwrap.dedent(
-        """
-        import threading
-
-        from scarf.utils.background import BackgroundTask
-        from scarf.utils.numba import threadsafe_threading_layer
-
-        assert not threadsafe_threading_layer()
-        task = BackgroundTask(threading.current_thread, name="probe")
-        assert task.result() is threading.main_thread()
-        print("INLINE_OK")
-        """
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", child],
-        env={**os.environ, "NUMBA_THREADING_LAYER": "workqueue"},
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert "INLINE_OK" in completed.stdout

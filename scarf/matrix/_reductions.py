@@ -13,19 +13,25 @@ type UfuncSide = Literal["left", "right"]
 
 
 class _Reduction:
-    """A deferred and cached reduction over a ChunkedArray."""
+    """A deferred and cached reduction over a ChunkedArray.
 
-    __slots__ = ("_parent", "_op", "_axis", "_cached")
+    ``dtype`` is the accumulator dtype of a sum, as NumPy's ``dtype``
+    keyword sets it; None keeps NumPy's default.
+    """
+
+    __slots__ = ("_parent", "_op", "_axis", "_dtype", "_cached")
 
     def __init__(
         self,
         parent: "ChunkedArray",
         op: ReductionOp,
         axis: int | None,
+        dtype: np.dtype[Any] | None = None,
     ) -> None:
         self._parent = parent
         self._op = op
         self._axis = axis
+        self._dtype = dtype
         self._cached: np.ndarray | None = None
 
     def compute(
@@ -39,6 +45,7 @@ class _Reduction:
                 self._axis,
                 nthreads,
                 msg,
+                dtype=self._dtype,
             )
         return self._cached
 

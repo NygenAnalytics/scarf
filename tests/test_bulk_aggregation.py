@@ -351,7 +351,7 @@ def test_bulk_output_is_admitted_before_streaming(tmp_path):
 
 
 @pytest.mark.parametrize("aggregation", ["sum", "mean"])
-def test_bulk_preserves_floating_point_counts_and_sum_dtype(aggregation):
+def test_bulk_aggregates_floating_point_counts_in_float64(aggregation):
     counts = np.array(
         [[0.25, 1.5, 2.0], [200.0, 400.0, 1.0], [1.0, 0.0, 0.25], [0.0, 1.0, 0.0]],
         dtype=np.float32,
@@ -369,7 +369,7 @@ def test_bulk_preserves_floating_point_counts_and_sum_dtype(aggregation):
         return_fraction=True,
         resources=ResourceBudget(16 * 1024**2, 4),
     )
-    assert actual.dtype == (np.float64 if aggregation == "mean" else np.float32)
+    assert actual.dtype == np.float64
     assert fractions is not None
     for code in range(4):
         members = codes == code
@@ -385,9 +385,72 @@ def test_bulk_preserves_floating_point_counts_and_sum_dtype(aggregation):
         )
 
 
-def test_bulk_sums_of_float_counts_accumulate_in_float64():
-    # Beyond 2**24 a float32 running sum no longer grows by one count, so the
-    # unit counts after the large first value were lost.
+@pytest.mark.parametrize("codes", [[0, 1], [0, 1, 2], [-2, 0, 1]])
+def test_normalized_aggregation_rejects_codes_off_its_rows(codes):
+    from scarf.features.aggregation import aggregate_normalized_groups
+    from scarf.matrix import ChunkedArray
+
+    with pytest.raises(ValueError, match="align with normalized rows"):
+        aggregate_normalized_groups(
+            ChunkedArray.from_numpy(np.ones((3, 2))), np.array(codes), 2, nthreads=1
+        )
+
+
+def test_normalized_aggregation_reserves_its_group_sums(tmp_path):
+    import tracemalloc
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    from scarf.features.aggregation import aggregate_normalized_groups
+    from scarf.matrix import ChunkedArray
+    from scarf.storage.execution import execution_report_scope
+
+    rng = np.random.default_rng(0)
+    values = rng.poisson(0.3, size=(8_000, 64)).astype(np.uint16)
+    root = zarr.open_group(store=LocalStore(str(tmp_path)), mode="w")
+    counts = root.create_array(
+        "counts",
+        shape=values.shape,
+        chunks=(1_000, 64),
+        shards=(1_000, 64),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    counts[:] = values
+    # The sums of 6,000 groups outweigh the two row blocks read at a time.
+    codes = rng.integers(-1, 6_000, size=len(values))
+    budget = 6_000_000
+
+    def aggregate() -> np.ndarray:
+        normalized = ChunkedArray(
+            counts, nthreads=2, resources=ResourceBudget(budget, 2)
+        )
+        return aggregate_normalized_groups(normalized * 0.5, codes, 6_000, nthreads=2)
+
+    aggregate()
+    with execution_report_scope() as reports:
+        tracemalloc.start()
+        try:
+            base, _ = tracemalloc.get_traced_memory()
+            means = aggregate()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    (plan,) = [report.plan for report in reports]
+    assert plan.residentBytes >= 6_000 * 64 * 8
+    assert peak - base <= plan.reservedBytes <= budget
+    grouped = codes >= 0
+    expected = np.zeros((6_000, 64))
+    np.add.at(expected, codes[grouped], values[grouped] * 0.5)
+    expected /= np.maximum(np.bincount(codes[grouped], minlength=6_000), 1)[:, None]
+    np.testing.assert_allclose(means, expected.T)
+
+
+def test_bulk_sums_of_float_counts_are_exact_above_float32_precision():
+    # Beyond 2**24 float32 holds only even integers, so a sum returned in the
+    # storage dtype rounded an exact odd total.
     counts = np.array([[2.0**24], [1.0], [1.0], [1.0]], dtype=np.float32)
     selected = np.arange(4)
 
@@ -402,6 +465,5 @@ def test_bulk_sums_of_float_counts_accumulate_in_float64():
         resources=ResourceBudget(16 * 1024**2, 1),
     )
 
-    assert actual.dtype == np.float32
-    assert actual[0, 0] == np.float32(2.0**24 + 3)
-    assert actual[0, 0] != np.float32(2.0**24)
+    assert actual.dtype == np.float64
+    assert actual[0, 0] == 2**24 + 3

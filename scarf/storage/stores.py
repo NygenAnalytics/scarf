@@ -1,14 +1,24 @@
+import asyncio
 import os
 import posixpath
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
-from collections.abc import Callable, Sequence
-from typing import Any
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Sequence,
+)
+from typing import Any, Self, cast
 
 import numpy as np
 import zarr
-from zarr.abc.store import Store
+from zarr.abc.store import ByteRequest, Store
+from zarr.core.buffer import Buffer, BufferPrototype
+from zarr.core.common import ZARR_JSON
+from zarr.storage import WrapperStore
 
 from .types import ZarrMode, as_zarr_array, as_zarr_group
 from .profiles import (
@@ -19,6 +29,10 @@ from .profiles import (
 )
 
 MATRIX_SOURCE_ATTR = "matrixSource"
+_MATRIX_SOURCE_KEYS = frozenset({"location", "workspace", "assays"})
+_MATRIX_SOURCE_ASSAY_KEYS = frozenset(
+    {"datasetFingerprint", "countsFingerprint", "requiresTranspose"}
+)
 # Object stores stop after 10 retries by default, which is about nine seconds
 # of backoff. Keep retrying transient errors for up to three minutes instead.
 _REMOTE_RETRY_CONFIG = {"max_retries": 100, "retry_timeout": timedelta(minutes=3)}
@@ -79,25 +93,38 @@ def zarr_root_path(node: zarr.Group | zarr.Array) -> str | None:
     root = getattr(store, "root", None)
     if root is not None:
         return str(root)
-    storePath = getattr(node, "store_path", None)
-    if storePath and str(storePath).startswith("file://"):
-        return str(storePath)[7:]
     return None
+
+
+def _is_local_store(store: Store) -> bool:
+    return (
+        getattr(store, "root", None) is not None
+        or str(store).startswith("file://")
+        or type(store).__name__ in ("MemoryStore", "LocalStore")
+    )
 
 
 def is_remote_datastore(
     zarr_loc: ZarrLocation | None,
     node: zarr.Group | zarr.Array,
 ) -> bool:
-    """Return whether a datastore uses a remote or object backend."""
+    """Return whether ``node`` is read from a remote or object backend.
+
+    In a mounted artifact namespace the stores that serve ``node`` decide: a
+    node inside an artifact group is read from the store that holds the group,
+    and any other node, such as the root, is remote when the target or the
+    source is. Otherwise a non-empty path or URI ``zarr_loc`` decides by its
+    scheme, and ``node``'s store decides when ``zarr_loc`` is None, empty, or a
+    ``Store``.
+    """
+    store = node.store
+    if isinstance(store, MountedArtifactStore):
+        from zarr.core.sync import sync
+
+        return not all(map(_is_local_store, sync(store._node_stores(node.path))))
     if isinstance(zarr_loc, str) and zarr_loc:
         return is_remote_zarr_location(zarr_loc)
-    if zarr_root_path(node) is not None:
-        return False
-    store_name = type(node.store).__name__
-    if store_name in ("MemoryStore", "LocalStore"):
-        return False
-    return True
+    return not _is_local_store(store)
 
 
 # Small requests worth overlapping against an object store, where every group,
@@ -200,13 +227,11 @@ def zarr_location_has_content(
     Remote and in-memory stores are probed through the Zarr store API. Probe
     failures raise so callers can fail closed instead of overwriting blindly.
     """
-    if isinstance(location, str) and not is_remote_zarr_location(location):
-        path = location[7:] if location.startswith("file://") else location
-        return os.path.lexists(path)
-
     store = make_store(location, storage_options=storage_options, read_only=True)
+    # Only a local path, including a file:// URI, resolves to a string.
     if isinstance(store, str):
-        return os.path.lexists(store)
+        path = store[7:] if store.startswith("file://") else store
+        return os.path.lexists(path)
 
     from zarr.core.sync import sync
 
@@ -381,12 +406,22 @@ def resolve_matrix_source(
     *,
     storage_options: dict[str, Any] | None = None,
 ) -> tuple[zarr.Group, str | None] | None:
-    """Open and validate a mounted matrix source, if present."""
+    """Open and validate a mounted matrix source, if present.
+
+    The manifest holds exactly ``location``, ``workspace``, and ``assays``, and
+    each assay entry exactly its recorded identity. Any other shape, including
+    a field added by a later release, is rejected rather than ignored.
+    """
     raw = root.attrs.get(MATRIX_SOURCE_ATTR)
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("matrixSource attribute must be a mapping")
+    if set(raw) != _MATRIX_SOURCE_KEYS:
+        raise ValueError(
+            "Existing mount has an unsupported matrix source contract; create a "
+            "fresh target with mount_datastore"
+        )
     location = raw.get("location")
     if not isinstance(location, str) or not location:
         raise ValueError("matrixSource.location must be a non-empty string")
@@ -397,23 +432,28 @@ def resolve_matrix_source(
     if not isinstance(assays, dict) or not assays:
         raise ValueError("matrixSource.assays must be a non-empty mapping")
 
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for assay_name, expected in assays.items():
+        if not isinstance(expected, dict):
+            raise ValueError(
+                f"matrixSource assay entry for {assay_name!r} must be a mapping"
+            )
+        if set(expected) != _MATRIX_SOURCE_ASSAY_KEYS or not isinstance(
+            expected["requiresTranspose"], bool
+        ):
+            raise ValueError(
+                f"Existing mount has an unsupported identity contract for assay "
+                f"{assay_name!r}; create a fresh target with mount_datastore"
+            )
+        entries.append((assay_name, expected))
+
+    from .identity import count_fingerprint, validate_preparation
+
     source_root = load_zarr(
         location,
         mode="r",
         storage_options=storage_options,
     )
-    entries: list[tuple[str, dict[str, Any]]] = []
-    for assay_name, expected in assays.items():
-        if not isinstance(assay_name, str):
-            raise ValueError("matrixSource assay names must be strings")
-        if not isinstance(expected, dict):
-            raise ValueError(
-                f"matrixSource assay entry for {assay_name!r} must be a mapping"
-            )
-        entries.append((assay_name, expected))
-
-    from .identity import REBUILD_REQUIRED, count_fingerprint, validate_preparation
-
     source_zw = _workspace_group(source_root, workspace)
     source_cells = as_zarr_group(source_zw["cellData"], name="cellData")
     if MATRIX_SOURCE_ATTR in source_root.attrs:
@@ -421,14 +461,6 @@ def resolve_matrix_source(
             "The mounted source must own its count matrices; create a fresh target"
         )
     for assay_name, expected in entries:
-        if set(expected) != {
-            "datasetFingerprint",
-            "countsFingerprint",
-            "requiresTranspose",
-        } or not isinstance(expected["requiresTranspose"], bool):
-            raise ValueError(
-                f"Existing mount has an unsupported identity contract; create a fresh target. {REBUILD_REQUIRED}"
-            )
         source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
         path = assay_name if workspace is None else f"matrices/{assay_name}"
         matrix = as_zarr_group(source_root[path], name=path)
@@ -447,3 +479,323 @@ def resolve_matrix_source(
                 f"Matrix source assay {assay_name!r} no longer matches the mounted identity"
             )
     return source_root, workspace
+
+
+_NO_SYNC_IO = (
+    "A mounted artifact namespace routes keys only through asynchronous store IO"
+)
+
+
+class MountedArtifactStore(WrapperStore[Store]):
+    """A mounted target that resolves its matrix source's artifacts read only.
+
+    Artifacts are immutable and their IDs are random 256-bit tokens, so a group
+    the source holds is the artifact that a copy in the target would be. Keys
+    below the artifact roots, ``[workspace/]artifacts`` and
+    ``[workspace/]{assay}/artifacts`` for every mounted assay, are routed by the
+    group ``{root}/{kind}/{id}`` that holds them: a group whose ``zarr.json``
+    the source holds and the target does not is read from the source, and
+    every other key goes to the target. Listings of a root and of its kind
+    directories are the union of both stores, a listing of the group above a
+    root names the root when only the source holds it, and a directory
+    document the target lacks is read from the source. Keys outside the roots,
+    such as cell and feature tables and ``pipeline/``, belong to the target.
+
+    Every write goes to the target. Writing or deleting inside a source group
+    raises ``PermissionError``. The store offers no synchronous IO, so Zarr's
+    synchronous fast paths take the routed asynchronous ones. Closing it closes
+    the target only; the source store belongs to the root that opened it.
+    """
+
+    def __init__(self, store: Store, source: Store, roots: Iterable[str]) -> None:
+        super().__init__(store)
+        self._source = source
+        self._roots = tuple(roots)
+        # Whether each artifact group is read from the source. A group found in
+        # neither store is not cached, so one the target creates later is
+        # resolved again. Copies made by with_read_only share the cache. It
+        # holds plain values, never loop-bound futures, because storage
+        # coroutines run on several event loops.
+        self._in_source: dict[str, bool] = {}
+
+    def _with_store(self, store: Store) -> Self:
+        clone = type(self)(store, self._source, self._roots)
+        clone._in_source = self._in_source
+        return clone
+
+    def __eq__(self, value: object) -> bool:
+        return (
+            isinstance(value, MountedArtifactStore)
+            and self._store == value._store
+            and self._source == value._source
+            and self._roots == value._roots
+        )
+
+    def __str__(self) -> str:
+        return str(self._store)
+
+    def __repr__(self) -> str:
+        return f"MountedArtifactStore({self._store!r}, source={self._source!r})"
+
+    @property
+    def root(self) -> Any:
+        """The target's filesystem root, so location checks see the mount itself."""
+        return getattr(self._store, "root", None)
+
+    @property
+    def _supports_sync_io(self) -> bool:
+        return False
+
+    def _in_tree(self, key: str) -> bool:
+        return any(key == root or key.startswith(f"{root}/") for root in self._roots)
+
+    def _group(self, key: str) -> str | None:
+        """Return the artifact group that holds ``key``, if any."""
+        for root in self._roots:
+            if key.startswith(f"{root}/"):
+                parts = key[len(root) + 1 :].split("/", 2)
+                if len(parts) > 1 and parts[1] not in ("", ZARR_JSON):
+                    return f"{root}/{parts[0]}/{parts[1]}"
+                return None
+        return None
+
+    async def _reads_source(self, group: str) -> bool:
+        cached = self._in_source.get(group)
+        if cached is not None:
+            return cached
+        document = f"{group}/{ZARR_JSON}"
+        if await self._store.exists(document):
+            in_source = False
+        elif await self._source.exists(document):
+            in_source = True
+        else:
+            return False
+        self._in_source[group] = in_source
+        return in_source
+
+    async def _owner(self, key: str) -> Store:
+        """Return the store that holds ``key`` in the namespace."""
+        group = self._group(key)
+        if group is not None:
+            return self._source if await self._reads_source(group) else self._store
+        if (
+            self._in_tree(key)
+            and not await self._store.exists(key)
+            and await self._source.exists(key)
+        ):
+            return self._source
+        return self._store
+
+    async def _node_stores(self, path: str) -> tuple[Store, ...]:
+        """Return the stores that serve the node at ``path``."""
+        group = self._group(posixpath.join(path, ZARR_JSON))
+        if group is None:
+            return self._store, self._source
+        return (self._source if await self._reads_source(group) else self._store,)
+
+    async def _refuse_source_write(self, key: str) -> None:
+        group = self._group(key)
+        if group is not None and await self._reads_source(group):
+            raise PermissionError(
+                f"Artifact {group!r} belongs to the read-only matrix source of "
+                "this mount"
+            )
+
+    def _forget(self, path: str) -> None:
+        """Drop the cached origins of groups that a delete of ``path`` removes."""
+        path = path.rstrip("/").removesuffix(f"/{ZARR_JSON}")
+        # Storage coroutines run on several event-loop threads, so iterate a copy.
+        for group in tuple(self._in_source):
+            if not path or group == path or group.startswith(f"{path}/"):
+                self._in_source.pop(group, None)
+
+    async def get(
+        self,
+        key: str,
+        prototype: BufferPrototype,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        group = self._group(key)
+        if (group is None and self._in_tree(key)) or (
+            group is not None
+            and group not in self._in_source
+            and key == f"{group}/{ZARR_JSON}"
+        ):
+            # A directory document, or a group document whose read decides the
+            # group's origin: the target's copy wins over the source's.
+            for in_source, store in ((False, self._store), (True, self._source)):
+                value = await store.get(key, prototype, byte_range)
+                if value is not None:
+                    if group is not None:
+                        self._in_source[group] = in_source
+                    return value
+            return None
+        return await (await self._owner(key)).get(key, prototype, byte_range)
+
+    async def get_partial_values(
+        self,
+        prototype: BufferPrototype,
+        key_ranges: Iterable[tuple[str, ByteRequest | None]],
+    ) -> list[Buffer | None]:
+        # WrapperStore would forward the batch to the target unrouted.
+        return await asyncio.gather(
+            *(self.get(key, prototype, byte_range) for key, byte_range in key_ranges)
+        )
+
+    async def _get_many(
+        self, requests: Iterable[tuple[str, BufferPrototype, ByteRequest | None]]
+    ) -> AsyncGenerator[tuple[str, Buffer | None], None]:
+        # WrapperStore would forward the batch to the target unrouted; the base
+        # implementation reads each key through get.
+        async for item in Store._get_many(self, requests):
+            yield item
+
+    async def get_ranges(
+        self,
+        key: str,
+        byte_ranges: Sequence[ByteRequest | None],
+        *,
+        prototype: BufferPrototype,
+        max_concurrency: int | None = None,
+        max_gap_bytes: int | None = None,
+        max_coalesced_bytes: int | None = None,
+    ) -> AsyncIterator[Sequence[tuple[int, Buffer | None]]]:
+        # Sharded reads fetch inner chunks here, so a source shard must be read
+        # from the source with that store's own coalescing.
+        options = {
+            name: value
+            for name, value in (
+                ("max_concurrency", max_concurrency),
+                ("max_gap_bytes", max_gap_bytes),
+                ("max_coalesced_bytes", max_coalesced_bytes),
+            )
+            if value is not None
+        }
+        store = await self._owner(key)
+        async for group in store.get_ranges(
+            key, byte_ranges, prototype=prototype, **options
+        ):
+            yield group
+
+    async def exists(self, key: str) -> bool:
+        return await (await self._owner(key)).exists(key)
+
+    async def getsize(self, key: str) -> int:
+        return await (await self._owner(key)).getsize(key)
+
+    async def is_empty(self, prefix: str) -> bool:
+        return await Store.is_empty(self, prefix)
+
+    def list(self) -> AsyncIterator[str]:
+        return self.list_prefix("")
+
+    async def list_prefix(self, prefix: str) -> AsyncIterator[str]:
+        seen: set[str] = set()
+        async for key in self._store.list_prefix(prefix):
+            if self._group(key) is None or await self._owner(key) is self._store:
+                seen.add(key)
+                yield key
+        if self._in_tree(prefix.rstrip("/")):
+            source_prefixes = [prefix]
+        else:
+            source_prefixes = [
+                f"{root}/" for root in self._roots if root.startswith(prefix)
+            ]
+        for source_prefix in source_prefixes:
+            async for key in self._source.list_prefix(source_prefix):
+                if key not in seen and await self._owner(key) is self._source:
+                    yield key
+
+    async def list_dir(self, prefix: str) -> AsyncIterator[str]:
+        path = prefix.rstrip("/")
+        group = self._group(path)
+        if group is not None:
+            owner = self._source if await self._reads_source(group) else self._store
+            async for name in owner.list_dir(prefix):
+                yield name
+            return
+        names: set[str] = set()
+        async for name in self._store.list_dir(prefix):
+            names.add(name)
+            yield name
+        if self._in_tree(path):
+            async for name in self._source.list_dir(prefix):
+                if name not in names:
+                    names.add(name)
+                    yield name
+            return
+        for root in self._roots:
+            parent, _, name = root.rpartition("/")
+            if (
+                parent == path
+                and name not in names
+                and await self._source.exists(f"{root}/{ZARR_JSON}")
+            ):
+                names.add(name)
+                yield name
+
+    async def set(self, key: str, value: Buffer) -> None:
+        await self._refuse_source_write(key)
+        await self._store.set(key, value)
+
+    async def set_if_not_exists(self, key: str, value: Buffer) -> None:
+        await self._refuse_source_write(key)
+        await self._store.set_if_not_exists(key, value)
+
+    async def _set_many(self, values: Iterable[tuple[str, Buffer]]) -> None:
+        items = list(values)
+        for key, _ in items:
+            await self._refuse_source_write(key)
+        await self._store._set_many(items)
+
+    async def delete(self, key: str) -> None:
+        await self._refuse_source_write(key)
+        await self._store.delete(key)
+        self._forget(key)
+
+    async def delete_dir(self, prefix: str) -> None:
+        await self._refuse_source_write(prefix.rstrip("/"))
+        await self._store.delete_dir(prefix)
+        self._forget(prefix)
+
+    async def clear(self) -> None:
+        await self._store.clear()
+        self._in_source.clear()
+
+    def get_sync(
+        self,
+        key: str,
+        *,
+        prototype: BufferPrototype | None = None,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        raise TypeError(_NO_SYNC_IO)
+
+    def set_sync(self, key: str, value: Buffer) -> None:
+        raise TypeError(_NO_SYNC_IO)
+
+    def delete_sync(self, key: str) -> None:
+        raise TypeError(_NO_SYNC_IO)
+
+
+def mount_artifact_namespace(
+    target_root: zarr.Group,
+    source_root: zarr.Group,
+    workspace: str | None,
+) -> zarr.Group:
+    """Reopen a mounted target so that it resolves its source's artifacts.
+
+    ``target_root`` is the root of a target whose manifest
+    :func:`resolve_matrix_source` validated, and ``source_root`` and
+    ``workspace`` are what it returned. The namespace keeps the target's access
+    mode and reuses the open source store, so it needs no second connection or
+    credentials.
+    """
+    prefix = "" if workspace is None else f"{workspace}/"
+    manifest = cast(dict[str, Any], target_root.attrs[MATRIX_SOURCE_ATTR])
+    roots = [
+        f"{prefix}artifacts",
+        *(f"{prefix}{assay}/artifacts" for assay in manifest["assays"]),
+    ]
+    store = MountedArtifactStore(target_root.store, source_root.store, roots)
+    return open_store(store, mode="r" if target_root.read_only else "r+")

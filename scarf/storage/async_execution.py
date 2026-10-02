@@ -91,6 +91,14 @@ def _ensure_worker_numba_cap(threads: int) -> None:
     _WORKER_NUMBA_CAP.applied = threads
 
 
+def _in_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def _leaves(error: BaseException) -> Iterator[BaseException]:
     if isinstance(error, BaseExceptionGroup):
         for inner in error.exceptions:
@@ -149,6 +157,29 @@ def _scoped_task(
     return task
 
 
+async def _kept(results: list[T], coroutine: Coroutine[Any, Any, T]) -> None:
+    """Run ``coroutine`` and leave its result in ``results``."""
+    results.append(await coroutine)
+
+
+async def _released_call(executor: ThreadPoolExecutor, fn: Callable[[], T]) -> T:
+    """Run ``fn`` on ``executor`` without its worker keeping ``fn`` or its result.
+
+    A pool worker holds its last work item until it takes the next one, so a
+    buffer that ``fn`` captures or returns would otherwise outlive the
+    reservation that covers it.
+    """
+    calls = [fn]
+    del fn
+    results: list[T] = []
+
+    def call() -> None:
+        results.append(calls.pop()())
+
+    await _await_completion(asyncio.get_running_loop().run_in_executor(executor, call))
+    return results.pop()
+
+
 async def _drained(coroutine: Coroutine[Any, Any, T]) -> T:
     """Run one storage coroutine and wait for every task it started."""
     tasks: set[asyncio.Future[Any]] = set()
@@ -163,20 +194,20 @@ async def _drained(coroutine: Coroutine[Any, Any, T]) -> T:
         result = await _await_completion(root)
     except BaseException as exc:
         errors.append(exc)
-    observed: set[asyncio.Future[Any]] = set()
+    # The root's outcome is already known. Gathering it again would report a
+    # cancelled root twice, as gather creates a new CancelledError for it.
+    observed: set[asyncio.Future[Any]] = {root}
     while outstanding := tasks - observed:
         observed.update(outstanding)
-        try:
-            outcomes = await _await_completion(
-                asyncio.gather(*outstanding, return_exceptions=True)
-            )
-            for outcome in outcomes:
-                if isinstance(outcome, BaseException) and not any(
-                    outcome is error for error in errors
-                ):
-                    errors.append(outcome)
-        except BaseException as exc:
-            errors.append(exc)
+        # Nothing cancels this coroutine: io() shields the future it waits on.
+        outcomes = await _await_completion(
+            asyncio.gather(*outstanding, return_exceptions=True)
+        )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not any(
+                outcome is error for error in errors
+            ):
+                errors.append(outcome)
     tasks.clear()
     if len(errors) > 1:
         raise BaseExceptionGroup("Storage I/O failed while draining work", errors)
@@ -228,28 +259,17 @@ def _active_zarr_workers() -> int | None:
     return None if pool is None else int(pool._max_workers)
 
 
-def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
+def ensure_zarr_host_ceiling() -> int:
     """Keep the existing process pool, or configure it before its first use."""
     global _HOST_THREAD_CEILING
-    host = max(1, detect_workers())
-    if maxWorkers is not None and maxWorkers < 1:
-        raise ValueError("Zarr worker ceiling must be positive")
     with _ZARR_CONFIG_LOCK:
         active = _active_zarr_workers()
-        configured = zarr.config.get("threading.max_workers", None)
-        existing = active or _HOST_THREAD_CEILING or configured
-        if maxWorkers is not None and existing is not None and maxWorkers != existing:
-            raise RuntimeError(
-                f"Zarr already uses a ceiling of {existing}; configure "
-                f"{maxWorkers} workers before opening storage in a fresh process"
-            )
         if active is not None:
             _HOST_THREAD_CEILING = active
-        if _HOST_THREAD_CEILING is None:
-            ceiling = int(existing or maxWorkers or host)
-            if active is None:
-                zarr.config.set({"threading.max_workers": ceiling})
-            _HOST_THREAD_CEILING = ceiling
+        elif _HOST_THREAD_CEILING is None:
+            configured = zarr.config.get("threading.max_workers", None)
+            _HOST_THREAD_CEILING = int(configured or max(1, detect_workers()))
+            zarr.config.set({"threading.max_workers": _HOST_THREAD_CEILING})
     return _HOST_THREAD_CEILING
 
 
@@ -322,9 +342,9 @@ class AsyncStorageRunner:
         self._blas: ThreadpoolController | None = None
 
     def run(self, operation: Callable[["AsyncStorageRunner"], Awaitable[T]]) -> T:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
+        # Outside an except clause, so a failure is not chained to the error
+        # that found no running loop.
+        if not _in_event_loop():
             return asyncio.run(self._run(operation))
         error: list[BaseException] = []
         result: list[T] = []
@@ -447,17 +467,22 @@ class AsyncStorageRunner:
         return cast(T, result)
 
     async def io(self, coroutine: Coroutine[Any, Any, T]) -> T:
-        """Run a self-contained storage coroutine on one of the I/O loops."""
+        """Run a self-contained storage coroutine on one of the I/O loops.
+
+        The result comes back in a holder, so the I/O loop thread keeps no
+        reference to it once the coroutine has finished.
+        """
         if self._io_loops is None:
             raise RuntimeError("I/O loops are not installed")
-        return await _await_completion(
-            asyncio.wrap_future(self._io_loops.submit(coroutine))
+        results: list[T] = []
+        await _await_completion(
+            asyncio.wrap_future(self._io_loops.submit(_kept(results, coroutine)))
         )
+        return results.pop()
 
     async def compute(self, fn: Callable[[], T]) -> T:
         if self._compute_pool is None or self._blas is None:
             raise RuntimeError("compute pool is not installed")
-        loop = asyncio.get_running_loop()
         threads = max(1, int(self.plan.threadsPerComputeWorker))
         blas = self._blas
 
@@ -469,11 +494,15 @@ class AsyncStorageRunner:
                 return fn()
 
         shutdown_checkpoint()
-        result = await _await_completion(
-            loop.run_in_executor(self._compute_pool, _limited)
-        )
+        result = await _released_call(self._compute_pool, _limited)
         shutdown_checkpoint()
         return result
+
+    async def offload(self, fn: Callable[[], T]) -> T:
+        """Run a short blocking call on the codec pool, off the event loop."""
+        if self._codec_pool is None:
+            raise RuntimeError("codec pool is not installed")
+        return await _released_call(self._codec_pool, fn)
 
     async def read_slot(self) -> asyncio.Semaphore:
         if self._read_slots is None:
