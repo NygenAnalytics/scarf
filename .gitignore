@@ -34,6 +34,7 @@ docs/jupyter_execute
 docs/source/scarf_datasets/
 docs/source/tutorials/scarf_datasets/
 docs/**/scarf_datasets/
+scarf_datasets/
 *.zarr/
 **/*.zarr/
 .coverage
@@ -82,3 +83,6 @@ scarf/agent/*.md
 review/
 scarf/cytebase/collection/
 scarf/cytebase/README.md
+# Cytebase analysis
+cytebase_analysis/
+ideas/

@@ -12,7 +12,8 @@ Public Scarf surfaces for analysts:
 - `scarf.cytebase.Catalog`, metadata-only `DatasetEntry` objects, and direct access to cloud-hosted Scarf DataStores
 - Documented integration metrics (`DataStore.metric_*`; `scarf.metrics` holds the underlying functions)
 - `MappingReference` / `MappingResult` for atlas-style mapping
-- `scarf.agent.analyze_rna` and its completed result, with the optional agent dependency
+- `scarf.agent` analysis, explicit resume, and saved `AnalysisRun` results, including incomplete
+  statuses, with the optional agent dependency
 
 Inheritance helpers (`BaseDataStore`, `GraphDataStore`, `MappingDatastore`) are listed under {doc}`api/datastore` for completeness.
 Prefer calling methods on `DataStore`.

@@ -135,38 +135,6 @@ def test_membership_rejects_invalid_stored_edge_layout(zero_weight_graphs, failu
         store.calc_membership_strength(clusters, graph)
 
 
-def test_agent_scores_zero_weight_graph(zero_weight_graphs):
-    from scarf.agent.parameter_tuning.contracts import ParameterMetrics
-    from scarf.agent.parameter_tuning.execution import (
-        _collect_cluster_structure_metrics,
-    )
-
-    store, graphs = zero_weight_graphs
-    graph = graphs[0]
-    clusters = store.run_paris_clustering(graph, n_clusters=1)
-    metrics = ParameterMetrics()
-    evidence, warnings = [], []
-
-    membership = _collect_cluster_structure_metrics(
-        store,
-        cluster_ref=clusters,
-        graph_ref=graph,
-        cluster_values=store.load_artifact(clusters)["labels"][:],
-        candidate_id="rna",
-        metrics=metrics,
-        evidence_ids=evidence,
-        warnings=warnings,
-    )
-
-    assert membership is not None
-    assert store.inspect_artifact(membership).complete
-    assert metrics.membershipStrengthMean == 1.0
-    assert metrics.membershipStrengthP10 == 1.0
-    assert metrics.clusterConnectivity == 0.5
-    assert "candidate:rna:membershipStrength" in evidence
-    assert warnings == []
-
-
 def test_topacedo_ignores_zero_edges(zero_weight_graphs):
     store, graphs = zero_weight_graphs
     graph = graphs[0]

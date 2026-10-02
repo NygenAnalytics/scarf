@@ -92,6 +92,8 @@ subtrees:
         title: Analysis with AI agents
       - file: tutorials/agent_workflow
         title: Automated agent workflow
+      - file: tutorials/garrido_trigo_agents
+        title: Garrido-Trigo automated analysis
   - caption: Advanced examples
     entries:
       - file: tutorials/plotting

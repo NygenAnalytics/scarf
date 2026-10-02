@@ -7,8 +7,26 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from scarf.readers.h5ad import H5adReader, inspect_h5ad
+from scarf.readers._h5ad_inspect import _read_text_scalar
 
 CELL_IDS = ["cell-a", "cell-b", "cell-c"]
+
+
+def test_text_scalars_accept_only_scalar_or_one_element_datasets(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "text.h5"
+    with h5py.File(path, "w") as h5:
+        uns = h5.create_group("uns")
+        uns.create_dataset("title", data=np.asarray([b"one"]))
+        uns.create_dataset("description", data=np.asarray([b"a", b"b"]))
+        uns.create_dataset("citation", data=np.bytes_("cited"))
+    with h5py.File(path, "r") as h5:
+        assert _read_text_scalar(h5, "uns/title", 500) == "one"
+        assert _read_text_scalar(h5, "uns/description", 500) is None
+        assert _read_text_scalar(h5, "uns/citation", 4) == "cite"
+        assert _read_text_scalar(h5, "uns", 500) is None
+        assert _read_text_scalar(h5, "uns/missing", 500) is None
 
 
 def _write_table(

@@ -1,880 +1,1449 @@
-"""One faithful, read-only analysis report from the authoritative journal."""
+"""Saved analyses produce readable, self-contained scientific reports offline."""
 
-import copy
-import json
+import base64
+import csv
+import io
+import re
+from html.parser import HTMLParser
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from scarf.agent.orchestrator import journal
-from scarf.agent.report import generator, plots
-from scarf.agent.report.artifacts import (
-    _local_root,
-    report_directory,
-    scientific_summary,
+from scarf.agent.records import RecordError, RunRecords
+from scarf.agent.result import AnalysisRun
+
+from .test_agent_result import _records
+
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
 )
-from scarf.agent.report.rendering import render_analysis_document
-from scarf.agent.types import ArtifactReferenceModel
-from scarf.storage.refs import ArtifactRef
-from tests.test_agent_analysis_plots import display_store
 
 
-def snapshot() -> dict[str, Any]:
-    from scarf.agent.experimental_context import ExperimentalContextResult
-    from scarf.agent.experimental_context.study import build_study_contract
-    from tests.agent_comparison_examples import comparison_review
+class _Document(HTMLParser):
+    """Inspect semantics and resource URLs without a browser dependency."""
 
-    request = {
-        "studyContext": "Human RNA cells",
-        "studyObjective": "Find stable populations <without> batch artifacts.",
-    }
-    context = ExperimentalContextResult.get_blank().model_dump(mode="json")
-    context["status"] = "done"
-    context["characterization"].update(
-        status="done",
-        columns=[{"name": "sample", "kind": "categorical", "domain": "design"}],
+    def __init__(self, page: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, dict[str, str | None]]] = []
+        self.text: list[str] = []
+        self.primary_text: list[str] = []
+        self.rows: list[list[str]] = []
+        self.headings: list[str] = []
+        self.paragraphs: list[str] = []
+        self.max_list_depth = 0
+        self._hidden: list[str] = []
+        self.sections: dict[str, list[str]] = {}
+        self.section_tags: dict[str, list[tuple[str, dict[str, str | None]]]] = {}
+        self._section: list[str] = []
+        self._details: list[list[bool]] = []
+        self._list_depth = 0
+        self._cell: list[str] | None = None
+        self._row: list[str] | None = None
+        self._heading: list[str] | None = None
+        self._paragraph: list[str] | None = None
+        self.feed(page)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        self.tags.append((tag, attributes))
+        if tag == "section":
+            identifier = str(attributes.get("id", ""))
+            self._section.append(identifier)
+            self.sections[identifier] = []
+            self.section_tags[identifier] = []
+        if self._section:
+            self.section_tags[self._section[-1]].append((tag, attributes))
+        if tag in {"style", "script", "head"}:
+            self._hidden.append(tag)
+        if tag == "details":
+            self._details.append(["open" in attributes, False])
+        if tag == "summary" and self._details:
+            self._details[-1][1] = True
+        if tag in {"ul", "ol"}:
+            self._list_depth += 1
+            self.max_list_depth = max(self.max_list_depth, self._list_depth)
+        if tag == "p":
+            self._paragraph = []
+        if tag == "tr":
+            self._row = []
+        if tag in {"th", "td"}:
+            self._cell = []
+        if tag in {"h1", "h2", "h3"}:
+            self._heading = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"style", "script", "head"} and self._hidden:
+            self._hidden.pop()
+        if tag == "summary" and self._details:
+            self._details[-1][1] = False
+        if tag == "details":
+            self._details.pop()
+        if tag == "section":
+            self._section.pop()
+        if tag in {"ul", "ol"}:
+            self._list_depth -= 1
+        if tag == "p" and self._paragraph is not None:
+            self.paragraphs.append(" ".join(self._paragraph))
+            self._paragraph = None
+        if tag in {"th", "td"} and self._cell is not None:
+            assert self._row is not None
+            self._row.append(" ".join(self._cell))
+            self._cell = None
+        if tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+        if tag in {"h1", "h2", "h3"} and self._heading is not None:
+            self.headings.append(" ".join(self._heading))
+            self._heading = None
+
+    def handle_data(self, data: str) -> None:
+        value = " ".join(data.split())
+        if not value or self._hidden:
+            return
+        self.text.append(value)
+        if self._section:
+            self.sections[self._section[-1]].append(value)
+        if all(opened or in_summary for opened, in_summary in self._details):
+            self.primary_text.append(value)
+        if self._cell is not None:
+            self._cell.append(value)
+        if self._heading is not None:
+            self._heading.append(value)
+        if self._paragraph is not None:
+            self._paragraph.append(value)
+
+
+def _complete(records: RunRecords, stage: str, name: str, value: Any) -> None:
+    records.append(
+        "stageCompleted", stage=stage, evidence=records.write_evidence(name, value)
     )
-    context["cellQc"]["profileId"] = "selected"
-    context["qcProfiles"] = [
+
+
+def _rich_records(tmp_path: Path) -> RunRecords:
+    records = _records(tmp_path)
+    _complete(records, "context", "established-context", {"sampleColumn": None})
+    prepared = records.read_json("evidence/inspect.json")
+    prepared.update(
         {
-            "profileId": "selected",
-            "action": "globalGaussian",
-            "driverAssay": "RNA2",
-            "driverAssayType": "RNA",
-            "attributes": ["RNA2_nCounts", "RNA2_nFeatures", "RNA2_percentMito"],
-            "activeCells": 675218,
-            "retainedCells": 621200,
-            "retainedFraction": 621200 / 675218,
-            "retainedCellsByColumn": {
-                "condition": {"control": 320000, "treated": 301200}
+            "assay": "RNA",
+            "inputCells": 12000,
+            "retainedCells": 12000,
+            "filtering": False,
+            "qcFlags": {
+                "RNA_nFeatures": {
+                    "low": 200,
+                    "high": 6000,
+                    "lowFlags": 14,
+                    "highFlags": 23,
+                    "missing": 7,
+                    "outlierRows": {"low": [97], "high": [103]},
+                },
+                "RNA_percentMito": {
+                    "low": None,
+                    "high": 25,
+                    "lowFlags": 0,
+                    "highFlags": 31,
+                    "missing": 0,
+                },
             },
         }
-    ]
-    context = ExperimentalContextResult.model_validate(context)
-    study = build_study_contract(
-        study_context=request["studyContext"],
-        study_objective=request["studyObjective"],
-        experimental_result=context,
     )
-    review = comparison_review()
-    return {
-        "runId": "exact-analysis",
-        "status": "completed",
-        "request": request,
-        "finalAnalysis": {
-            "primaryAssay": "RNA2",
-            "limitations": ["Condition and batch are confounded."],
-        },
-        "stages": [
+    _complete(records, "preprocess", "prepared", prepared)
+    candidate = {
+        "candidateId": "c0",
+        "parentId": None,
+        "hvgCount": 1000,
+        "pcaDims": 21,
+        "neighborsK": 11,
+        "useHarmony": False,
+    }
+    partition = {
+        "optionId": "c0:r0.5",
+        "candidateId": "c0",
+        "resolution": 0.5,
+        "score": 0.42,
+        "count": 12000,
+        "clusterCount": 2,
+        "clusterCounts": {"1": 8000, "2": 4000},
+        "clusterCountsTruncated": False,
+    }
+    records.append(
+        "candidateMeasured",
+        candidateId="c0",
+        evidence=records.write_evidence(
+            "candidate",
             {
-                "stage": "parameter_tuning",
-                "status": "done",
-                "report": {
-                    "recommendedCandidateId": "candidate-two",
-                    "evaluations": review["candidates"],
-                },
-                "decisions": [],
+                "runId": "candidate-run",
+                "parameters": candidate,
+                "partitions": [partition],
+                "silhouetteSampleCells": 2000,
+                "limitations": [],
+            },
+        ),
+    )
+    _complete(records, "explore", "explored", {"candidates": [candidate]})
+    finalist = {
+        "runId": "selected-finalist",
+        "parameters": candidate,
+        "metrics": {
+            "markerCoherence": 0.5,
+            "markerSpecificityMedian": 0.87,
+            "doubletHighScoreConcentration": None,
+            "mixing": {},
+            "protection": {},
+        },
+        "diagnosticScope": {"populationCells": 12000, "sampleCells": 10000},
+        "clusters": [
+            {
+                "clusterId": "1",
+                "count": 8000,
+                "markers": [
+                    {"gene": "CD3D", "score": 0.9, "fracExp": 0.75},
+                    {"gene": "IL7R", "score": 0.8, "fracExp": 0.5},
+                ],
+                "qualifyingMarkerCount": 18,
             },
             {
-                "stage": "experimental_context",
-                "status": "done",
-                "report": context.model_dump(mode="json"),
-                "outputs": {"studyContract": study.model_dump(mode="json")},
-                "decisions": [
-                    {
-                        "record": {
-                            "decisionId": "cellQuality",
-                            "rationale": "The selected quality policy retains supported study groups.",
-                        },
-                    }
-                ],
+                "clusterId": "2",
+                "count": 4000,
+                "markers": [],
+                "qualifyingMarkerCount": 0,
             },
         ],
-        "analysisReviews": [review],
+        "limitations": ["Rare populations may be absent from the diagnostic sample."],
     }
-
-
-def display_payload() -> dict[str, Any]:
-    return {
-        "clusterCounts": {"0": 620_000, "1": 1_200},
-        "markers": [{"cluster": "1", "feature": "MS4A1", "score": 0.84}],
-        "umap": "plots/final_umap.png",
-        "displayedCells": 50_000,
-        "displayNotes": [],
-    }
-
-
-@pytest.mark.parametrize("mode", ["visual", "structured"])
-def test_one_page_shows_recorded_choices_evidence_and_qualitative_findings(
-    mode,
-) -> None:
-    state = snapshot()
-    state["analysisReviews"][0]["evidenceMode"] = mode
-    original = copy.deepcopy(state)
-    payload = scientific_summary(state) | display_payload()
-    document = render_analysis_document(payload)
-    assert state == original
-    assert "621,200 cells" in document and "2 clusters" in document
-    assert "50,000 of 621,200" in document
-    assert "QC retained 621,200 cells (92.0%)" in document
-    assert "Resolution 0.75 retains a small population with clear markers." in document
-    assert (
-        "Repeat agreement was 0.92 and 84% of clusters had qualifying markers."
-        in document
+    records.append(
+        "finalistMeasured",
+        optionId="c0:r0.5",
+        evidence=records.write_evidence("selected-finalist", finalist),
     )
-    assert "Original detailed model reasoning retained in the journal." not in document
-    assert "small population with clear markers" in document
-    assert "Condition and batch are confounded." in document
-    assert "The selected quality policy retains supported study groups." in document
-    assert document.index(
-        "The selected quality policy retains supported study groups."
-    ) < document.index("Compared policy")
-    assert "&lt;without&gt;" in document and "<without>" not in document
-    assert "hidden-record-id" not in document and "not-in-report" not in document
-    assert "technical.html" not in document and "decision-tree" not in document
-    assert "added noise" not in document and "weaker" not in document
-    assert ("No plots were supplied for visual inspection" in document) == (
-        mode == "structured"
-    )
-    assert (
-        document.index("final_umap.png")
-        < document.index("Cell quality")
-        < document.index("Selected methods and evidence")
-        < document.index("Limits of this analysis")
-        < document.index("<footer>")
-    )
-
-
-def test_report_uses_nygen_page_styles() -> None:
-    document = render_analysis_document(
-        scientific_summary(snapshot()) | display_payload()
-    )
-    header = document.split("<header>", 1)[1].split("</header>", 1)[0]
-    assert '<a href="https://www.nygen.io/">Nygen Analytics</a>' in header
-    assert '<a href="https://www.nygen.io/products/scarfweb">ScarfWeb</a>' in header
-    assert '<a href="https://www.nygen.io/products/cytetype">CyteType</a>' in header
-    assert "Distributed, secure infrastructure" not in header
-    assert "justify-content:space-between" in document
-    assert "family=Inter:wght@300;400" in document
-    assert "font-family:Inter,sans-serif" in document
-    assert "line-height:1.2" in document
-    assert "background:#ffffff" in document
-    assert "#0077fc" in document
-    assert "color:#b4b4b4" in document
-    assert "font-weight:300" in document and "font-weight:400" in document
-    assert "letter-spacing:-.04em" in document
-    assert "border-radius:999px" in document
-    assert all(color not in document for color in ("#237e6a", "#f4f6f5", "#bd8b22"))
-
-
-def test_all_untrusted_scientific_text_is_escaped() -> None:
-    state = snapshot()
-    injection = '<img src=x onerror="alert(1)">'
-    state["stages"][1]["decisions"][0]["record"]["rationale"] = injection
-    state["finalAnalysis"]["limitations"] = [injection]
-    payload = scientific_summary(state) | display_payload()
-    payload["markers"][0]["feature"] = injection
-    document = render_analysis_document(payload)
-    assert injection not in document
-    assert document.count("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;") == 3
-
-
-def test_missing_evidence_rejects_regeneration_without_inventing_reasons() -> None:
-    state = snapshot()
-    state["analysisReviews"] = []
-    with pytest.raises(ValueError, match="mandatory objective and comparison evidence"):
-        scientific_summary(state)
-
-
-def test_report_distinguishes_actual_comparisons_and_unavailable_choices() -> None:
-    state = snapshot()
-    document = render_analysis_document(scientific_summary(state) | display_payload())
-    assert "Number of variable genes" in document and "4,000" in document
-    assert "No technical grouping supports a batch-specific ranking." in document
-    assert "Variable-gene ranking: not compared" in document
-    assert "Genes and representation" in document and "Clustering" in document
-    assert "Clusters with qualifying markers" in document and "84.0%" in document
-    assert "candidate-two" not in document and "hvgCount:4000" not in document
-    assert "Full cohort (621,200 cells)" in document
-
-
-def test_repeated_reviews_do_not_repeat_candidate_inventory_or_raw_history() -> None:
-    state = snapshot()
-    earlier = copy.deepcopy(state["analysisReviews"][0])
-    earlier.update(
-        action="combine",
-        rationale="Historical model claim about an unexecuted correction.",
-    )
-    state["analysisReviews"].insert(0, earlier)
-    document = render_analysis_document(scientific_summary(state) | display_payload())
-    assert document.count("<td>41</td>") == 1
-    assert document.count("<td>1.25</td>") == 1
-    assert "Historical model claim" not in document
-    assert "Complete recorded reasoning" not in document
-    assert document.index("Populations and markers") < document.index(
-        "Genes and representation"
-    )
-
-
-def population_snapshot() -> dict[str, Any]:
-    state = snapshot()
-    review = state["analysisReviews"][0]
-    cells = review["candidates"][0]["cellSelection"]
-    clusters = {
-        "scope": "assay",
-        "assay": "RNA2",
-        "kind": "cluster_labels",
-        "artifactId": "3" * 64,
-    }
-    state["finalAnalysis"].update(cellSelection=cells, clusters=clusters)
-    state["stages"][1]["outputs"]["studyContract"]["independentUnitColumns"] = ["donor"]
-    review["populationSupport"] = {
-        "candidate-two": {
-            "candidateId": "candidate-two",
-            "cellSelection": ArtifactRef(
-                scope="datastore",
-                kind="cell_selection",
-                artifact_id=cells["artifactId"],
-            ).to_dict(),
-            "clusters": ArtifactRef(
-                scope="assay",
-                assay="RNA2",
-                kind="cluster_labels",
-                artifact_id=clusters["artifactId"],
-            ).to_dict(),
-            "columns": {
-                "donor": {
-                    "status": "computed",
-                    "observedGroups": 19,
-                    "missingCells": 200,
-                    "omittedPopulations": 1,
-                    "populations": [
-                        {
-                            "cluster": "1",
-                            "cells": 1200,
-                            "groupsWithAtLeast5Cells": 4,
-                            "largestGroupFraction": 0.938,
-                        }
-                    ],
-                }
-            },
-        }
-    }
-    return state
-
-
-def test_population_support_is_descriptive_and_missing_rows_are_unavailable() -> None:
-    document = render_analysis_document(
-        scientific_summary(population_snapshot()) | display_payload()
-    )
-    assert "93.8%" in document and "<td>4</td>" in document
-    assert "five cells is not a replication threshold" in document
-    assert "200 cells lack" in document
-    assert "not saved for 1 populations" in document
-    assert "Unavailable" in document
-    assert "not validated cell identities" in document
-    assert '<progress value="0.938000"' in document
-    assert '<progress value="0.001932"' in document
-    assert '<div class="population-overview">' in document
-    assert "@media(max-width:800px)" in document
-
-
-def test_report_consumes_population_diagnostics_without_recomputing_or_mutating(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from scarf.agent.parameter_tuning.diagnostics import population_support_evidence
-    from tests.test_agent_population_support import _setup
-
-    store, evaluation, _ = _setup(
-        monkeypatch,
-        np.repeat([1, 2], 6),
-        {"donor": np.tile(["d1", "d2"], 6)},
-    )
-    evaluation.candidateId = "candidate-two"
-    population = population_support_evidence(store, evaluation, ["donor"])
-    state = population_snapshot()
-    review = state["analysisReviews"][0]
-    review["populationSupport"] = {evaluation.candidateId: population}
-    for key in ("cellSelection", "clusters"):
-        state["finalAnalysis"][key] = ArtifactReferenceModel.from_artifact_ref(
-            ArtifactRef.from_dict(population[key])
-        ).model_dump(mode="json")
-    original = copy.deepcopy(state)
-    calls = store.calls.copy()
-    monkeypatch.setattr(
-        generator,
-        "collect_analysis_artifacts",
-        lambda *_: display_payload() | {"clusterCounts": {"1": 6, "2": 6}},
-    )
-
-    path = generator.render_analysis_report(store, state, tmp_path)
-
-    assert path == tmp_path / "index.html"
-    assert "12 cells" in path.read_text()
-    assert "50.0%" in path.read_text()
-    assert state == original
-    assert store.calls == calls
-    assert "artifact_id" in population["clusters"]
-    assert "artifactId" in state["finalAnalysis"]["clusters"]
-
-
-def test_selected_population_concerns_and_study_limits_remain_prominent() -> None:
-    state = snapshot()
-    explanation = "Population 1 lacks qualifying markers and remains unclassified."
-    state["analysisReviews"][0]["populationConcerns"] = [
+    _complete(
+        records,
+        "finalists",
+        "assessed",
         {
-            "candidateId": "candidate-two",
-            "clusterId": "1",
-            "status": "nonEssentialLimitation",
-            "evidenceIds": ["candidate:candidate-two:clusters"],
-            "explanation": explanation,
-        }
-    ]
-    study_limit = "The study contains only one independent donor."
-    state["stages"][1]["outputs"]["studyContract"]["limitations"].append(study_limit)
-    state["finalAnalysis"]["limitations"].append(explanation)
-    document = render_analysis_document(scientific_summary(state) | display_payload())
-    assert document.count(explanation) == 1
-    assert document.index("final_umap.png") < document.index(explanation)
-    assert document.index("final_umap.png") < document.index(study_limit)
-    assert document.index(explanation) < document.index("<footer>")
-    assert document.index(study_limit) < document.index("<footer>")
-
-
-def test_report_keeps_the_recorded_tradeoff_beside_its_comparison() -> None:
-    payload = scientific_summary(snapshot()) | display_payload()
-    payload["assessments"][0]["comparisonConclusions"][0]["tradeoffs"] = [
-        {"interpretation": "The preferred setting loses some repeat agreement."}
-    ]
-    document = render_analysis_document(payload)
-    assert "The preferred setting loses some repeat agreement." in document
-    assert document.index("Genes and representation") < document.index(
-        "The preferred setting loses some repeat agreement."
-    )
-
-
-@pytest.mark.parametrize("field", ["clusters", "cellSelection", "candidateId"])
-def test_population_support_must_match_the_final_candidate_and_artifacts(field) -> None:
-    state = population_snapshot()
-    population = state["analysisReviews"][0]["populationSupport"]["candidate-two"]
-    population[field] = (
-        "different-candidate"
-        if field == "candidateId"
-        else {**population[field], "artifact_id": "f" * 64}
-    )
-    with pytest.raises(ValueError, match="Reported population support"):
-        scientific_summary(state)
-
-
-@pytest.mark.parametrize("field", ["clusters", "cellSelection"])
-@pytest.mark.parametrize("value", [None, "unbound-reference"])
-def test_report_requires_population_artifact_reference_mappings(field, value) -> None:
-    state = population_snapshot()
-    state["analysisReviews"][0]["populationSupport"]["candidate-two"][field] = value
-    original = copy.deepcopy(state)
-    with pytest.raises(ValueError, match=f"lacks its {field} reference"):
-        scientific_summary(state)
-    assert state == original
-
-
-@pytest.mark.parametrize("field", ["clusters", "cellSelection"])
-@pytest.mark.parametrize(
-    "mutation, message",
-    [
-        ({"artifact_id": "malformed"}, "64-character lowercase hex"),
-        ({"artifactId": "f" * 64}, "fields do not match"),
-        ({"type": "external_artifact"}, "type must be 'artifact'"),
-    ],
-)
-def test_report_rejects_malformed_population_artifact_references(
-    field: str, mutation: dict[str, str], message: str
-) -> None:
-    state = population_snapshot()
-    population = state["analysisReviews"][0]["populationSupport"]["candidate-two"]
-    population[field].update(mutation)
-    original = copy.deepcopy(state)
-    with pytest.raises(ValueError, match=message):
-        scientific_summary(state)
-    assert state == original
-
-
-@pytest.mark.parametrize(
-    "missing", ["evidenceRequirements", "comparisonCoverage", "comparisonConclusions"]
-)
-def test_incompatible_report_evidence_fails_before_rendering_or_replacing_files(
-    monkeypatch, tmp_path, missing
-) -> None:
-    state = snapshot()
-    if missing == "evidenceRequirements":
-        state["stages"][1]["outputs"]["studyContract"].pop(missing)
-    else:
-        state["analysisReviews"][0].pop(missing)
-    old_page = tmp_path / "index.html"
-    old_page.write_text("Existing historical report")
-    numerical = tmp_path / "saved-artifact"
-    numerical.write_bytes(b"original numerical values")
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("An incompatible report must fail before artifact display reads")
-
-    monkeypatch.setattr(generator, "collect_analysis_artifacts", unexpected)
-    with pytest.raises(ValueError, match="start a new workflow"):
-        generator.render_analysis_report(SimpleNamespace(), state, tmp_path)
-    assert old_page.read_text() == "Existing historical report"
-    assert numerical.read_bytes() == b"original numerical values"
-
-
-def test_invalid_or_missing_fractions_never_render_as_zero() -> None:
-    state = population_snapshot()
-    population = state["analysisReviews"][0]["populationSupport"]["candidate-two"][
-        "columns"
-    ]["donor"]["populations"][0]
-    population["largestGroupFraction"] = float("nan")
-    payload = scientific_summary(state) | display_payload()
-    payload["qcProfiles"][0]["retainedFraction"] = None
-    document = render_analysis_document(payload)
-    assert "0.0%" not in document
-    assert '<progress value="nan"' not in document
-
-
-def test_comparison_scopes_use_candidate_evidence_not_the_latest_review_scope() -> None:
-    from tests.agent_comparison_examples import comparison_review
-
-    state = snapshot()
-    subset = comparison_review("sample0")
-    payload = scientific_summary(state) | display_payload()
-    payload["assessments"].insert(0, subset)
-    # A later full review can also cite earlier screening comparisons.
-    for setting in subset["comparisonCoverage"]["candidateSettings"].values():
-        assert setting["scope"] == "sample0"
-    subset["scope"] = "full"
-    payload["assessments"].insert(
-        0, {"scope": "sample0", "coverage": {"screeningCells": 50000}}
-    )
-    document = render_analysis_document(payload)
-    assert "Screening sample (50,000 cells)" in document
-    assert "Full cohort (621,200 cells)" in document
-    assert "Screening sample (621,200 cells)" not in document
-
-
-def test_screening_that_uses_all_cells_is_not_labeled_as_a_sample() -> None:
-    from tests.agent_comparison_examples import comparison_review
-
-    payload = scientific_summary(snapshot()) | display_payload()
-    all_cells = comparison_review("sample0")
-    all_cells["coverage"]["screeningCells"] = 621200
-    all_cells["comparisonCoverage"]["population"] = "allCells"
-    payload["assessments"] = [all_cells]
-    document = render_analysis_document(payload)
-    assert "Full cohort (621,200 cells)" in document
-    assert "Screening sample" not in document
-
-
-def test_model_usage_counts_every_request_including_failures() -> None:
-    payload = scientific_summary(snapshot()) | display_payload()
-    payload["modelUsage"] = {
-        "invocations": 1,
-        "failedInvocations": 1,
-        "requests": 2,
-        "availability": "partial",
-    }
-    document = render_analysis_document(payload)
-    assert "2 model requests, including failed and retried requests" in document
-    assert "completed responses" not in document
-    assert "not included in the response count" not in document
-
-
-@pytest.mark.parametrize("mode", ["visual", "structured"])
-@pytest.mark.parametrize("damage", [None, "digest", "scope", "action", "genes", "mode"])
-@pytest.mark.parametrize("revised", [False, True])
-def test_review_view_requires_exact_checkpoint_bindings(
-    monkeypatch: pytest.MonkeyPatch, damage: str | None, mode: str, revised: bool
-) -> None:
-    import hashlib
-
-    from scarf.agent import record_io
-    from scarf.agent.orchestrator.models import AutomatedWorkflowConfig
-    from scarf.agent.orchestrator.rna_tuning import TuningAction
-
-    state = snapshot()
-    view = state["analysisReviews"][0]
-    candidate = copy.deepcopy(
-        next(
-            item
-            for item in view["candidates"]
-            if item["candidateId"] == "candidate-two"
-        )
-    )
-    features = ArtifactReferenceModel(
-        assay="RNA2", kind="feature_selection", artifactId="4" * 64
-    ).model_dump(mode="json")
-    candidate["artifacts"] = {"graphFeatures": features}
-    action = {
-        key: value for key, value in view.items() if key in TuningAction.model_fields
-    }
-    payload = {
-        "inputs": {
-            "scope": "full",
-            "imageHashes": {"observed": "image-digest"} if mode == "visual" else {},
-            "evidenceMode": mode,
-            "visualInspection": "available" if mode == "visual" else "unavailable",
-            "candidates": [candidate],
-            "settings": {
-                "candidate-two": {
-                    **view["settings"]["candidate-two"],
-                    "parameters": candidate["parameters"],
-                    "features": features,
-                }
-            },
-            "featureEvidence": {
-                "candidate-two": view["featureEvidence"]["candidate-two"]
-            },
-            "comparisonCoverage": view["comparisonCoverage"],
-            "coverage": view["coverage"],
+            "selected": "c0:r0.5",
+            "finalists": {"c0:r0.5": finalist},
+            "rejected": {},
         },
-        "outputs": {"action": action},
-    }
-    digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
-    entry = {
-        "scope": "full",
-        "review": action,
-        "checkpointKey": (
-            f"parameter_tuning/evidence_revisions/{'a' * 64}/full/review0"
-            if revised
-            else "parameter_tuning/full/review0"
-        ),
-        "checkpointSha256": digest,
-        "imageHashes": payload["inputs"]["imageHashes"],
-        "evidenceMode": mode,
-        "visualInspection": payload["inputs"]["visualInspection"],
-    }
-    if damage == "digest":
-        entry["checkpointSha256"] = "bad-digest"
-    elif damage == "scope":
-        entry["scope"] = "sample0"
-    elif damage == "action":
-        entry["review"] = {**action, "rationale": "Unrecorded reasoning"}
-    elif damage == "mode":
-        entry["evidenceMode"] = "structured" if mode == "visual" else "visual"
-    elif damage == "genes":
-        payload["inputs"]["settings"]["candidate-two"]["features"] = {
-            **features,
-            "artifactId": "5" * 64,
-        }
-        digest = hashlib.sha256(record_io.canonical_json_bytes(payload)).hexdigest()
-        entry["checkpointSha256"] = digest
-    record = record_io.canonical_json_bytes({**payload, "contentSha256": digest})
-    monkeypatch.setattr(record_io, "read_key", lambda *_args: record)
-    stages = [
-        {
-            "stage": "parameter_tuning",
-            "outputs": {"tuningEvidence": {"history": [entry]}},
-        }
-    ]
-    if damage is not None:
-        with pytest.raises(ValueError, match="Analysis review"):
-            journal._analysis_review_views(
-                SimpleNamespace(zw=object()),
-                "agents/orchestrations",
-                "workflow",
-                stages,
-                AutomatedWorkflowConfig(),
-            )
-    else:
-        result = journal._analysis_review_views(
-            SimpleNamespace(zw=object()),
-            "agents/orchestrations",
-            "workflow",
-            stages,
-            AutomatedWorkflowConfig(),
+    )
+    final = records.read_json("evidence/finalize.json")
+    final["selected"] = "c0:r0.5"
+    _complete(records, "finalize", "selected-final", final)
+    records.append(
+        "pipelinePlanned",
+        operation="final",
+        label="final-label",
+        candidate=candidate,
+        resolution=0.5,
+    )
+    records.append(
+        "decisionAccepted",
+        decisionId="select",
+        stage="finalists",
+        output={
+            "action": "choose",
+            "optionIds": ["c0:r0.5"],
+            "rationale": "Retain the stable broad populations with measured markers.",
+            "evidenceIds": ["c0:r0.5"],
+        },
+    )
+    return records
+
+
+_STEPS = {
+    "overview": "Study and input data",
+    "quality": "Quality and preparation",
+    "exploration": "Explore clustering",
+    "selection": "Select the final analysis",
+    "results": "Examine the results",
+    "populations": "Provisional cell identities",
+}
+
+
+def _workflow_steps(document: _Document) -> dict[str, dict[str, str | None]]:
+    return {
+        identifier: next(
+            attrs
+            for tag, attrs in document.section_tags[identifier]
+            if tag == "details"
+            and "workflow-step" in str(attrs.get("class", "")).split()
         )
-        assert result[0]["rationale"] == action["rationale"]
-        assert result[0]["evidenceMode"] == mode
-        assert result[0]["settings"]["candidate-two"]["hvgCount"] == 1000
-        assert result[0]["candidates"][0]["artifacts"] == candidate["artifacts"]
-        assert result[0]["comparisonCoverage"] == view["comparisonCoverage"]
-        assert result[0]["coverage"] == view["coverage"]
+        for identifier in _STEPS
+    }
 
 
-def test_report_regeneration_only_replaces_derived_files(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def _save_narrative(records: RunRecords, section: str, text: str) -> None:
+    if section == "decision":
+        records.append(
+            "decisionAccepted",
+            decisionId="formatted-decision",
+            stage="finalists",
+            output={"rationale": text},
+        )
+    elif section == "annotation":
+        annotated = records.read_json("evidence/annotate.json")
+        annotated["annotations"][0]["rationale"] = text
+        _complete(records, "annotate", "narrative-annotation", annotated)
+    elif section in {"context", "objective"}:
+        study = records.manifest["study"]
+        study[section] = text
+        records.append("inputsResolved", study=study, config=records.manifest["config"])
+    elif section == "limitation":
+        records.append("limitation", message=text)
+    elif section == "question":
+        records.append(
+            "status",
+            status="needsInput",
+            stage="context",
+            questions=[{"questionId": "clarify-evidence", "question": text}],
+        )
+    else:
+        raise AssertionError(f"Unknown narrative fixture section: {section}")
+
+
+@pytest.mark.parametrize("literal_newlines", [False, True])
+def test_report_formats_narrative_paragraphs_emphasis_and_nested_lists(
+    tmp_path: Path, literal_newlines: bool
 ) -> None:
-    root = tmp_path / "data.zarr"
-    root.mkdir()
-    frozen = root / "numerical-artifact"
-    frozen.write_bytes(b"immutable")
-    output = report_directory(root, "exact-analysis", "workspace")
-    monkeypatch.setattr(
-        generator, "collect_analysis_artifacts", lambda *_: display_payload()
+    records = _rich_records(tmp_path)
+    narrative = (
+        "**Decision evidence** is consistent.\n\n"
+        "Retain *provisional* identities and `sample_id_2`.\n\n"
+        "- Parent conclusion\n"
+        "  - Child observation\n"
+        "  - Second observation\n"
+        "- Separate conclusion\n\n"
+        "1. First check\n"
+        "2. Second check"
     )
-    result = generator.render_analysis_report(SimpleNamespace(), snapshot(), output)
-    assert result == output / "index.html"
-    assert list(output.glob("*.html")) == [result]
-    before = result.read_text()
-    assert (
-        generator.render_analysis_report(SimpleNamespace(), snapshot(), output)
-        == result
+    if literal_newlines:
+        narrative = narrative.replace("\n", "\\n")
+    _save_narrative(records, "decision", narrative)
+    _save_narrative(records, "annotation", narrative)
+    before = {
+        path.relative_to(records.path): path.read_bytes()
+        for path in records.path.rglob("*")
+        if path.is_file()
+    }
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    visible = " ".join(document.text)
+    assert "Decision evidence is consistent." in document.paragraphs
+    assert any("Retain provisional identities" in text for text in document.paragraphs)
+    assert "<strong>Decision evidence</strong>" in page
+    assert "<em>provisional</em>" in page
+    assert "<code>sample_id_2</code>" in page
+    assert document.max_list_depth >= 2
+    assert any(tag == "ol" for tag, _ in document.tags)
+    assert "\\n" not in visible
+    assert "**Decision evidence**" not in visible
+    assert "*provisional*" not in visible
+    assert "`sample_id_2`" not in visible
+    assert "Typography license" not in visible
+    assert "Read as Markdown" not in visible
+    for relative, original in before.items():
+        assert (records.path / relative).read_bytes() == original
+    saved = list(
+        csv.DictReader(io.StringIO((records.path / "annotations.csv").read_text()))
     )
-    assert result.read_text() == before
-    assert frozen.read_bytes() == b"immutable"
-    assert not list(output.glob(".*.tmp"))
+    assert saved[0]["rationale"] == narrative
 
 
-def test_public_report_opens_exact_journal_and_workspace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "section",
+    ["decision", "annotation", "context", "objective", "limitation", "question"],
+)
+def test_report_formats_saved_narrative_sections_consistently(
+    tmp_path: Path, section: str
 ) -> None:
-    calls: list[Any] = []
-    store = SimpleNamespace(workspace="workspace")
-
-    def open_store(target: Path, run_id: str, *, workspace: str | None) -> Any:
-        calls.append((target, run_id, workspace))
-        return store
-
-    def load_snapshot(target: Any, run_id: str) -> dict[str, Any]:
-        assert target is store and run_id == "exact-analysis"
-        return snapshot()
-
-    monkeypatch.setattr(journal, "open_analysis_store", open_store, raising=False)
-    monkeypatch.setattr(journal, "analysis_snapshot", load_snapshot, raising=False)
-    monkeypatch.setattr(
-        generator, "collect_analysis_artifacts", lambda *_: display_payload()
+    records = _rich_records(tmp_path)
+    _save_narrative(
+        records, section, "Keep **measured evidence** and *uncertainty* visible."
     )
-    path = generator.generate_agent_report(
-        tmp_path, "exact-analysis", workspace="workspace"
-    )
-    assert calls == [(tmp_path, "exact-analysis", "workspace")]
-    assert (
-        path
-        == tmp_path / "workspace/agents/orchestrations/exact-analysis/report/index.html"
-    )
+    page = AnalysisRun(records.path).report().read_text()
+    visible = " ".join(_Document(page).text)
+    assert "<strong>measured evidence</strong>" in page
+    assert "<em>uncertainty</em>" in page
+    assert "**measured evidence**" not in visible
+    assert "*uncertainty*" not in visible
 
 
-def test_report_does_not_replace_existing_page_after_render_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    old = tmp_path / "index.html"
-    old.write_text("previous report")
-    monkeypatch.setattr(
-        generator, "collect_analysis_artifacts", lambda *_: display_payload()
-    )
-
-    def fail(_payload: Any) -> str:
-        raise RuntimeError("render failed")
-
-    monkeypatch.setattr(generator, "render_analysis_document", fail)
-    with pytest.raises(RuntimeError, match="render failed"):
-        generator.render_analysis_report(SimpleNamespace(), snapshot(), tmp_path)
-    assert old.read_text() == "previous report"
-    assert not list(tmp_path.glob(".*.tmp"))
-
-
-def test_report_rejects_remote_paths_escaping_workspaces_and_incomplete_runs(
+def test_narrative_formatting_preserves_unicode_and_identifier_characters(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ValueError, match="local filesystem"):
-        _local_root("s3://example/data.zarr")
-    with pytest.raises(FileNotFoundError):
-        _local_root(tmp_path / "missing")
-    assert _local_root(f"file://{tmp_path}") == tmp_path
-    with pytest.raises(ValueError, match="outside"):
-        report_directory(tmp_path, "run", "../outside")
-    with pytest.raises(ValueError, match="identifier"):
-        report_directory(tmp_path, "../escape", None)
-    state = snapshot()
-    state["status"] = "needsInput"
-    with pytest.raises(ValueError, match="completed"):
-        generator.render_analysis_report(SimpleNamespace(), state, tmp_path / "report")
-    assert not (tmp_path / "report").exists()
-
-
-def test_large_report_reads_saved_map_and_marker_table_without_analysis(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store, refs, _ = display_store(monkeypatch)
-    marker_calls: list[str] = []
-
-    def markers(_ref: Any, *, group_id: str) -> pd.DataFrame:
-        marker_calls.append(group_id)
-        return pd.DataFrame(
-            {
-                "feature_name": ["CD79A", "MS4A1", "CD74", "HLA-DRA"],
-                "score": [0.7, 0.9, 0.8, 0.6],
-            }
-        )
-
-    store.get_markers = markers
-    inspect = store.inspect_artifact
-
-    def marker_status(ref: Any) -> Any:
-        status = inspect(ref)
-        if ref.kind == "marker_table":
-            status.inputs["clusters"] = refs["clusters"].to_dict()
-        return status
-
-    store.inspect_artifact = marker_status
-    final = {
-        "umap": ArtifactReferenceModel.from_artifact_ref(refs["umap"]).model_dump(),
-        "clusters": ArtifactReferenceModel.from_artifact_ref(
-            refs["clusters"]
-        ).model_dump(),
-        "cellSelection": ArtifactReferenceModel.from_artifact_ref(
-            refs["cell_selection"]
-        ).model_dump(),
-        "graph": ArtifactReferenceModel.from_artifact_ref(refs["graph"]).model_dump(),
-        "markers": {
-            "scope": "assay",
-            "assay": "RNA2",
-            "kind": "marker_table",
-            "artifactId": "5" * 64,
-        },
-    }
-    data = plots.collect_analysis_artifacts(store, final, tmp_path)
-    assert data["displayNotes"] == []
-    assert data["displayedCells"] == 50_000
-    assert sum(data["clusterCounts"].values()) == 621_200
-    assert len(data["markers"]) == 12 and len(marker_calls) == 4
-    assert data["markers"][0]["feature"] == "MS4A1"
-    assert (tmp_path / "plots/final_umap.png").is_file()
-    provenance = json.loads((tmp_path / "plots/final_umap.png.json").read_text())
-    assert provenance["provenance"]["extras"]["input_n_cells"] == 621_200
-    assert list((tmp_path / "plots").glob("*.png")) == [
-        tmp_path / "plots/final_umap.png"
-    ]
-
-
-def test_optional_map_failure_preserves_counts_and_report(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    store, refs, _ = display_store(monkeypatch, n=12)
-
-    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
-        raise ImportError("matplotlib unavailable")
-
-    monkeypatch.setattr(plots, "plot_final_umap", unavailable)
-    state = snapshot()
-    state["finalAnalysis"]["clusters"] = ArtifactReferenceModel.from_artifact_ref(
-        refs["clusters"]
-    ).model_dump()
-    for name, ref_name in (
-        ("umap", "umap"),
-        ("cellSelection", "cell_selection"),
-        ("graph", "graph"),
+    records = _rich_records(tmp_path)
+    narrative = (
+        r"**β-cell evidence** from naïve donors uses HLA_DRA and sample_id_2."
+        r"\n\nKeep `C:\new\raw_data` and `GENE_A_B` literal; α/β ratios remain measured."
+        r" Paths C:\new\source_counts and \\server\new\study remain unchanged."
+        r" Preserve *_ontology_term_id and MT-* as gene-pattern text, plus \*literal stars\*."
+        r" Patterns MT-*, percent.*, stay literal near **confidence**."
+        r" Relative paths results\native\run.json and results\new_batch\counts stay literal."
+        r" POSIX paths /data/*/RNA* and /tmp/_cache_/rna stay literal."
+        r" The URL https://example.invalid/*/RNA* stays plain text."
+    )
+    _save_narrative(records, "decision", narrative)
+    page = AnalysisRun(records.path).report().read_text()
+    visible = " ".join(_Document(page).text)
+    for text in (
+        "β-cell evidence",
+        "naïve",
+        "HLA_DRA",
+        "sample_id_2",
+        "GENE_A_B",
+        "α/β",
+        r"results\native\run.json",
+        r"results\new_batch\counts",
+        "/data/*/RNA*",
+        "/tmp/_cache_/rna",
+        "https://example.invalid/*/RNA*",
     ):
-        state["finalAnalysis"][name] = ArtifactReferenceModel.from_artifact_ref(
-            refs[ref_name]
-        ).model_dump()
-    path = generator.render_analysis_report(store, state, tmp_path)
-    document = path.read_text()
-    assert "12 cells" in document
-    assert "matplotlib unavailable" in document
-    assert "Resolution 0.75 retains a small population with clear markers." in document
-    assert 'src="plots/final_umap.png"' not in document
+        assert text in visible
+    assert r"C:\new\raw_data" in visible
+    assert r"C:\new\source_counts" in visible
+    assert r"\\server\new\study" in visible
+    assert "*_ontology_term_id" in visible
+    assert "MT-*" in visible
+    assert "MT-*, percent.*," in visible
+    assert "*literal stars*" in visible
+    assert r"\*literal stars\*" not in visible
+    assert "<code>GENE_A_B</code>" in page
+    assert r"<code>C:\new\raw_data</code>" in page
+    assert "<em>literal stars</em>" not in page
+    assert "<strong>confidence</strong>" in page
 
 
-def test_invalid_map_lineage_is_not_hidden_as_optional_display_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_narrative_sentence_endings_do_not_hide_literal_paragraph_breaks(
+    tmp_path: Path,
 ) -> None:
-    store, refs, _ = display_store(monkeypatch, n=12)
-    final = {
-        name: ArtifactReferenceModel.from_artifact_ref(refs[ref_name]).model_dump()
-        for name, ref_name in (
-            ("umap", "umap"),
-            ("clusters", "clusters"),
-            ("graph", "graph"),
-            ("cellSelection", "cell_selection"),
+    records = _rich_records(tmp_path)
+    _save_narrative(
+        records,
+        "decision",
+        r"Context established (capture unknown).\n\nPROTECTED: retain biology.\n\nNext paragraph.",
+    )
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    assert "Context established (capture unknown)." in document.paragraphs
+    assert "PROTECTED: retain biology." in document.paragraphs
+    assert "Next paragraph." in document.paragraphs
+    assert r"\n" not in " ".join(document.text)
+
+
+def test_narrative_formatting_keeps_supplied_html_links_and_images_inert(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    attack = (
+        '**Review evidence**\n\n<img src="https://example.invalid/tracker" onerror="alert(1)">'
+        "\n<script>alert(2)</script>\n\n[unsafe](javascript:alert(3))"
+        "\n\n![external image](https://example.invalid/pixel.png)"
+    )
+    _save_narrative(records, "decision", attack)
+    _save_narrative(records, "annotation", attack)
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert "<strong>Review evidence</strong>" in page
+    assert "&lt;img" in page
+    assert "&lt;script&gt;" in page
+    assert "script" not in [tag for tag, _ in document.tags]
+    for _, attrs in document.tags:
+        assert not any(name.startswith("on") for name in attrs)
+        for attribute in ("href", "src"):
+            value = str(attrs.get(attribute, "")).lower()
+            assert not value.startswith("javascript:")
+            assert "example.invalid" not in value
+    saved = list(
+        csv.DictReader(io.StringIO((records.path / "annotations.csv").read_text()))
+    )
+    assert saved[0]["rationale"] == attack
+
+
+def test_narrative_supports_nested_emphasis_escaped_stars_and_single_line_breaks(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    narrative = (
+        "**Outer *inner* evidence** and ***combined emphasis***.\r\n"
+        r"Another line with \*literal text\* and `*literal_code*`."
+    )
+    _save_narrative(records, "decision", narrative)
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert "<strong>Outer <em>inner</em> evidence</strong>" in page
+    assert "<strong><em>combined emphasis</em></strong>" in page
+    assert "<code>*literal_code*</code>" in page
+    assert "<em>literal text</em>" not in page
+    assert "*literal text*" in " ".join(document.text)
+    assert any(tag == "br" for tag, _ in document.tags)
+    assert any(
+        "Outer inner evidence" in paragraph and "Another line" in paragraph
+        for paragraph in document.paragraphs
+    )
+
+
+def test_narrative_lists_keep_continuations_switch_types_and_end_before_prose(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    _save_narrative(
+        records,
+        "decision",
+        "3. First ordered observation\n"
+        "   continuation with **support**\n"
+        "   - Nested subgroup\n"
+        "4. Next ordered observation\n"
+        "- Unordered conclusion\n"
+        "  continued explanation\n"
+        "Outside the list.",
+    )
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert any(
+        tag == "ol" and attrs.get("start") == "3" for tag, attrs in document.tags
+    )
+    assert document.max_list_depth >= 2
+    assert "<strong>support</strong>" in page
+    assert "<br>\ncontinued explanation" in page
+    assert "Outside the list." in document.paragraphs
+    assert "Nested subgroup" in document.text
+    assert "Next ordered observation" in document.text
+
+
+def test_narrative_leaves_malformed_and_unsupported_markup_as_inert_text(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    _save_narrative(
+        records,
+        "decision",
+        "An unmatched **marker and `backtick remain text.\n\n"
+        "****decorative**** [reference](https://example.invalid/article) "
+        "![image](data:image/svg+xml,<svg onload='alert(1)'>)",
+    )
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    visible = " ".join(document.text)
+    assert "**marker" in visible
+    assert "`backtick" in visible
+    assert "****decorative****" in visible
+    assert "[reference](https://example.invalid/article)" in visible
+    assert "svg" not in [tag for tag, _ in document.tags]
+    assert not any(
+        str(attrs.get("href", "")).startswith("https://example.invalid")
+        for _, attrs in document.tags
+    )
+    svg_images = [
+        attrs
+        for tag, attrs in document.tags
+        if tag == "img" and str(attrs.get("src", "")).startswith("data:image/svg+xml")
+    ]
+    assert len(svg_images) == 1
+    assert svg_images[0]["class"] == "cluster-size-plot"
+    assert (
+        base64.b64decode(str(svg_images[0]["src"]).split(",", 1)[1])
+        == (records.path / "cluster_sizes.svg").read_bytes()
+    )
+
+
+def test_recorded_issue_narratives_format_without_changing_the_completed_status(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    message = r"**Retry note**\n\nFirst rejection.\nSecond detail."
+    records.append("modelFailure", stage="context", message=message)
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert "<strong>Retry note</strong>" in page
+    assert "Retry note" in document.paragraphs
+    assert "First rejection. Second detail." in document.paragraphs
+    assert any(
+        "Retry note First rejection. Second detail." in " ".join(row)
+        for row in document.rows
+    )
+    assert message not in " ".join(document.text)
+    assert AnalysisRun(records.path).status == "completed"
+
+
+def test_report_has_scientific_sections_tables_and_collapsed_provenance(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    tags = [tag for tag, _ in document.tags]
+    identifiers = {attrs.get("id") for _, attrs in document.tags}
+    assert "Single-cell RNA analysis" in document.headings
+    assert set(_STEPS) | {"provenance"} <= identifiers
+    assert not {"methods", "decisions", "limitations"} & identifiers
+    assert tags.count("table") >= 3
+    table_regions = [
+        attrs
+        for tag, attrs in document.tags
+        if tag == "div" and "table-wrap" in str(attrs.get("class", "")).split()
+    ]
+    assert len(table_regions) == tags.count("table")
+    assert all(
+        attrs.get("tabindex") == "0"
+        and attrs.get("role") == "region"
+        and attrs.get("aria-label")
+        for attrs in table_regions
+    )
+    assert "pre" not in tags
+    assert "script" not in tags
+    assert any(tag == "details" and "open" not in attrs for tag, attrs in document.tags)
+    primary = " ".join(document.primary_text)
+    assert "12,000" in primary
+    assert "T cells" not in primary
+    assert "T cells" in " ".join(document.text)
+    assert "provisional" in primary.lower()
+    for internal_name in (
+        "hvgCount",
+        "pcaDims",
+        "neighborsK",
+        "markerCoherence",
+        "qcFlags",
+        "retainedCells",
+    ):
+        assert internal_name not in primary
+    assert "Marker coherence" in " ".join(document.text)
+
+
+def test_report_follows_six_workflow_steps_with_full_markdown_content(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert list(document.sections) == [*_STEPS, "provenance"]
+    assert [title for title in document.headings if title in _STEPS.values()] == list(
+        _STEPS.values()
+    )
+    steps = _workflow_steps(document)
+    assert [key for key, attrs in steps.items() if "open" in attrs] == ["overview"]
+    assert all(attrs["data-stage-status"] == "completed" for attrs in steps.values())
+    primary = " ".join(document.primary_text)
+    assert all(title in primary for title in _STEPS.values())
+    assert "Candidate analyses measured: 1." in primary
+    assert "Selected: Baseline" in primary
+    assert "2 clusters reviewed" in primary
+    assert "Observed CD3D." not in primary
+    assert "Retain the stable broad populations with measured markers." not in primary
+    for identifier in _STEPS:
+        assert any(
+            tag == "a" and attrs.get("href") == f"#{identifier}"
+            for tag, attrs in document.tags
         )
-    }
+    provenance_details = [
+        attrs for tag, attrs in document.section_tags["provenance"] if tag == "details"
+    ]
+    assert provenance_details
+    assert all("open" not in attrs for attrs in provenance_details)
+    markdown = (records.path / "report.md").read_text()
+    indices = [
+        markdown.index(f"## {index:02}. {title}")
+        for index, title in enumerate(_STEPS.values(), 1)
+    ]
+    assert indices == sorted(indices)
+    assert "Observed CD3D." in markdown
+    assert "Retain the stable broad populations with measured markers." in markdown
+    assert "<details" not in markdown
 
-    def mismatch(*_args: Any, **_kwargs: Any) -> Any:
-        raise ValueError("Final artifacts must share the exact frozen cell selection")
 
-    monkeypatch.setattr(plots, "plot_final_umap", mismatch)
-    with pytest.raises(ValueError, match="exact frozen cell selection"):
-        plots.collect_analysis_artifacts(store, final, tmp_path)
-    assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.parametrize("reused", [False, True])
-def test_full_review_allowance_excludes_reused_screening_evidence(
-    monkeypatch: pytest.MonkeyPatch, reused: bool
+@pytest.mark.parametrize(
+    ("stage", "section"),
+    [
+        ("inspect", "overview"),
+        ("context", "overview"),
+        ("preprocess", "quality"),
+        ("explore", "exploration"),
+        ("finalists", "selection"),
+        ("finalize", "results"),
+        ("annotate", "populations"),
+    ],
+)
+def test_report_keeps_decision_explanations_with_the_relevant_step(
+    tmp_path: Path, stage: str, section: str
 ) -> None:
-    from scarf.agent import record_io
-    from scarf.agent.orchestrator.models import AutomatedWorkflowConfig
-    from scarf.agent.orchestrator.rna_tuning import TuningAction
+    records = _rich_records(tmp_path)
+    rationale = f"Unique recorded explanation for the {stage} stage."
+    records.append(
+        "decisionAccepted",
+        stage=stage,
+        decisionId=f"local-{stage}",
+        output={"rationale": rationale},
+    )
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    assert rationale in " ".join(document.sections[section])
+    assert all(
+        rationale not in " ".join(text)
+        for identifier, text in document.sections.items()
+        if identifier != section
+    )
 
-    view = snapshot()["analysisReviews"][0]
-    template = next(
-        item for item in view["candidates"] if item["candidateId"] == "candidate-two"
+
+@pytest.mark.parametrize(
+    ("stage", "section", "status", "label"),
+    [
+        ("context", "overview", "needsInput", "Awaiting input"),
+        ("preprocess", "quality", "running", "In progress"),
+        ("explore", "exploration", "failed", "Stopped"),
+        ("finalists", "selection", "interrupted", "Interrupted"),
+        ("finalize", "results", "running", "In progress"),
+        ("annotate", "populations", "needsInput", "Awaiting input"),
+    ],
+)
+def test_report_opens_the_unfinished_step_and_keeps_issues_visible(
+    tmp_path: Path, stage: str, section: str, status: str, label: str
+) -> None:
+    records = _records(tmp_path, status="running", final=False)
+    records.append(
+        "status",
+        stage=stage,
+        status=status,
+        message="Recorded interruption detail.",
+        questions=[
+            {"questionId": "clarify", "question": "Confirm the sample grouping."}
+        ],
     )
-    features = ArtifactReferenceModel(
-        assay="RNA2", kind="feature_selection", artifactId="4" * 64
-    ).model_dump(mode="json")
-    candidates, settings, evidence = [], {}, {}
-    for identity in ("candidate-two", "candidate-screened"):
-        candidate = copy.deepcopy(template) | {
-            "candidateId": identity,
-            "artifacts": {"graphFeatures": features},
-        }
-        candidates.append(candidate)
-        settings[identity] = {
-            **view["settings"]["candidate-two"],
-            "parameters": candidate["parameters"],
-            "features": features,
-        }
-        evidence[identity] = view["featureEvidence"]["candidate-two"]
-    coverage = copy.deepcopy(view["comparisonCoverage"])
-    coverage["validationSources"] = (
-        {"candidate-screened": {"scope": "sample0", "slot": 0, "identity": "b" * 64}}
-        if reused
-        else {}
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    steps = _workflow_steps(document)
+    assert [key for key, attrs in steps.items() if "open" in attrs] == [section]
+    assert steps[section]["data-stage-status"] == status
+    assert label in " ".join(document.sections[section])
+    primary = " ".join(document.primary_text)
+    assert "Recorded interruption detail." in primary
+    assert ("Confirm the sample grouping." in primary) == (status == "needsInput")
+    assert AnalysisRun(records.path).status == status
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted", "needsInput", "running"])
+def test_report_current_stage_status_takes_priority_over_historical_completion(
+    tmp_path: Path, status: str
+) -> None:
+    records = _rich_records(tmp_path)
+    final = records.read_json("evidence/selected-final.json")
+    records.append(
+        "status",
+        stage="finalize",
+        status=status,
+        message="Resumed final-result validation requires attention.",
+        questions=[
+            {"questionId": "confirm", "question": "Confirm the relocated source."}
+        ],
     )
-    action = {
-        key: value for key, value in view.items() if key in TuningAction.model_fields
+    before = records.events()
+    run = AnalysisRun(records.path)
+    document = _Document(run.report().read_text())
+    steps = _workflow_steps(document)
+    assert [key for key, attrs in steps.items() if "open" in attrs] == ["results"]
+    assert steps["results"]["data-stage-status"] == status
+    assert steps["selection"]["data-stage-status"] == "completed"
+    assert "Resumed final-result validation requires attention." in " ".join(
+        document.primary_text
+    )
+    assert "T cells" in " ".join(document.sections["populations"])
+    assert "8,000" in (records.path / "cluster_sizes.svg").read_text()
+    assert any(
+        tag == "img" and attrs.get("class") == "cluster-size-plot"
+        for tag, attrs in document.section_tags["results"]
+    )
+    assert records.read_json("evidence/selected-final.json") == final
+    assert records.events() == before
+    assert run.status == status
+
+
+def test_report_does_not_infer_missing_stage_completions_from_final_results(
+    tmp_path: Path,
+) -> None:
+    records = _records(tmp_path)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    steps = _workflow_steps(document)
+    assert steps["overview"]["data-stage-status"] == "partial"
+    for section in ("quality", "exploration", "selection"):
+        assert steps[section]["data-stage-status"] == "unavailable"
+        assert "Not recorded" in " ".join(document.sections[section])
+    for section in ("results", "populations"):
+        assert steps[section]["data-stage-status"] == "completed"
+
+
+def test_report_distinguishes_measured_exploration_from_completed_exploration(
+    tmp_path: Path,
+) -> None:
+    records = _records(tmp_path, status="running", final=False)
+    records.append(
+        "candidateMeasured",
+        candidateId="c0",
+        evidence=records.write_evidence(
+            "unfinished-candidate",
+            {"parameters": {"candidateId": "c0"}, "partitions": []},
+        ),
+    )
+    records.append("status", status="running", stage="finalists")
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    steps = _workflow_steps(document)
+    assert steps["exploration"]["data-stage-status"] != "completed"
+    assert steps["selection"]["data-stage-status"] == "running"
+    assert steps["results"]["data-stage-status"] == "pending"
+    assert steps["populations"]["data-stage-status"] == "pending"
+
+
+def test_report_finishes_with_identities_download_and_general_limitations(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    records.append("limitation", message="Study-wide uncertainty remains unresolved.")
+    for name in ("umap_clusters.png", "marker_dotplot.png"):
+        (records.path / name).write_bytes(_PNG)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    image_sections = {
+        identifier: [
+            attrs
+            for tag, attrs in tags
+            if tag == "img"
+            and any(
+                word in str(attrs.get("alt", "")).lower()
+                for word in ("umap", "marker dotplot")
+            )
+        ]
+        for identifier, tags in document.section_tags.items()
     }
-    payload = {
-        "inputs": {
-            "scope": "full",
-            "imageHashes": {},
-            "evidenceMode": "structured",
-            "visualInspection": "unavailable",
-            "candidates": candidates,
-            "settings": settings,
-            "featureEvidence": evidence,
-            "comparisonCoverage": coverage,
-            "coverage": view["coverage"],
-        },
-        "outputs": {"action": action},
+    assert len(image_sections["results"]) == 2
+    assert "umap" in str(image_sections["results"][0]["alt"]).lower()
+    assert "marker dotplot" in str(image_sections["results"][1]["alt"]).lower()
+    assert all(
+        not images for section, images in image_sections.items() if section != "results"
+    )
+    populations = " ".join(document.sections["populations"])
+    assert "T cells" in populations
+    assert "Study-wide uncertainty remains unresolved." in populations
+    annotation_links = [
+        attrs
+        for tag, attrs in document.tags
+        if tag == "a" and attrs.get("href") == "annotations.csv"
+    ]
+    section_annotation_links = [
+        attrs
+        for section in ("populations", "provenance")
+        for tag, attrs in document.section_tags[section]
+        if tag == "a" and attrs.get("href") == "annotations.csv"
+    ]
+    assert annotation_links == section_annotation_links
+    assert any(
+        tag == "a" and attrs.get("href") == "annotations.csv"
+        for tag, attrs in document.section_tags["populations"]
+    )
+
+
+def test_report_retains_general_limitations_before_annotations_are_available(
+    tmp_path: Path,
+) -> None:
+    records = _records(tmp_path, status="failed", final=False)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    assert "No biological replication." in " ".join(document.sections["populations"])
+    assert "T cells" not in " ".join(document.text)
+
+
+def test_report_assets_and_typography_are_embedded_without_remote_requests(
+    tmp_path: Path,
+) -> None:
+    page = AnalysisRun(_records(tmp_path).path).report().read_text()
+    document = _Document(page)
+    images = [attrs for tag, attrs in document.tags if tag == "img"]
+    assert any("nygen" in str(attrs.get("alt", "")).lower() for attrs in images)
+    assert any("scarf" in str(attrs.get("alt", "")).lower() for attrs in images)
+    assert all(str(attrs.get("src", "")).startswith("data:") for attrs in images)
+    assert any(
+        tag == "link"
+        and "icon" in str(attrs.get("rel", ""))
+        and str(attrs.get("href", "")).startswith("data:")
+        for tag, attrs in document.tags
+    )
+    assert not any(
+        str(attrs.get(key, "")).startswith(("http:", "https:", "//"))
+        for tag, attrs in document.tags
+        for key in ("src", "href")
+        if key == "src" or tag != "a"
+    )
+    assert "@import" not in page
+    assert re.search(r"font-family\s*:[^;}]*Inter", page)
+    assert "#0077fc" in page.lower()
+    assert re.search(r"line-height\s*:\s*1\.2\b", page)
+    assert 'href="annotations.csv"' in page
+    assert 'href="report.md"' in page
+
+
+def test_report_links_company_repository_and_paper_in_branding(tmp_path: Path) -> None:
+    records = _records(tmp_path)
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    destinations = {
+        "https://www.nygen.io/",
+        "https://github.com/nygenAnalytics/scarf",
+        "https://doi.org/10.1038/s41467-022-32097-3",
     }
-    digest = record_io.sha256_json(payload)
-    record = record_io.canonical_json_bytes({**payload, "contentSha256": digest})
-    monkeypatch.setattr(record_io, "read_key", lambda *_args: record)
-    entry = {
-        "scope": "full",
-        "review": action,
-        "checkpointKey": "parameter_tuning/full/review0",
-        "checkpointSha256": digest,
-        "imageHashes": {},
-        "evidenceMode": "structured",
-        "visualInspection": "unavailable",
+    assert {
+        str(attrs["href"])
+        for tag, attrs in document.tags
+        if tag == "a"
+        and str(attrs.get("href", "")).startswith(("http:", "https:", "//"))
+    } == destinations
+    masthead = _Document(
+        page[page.index('<div class="masthead">') : page.index('<header class="hero">')]
+    )
+    assert "Nygen" in masthead.text
+    assert "nygen.io" in masthead.text
+    assert any(
+        tag == "img" and attrs.get("alt") == "Nygen logo"
+        for tag, attrs in masthead.tags
+    )
+    assert {attrs.get("href") for tag, attrs in masthead.tags if tag == "a"} == {
+        "https://www.nygen.io/"
     }
-    arguments = (
-        SimpleNamespace(zw=object()),
-        "agents/orchestrations",
-        "workflow",
-        [
+    footer_match = re.search(r"<footer\b[^>]*>(.*?)</footer>", page, re.DOTALL)
+    assert footer_match is not None
+    footer = _Document(footer_match[1])
+    assert "Scarf on GitHub" in footer.text
+    assert any(
+        tag == "img" and attrs.get("alt") == "Scarf logo" for tag, attrs in footer.tags
+    )
+    assert {
+        attrs.get("href") for tag, attrs in footer.tags if tag == "a"
+    } == destinations - {"https://www.nygen.io/"}
+    citation = (
+        "Dhapola, P., Rodhe, J., Olofzon, R. et al. Scarf enables a highly "
+        "memory-efficient analysis of large-scale single-cell genomics data. "
+        "Nat Commun 13, 4616 (2022)."
+    )
+    assert citation in " ".join(footer.text)
+    markdown = (records.path / "report.md").read_text()
+    assert citation in markdown
+    assert all(f"]({url})" in markdown for url in destinations)
+    assert not any(tag == "script" for tag, _ in document.tags)
+
+
+@pytest.mark.parametrize(
+    ("asset_name", "filename"),
+    [
+        ("NYGEN_LOGO", "logo.png"),
+        ("SCARF_LOGO", "logo_wide.png"),
+        ("FAVICON", "favicon.ico"),
+    ],
+)
+def test_embedded_brand_assets_match_supplied_company_files(
+    asset_name: str, filename: str
+) -> None:
+    from scarf.agent import report_assets
+
+    encoded = getattr(report_assets, asset_name).split(",", 1)[1]
+    supplied = Path(__file__).parents[1] / "docs" / "source" / filename
+    assert base64.b64decode(encoded, validate=True) == supplied.read_bytes()
+
+
+def test_embedded_inter_font_retains_its_distribution_license(tmp_path: Path) -> None:
+    from scarf.agent.report_assets import INTER_FONT, INTER_FONT_LICENSE
+
+    assert base64.b64decode(INTER_FONT.split(",", 1)[1], validate=True).startswith(
+        b"wOF2"
+    )
+    records = _records(tmp_path)
+    page = AnalysisRun(records.path).report().read_text()
+    assert "SIL OPEN FONT LICENSE Version 1.1" in INTER_FONT_LICENSE
+    assert INTER_FONT_LICENSE in page
+    visible = " ".join(_Document(page).text)
+    markdown = (records.path / "report.md").read_text()
+    for text in (visible, markdown):
+        assert "Typography license" not in text
+        assert "SIL OPEN FONT LICENSE Version 1.1" not in text
+        assert "The Inter Project Authors" not in text
+
+
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        ("running", "In progress"),
+        ("needsInput", "Awaiting input"),
+        ("completed", "Completed"),
+        ("failed", "Stopped"),
+        ("interrupted", "Interrupted"),
+    ],
+)
+def test_report_outcomes_have_readable_status_and_actionable_questions(
+    tmp_path: Path, status: str, label: str
+) -> None:
+    records = _records(tmp_path, status=status, final=status == "completed")
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    visible = " ".join(document.text)
+    assert label in visible
+    assert ("Choose an assay." in visible) == (status == "needsInput")
+    if status != "completed":
+        assert "T cells" not in visible
+    assert AnalysisRun(records.path).status == status
+
+
+def test_report_cluster_sizes_and_markers_use_only_the_selected_finalist(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    assessed = records.read_json("evidence/assessed.json")
+    assessed["finalists"]["c1:r0.5"] = {
+        "runId": "unselected-finalist",
+        "clusters": [
             {
-                "stage": "parameter_tuning",
-                "outputs": {"tuningEvidence": {"history": [entry]}},
+                "clusterId": "1",
+                "count": 1234,
+                "markers": [{"gene": "WRONG_FINALIST_MARKER", "score": 1.0}],
             }
         ],
-        AutomatedWorkflowConfig(maxFullPartitions=1),
+    }
+    _complete(records, "finalists", "assessed-with-alternative", assessed)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    population = next(row for row in document.rows if "T cells" in " ".join(row))
+    assert "8,000" in " ".join(population)
+    assert "Medium" in " ".join(population)
+    assert "CD3D" in " ".join(population)
+    assert "1,234" not in " ".join(population)
+    assert "WRONG_FINALIST_MARKER" not in " ".join(document.text)
+    assert "IL7R" in " ".join(document.text)
+    assert "Observed CD3D." in " ".join(document.text)
+
+
+def test_report_qc_flags_are_named_and_preserve_missing_measurements(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    qc_row = next(row for row in document.rows if "Detected genes" in " ".join(row))
+    assert {"14", "23", "7"} <= set(qc_row)
+    visible = " ".join(document.text)
+    assert "Mitochondrial" in visible
+    assert "retained" in visible.lower()
+    assert "outlierRows" not in visible
+    assert "lowFlags" not in visible
+    assert "doubletHighScoreConcentration" not in visible
+
+
+def test_report_missing_counts_and_evidence_are_unknown_not_zero(
+    tmp_path: Path,
+) -> None:
+    records = RunRecords.create(
+        tmp_path / "no-evidence",
+        {
+            "runId": "uninspected",
+            "source": "../missing",
+            "study": {"context": "Awaiting source validation.", "objective": "Explore"},
+            "config": {},
+        },
     )
-    if reused:
-        assert len(journal._analysis_review_views(*arguments)[0]["candidates"]) == 2
+    records.append(
+        "status", status="failed", stage="inspect", message="Invalid source."
+    )
+    page = AnalysisRun(records.path).report().read_text()
+    visible = " ".join(_Document(page).text)
+    assert "Invalid source." in visible
+    assert "Not recorded" in visible or "Not available" in visible
+    assert "None" not in visible
+    assert re.search(r"\bnan\b", visible, re.IGNORECASE) is None
+    assert "T cells" not in visible
+    assert (
+        len(
+            list(
+                csv.DictReader(
+                    io.StringIO((records.path / "annotations.csv").read_text())
+                )
+            )
+        )
+        == 0
+    )
+
+
+def test_report_escapes_supplied_text_in_every_scientific_section(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    attack = '<img src=x onerror="alert(1)"><svg onload="alert(2)">'
+    study = records.manifest["study"]
+    study.update(context=attack, objective=attack, tissue=attack, organism=attack)
+    records.append("inputsResolved", study=study, config=records.manifest["config"])
+    records.append(
+        "candidateMeasured",
+        candidateId=attack,
+        evidence=records.write_evidence(
+            "unsafe-candidate-name", records.read_json("evidence/candidate.json")
+        ),
+    )
+    annotated = records.read_json("evidence/annotate.json")
+    annotated["annotations"][0].update(
+        identity=attack,
+        supportingMarkers=[attack],
+        rationale=attack,
+    )
+    _complete(records, "annotate", "unsafe-annotations", annotated)
+    records.append("limitation", message=attack)
+    records.append("modelFailure", stage="annotate", message=attack)
+    records.append(
+        "status",
+        status="needsInput",
+        stage="annotate",
+        questions=[{"questionId": "clarify", "question": attack}],
+    )
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    assert attack not in page
+    assert "&lt;img" in page
+    assert "svg" not in [tag for tag, _ in document.tags]
+    assert not any(
+        name.startswith("on") for _, attrs in document.tags for name in attrs
+    )
+    assert attack in " ".join(document.text)
+    assert "<script>" not in page
+    markdown = (records.path / "report.md").read_text()
+    assert attack not in markdown
+    assert "<img" not in markdown
+    assert "<svg" not in markdown
+    assert "&lt;img" in markdown
+    saved = list(
+        csv.DictReader(io.StringIO((records.path / "annotations.csv").read_text()))
+    )
+    assert saved[0]["identity"] == attack
+
+
+def test_report_inspection_does_not_claim_filtering_or_doublet_scoring_finished(
+    tmp_path: Path,
+) -> None:
+    records = _records(tmp_path, status="failed", final=False)
+    configuration = records.manifest["config"]
+    configuration.update(
+        qcPolicy="manual", qcBounds={"RNA_nFeatures": [200, None]}, scoreDoublets=True
+    )
+    records.append(
+        "inputsResolved", study=records.manifest["study"], config=configuration
+    )
+    prepared = records.read_json("evidence/inspect.json")
+    prepared["filtering"] = {
+        "method": "manual",
+        "attrs": ["RNA_nFeatures"],
+        "lows": [200],
+        "highs": [None],
+    }
+    _complete(records, "inspect", "inspected-filter-policy", prepared)
+    visible = " ".join(_Document(AnalysisRun(records.path).report().read_text()).text)
+    assert "configured" in visible.lower()
+    assert "filtering was applied" not in visible.lower()
+    assert "doublet scoring is requested" in visible.lower()
+    assert "scoring was completed" not in visible.lower()
+    assert "scores were computed" not in visible.lower()
+    assert AnalysisRun(records.path).pipeline_runs == []
+
+
+def test_report_partial_usage_shows_known_totals_and_unknown_measurements(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    records.append(
+        "modelResponse",
+        usage={
+            "inputTokens": 1000,
+            "outputTokens": 25,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": None,
+        },
+    )
+    records.append("modelResponse", usage=None)
+    records.append("modelResponse", usage={"inputTokens": None, "outputTokens": 75})
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    inputs = next(row for row in document.rows if "Input tokens" in row)
+    outputs = next(row for row in document.rows if "Output tokens" in row)
+    cache_reads = next(row for row in document.rows if "Tokens read from cache" in row)
+    cache_writes = next(
+        row for row in document.rows if "Tokens written to cache" in row
+    )
+    assert "1,000" in inputs
+    assert "1 of 3 recorded responses" in inputs
+    assert "100" in outputs
+    assert "2 of 3 recorded responses" in outputs
+    assert "0" in cache_reads
+    assert "Not recorded" in cache_writes or "Not available" in cache_writes
+    assert "0" not in cache_writes
+    assert "Unavailable usage is unknown." in " ".join(document.text)
+
+
+def test_report_harmony_assessment_preserves_biological_and_technical_diagnostics(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    finalist = records.read_json("evidence/selected-finalist.json")
+    finalist["parameters"]["useHarmony"] = True
+    finalist["metrics"].update(
+        mixing={"sequencing_batch": 0.71},
+        protection={"treatment": {"cLISI": 0.93, "graphConnectivity": 0.86}},
+        crossUnitSupport=0.75,
+        doubletHighScoreConcentration=1.6,
+    )
+    records.append(
+        "finalistMeasured",
+        optionId="c1:r0.5",
+        evidence=records.write_evidence("corrected-finalist", finalist),
+    )
+    final = records.read_json("evidence/selected-final.json")
+    final["selected"] = "c1:r0.5"
+    _complete(records, "finalize", "corrected-final", final)
+    _complete(
+        records,
+        "finalists",
+        "corrected-assessment",
+        {
+            "selected": "c1:r0.5",
+            "finalists": {"c1:r0.5": finalist},
+            "rejected": {},
+        },
+    )
+    records.append(
+        "pipelinePlanned",
+        operation="final",
+        label="corrected-final-label",
+        candidate={**finalist["parameters"], "candidateId": "c1"},
+        resolution=0.5,
+    )
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    visible = " ".join(document.text)
+    assert "Harmony" in visible
+    for label, value in (
+        ("Batch mixing", "0.71"),
+        ("Biological separation", "0.93"),
+        ("Graph connectivity", "0.86"),
+        ("Support across samples", "75.0%"),
+        ("Concentration of high doublet scores", "1.6"),
+    ):
+        rows = [row for row in document.rows if label in " ".join(row)]
+        assert any(value in " ".join(row) for row in rows)
+    assert "sequencing_batch" in visible or "sequencing batch" in visible
+    assert "treatment" in visible
+    assert "crossUnitSupport" not in visible
+    assert "doubletHighScoreConcentration" not in visible
+
+
+def test_report_does_not_open_source_or_mutate_frozen_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scarf.agent.evidence as evidence
+
+    records = _rich_records(tmp_path)
+    before = {
+        path.relative_to(records.path): path.read_bytes()
+        for path in records.path.rglob("*")
+        if path.is_file()
+    }
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Offline rendering must not access a numerical store")
+
+    monkeypatch.setattr(evidence, "open_store", forbidden)
+    first = AnalysisRun(records.path).report().read_bytes()
+    second = AnalysisRun(records.path).report().read_bytes()
+    assert first == second
+    for relative, original in before.items():
+        assert (records.path / relative).read_bytes() == original
+    assert not AnalysisRun(records.path).source.exists()
+
+
+def test_large_population_report_bounds_visible_rows_but_exports_every_annotation(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    annotated = records.read_json("evidence/annotate.json")
+    annotated["annotations"] = [
+        {
+            "clusterId": str(index),
+            "identity": f"Population {index:03d}",
+            "confidence": "low",
+            "supportingMarkers": [],
+            "contradictingMarkers": [],
+            "rationale": f"Observed evidence for population {index:03d}.",
+        }
+        for index in range(102)
+    ]
+    _complete(records, "annotate", "many-populations", annotated)
+    before = records.events()
+    page = AnalysisRun(records.path).report().read_text()
+    document = _Document(page)
+    visible = " ".join(document.text)
+    assert "Population 099" in visible
+    assert "Population 100" not in visible
+    assert "Additional entries: 2; see saved records." in visible
+    assert "102" in visible
+    saved = list(
+        csv.DictReader(io.StringIO((records.path / "annotations.csv").read_text()))
+    )
+    assert len(saved) == 102
+    assert saved[-1]["identity"] == "Population 101"
+    assert records.events() == before
+    assert len(AnalysisRun(records.path).annotations) == 102
+
+
+def test_report_sorts_cluster_labels_naturally_without_reordering_saved_annotations(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    annotated = records.read_json("evidence/annotate.json")
+    supplied = ["10", "2", "alpha", "1", "Beta", "zeta"]
+    expected = ["1", "2", "10", "alpha", "Beta", "zeta"]
+    template = annotated["annotations"][0]
+    annotated["annotations"] = [
+        {**template, "clusterId": identifier, "identity": f"Population {identifier}"}
+        for identifier in supplied
+    ]
+    _complete(records, "annotate", "unordered-clusters", annotated)
+    before = records.events()
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    populations = [
+        row
+        for row in document.rows
+        if len(row) > 1 and row[1].startswith("Population ")
+    ]
+    assert [row[0] for row in populations] == expected
+    details = [
+        text
+        for text in document.text
+        if text.startswith("Cluster ") and "Population " in text
+    ]
+    assert details == [
+        f"Cluster {identifier} · Population {identifier}" for identifier in expected
+    ]
+    saved = list(
+        csv.DictReader(io.StringIO((records.path / "annotations.csv").read_text()))
+    )
+    assert [row["clusterId"] for row in saved] == supplied
+    assert [
+        row["clusterId"] for row in AnalysisRun(records.path).annotations
+    ] == supplied
+    assert records.events() == before
+
+
+def test_report_embeds_existing_local_umap_without_opening_the_source(
+    tmp_path: Path,
+) -> None:
+    records = _rich_records(tmp_path)
+    (records.path / "umap_clusters.png").write_bytes(_PNG)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    previews = [
+        attrs
+        for tag, attrs in document.tags
+        if tag == "img" and "umap" in str(attrs.get("alt", "")).lower()
+    ]
+    assert len(previews) == 1
+    assert (
+        previews[0]["src"] == "data:image/png;base64," + base64.b64encode(_PNG).decode()
+    )
+    assert "Saved UMAP preview" in " ".join(document.text)
+
+
+def test_report_embeds_marker_dotplot_and_umap_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scarf.agent.evidence as evidence
+
+    records = _rich_records(tmp_path)
+    marker_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    images = {"umap_clusters.png": _PNG, "marker_dotplot.png": marker_png}
+    for name, image in images.items():
+        (records.path / name).write_bytes(image)
+    before = records.events()
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Offline rendering must use saved previews without opening a store")
+
+    monkeypatch.setattr(evidence, "open_store", forbidden)
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    previews = {
+        str(attrs["alt"]): attrs["src"]
+        for tag, attrs in document.tags
+        if tag == "img"
+        and any(
+            word in str(attrs.get("alt", "")).lower()
+            for word in ("umap", "marker dotplot")
+        )
+    }
+    assert len(previews) == 2
+    for term, filename in (
+        ("UMAP", "umap_clusters.png"),
+        ("marker dotplot", "marker_dotplot.png"),
+    ):
+        matching = [value for alt, value in previews.items() if term in alt]
+        assert matching == [
+            "data:image/png;base64," + base64.b64encode(images[filename]).decode()
+        ]
+    visible = " ".join(document.text)
+    assert "Marker expression" in document.headings
+    assert "Saved marker dotplot" in visible
+    assert "fraction" in visible.lower() and "expressing" in visible.lower()
+    assert "log(1 + mean normalized expression)" in visible
+    markdown = (records.path / "report.md").read_text()
+    assert "![Saved UMAP preview](umap_clusters.png)" in markdown
+    assert "![Saved marker dotplot](marker_dotplot.png)" in markdown
+    assert records.events() == before
+    assert not AnalysisRun(records.path).source.exists()
+    for name, image in images.items():
+        assert (records.path / name).read_bytes() == image
+
+
+@pytest.mark.parametrize(
+    ("filename", "alt"),
+    [("umap_clusters.png", "umap"), ("marker_dotplot.png", "marker dotplot")],
+)
+@pytest.mark.parametrize("preview", ["missing", "symlink", "oversized", "invalid"])
+def test_report_omits_unavailable_or_unsafe_previews_without_losing_results(
+    tmp_path: Path, preview: str, filename: str, alt: str
+) -> None:
+    records = _rich_records(tmp_path)
+    path = records.path / filename
+    other_filename, other_alt = (
+        ("marker_dotplot.png", "marker dotplot")
+        if filename == "umap_clusters.png"
+        else ("umap_clusters.png", "umap")
+    )
+    (records.path / other_filename).write_bytes(_PNG)
+    if preview == "symlink":
+        outside = tmp_path / "external.png"
+        outside.write_bytes(_PNG)
+        path.symlink_to(outside)
+    elif preview == "oversized":
+        with path.open("wb") as stream:
+            stream.write(_PNG)
+            stream.seek(8 * 1024 * 1024)
+            stream.write(b"x")
+    elif preview == "invalid":
+        path.write_text("<svg onload='alert(1)'>")
+    document = _Document(AnalysisRun(records.path).report().read_text())
+    assert not any(
+        tag == "img" and alt in str(attrs.get("alt", "")).lower()
+        for tag, attrs in document.tags
+    )
+    assert any(
+        tag == "img" and other_alt in str(attrs.get("alt", "")).lower()
+        for tag, attrs in document.tags
+    )
+    visible = " ".join(document.text)
+    assert "T cells" in visible
+    assert "Completed" in visible
+    assert "preview" in visible.lower()
+    assert "not computed" not in visible.lower()
+
+
+@pytest.mark.parametrize("mismatch", ["runId", "clusters"])
+def test_report_refuses_annotations_from_another_frozen_clustering(
+    tmp_path: Path, mismatch: str
+) -> None:
+    records = _rich_records(tmp_path)
+    saved = records.read_json("evidence/annotate.json")
+    if mismatch == "runId":
+        saved["runId"] = "unrelated-run"
     else:
-        with pytest.raises(ValueError, match="candidate evidence does not align"):
-            journal._analysis_review_views(*arguments)
+        saved["clusters"] = {**saved["clusters"], "artifact_id": "d" * 64}
+    _complete(records, "annotate", "wrong-clustering", saved)
+    with pytest.raises(RecordError, match="final frozen clustering"):
+        AnalysisRun(records.path).report()
+    assert not (records.path / "report.html").exists()
+    assert AnalysisRun(records.path).status == "completed"

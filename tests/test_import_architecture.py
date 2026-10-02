@@ -611,141 +611,89 @@ def test_internal_modules_do_not_use_moved_symbols_from_hybrid_facades():
     assert _moved_symbol_imports() == set()
 
 
-def test_agent_implementations_live_in_owner_packages():
-    agent_root = _SCARF_ROOT / "agent"
-    retired = {
-        "biological_interpretation.py",
-        "characterize_covariates.py",
-        "characterize_features.py",
-        "data_enrichment.py",
-        "decide.py",
-        "decision_kernel.py",
-        "decision_persistence.py",
-        "experimental_context.py",
-        "hvg_diagnostics.py",
-        "hypothesis_testing.py",
-        "parameter_tuning.py",
-        "persistence.py",
-        "qc_execution.py",
-        "qc_profiles.py",
-        "report.py",
-        "rna_decisions.py",
-        "sequential_tuning.py",
-        "study_contract.py",
-        "tuning_diagnostics.py",
-    }
-    required = {
-        "biological_interpretation": {
-            "__init__.py",
-            "agent.py",
-            "contracts.py",
-            "tools.py",
-            "validation.py",
-        },
-        "cell_quality": {"__init__.py", "execution.py", "profiles.py"},
-        "data_enrichment": {
-            "__init__.py",
-            "agent.py",
-            "characterization.py",
-            "contracts.py",
-            "tools.py",
-            "validation.py",
-        },
-        "decisions": {"__init__.py", "kernel.py", "rna.py", "selection.py"},
-        "experimental_context": {
-            "__init__.py",
-            "agent.py",
-            "characterization.py",
-            "contracts.py",
-            "qc_evidence.py",
-            "study.py",
-            "tools.py",
-            "validation.py",
-        },
-        "parameter_tuning": {
-            "__init__.py",
-            "agent.py",
-            "contracts.py",
-            "diagnostics.py",
-            "execution.py",
-            "hvg.py",
-            "selection.py",
-        },
-        "report": {
-            "__init__.py",
-            "artifacts.py",
-            "contracts.py",
-            "generator.py",
-            "plots.py",
-            "rendering.py",
-        },
-    }
+def test_agent_facade_defers_numerical_and_provider_imports():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
 
-    assert retired.isdisjoint(path.name for path in agent_root.glob("*.py"))
-    assert not list((agent_root / "persistence").glob("*.py"))
-    assert not list((agent_root / "hypotheses").glob("*.py"))
-    assert not (agent_root / "parameter_tuning/sequential.py").exists()
-    assert not (agent_root / "parameter_tuning/prompts.py").exists()
-    assert not (agent_root / "report/decision_tree.py").exists()
-    for package, names in required.items():
-        package_root = agent_root / package
-        assert package_root.is_dir()
-        assert names <= {path.name for path in package_root.glob("*.py")}
+import scarf
 
+assert "scarf.agent" not in sys.modules
+assert not any(
+    name == "pydantic_ai" or name.startswith("pydantic_ai.")
+    for name in sys.modules
+)
 
-def test_agent_contracts_do_not_import_orchestration_or_reporting():
-    contracts = sorted((_SCARF_ROOT / "agent").glob("*/contracts.py"))
-    forbidden = ("agent.orchestrator", "agent.report")
-    for path in contracts:
-        imports = _runtime_import_modules(path, include_function_local=False)
-        assert not {
-            module
-            for module in imports
-            if module.startswith(tuple(f"{root}." for root in forbidden))
-            or module in forbidden
-        }
+import scarf.agent as agent
 
-    shared_tools = _SCARF_ROOT / "agent" / "tools" / "__init__.py"
-    shared_imports = _runtime_import_modules(
-        shared_tools,
-        include_function_local=False,
+runtime_modules = (
+    "scarf.agent.evidence",
+    "scarf.agent.execution",
+    "scarf.agent.provider",
+    "scarf.agent.workflow",
+    "scarf.datastore",
+    "pydantic_ai",
+)
+for public_name in (None, "Study", "analyze_rna", "AnalysisRun"):
+    if public_name is not None:
+        getattr(agent, public_name)
+    assert not any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for name in sys.modules
+        for prefix in runtime_modules
     )
+""",
+        ],
+        check=True,
+    )
+
+
+def test_agent_support_modules_keep_narrow_dependencies():
+    # Decisions stay independent of execution, the provider cannot reach Scarf
+    # computation, and reports can be regenerated without opening a store.
+    allowed_imports = {
+        "models": set(),
+        "choices": {"agent.models"},
+        "prompts": set(),
+        "records": set(),
+        "provider": {"agent.models", "agent.prompts", "agent.records"},
+        "rendering": {"agent.records", "agent.report_charts", "agent.report_html"},
+        "report_html": {
+            "agent.report_assets",
+            "agent.report_style",
+            "agent.report_text",
+        },
+        "report_assets": set(),
+        "report_charts": set(),
+        "report_style": set(),
+        "report_text": set(),
+    }
+    for name, allowed in allowed_imports.items():
+        path = _SCARF_ROOT / "agent" / f"{name}.py"
+        assert _runtime_import_modules(path) <= allowed, name
+
+
+def test_core_packages_do_not_import_scarf_agent():
     assert not {
-        module
-        for module in shared_imports
-        if module.startswith(
-            (
-                "agent.biological_interpretation",
-                "agent.data_enrichment",
-                "agent.experimental_context",
-                "agent.orchestrator",
-                "agent.parameter_tuning",
-                "agent.persistence",
-                "agent.report",
-            )
-        )
+        (relative, module)
+        for relative, imports in _root_imports_by_path().items()
+        if not relative.startswith("agent/")
+        for module in imports
+        if module == "agent" or module.startswith("agent.")
     }
 
 
 def test_agent_internal_modules_import_concrete_owners():
-    facades = {
-        "agent.biological_interpretation",
-        "agent.cell_quality",
-        "agent.data_enrichment",
-        "agent.decisions",
-        "agent.experimental_context",
-        "agent.hypotheses",
-        "agent.parameter_tuning",
-        "agent.persistence",
-        "agent.report",
-    }
     violations: set[tuple[str, str]] = set()
     agent_root = _SCARF_ROOT / "agent"
     for path in agent_root.rglob("*.py"):
-        if path == agent_root / "__init__.py" or path.name == "__init__.py":
+        if path.name == "__init__.py":
             continue
         for module in _runtime_import_modules(path):
-            if module in facades:
+            if module == "agent":
                 violations.add((path.relative_to(agent_root).as_posix(), module))
 
     assert violations == set()

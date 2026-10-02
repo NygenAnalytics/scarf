@@ -527,7 +527,7 @@ def test_retired_merge_names_are_absent():
 
 
 def test_retired_loom_names_are_absent():
-    from importlib.util import find_spec
+    from importlib import import_module
 
     import scarf
     import scarf.readers as readers_module
@@ -541,7 +541,11 @@ def test_retired_loom_names_are_absent():
         "scarf.writers.loom",
         "scarf.agent.ingest.loom",
     ):
-        assert find_spec(module_name) is None
+        with pytest.raises(ModuleNotFoundError) as missing:
+            import_module(module_name)
+        assert missing.value.name == module_name or module_name.startswith(
+            f"{missing.value.name}."
+        )
 
 
 def test_retired_dask_names_are_absent():
