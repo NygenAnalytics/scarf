@@ -1,10 +1,13 @@
 """Milestone C: MetaData.iter_row_blocks parity and make_bulk cell_key semantics."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 
 from scarf.datastore._operations.features import _aligned_feature_labels
 from scarf.metadata.artifacts import artifact_values
+from scarf.metadata.rows import metadata_column_fingerprint
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.utils.logging import logger
 
@@ -12,6 +15,22 @@ _PSEUDO_REP_WARNING = (
     "make_bulk with pseudo_reps > 1 randomly splits cells within each "
     "group into descriptive resamples"
 )
+
+
+def test_metric_fingerprint_changes_when_only_missing_mask_changes() -> None:
+    values = np.asarray([1.0, 2.0, 3.0])
+    missing = np.asarray([False, False, False])
+    metadata = SimpleNamespace(
+        N=3,
+        _get_array=lambda _column: values,
+        default_block_rows=lambda _column: 2,
+        _get_missing_mask_array=lambda _column: missing,
+    )
+    first = metadata_column_fingerprint(metadata, "age")
+    missing[1] = True
+    assert metadata_column_fingerprint(metadata, "age") != first
+    missing[1] = False
+    assert metadata_column_fingerprint(metadata, "age") == first
 
 
 def test_iter_row_blocks_matches_active_index_and_fetch(datastore):

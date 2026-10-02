@@ -15,6 +15,7 @@ from threadpoolctl import threadpool_limits
 from scarf.utils import configure_output, logger
 
 pytest_plugins = [
+    "tests.fixtures_agent",
     "tests.fixtures_downloader",
     "tests.fixtures_readers",
     "tests.fixtures_datastore",
