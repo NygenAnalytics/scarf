@@ -660,7 +660,16 @@ def test_agent_support_modules_keep_narrow_dependencies():
         "prompts": set(),
         "records": set(),
         "provider": {"agent.models", "agent.prompts", "agent.records"},
-        "rendering": {"agent.records"},
+        "rendering": {"agent.records", "agent.report_charts", "agent.report_html"},
+        "report_html": {
+            "agent.report_assets",
+            "agent.report_style",
+            "agent.report_text",
+        },
+        "report_assets": set(),
+        "report_charts": set(),
+        "report_style": set(),
+        "report_text": set(),
     }
     for name, allowed in allowed_imports.items():
         path = _SCARF_ROOT / "agent" / f"{name}.py"
