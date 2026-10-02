@@ -193,6 +193,25 @@ class TestNumpySemantics:
         assert mean.shape == std.shape == (3,)
         assert np.isnan(mean).all() and np.isnan(std).all()
 
+    def test_sum_accumulates_in_a_requested_dtype(self):
+        # Above 2**24 float32 holds only even integers, so its own sums round
+        # the odd totals that a float64 accumulator keeps.
+        values = np.array([[2.0**24, 1.0], [1.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        ca = ChunkedArray.from_numpy(values, block_size=1)
+        for axis in (None, 0, 1):
+            actual = ca.sum(axis=axis, dtype=np.float64).compute()
+            assert actual.dtype == np.float64
+            np.testing.assert_array_equal(
+                actual, values.sum(axis=axis, dtype=np.float64)
+            )
+        assert ca.sum(axis=0).compute().dtype == np.float32
+        empty = ca[np.array([], dtype=np.int64), :]
+        for axis in (0, 1):
+            expected = values[:0].sum(axis=axis, dtype=np.int64)
+            actual = empty.sum(axis=axis, dtype=np.int64).compute()
+            assert actual.dtype == expected.dtype
+            np.testing.assert_array_equal(actual, expected)
+
     def test_reduction_axes_are_validated(self):
         values = np.arange(6, dtype=np.float64).reshape(2, 3)
         ca = ChunkedArray.from_numpy(values)

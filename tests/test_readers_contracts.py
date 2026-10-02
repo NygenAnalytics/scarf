@@ -28,6 +28,7 @@ _PUBLIC_CLASS_METHODS = {
     CrReader: (
         "__init__",
         "consume",
+        "count_value_ranges",
         "rename_assays",
         "reclassify_features",
         "feature_ids",
@@ -39,6 +40,7 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "cell_names",
         "consume",
+        "count_value_ranges",
         "close",
     ),
     CrDirReader: ("__init__",),
@@ -52,6 +54,7 @@ _PUBLIC_CLASS_METHODS = {
         "get_feat_columns",
         "feature_types",
         "assay_feature_slices",
+        "count_value_ranges",
         "consume_dataset",
         "consume_group",
         "consume",
@@ -65,6 +68,7 @@ _PUBLIC_CLASS_METHODS = {
     MtxReader: (
         "__init__",
         "consume",
+        "count_value_ranges",
         "close",
     ),
     SeuratReader: (
@@ -75,12 +79,12 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
-    CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
+    CrReader: "0237d8e7c63b64fb6526f3536d5f65c1d704fe56675bf38b41644be419a5607f",
+    CrH5Reader: "1883e2430d73bad3aeaa564c2478292207f9fe9c8829a0215ad120d54f4f0f85",
     CrDirReader: "d1d6697ba86d1e34aeb3e176ba84000e4fc50267176cec6f922ef696050b40dc",
-    H5adReader: "d8556a75fb03793e802e86bf87a07f0097d1337e55700edd9af68ec7212a2e28",
+    H5adReader: "fa58572c84f63409dbdfef77a614c0ec6dd06ecb9501e1694f3d16881abb8836",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
-    MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
+    MtxReader: "2f21dbdf80ba9554aacd7fd8405c4f838a512e0b83c20038ee6a2e41cfa69cbe",
     SeuratReader: "c51148f751a74072c2f79448a4b6a25f0dc0c52b0abfbe837fb1b9e0c667368c",
 }
 _MODULE_SIGNATURE_DIGEST = (

@@ -258,8 +258,9 @@ def test_marker_results_on_strip_counts_t():
         feat_idx=np.arange(values.shape[1], dtype=np.int64),
         nthreads=1,
     )
-    assert set(results) == {"a", "b"}
-    assert len(results["a"]) == 4
+    np.testing.assert_array_equal(results.group_ids, ["a", "b"])
+    np.testing.assert_array_equal(results.feature_index, np.arange(4))
+    assert len(results.table("a", np.asarray(assay.feats.fetch_all("names")))) == 4
 
 
 def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
@@ -281,10 +282,10 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
     assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     original = feature_stream.map_feature_read_groups
-    ordered_calls: list[bool] = []
+    stream_calls: list[np.ndarray] = []
 
     def checked_map(*args, **kwargs):
-        ordered_calls.append(bool(kwargs.get("orderedCompute")))
+        stream_calls.append(np.asarray(kwargs["feat_idx"]))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(feature_stream, "map_feature_read_groups", checked_map)
@@ -300,7 +301,8 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
     assert batches
     joined = np.concatenate([batch.to_numpy() for batch in batches], axis=1)
     assert joined.shape[0] == 4
-    assert ordered_calls == [True]
+    assert len(stream_calls) == 1
+    np.testing.assert_array_equal(stream_calls[0], np.arange(values.shape[1]))
     np.testing.assert_array_equal(
         np.concatenate([batch.columns.to_numpy() for batch in batches]),
         np.arange(values.shape[1]),
@@ -378,21 +380,12 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
     )
     assert sum(batch.shape[1] for batch in wide) == values.shape[1]
 
-    assay.rawDataT = None
-    with pytest.raises(ValueError, match="requires sharded countsT"):
-        list(
-            assay.iter_normed_feature_wise(
-                cell_idx=np.arange(values.shape[0], dtype=np.int64),
-                feat_idx=np.arange(values.shape[1], dtype=np.int64),
-                batch_size=1,
-                msg=None,
-            )
-        )
-
 
 def test_iter_normed_feature_wise_splits_read_groups_to_fit_consumer_scratch():
-    from scarf.storage.feature_stream import persisted_read_group
-    from scarf.storage.geometry import array_geometry
+    from scarf.storage.feature_stream import (
+        persisted_read_group,
+        read_group_stream_floor,
+    )
 
     root = _memory_root()
     values = (np.arange(40 * 24, dtype=np.uint32) % 11).reshape(40, 24)
@@ -407,13 +400,10 @@ def test_iter_normed_feature_wise_splits_read_groups_to_fit_consumer_scratch():
     expected = 1000.0 * values[:, feat_idx] / n_counts[:, None]
 
     counts_t = assay.rawDataT
-    feature_width, read_group_bytes = persisted_read_group(counts_t)
+    feature_width, _ = persisted_read_group(counts_t)
     assert feature_width >= values.shape[1]
-    geometry = array_geometry(counts_t)
-    reader_bytes = read_group_bytes + (
-        min(values.shape[1], max(feature_width, geometry.axisChunk(0)))
-        * min(geometry.axisChunk(1), values.shape[0])
-        * 4
+    reader_bytes = read_group_stream_floor(
+        counts_t, cell_idx=cell_idx, feat_idx=feat_idx
     )
     resident_bytes = 4 * values.shape[0] + 8 * values.shape[1]
     scratch_itemsize = 64
@@ -1096,12 +1086,7 @@ def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
     counts = root["RNA/counts"]
     counts[:] = values
     finalize_test_counts(counts)
-    write_counts_t(
-        counts,
-        root["RNA"],
-        resources=ResourceBudget(1024**3, 2),
-        policy=policy,
-    )
+    write_counts_t(counts, root["RNA"], resources=ResourceBudget(1024**3, 2))
     ok = assess_counts_t_reuse(
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )

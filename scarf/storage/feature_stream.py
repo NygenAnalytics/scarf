@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequen
 from concurrent.futures import Future
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, TypeVar
 
 import numpy as np
@@ -170,7 +171,12 @@ def plan_feature_stream(
     residentBytes: int = 0,
     requestedBatchSize: int | None = None,
 ) -> FeatureStreamPlan:
-    """Plan variable-width feature blocks from physical chunk geometry."""
+    """Plan variable-width feature blocks from physical chunk geometry.
+
+    A block is one Zarr read of the selected cells and its features.
+    ``blockBytes`` counts what the caller holds for a block, its read's result
+    included, and the plan adds what the read holds beside the result.
+    """
     feature_axis = _axis(featureAxis, name="featureAxis")
     cell_axis = _axis(cellAxis, name="cellAxis")
     if feature_axis == cell_axis:
@@ -196,10 +202,34 @@ def plan_feature_stream(
             f"{resources.memoryBytes} bytes"
         )
 
-    decode_bytes = geometry.nominalChunkBytes()
+    n_cells = int(cell_indices.size)
+    cell_chunks = -(-geometry.axisShard(cell_axis) // geometry.axisChunk(cell_axis))
+    feature_chunks = -(
+        -geometry.axisShard(feature_axis) // geometry.axisChunk(feature_axis)
+    )
+    per_chunk = np.bincount(geometry.binOf(feature_axis, feature_indices))
+    # A block spans at most as many chunks as the fewest selected features
+    # per chunk that add up to its width.
+    smallest_first = np.cumsum(np.sort(per_chunk[per_chunk > 0]))
 
-    def fits(width: int) -> bool:
-        return _owned_bytes(blockBytes, width) + decode_bytes <= available
+    def read_bytes(width: int, bins: int | None = None) -> tuple[int, int]:
+        """Return what a block read holds beside its result, and per decode.
+
+        Each concurrent decode can hold the compressed bytes of the chunks the
+        block touches in its own shard, over ``bins`` feature chunks or as
+        many as ``width`` features can span.
+        """
+        if bins is None:
+            bins = max(1, int(np.searchsorted(smallest_first, width, side="right")))
+        result = n_cells * width * geometry.itemsize
+        chunks = cell_chunks * min(bins, feature_chunks)
+        decode = geometry.readBytes(0, chunks, decodes=1)
+        return geometry.readBytes(result, chunks, decodes=1) - result - decode, decode
+
+    def fits(width: int, bins: int | None = None) -> bool:
+        return (
+            _owned_bytes(blockBytes, width) + sum(read_bytes(width, bins)) <= available
+        )
 
     if feature_indices.size == 0:
         return FeatureStreamPlan(
@@ -218,7 +248,7 @@ def plan_feature_stream(
             feature_indices,
             maxWidth=requested,
         )
-        if any(not fits(block.indices.size) for block in blocks):
+        if any(not fits(block.indices.size, len(block.bins)) for block in blocks):
             raise MemoryError(
                 f"Requested feature batch width {requested} does not fit; "
                 f"the affordable width is {affordable_width(fits, requested)}"
@@ -231,7 +261,13 @@ def plan_feature_stream(
             fits=fits,
         )
 
-    block_bytes = max(_owned_bytes(blockBytes, block.indices.size) for block in blocks)
+    copy_bytes, decode_bytes = read_bytes(
+        max(block.indices.size for block in blocks),
+        max(len(block.bins) for block in blocks),
+    )
+    block_bytes = copy_bytes + max(
+        _owned_bytes(blockBytes, block.indices.size) for block in blocks
+    )
     admission = admit_stream(
         resources,
         nBlocks=len(blocks),
@@ -304,10 +340,9 @@ def _feature_group_ranges(
     n_feats = int(geometry.shape[0])
     group_width = max(1, int(featureWidth))
     merged: list[tuple[int, int]] = []
+    # Chunk starts ascend, so each starts at or after the previous group's end.
     for start in selected_feature_chunk_starts(array, feat_idx):
         feat_end = min(start + geometry.axisChunk(0), n_feats)
-        if merged and start < merged[-1][1]:
-            continue
         if (
             merged
             and start == merged[-1][1]
@@ -351,6 +386,7 @@ def _plan_feature_consume(
     scratchBytes: int = 0,
     innerReadBytes: int = 0,
     maxInnerReads: int | None = None,
+    maxUnitsInFlight: int | None = None,
     chunksPerShard: int = 1,
     ordered: bool,
 ) -> OperationPlan:
@@ -362,6 +398,7 @@ def _plan_feature_consume(
             scratchBytes=max(0, int(scratchBytes)),
             innerReadBytes=max(0, int(innerReadBytes)),
             maxInnerReads=maxInnerReads,
+            maxUnitsInFlight=maxUnitsInFlight,
             ordered=ordered,
             writes=False,
             chunksPerShard=max(1, int(chunksPerShard)),
@@ -431,9 +468,12 @@ def _iter_bounded_handoff(
             if entry is sentinel:
                 break
             item, released = entry
+            del entry
             try:
                 yield item
             finally:
+                # The producer may free the item's buffers once it is released.
+                del item
                 released.set_result(None)
     finally:
         stop.set()
@@ -482,6 +522,119 @@ def _selected_cell_bands(
     return bands
 
 
+def _touched_chunks(geometry: ArrayGeometry, n_features: int) -> int:
+    """Return the inner chunks that one cell band of a feature group touches.
+
+    Feature groups start at a chunk boundary and every band is one cell chunk.
+    """
+    return max(1, -(-int(n_features) // geometry.axisChunk(0)))
+
+
+@dataclass(frozen=True, slots=True)
+class _CellSelection:
+    """Selected cells of one stream and the bands they fall in."""
+
+    cells: np.ndarray
+    bands: list[tuple[int, int, np.ndarray, np.ndarray]]
+    indexBytes: int
+
+
+def _cell_selection(
+    geometry: ArrayGeometry, cell_idx: np.ndarray | None
+) -> _CellSelection:
+    """Split the selected cells into cell bands and count their index bytes.
+
+    The bands hold a local and a destination index for every selected cell,
+    and the stream also owns the selected cells when it creates them.
+    """
+    n_cells = int(geometry.shape[1])
+    if cell_idx is None:
+        cells = np.arange(n_cells, dtype=np.int64)
+    else:
+        cells = np.asarray(cell_idx, dtype=np.int64)
+        if cells.size and (int(cells.min()) < 0 or int(cells.max()) >= n_cells):
+            raise IndexError("cell_idx contains an out-of-range index")
+    bands = _selected_cell_bands(
+        cells, n_cells=n_cells, cell_chunk=geometry.axisChunk(1)
+    )
+    index_bytes = sum(
+        int(local.nbytes) + int(destinations.nbytes)
+        for _start, _end, local, destinations in bands
+    )
+    if cells is not cell_idx:
+        index_bytes += int(cells.nbytes)
+    return _CellSelection(cells=cells, bands=bands, indexBytes=index_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadGroupLayout:
+    """Read groups of one stream and the bytes its plan reserves for them.
+
+    ``unitBytes`` is the destination of the widest group over the selected
+    cells, and ``readBytes`` what one band read of that group holds while
+    Zarr decodes it.
+    """
+
+    geometry: ArrayGeometry
+    groups: list[tuple[int, int]]
+    selection: _CellSelection
+    featureWidth: int
+    readGroupBytes: int
+    bandBytes: int
+    unitBytes: int
+    readBytes: int
+
+
+def _read_group_layout(
+    array: Any,
+    *,
+    cell_idx: np.ndarray | None,
+    feat_idx: Sequence[int] | np.ndarray | None,
+) -> _ReadGroupLayout | None:
+    geometry = _plane(array)
+    feature_width, read_group_bytes = persisted_read_group(array)
+    groups = _feature_group_ranges(array, feat_idx=feat_idx, featureWidth=feature_width)
+    if not groups:
+        return None
+    selection = _cell_selection(geometry, cell_idx)
+    widest = max(feat_end - feat_start for feat_start, feat_end in groups)
+    band_cells = max(
+        (cell_end - cell_start for cell_start, cell_end, _l, _d in selection.bands),
+        default=0,
+    )
+    band_bytes = widest * band_cells * geometry.itemsize
+    return _ReadGroupLayout(
+        geometry=geometry,
+        groups=groups,
+        selection=selection,
+        featureWidth=feature_width,
+        readGroupBytes=read_group_bytes,
+        bandBytes=band_bytes,
+        unitBytes=widest * int(selection.cells.shape[0]) * geometry.itemsize,
+        readBytes=geometry.readBytes(band_bytes, _touched_chunks(geometry, widest)),
+    )
+
+
+def read_group_stream_floor(
+    counts_t: Any,
+    *,
+    cell_idx: np.ndarray | None = None,
+    feat_idx: Sequence[int] | np.ndarray | None = None,
+) -> int:
+    """Return the fewest bytes ``map_feature_read_groups`` reserves.
+
+    That is one read group gathered over the selected cells, one band read in
+    flight, and the stream's band indices. Callers that size their own
+    buffers up front leave this much of the budget to the stream.
+    """
+    layout = _read_group_layout(
+        as_zarr_array(counts_t), cell_idx=cell_idx, feat_idx=feat_idx
+    )
+    if layout is None:
+        return 0
+    return layout.unitBytes + layout.readBytes + layout.selection.indexBytes
+
+
 def _stream_units(
     units: Sequence[Any],
     load: Callable[[AsyncStorageRunner, int, Any], AbstractAsyncContextManager[Any]],
@@ -497,8 +650,9 @@ def _stream_units(
     """Load, process, and hand off units in order with bounded read-ahead.
 
     ``load`` holds its buffer reservations until the unit's result has been
-    handed off. With ``orderedCompute`` the units are processed in order;
-    otherwise results arrive in completion order.
+    handed off, and the stream drops its own references to the unit and the
+    result before ``load`` releases them. With ``orderedCompute`` the units
+    are processed in order; otherwise results arrive in completion order.
     """
     in_flight = plan.readWorkers
     fetch_seconds = 0.0
@@ -528,13 +682,8 @@ def _stream_units(
                 nonlocal next_idx, fetch_seconds, compute_seconds
                 nonlocal compute_wait_seconds, units_completed
                 if stop.is_set():
-                    # Ordered units still take their turn so later ones proceed.
-                    if orderedCompute:
-                        async with turn:
-                            while next_idx != idx:
-                                await turn.wait()
-                            next_idx += 1
-                            turn.notify_all()
+                    # Units start in order, so every later unit also sees the
+                    # stop request and none of them waits for this one's turn.
                     return
                 async with load(runner, idx, unit) as item:
                     fetch_seconds += item.readSec
@@ -545,16 +694,17 @@ def _stream_units(
                                 await turn.wait()
                             compute_wait_seconds += time.perf_counter() - wait_started
                             compute_started = time.perf_counter()
-                            result = await runner.compute(lambda: process(item))
+                            result = await runner.compute(partial(process, item))
                             compute_seconds += time.perf_counter() - compute_started
                             await deliver(result)
                             next_idx += 1
                             turn.notify_all()
                     else:
                         compute_started = time.perf_counter()
-                        result = await runner.compute(lambda: process(item))
+                        result = await runner.compute(partial(process, item))
                         compute_seconds += time.perf_counter() - compute_started
                         await deliver(result)
+                    del item, result
                     units_completed += 1
                     if progress_bar is not None:
                         progress_bar.update(1)
@@ -612,137 +762,114 @@ def map_feature_read_groups(
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
     scratchBytes: int = 0,
-    extraItemsize: int = 0,
-    orderedCompute: bool = False,
 ) -> Iterator[T]:
-    """Map ``process`` over persisted read groups with bounded handoff."""
-    array = as_zarr_array(counts_t)
-    geometry = _plane(array)
-    _n_feats, n_cells = (int(value) for value in geometry.shape)
-    feat_chunk = geometry.axisChunk(0)
-    cell_chunk = geometry.axisChunk(1)
-    feature_width, read_group_bytes = persisted_read_group(array)
-    merged = _feature_group_ranges(
-        array,
-        feat_idx=feat_idx,
-        featureWidth=feature_width,
-    )
-    if not merged:
-        return iter(())
+    """Map ``process`` over persisted read groups in order with bounded handoff.
 
-    if cell_idx is None:
-        selected_cells = np.arange(n_cells, dtype=np.int64)
-    else:
-        selected_cells = np.asarray(cell_idx, dtype=np.int64)
-    n_selected = int(selected_cells.shape[0])
+    A read group holds every selected cell, so one compute worker processes
+    the groups one at a time while the next group is read. The plan reserves
+    each group's destination over the selected cells, what each band read
+    holds while Zarr decodes it, the stream's band indices, and
+    ``scratchBytes`` for the caller.
+    """
+    array = as_zarr_array(counts_t)
+    layout = _read_group_layout(array, cell_idx=cell_idx, feat_idx=feat_idx)
+    if layout is None:
+        return iter(())
+    geometry = layout.geometry
+    merged = layout.groups
+    bands = layout.selection.bands
+    n_selected = int(layout.selection.cells.shape[0])
     budget = resources or resolve_budget()
     resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     itemsize = geometry.itemsize
-    bands = _selected_cell_bands(
-        selected_cells,
-        n_cells=n_cells,
-        cell_chunk=cell_chunk,
-    )
     requested_chunk_reads = (
         int(resolved_io.readWorkers)
         if resolved_io.readWorkers is not None
         else auto_read_width(budget.workers)
     )
-    compute_width = (
-        1
-        if orderedCompute
-        else min(
-            budget.workers,
-            int(resolved_io.computeWorkers or budget.workers),
-        )
-    )
-    requested_group_reads = min(
-        requested_chunk_reads,
-        max(1, 2 * compute_width),
-    )
+    # One group is processed while the next one is read, and the band reads
+    # of the groups in flight share the requested read width.
+    requested_group_reads = min(requested_chunk_reads, 2)
     available_group_reads = max(1, min(len(merged), requested_group_reads))
     requested_inner_reads = min(
         max(1, len(bands)),
         max(1, math.ceil(requested_chunk_reads / available_group_reads)),
     )
-    group_io = StorageIoPolicy(
-        readWorkers=requested_group_reads,
+    chunk_io = StorageIoPolicy(
+        readWorkers=requested_chunk_reads,
         computeWorkers=resolved_io.computeWorkers,
         writeWorkers=resolved_io.writeWorkers,
     )
-    max_band_bytes = max(
-        (
-            (feat_end - feat_start) * (cell_end - cell_start) * itemsize
-            for feat_start, feat_end in merged
-            for cell_start, cell_end, _local, _destinations in bands
-        ),
-        default=1,
-    )
-    if extraItemsize < 0:
-        raise ValueError("extraItemsize must not be negative")
-    extra_itemsize = operator.index(extraItemsize)
-    extra_unit_bytes = extra_itemsize * feature_width * n_selected
     plan = _plan_feature_consume(
         budget,
-        io=group_io,
+        io=chunk_io,
         nUnits=len(merged),
-        unitBytes=read_group_bytes + extra_unit_bytes,
-        scratchBytes=scratchBytes,
-        innerReadBytes=max_band_bytes,
+        unitBytes=layout.unitBytes,
+        scratchBytes=scratchBytes + layout.selection.indexBytes,
+        innerReadBytes=layout.readBytes,
         maxInnerReads=requested_inner_reads,
-        chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-        ordered=orderedCompute,
+        maxUnitsInFlight=requested_group_reads,
+        chunksPerShard=max(1, geometry.axisShard(0) // geometry.axisChunk(0)),
+        ordered=True,
     )
     source = array.async_array
+
+    async def read_group(
+        runner: AsyncStorageRunner, idx: int, feat_start: int, feat_end: int
+    ) -> FeatureReadGroup:
+        n_local = feat_end - feat_start
+        chunks = _touched_chunks(geometry, n_local)
+        dest = np.empty((n_local, n_selected), dtype=array.dtype)
+
+        async def read_band(
+            cell_start: int,
+            cell_end: int,
+            local: np.ndarray,
+            destinations: np.ndarray,
+        ) -> float:
+            read_bytes = geometry.readBytes(
+                n_local * (cell_end - cell_start) * itemsize, chunks
+            )
+            async with runner.read_lane():
+                async with runner.reserve_bytes(read_bytes):
+                    started = time.perf_counter()
+                    block = np.asarray(
+                        await runner.io(
+                            source.getitem(
+                                (
+                                    slice(feat_start, feat_end),
+                                    slice(cell_start, cell_end),
+                                )
+                            )
+                        )
+                    )
+                    read_seconds = time.perf_counter() - started
+                    await runner.offload(
+                        partial(_copy_band, dest, block, local, destinations)
+                    )
+                    del block
+            return read_seconds
+
+        read_seconds = sum(await asyncio.gather(*(read_band(*band) for band in bands)))
+        return FeatureReadGroup(
+            featStart=int(feat_start),
+            featEnd=int(feat_end),
+            values=dest,
+            readSec=read_seconds,
+            blockBytes=int(dest.nbytes),
+            unitIndex=idx,
+        )
 
     @asynccontextmanager
     async def load(
         runner: AsyncStorageRunner, idx: int, unit: tuple[int, int]
     ) -> AsyncIterator[FeatureReadGroup]:
         feat_start, feat_end = unit
-        n_local = feat_end - feat_start
-        extra_live = extra_itemsize * n_local * n_selected
-        destination_bytes = max(1, n_local * n_selected * itemsize + extra_live)
-        async with runner.reserve_bytes(destination_bytes):
-            dest = np.empty((n_local, n_selected), dtype=array.dtype)
-
-            async def read_band(
-                cell_start: int,
-                cell_end: int,
-                local: np.ndarray,
-                destinations: np.ndarray,
-            ) -> float:
-                read_bytes = n_local * (cell_end - cell_start) * itemsize
-                async with runner.read_lane():
-                    async with runner.reserve_bytes(read_bytes):
-                        started = time.perf_counter()
-                        block = np.asarray(
-                            await runner.io(
-                                source.getitem(
-                                    (
-                                        slice(feat_start, feat_end),
-                                        slice(cell_start, cell_end),
-                                    )
-                                )
-                            )
-                        )
-                        read_seconds = time.perf_counter() - started
-                        await asyncio.to_thread(
-                            _copy_band, dest, block, local, destinations
-                        )
-                return read_seconds
-
-            read_seconds = sum(
-                await asyncio.gather(*(read_band(*band) for band in bands))
-            )
-            yield FeatureReadGroup(
-                featStart=int(feat_start),
-                featEnd=int(feat_end),
-                values=dest,
-                readSec=read_seconds,
-                blockBytes=int(dest.nbytes),
-                unitIndex=idx,
-            )
+        destination_bytes = (feat_end - feat_start) * n_selected * itemsize
+        async with runner.reserve_bytes(max(1, destination_bytes)):
+            group = await read_group(runner, idx, feat_start, feat_end)
+            yield group
+            del group
 
     return _stream_units(
         merged,
@@ -750,7 +877,7 @@ def map_feature_read_groups(
         process,
         plan=plan,
         unitKind="countsTReadGroup",
-        orderedCompute=orderedCompute,
+        orderedCompute=True,
         progress=progress,
         metrics=metrics,
         details={
@@ -758,10 +885,11 @@ def map_feature_read_groups(
             "effectiveGroupsInFlight": plan.readWorkers,
             "requestedChunkReadsInFlight": requested_chunk_reads,
             "effectiveChunkReadsInFlight": plan.readWorkers * plan.innerReads,
-            "readGroupBytes": read_group_bytes,
-            "cellBandBytes": max_band_bytes,
+            "readGroupBytes": layout.readGroupBytes,
+            "cellBandBytes": layout.bandBytes,
+            "cellBandReadBytes": layout.readBytes,
             "cellBandCount": len(bands),
-            "featureWidth": feature_width,
+            "featureWidth": layout.featureWidth,
         },
     )
 
@@ -780,12 +908,15 @@ def map_feature_cell_bands(
     orderedCompute: bool = True,
     cellMajorOrder: bool = False,
 ) -> Iterator[T]:
-    """Map ``process`` over cell-band slices in deterministic traversal order."""
+    """Map ``process`` over cell-band slices in deterministic traversal order.
+
+    A band stays reserved from its read until its result has been handed off,
+    so the plan charges what the read holds while Zarr decodes it, together
+    with the stream's band and row indices and ``scratchBytes`` for the caller.
+    """
     array = as_zarr_array(counts_t)
     geometry = _plane(array)
-    n_feats, n_cells = (int(value) for value in geometry.shape)
-    feat_chunk = geometry.axisChunk(0)
-    cell_chunk = geometry.axisChunk(1)
+    n_feats = int(geometry.shape[0])
     feature_width, read_group_bytes = persisted_read_group(array)
     merged = _feature_group_ranges(
         array,
@@ -795,16 +926,8 @@ def map_feature_cell_bands(
     if not merged:
         return iter(())
     sparse_rows = _sparse_group_rows(merged, feat_idx, n_feats=n_feats)
-
-    if cell_idx is None:
-        selected_cells = np.arange(n_cells, dtype=np.int64)
-    else:
-        selected_cells = np.asarray(cell_idx, dtype=np.int64)
-    bands = _selected_cell_bands(
-        selected_cells,
-        n_cells=n_cells,
-        cell_chunk=cell_chunk,
-    )
+    selection = _cell_selection(geometry, cell_idx)
+    bands = selection.bands
     if cellMajorOrder:
         work = [
             (feat_start, feat_end, cell_start, cell_end, local, destinations)
@@ -823,17 +946,21 @@ def map_feature_cell_bands(
     budget = resources or resolve_budget()
     resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     itemsize = geometry.itemsize
-    max_band_bytes = max(
-        (feat_end - feat_start) * (cell_end - cell_start) * itemsize
-        for feat_start, feat_end, cell_start, cell_end, _local, _destinations in work
+    widest = max(feat_end - feat_start for feat_start, feat_end in merged)
+    max_band_bytes = (
+        widest
+        * max(cell_end - cell_start for cell_start, cell_end, _l, _d in bands)
+        * itemsize
     )
     plan = _plan_feature_consume(
         budget,
         io=resolved_io,
         nUnits=len(work),
-        unitBytes=max_band_bytes,
-        scratchBytes=scratchBytes,
-        chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
+        unitBytes=geometry.readBytes(max_band_bytes, _touched_chunks(geometry, widest)),
+        scratchBytes=scratchBytes
+        + selection.indexBytes
+        + sum(int(rows.nbytes) for rows in sparse_rows.values()),
+        chunksPerShard=max(1, geometry.axisShard(0) // geometry.axisChunk(0)),
         ordered=orderedCompute,
     )
     source = array.async_array
@@ -844,7 +971,10 @@ def map_feature_cell_bands(
     ) -> AsyncIterator[FeatureCellBand]:
         feat_start, feat_end, cell_start, cell_end, local, destinations = unit
         n_local = feat_end - feat_start
-        read_bytes = max(1, n_local * (cell_end - cell_start) * itemsize)
+        read_bytes = geometry.readBytes(
+            n_local * (cell_end - cell_start) * itemsize,
+            _touched_chunks(geometry, n_local),
+        )
         rows = sparse_rows.get((feat_start, feat_end))
         async with runner.reserve_bytes(read_bytes):
             async with runner.read_lane():
@@ -876,6 +1006,7 @@ def map_feature_cell_bands(
                 unitIndex=idx,
                 rows=rows,
             )
+            del block
 
     return _stream_units(
         work,

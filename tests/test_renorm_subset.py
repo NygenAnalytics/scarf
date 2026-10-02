@@ -10,21 +10,21 @@ from scarf.writers import write_renorm_subset_to_zarr
 
 
 @pytest.mark.parametrize(
-    "dtype", ["uint8", "uint16", "uint32", "uint64", "float32", "float64"]
+    "dtype",
+    ["bool", "uint8", "uint16", "uint32", "uint64", "int32", "float32", "float64"],
 )
-def test_count_normalization_limits_promoted_work_arrays(dtype):
+def test_count_normalization_allocates_only_its_output_and_row_totals(dtype):
     from scarf.assay.normalization import _normalize_count_block
 
-    values = np.random.default_rng(34).integers(0, 20, size=(10_000, 64)).astype(dtype)
-    totals = values.sum(axis=1)
-    expected = np.log1p(1000.0 * values / totals[:, None]).astype(np.float32)
-    allocation_limit = (
-        expected.nbytes
-        + values.size * max(8, values.dtype.itemsize)
-        + len(values) * (max(8, totals.dtype.itemsize) + 1)
-        + 128 * 1024
-    )
-    # Compile the integer kernel before tracing the steady-state allocations.
+    counts = np.random.default_rng(34).integers(0, 20, size=(10_000, 64))
+    values = counts > 9 if dtype == "bool" else counts.astype(dtype)
+    widened = values.astype(np.float64)
+    totals = widened.sum(axis=1)
+    totals[totals == 0] = 1
+    expected = np.log1p(1000.0 * widened / totals[:, None]).astype(np.float32)
+    # The float32 output plus float64 row totals and their zero mask.
+    allocation_limit = expected.nbytes + len(values) * (8 + 1) + 128 * 1024
+    # Compile the kernel for this dtype before tracing the steady-state allocations.
     _normalize_count_block(values[:1], scaleFactor=1000.0, logTransform=True)
     tracemalloc.start()
     try:
@@ -43,7 +43,8 @@ def _subset_indices(rna):
 
 
 def _reference_renorm_subset(rna, cell_idx, feat_idx, log_transform=False):
-    raw = rna.rawData[cell_idx, :][:, feat_idx].compute()
+    """Return the float32 rounding of the float64 subset normalization."""
+    raw = rna.rawData[cell_idx, :][:, feat_idx].compute().astype(np.float64)
     row_sum = raw.sum(axis=1)
     row_sum[row_sum == 0] = 1
     out = rna.sf * raw / row_sum[:, np.newaxis]
@@ -73,7 +74,7 @@ def test_write_renorm_subset_matches_reference(toy_crdir_ds):
     )
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx)
     written = rna.z[f"{loc}/data"][:]
-    np.testing.assert_allclose(written, expected, rtol=1e-5)
+    np.testing.assert_array_equal(written, expected)
 
 
 def test_write_renorm_subset_log_transform(toy_crdir_ds):
@@ -93,7 +94,7 @@ def test_write_renorm_subset_log_transform(toy_crdir_ds):
     )
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx, log_transform=True)
     written = rna.z[f"{loc}/data"][:]
-    np.testing.assert_allclose(written, expected, rtol=1e-5)
+    np.testing.assert_array_equal(written, expected)
 
 
 def test_run_normalization_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
@@ -117,10 +118,9 @@ def test_run_normalization_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
     )
     assert called["normed"] == 0
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx)
-    np.testing.assert_allclose(
+    np.testing.assert_array_equal(
         artifact_group(toy_crdir_ds.zw, normalized)["data"][:],
         expected,
-        rtol=1e-5,
     )
 
 

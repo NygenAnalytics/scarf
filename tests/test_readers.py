@@ -172,12 +172,13 @@ def test_crdir_reader_filters_and_streams_selected_barcodes(tmp_path):
             [
                 "%%MatrixMarket matrix coordinate integer general",
                 "% tiny deterministic matrix",
-                "3 4 5",
-                "1 1 2",
-                "2 1 3",
-                "1 2 6",
+                "3 4 6",
+                "1 1 200",
+                "2 1 101",
+                "1 2 250",
+                "3 2 60",
                 "3 3 1",
-                "2 4 4",
+                "2 4 300",
             ]
         )
         + "\n"
@@ -186,20 +187,23 @@ def test_crdir_reader_filters_and_streams_selected_barcodes(tmp_path):
     reader = CrDirReader(
         str(tmp_path),
         is_filtered=False,
-        filtering_cutoff=4,
+        filtering_cutoff=300,
     )
 
     np.testing.assert_array_equal(reader.validBarcodeIdx, np.array([0, 1]))
     assert reader.nCells == 2
     assert reader.nFeatures == 3
-    assert reader.matrixEntryCount == 5
+    assert reader.matrixEntryCount == 6
     assert reader.cell_names() == ["b1", "b2"]
+    # The background barcode's 300 is not kept, so its dtype is not needed.
+    assert reader.count_value_ranges(0)[0].maximum == 250
+    assert reader.matrix_dtype == np.uint8
 
-    chunks = list(reader.consume(batch_size=1, lines_in_mem=2, dtype=np.uint16))
+    chunks = list(reader.consume(batch_size=1, lines_in_mem=2))
     assert [chunk.shape for chunk in chunks] == [(1, 3), (1, 3)]
-    assert all(chunk.dtype == np.uint16 for chunk in chunks)
-    np.testing.assert_array_equal(chunks[0].toarray(), [[2, 3, 0]])
-    np.testing.assert_array_equal(chunks[1].toarray(), [[6, 0, 0]])
+    assert all(chunk.dtype == np.uint8 for chunk in chunks)
+    np.testing.assert_array_equal(chunks[0].toarray(), [[200, 101, 0]])
+    np.testing.assert_array_equal(chunks[1].toarray(), [[250, 0, 60]])
 
 
 def test_crdir_reader_splits_many_cells_from_one_input_chunk(tmp_path):
@@ -249,16 +253,13 @@ def test_crdir_reader_coalesces_duplicates_across_input_chunks(tmp_path):
     )
 
     reader = CrDirReader(str(tmp_path))
-    chunks = list(
-        reader.consume(
-            batch_size=1,
-            lines_in_mem=100,
-            dtype=np.uint32,
-        )
-    )
+    chunks = list(reader.consume(batch_size=1, lines_in_mem=100))
 
+    # The range holds the summed count, so it is stored in uint16, not uint8.
+    assert reader.count_value_ranges(0)[0].maximum == n_entries
     assert len(chunks) == 1
     assert chunks[0].nnz == 1
+    assert chunks[0].dtype == np.uint16
     np.testing.assert_array_equal(chunks[0].toarray(), [[n_entries]])
 
 
@@ -290,8 +291,6 @@ def test_crdir_reader_supports_gzip_and_metadata_fallback(tmp_path):
     assert reader.feature_names() == ["f1", "f2"]
     assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
     assert reader.cell_names() == ["b1", "b2"]
-    with pytest.raises(ValueError, match="Dataset key must be provided"):
-        reader._read_dataset()
 
     chunks = list(reader.consume(batch_size=2, lines_in_mem=1))
     assert len(chunks) == 1
@@ -763,7 +762,7 @@ def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
     for chunk in h5ad_reader.consume(batch_size=1000):
         assert 0 < chunk.shape[0] <= 1000
         assert chunk.shape[1] == h5ad_reader.nFeatures
-        assert chunk.dtype == h5ad_reader.matrixDtype
+        assert chunk.dtype == h5ad_reader.sourceMatrixDtype
         streamed_rows += chunk.shape[0]
         streamed_nnz += chunk.nnz
         streamed_sum += chunk.data.sum(dtype=np.float64)
@@ -1165,9 +1164,9 @@ def test_h5ad_reader_streams_compound_obs_cluster_fields(tmp_path):
             np.array([None, b"resting", None], dtype=object),
         )
         np.testing.assert_array_equal(missing, [True, False, True])
+        # Blocks of cell IDs are the text that the import stores.
         np.testing.assert_array_equal(
-            reader._cell_ids_block(1, 3),
-            [b"cell_1", b"cell_2"],
+            reader._cell_ids_block(1, 3), ["cell_1", "cell_2"]
         )
         # A vector field does not fit one metadata value per cell.
         assert set(dict(reader.get_cell_columns())) == {"batch"}
@@ -1600,7 +1599,14 @@ def test_csv_reader_rejects_missing_and_negative_counts(tmp_path, row, message):
         ("g1,g2\n", {}, ValueError, "contains no data rows"),
         ("g1,g2\n1,x\n", {}, ValueError, "must contain numbers"),
         ("g1,g2\n1,True\n2,False\n", {}, ValueError, "must contain numbers"),
-        ("g1,g2\n1,2\n", {"cell_data_cols": ["batch"]}, KeyError, "not CSV columns"),
+        (
+            "g1,g2\n1,2\n",
+            {"cell_data_cols": ["batch"]},
+            KeyError,
+            "cell_data_cols are not CSV columns",
+        ),
+        # Unknown skip_cols names used to be ignored.
+        ("g1,g2\n1,2\n", {"skip_cols": ["drop"]}, KeyError, "skip_cols are not CSV"),
     ],
 )
 def test_csv_reader_rejects_unusable_files(tmp_path, text, kwargs, error, message):

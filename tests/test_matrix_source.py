@@ -9,10 +9,6 @@ from zarr.codecs import BloscCodec, ZstdCodec
 from zarr.storage import ObjectStore
 
 from scarf.datastore.datastore import DataStore, mount_datastore
-from scarf.metadata.artifacts import (
-    plan_cell_data_artifact,
-    write_cell_data_artifact,
-)
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
@@ -308,10 +304,31 @@ def test_mount_rejects_overlap_chained_mounts_and_old_contracts(tmp_path):
 
     root = zarr.open_group(target, mode="r+")
     manifest = dict(root.attrs[MATRIX_SOURCE_ATTR])
+    assert set(manifest) == {"location", "workspace", "assays"}
+    # The top level is exact, so a field a later release adds fails closed.
+    for changed in (
+        {**manifest, "artifacts": "read_only"},
+        {key: value for key, value in manifest.items() if key != "workspace"},
+    ):
+        root.attrs[MATRIX_SOURCE_ATTR] = changed
+        with pytest.raises(
+            ValueError,
+            match="unsupported matrix source contract; create a fresh target "
+            "with mount_datastore$",
+        ):
+            resolve_matrix_source(zarr.open_group(target, mode="r"))
+        with pytest.raises(ValueError, match="unsupported matrix source contract"):
+            DataStore(target, default_assay="RNA")
     fingerprint = manifest["assays"]["RNA"]["datasetFingerprint"]
-    manifest["assays"] = {"RNA": {"datasetFingerprint": fingerprint}}
-    root.attrs[MATRIX_SOURCE_ATTR] = manifest
-    with pytest.raises(ValueError, match="unsupported identity contract"):
+    root.attrs[MATRIX_SOURCE_ATTR] = {
+        **manifest,
+        "assays": {"RNA": {"datasetFingerprint": fingerprint}},
+    }
+    with pytest.raises(
+        ValueError,
+        match="unsupported identity contract for assay 'RNA'; create a fresh "
+        "target with mount_datastore$",
+    ):
         resolve_matrix_source(zarr.open_group(target, mode="r"))
 
 
@@ -490,26 +507,11 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         overwrite=True,
     )
 
-    cell_selection = ds.snapshot_cell_selection()
-    cluster_plan = plan_cell_data_artifact(
-        ds.zw,
-        scope="assay",
-        assay="RNA",
-        kind="cluster_labels",
-        operation="test_marker_clusters",
-        parameters={},
-        inputs={},
-        execution_options={},
-        cell_selection=cell_selection,
-        arrays={"values": ((ds.cells.N,), None)},
-    )
-    write_cell_data_artifact(
-        ds.zw,
-        cluster_plan,
-        {"values": np.array(["a", "a", "b", "b"])},
+    clusters = ds.snapshot_cluster_labels(
+        "marker_groups", cell_selection=ds.snapshot_cell_selection()
     )
     markers = ds.run_marker_search(
-        cluster_plan.ref,
+        clusters,
         from_assay="RNA",
         features=ds.set_feature_selection(
             mask=np.ones(ds.RNA.feats.N, dtype=bool),

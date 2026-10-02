@@ -3,6 +3,7 @@ from .confidence import (
     mapping_score_weights,
 )
 from .models import (
+    LabelTransferResult,
     MappingResult,
     QueryCorrection,
     ScaledPCAProjectionModel,
@@ -23,6 +24,7 @@ from .symphony import (
 )
 
 __all__ = [
+    "LabelTransferResult",
     "MappingReference",
     "MappingResult",
     "QueryCorrection",

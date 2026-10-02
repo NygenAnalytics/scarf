@@ -2,7 +2,6 @@ import csv
 import gc
 import gzip
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -16,10 +15,10 @@ from typing import Any, Literal, TextIO
 
 import numpy as np
 import pandas as pd
-from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.arrays import cumulative_nnz, max_window_nnz
+from ..utils.count_values import CountValueRange, new_count_ranges
 from .cellranger import CrReader
 from ._text import require_unique_identifiers
 
@@ -97,12 +96,7 @@ def _local_absolute(path: str | Path) -> Path:
 
 def _matrix_prefix(name: str) -> str:
     stem = PurePosixPath(_without_gzip(name)).stem
-    lowered = stem.lower()
-    if lowered == "matrix":
-        return ""
-    if lowered.endswith("matrix"):
-        return stem[: -len("matrix")]
-    return ""
+    return stem[: -len("matrix")] if stem.lower().endswith("matrix") else ""
 
 
 def _same_parent_names(
@@ -320,11 +314,8 @@ def _count_sidecar_rows(
 
 def _csv_header(open_text: Callable[[], Any]) -> tuple[str, ...]:
     with open_text() as handle:
-        reader = csv.reader(handle)
-        try:
-            return tuple(str(value).strip() for value in next(reader))
-        except StopIteration:
-            return ()
+        # An empty file has no header.
+        return tuple(str(value).strip() for value in next(csv.reader(handle), ()))
 
 
 def _candidate_from_triplet(
@@ -462,7 +453,6 @@ def _explicit_candidate(
     feature_path: str,
     cell_path: str,
     *,
-    cell_metadata_path: str | None,
     feature_reference_path: str | None,
 ) -> MtxCandidate:
     matrix = str(_local_absolute(matrix_path))
@@ -477,7 +467,7 @@ def _explicit_candidate(
         features=features,
         cells=cells,
         parseLayout=parse_layout,
-        cellMetadata=cell_metadata_path,
+        cellMetadata=None,
         featureReference=feature_reference_path,
         related=(),
     )
@@ -487,11 +477,6 @@ def _explicit_candidate(
             archive_path=None,
             triplet=triplet,
             open_text=lambda name: _open_path_text(name),
-        ),
-        cellMetadataPath=(
-            str(_local_absolute(cell_metadata_path))
-            if cell_metadata_path is not None
-            else None
         ),
         featureReferencePath=(
             str(_local_absolute(feature_reference_path))
@@ -523,7 +508,6 @@ class _MtxEngine:
         is_filtered: bool,
         filtering_cutoff: int,
         temp_dir: str | None,
-        dtype: DTypeLike,
     ) -> None:
         self.candidate = candidate
         self.separator = separator
@@ -531,9 +515,6 @@ class _MtxEngine:
         self.isFiltered = bool(is_filtered)
         self.filteringCutoff = int(filtering_cutoff)
         self.tempDir = None if temp_dir is None else str(Path(temp_dir))
-        self.matrixDtype = np.dtype(dtype)
-        if self.matrixDtype.kind not in "iu":
-            raise TypeError("Matrix Market count dtype must be an integer dtype")
         if self.filteringCutoff < 0:
             raise ValueError("filtering_cutoff cannot be negative")
         if self.tempDir is not None and not Path(self.tempDir).is_dir():
@@ -546,9 +527,6 @@ class _MtxEngine:
         self._csrData: np.ndarray | np.memmap | None = None
         self._csrIndices: np.ndarray | np.memmap | None = None
         self._csrIndptr: np.ndarray | np.memmap | None = None
-        self._cellMap: np.ndarray | None = None
-        self._rowNnz: np.ndarray | None = None
-        self._cumulativeRowNnz: np.ndarray | None = None
         self._importLinesInMem = 100_000
         self.temporaryDiskBytes = 0
         try:
@@ -574,21 +552,26 @@ class _MtxEngine:
             require_unique_identifiers(self._rawFeatureIds, "Feature IDs")
             require_unique_identifiers(self._rawCellNames, "Cell IDs")
 
-            self.coordinateOrder = self._probe_coordinate_order()
-            row_nnz: np.ndarray | None = None
+            (
+                row_nnz,
+                cell_totals,
+                cell_maxima,
+                feature_maxima,
+                self.coordinateOrder,
+            ) = self._scan_matrix(self._importLinesInMem)
             if self.isFiltered:
                 valid = np.arange(self.rawCellCount, dtype=np.int64)
             else:
-                row_nnz, cell_totals, order = self._scan_matrix(self._importLinesInMem)
-                if order != self.coordinateOrder:
-                    raise RuntimeError(
-                        "Matrix Market coordinate-order probes were inconsistent"
-                    )
                 valid = np.flatnonzero(cell_totals > self.filteringCutoff).astype(
                     np.int64,
                     copy=False,
                 )
-            self._set_valid_cells(valid, row_nnz)
+            self._set_valid_cells(valid, row_nnz, cell_maxima)
+            # The scan's feature maxima cover every raw cell, so they are the
+            # kept cells' maxima only when no cell is dropped.
+            self._keptFeatureMaxima: np.ndarray | None = (
+                feature_maxima if valid.size == self.rawCellCount else None
+            )
             self._featureColumns = self._feature_reference_columns()
         except BaseException:
             self.release()
@@ -639,7 +622,8 @@ class _MtxEngine:
     def _set_valid_cells(
         self,
         valid: np.ndarray,
-        row_nnz: np.ndarray | None,
+        row_nnz: np.ndarray,
+        cell_maxima: np.ndarray,
     ) -> None:
         self.validCellIndexes = valid
         self.nCells = int(valid.size)
@@ -647,18 +631,17 @@ class _MtxEngine:
         self._cellColumns = {
             name: values[valid] for name, values in self._rawCellColumns.items()
         }
-        if row_nnz is not None:
-            self._set_row_nnz(row_nnz[valid])
-
-    def _set_row_nnz(self, row_nnz: np.ndarray) -> None:
-        self._rowNnz = np.asarray(row_nnz, dtype=np.int64)
-        self._cumulativeRowNnz = cumulative_nnz(self._rowNnz)
+        self._cumulativeRowNnz = cumulative_nnz(row_nnz[valid])
+        self.countMaximum = int(cell_maxima[valid].max(initial=0))
+        # Batches hold the kept counts in the narrowest dtype that holds them.
+        self.matrixDtype: np.dtype[Any] = np.min_scalar_type(self.countMaximum)
 
     def _read_features(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if _is_bed_sidecar(self.candidate.featurePath):
             ids = self._read_bed_features()
-            return ids, ids.copy(), np.full(ids.size, "Peaks", dtype=object)
-        if _is_parse_matrix(self.candidate.matrixPath):
+            names = ids.copy()
+            types = np.full(ids.size, "Peaks", dtype=object)
+        elif _is_parse_matrix(self.candidate.matrixPath):
             frame = pd.read_csv(self.featurePath, compression="infer")
             columns = tuple(str(value) for value in frame.columns)
             id_column = _column_name(
@@ -684,8 +667,6 @@ class _MtxEngine:
                 keep_default_na=False,
                 compression="infer",
             )
-            if frame.shape[1] < 1:
-                raise ValueError("Feature sidecar must contain at least one column")
             ids = frame.iloc[:, 0].astype(str).to_numpy()
             names = (
                 frame.iloc[:, 1].astype(str).to_numpy()
@@ -725,15 +706,10 @@ class _MtxEngine:
             raise ValueError(
                 "Peak BED sidecar start and end columns must hold integers"
             ) from exc
-        ids = np.asarray(
+        return np.asarray(
             [f"{c}:{s}-{e}" for c, s, e in zip(chrom, start, end, strict=True)],
             dtype=object,
         )
-        if ids.size != self.nFeatures:
-            raise ValueError(
-                f"Feature sidecar has {ids.size} rows, expected {self.nFeatures}"
-            )
-        return ids
 
     def _read_cells(
         self,
@@ -771,12 +747,10 @@ class _MtxEngine:
                     compression="infer",
                 )
             except pd.errors.EmptyDataError:
-                frame = pd.DataFrame()
-            if frame.empty and self.rawCellCount == 0:
-                return np.empty(0, dtype=str), {}, None
-            if frame.shape[1] < 1:
-                raise ValueError("Cell sidecar must contain at least one column")
-            names = frame.iloc[:, 0].astype(str).to_numpy()
+                # A sidecar without lines lists no cells.
+                names = np.empty(0, dtype=str)
+            else:
+                names = frame.iloc[:, 0].astype(str).to_numpy()
             columns = {}
             selected_key = None
         if names.size != self.rawCellCount:
@@ -833,87 +807,10 @@ class _MtxEngine:
             result[resolved_name] = values
         return result
 
-    def _probe_coordinate_order(self) -> CoordinateOrder:
-        cell_previous: tuple[int, int] | None = None
-        feature_previous: tuple[int, int] | None = None
-        parsed = 0
-        dimensions_seen = False
-        with _open_path_text(self.matrixPath) as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("%"):
-                    continue
-                if not dimensions_seen:
-                    dimensions_seen = True
-                    continue
-                fields = (
-                    stripped.split()
-                    if self.separator == " "
-                    else re.split(self.separator, stripped)
-                )
-                if len(fields) != 3:
-                    raise ValueError("Could not parse Matrix Market coordinates")
-                try:
-                    axis1 = int(fields[0])
-                    axis2 = int(fields[1])
-                    if self.header.field == "integer":
-                        value: int | float = int(fields[2])
-                    else:
-                        value = float(fields[2])
-                except (OverflowError, ValueError) as exc:
-                    raise ValueError(
-                        "Could not parse Matrix Market coordinates"
-                    ) from exc
-                if value < 0 or not np.isfinite(value) or value != np.floor(value):
-                    raise ValueError(
-                        "Matrix Market counts must be finite non-negative integers"
-                    )
-                if self.candidate.matrixOrientation == "featuresByCells":
-                    feature = axis1 + self.indexOffset
-                    cell = axis2 + self.indexOffset
-                else:
-                    cell = axis1 + self.indexOffset
-                    feature = axis2 + self.indexOffset
-                if (
-                    feature < 0
-                    or feature >= self.nFeatures
-                    or cell < 0
-                    or cell >= self.rawCellCount
-                ):
-                    raise ValueError(
-                        "Matrix Market coordinate is outside the declared dimensions"
-                    )
-                cell_key = (cell, feature)
-                feature_key = (feature, cell)
-                cell_invalid = cell_previous is not None and cell_key < cell_previous
-                feature_invalid = (
-                    feature_previous is not None and feature_key < feature_previous
-                )
-                parsed += 1
-                if cell_invalid and feature_invalid:
-                    raise ValueError(
-                        "Matrix Market coordinates are neither cell-major nor "
-                        f"feature-major at entry {parsed}"
-                    )
-                if cell_invalid:
-                    return "featureMajor"
-                if feature_invalid:
-                    return "cellMajor"
-                cell_previous = cell_key
-                feature_previous = feature_key
-        if parsed != self.header.nEntries:
-            raise ValueError(
-                f"Matrix Market header declares {self.header.nEntries} entries, "
-                f"but {parsed} were read"
-            )
-        return "cellMajor"
-
     def _raw_chunks(
         self,
         lines_in_mem: int,
     ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        if lines_in_mem <= 0:
-            raise ValueError("lines_in_mem must be positive")
         if self.header.nEntries == 0:
             return
         separator = r"\s+" if self.separator == " " else self.separator
@@ -973,8 +870,6 @@ class _MtxEngine:
         second: np.ndarray,
         previous: tuple[int, int] | None,
     ) -> int | None:
-        if first.size == 0:
-            return None
         if previous is None:
             joined_first = first
             joined_second = second
@@ -997,9 +892,18 @@ class _MtxEngine:
     def _scan_matrix(
         self,
         lines_in_mem: int,
-    ) -> tuple[np.ndarray, np.ndarray, CoordinateOrder]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, CoordinateOrder]:
+        """Return the entries, total, and largest count of each raw cell, and
+        the largest count of each feature.
+
+        Coordinates are validated in either cell-major or feature-major order,
+        which keeps duplicate coordinates adjacent, so the counts are summed
+        over duplicates, as the import stores them.
+        """
         row_nnz = np.zeros(self.rawCellCount, dtype=np.int64)
         cell_totals = np.zeros(self.rawCellCount, dtype=np.uint64)
+        cell_maxima = np.zeros(self.rawCellCount, dtype=np.uint64)
+        feature_maxima = np.zeros(self.nFeatures, dtype=np.uint64)
         previous: tuple[int, int] | None = None
         pending: tuple[int, int, np.uint64] | None = None
         parsed = 0
@@ -1011,9 +915,10 @@ class _MtxEngine:
             cells: np.ndarray,
             values: np.ndarray,
         ) -> None:
-            if cells.size:
-                np.add.at(row_nnz, cells, 1)
-                np.add.at(cell_totals, cells, values)
+            np.add.at(row_nnz, cells, 1)
+            np.add.at(cell_totals, cells, values)
+            np.maximum.at(cell_maxima, cells, values)
+            np.maximum.at(feature_maxima, features, values)
 
         for features, cells, values in self._raw_chunks(lines_in_mem):
             if features.size == 0:
@@ -1082,17 +987,24 @@ class _MtxEngine:
         order: CoordinateOrder = (
             "cellMajor" if cell_violation is None else "featureMajor"
         )
-        return row_nnz, cell_totals, order
+        return row_nnz, cell_totals, cell_maxima, feature_maxima, order
 
-    def _ensure_matrix_stats(self, lines_in_mem: int) -> None:
-        if self._rowNnz is not None:
-            return
-        row_nnz, _, order = self._scan_matrix(lines_in_mem)
-        if order != self.coordinateOrder:
-            raise RuntimeError(
-                "Matrix Market coordinate-order probes were inconsistent"
-            )
-        self._set_row_nnz(row_nnz[self.validCellIndexes])
+    def kept_feature_maxima(self) -> np.ndarray:
+        """Return the largest count of each feature over the kept cells.
+
+        When the reader dropped cells, the file is read once more to find them.
+        """
+        if self._keptFeatureMaxima is None:
+            kept = np.zeros(self.rawCellCount, dtype=bool)
+            kept[self.validCellIndexes] = True
+            maxima = np.zeros(self.nFeatures, dtype=np.uint64)
+            for features, cells, values in self._coalesced_chunks(
+                self._importLinesInMem
+            ):
+                selected = kept[cells]
+                np.maximum.at(maxima, features[selected], values[selected])
+            self._keptFeatureMaxima = maxima
+        return self._keptFeatureMaxima
 
     def _coalesced_chunks(
         self,
@@ -1139,7 +1051,7 @@ class _MtxEngine:
                 yield (
                     features[starts[:complete]],
                     cells[starts[:complete]],
-                    self._checked_values(reduced[:complete]),
+                    reduced[:complete],
                 )
             last = int(starts[-1])
             pending = (
@@ -1156,28 +1068,31 @@ class _MtxEngine:
             yield (
                 np.array([pending[0]], dtype=np.int64),
                 np.array([pending[1]], dtype=np.int64),
-                self._checked_values(np.array([pending[2]], dtype=np.uint64)),
+                np.array([pending[2]], dtype=np.uint64),
             )
 
     def _checked_values(self, values: np.ndarray) -> np.ndarray:
-        maximum = np.iinfo(self.matrixDtype).max
-        if values.size and int(values.max()) > maximum:
-            raise OverflowError(f"Matrix Market count exceeds dtype {self.matrixDtype}")
+        """Return the counts of kept cells in ``matrixDtype``.
+
+        Construction found the largest count, so a larger one means that the
+        file changed since then.
+        """
+        if values.size and int(values.max()) > self.countMaximum:
+            raise OverflowError(
+                "A Matrix Market count exceeds the largest count found when the "
+                "reader scanned the file; the file changed"
+            )
         return values.astype(self.matrixDtype, copy=False)
 
     def _prepare_feature_major(self, lines_in_mem: int = 1_000_000) -> None:
         if self._csrIndptr is not None:
             return
-        if self._rowNnz is None or self._cumulativeRowNnz is None:
-            raise RuntimeError(
-                "Feature-major Matrix Market row statistics are unavailable"
-            )
         parent = (
             Path(self.tempDir)
             if self.tempDir is not None
             else Path(tempfile.gettempdir())
         )
-        retained_nnz = int(self._rowNnz.sum(dtype=np.int64))
+        retained_nnz = int(self._cumulativeRowNnz[-1])
         index_dtype = (
             np.int32
             if max(self.nFeatures, retained_nnz) <= np.iinfo(np.int32).max
@@ -1252,7 +1167,7 @@ class _MtxEngine:
                 positions += np.arange(grouped_cells.size, dtype=np.int64)
                 positions -= np.repeat(edges[:-1], widths)
                 cursor[grouped_cells[edges[:-1]]] += widths
-                data[positions] = selected_values[order]
+                data[positions] = self._checked_values(selected_values[order])
                 indices[positions] = selected_features[order]
             if not np.array_equal(cursor, self._cumulativeRowNnz[1:]):
                 raise RuntimeError(
@@ -1265,14 +1180,11 @@ class _MtxEngine:
             self._csrData = data
             self._csrIndices = indices
             self._csrIndptr = indptr
-            self._cellMap = cell_map
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
             raise
 
     def configure_import_lines(self, lines_in_mem: int) -> None:
-        if lines_in_mem <= 0:
-            raise ValueError("lines_in_mem must be positive")
         self._importLinesInMem = int(lines_in_mem)
 
     def prepare(self, lines_in_mem: int | None = None) -> None:
@@ -1285,7 +1197,6 @@ class _MtxEngine:
             self.matrixPath = self._local_path(self.candidate.matrixPath)
         if self.coordinateOrder == "featureMajor":
             try:
-                self._ensure_matrix_stats(resolved_lines)
                 self._prepare_feature_major(resolved_lines)
             except BaseException:
                 self.release()
@@ -1293,10 +1204,10 @@ class _MtxEngine:
 
     @staticmethod
     def _close_array(array: np.ndarray | np.memmap | None) -> None:
-        if isinstance(array, np.memmap):
-            mmap = getattr(array, "_mmap", None)
-            if mmap is not None:
-                mmap.close()
+        # Only a memory map holds a file mapping to close.
+        mmap = getattr(array, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
 
     def release(self) -> None:
         for array in (self._csrData, self._csrIndices, self._csrIndptr):
@@ -1304,37 +1215,20 @@ class _MtxEngine:
         self._csrData = None
         self._csrIndices = None
         self._csrIndptr = None
-        self._cellMap = None
         gc.collect()
         if self._csrDirectory is not None:
             shutil.rmtree(self._csrDirectory, ignore_errors=True)
             self._csrDirectory = None
-        if self._archiveDirectory is not None:
-            if self._archiveTemporary is not None:
-                self._archiveTemporary.cleanup()
-            else:
-                shutil.rmtree(self._archiveDirectory, ignore_errors=True)
-            self._archiveDirectory = None
+        if self._archiveTemporary is not None:
+            self._archiveTemporary.cleanup()
             self._archiveTemporary = None
+            self._archiveDirectory = None
             self._archivePaths.clear()
 
     def resident_bytes(self) -> int:
-        arrays = (
-            self.validCellIndexes,
-            self._rowNnz,
-            self._cumulativeRowNnz,
-            self._cellMap,
-        )
-        return int(
-            sum(array.nbytes for array in arrays if isinstance(array, np.ndarray))
-        )
+        return int(self.validCellIndexes.nbytes + self._cumulativeRowNnz.nbytes)
 
     def max_window_nnz(self, window_rows: int) -> int:
-        if window_rows <= 0:
-            raise ValueError("window_rows must be positive")
-        if self._cumulativeRowNnz is None:
-            width = min(int(window_rows), self.nCells)
-            return min(self.matrixEntryCount, width * self.nFeatures)
         return max_window_nnz(self._cumulativeRowNnz, window_rows)
 
     def producer_staging_bytes(
@@ -1365,13 +1259,11 @@ class _MtxEngine:
         self,
         batch_size: int,
         lines_in_mem: int,
-        dtype: DTypeLike | None = None,
     ) -> Generator[coo_matrix, None, None]:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if lines_in_mem <= 0:
             raise ValueError("lines_in_mem must be positive")
-        requested_dtype = self.matrixDtype if dtype is None else np.dtype(dtype)
         try:
             if self.coordinateOrder == "featureMajor":
                 self.prepare(lines_in_mem)
@@ -1381,12 +1273,7 @@ class _MtxEngine:
                 if self.candidate.archivePath is not None:
                     self.matrixPath = self._local_path(self.candidate.matrixPath)
                 source = self._consume_cell_major(batch_size, lines_in_mem)
-            for matrix in source:
-                yield (
-                    matrix
-                    if requested_dtype == self.matrixDtype
-                    else matrix.astype(requested_dtype)
-                )
+            yield from source
         finally:
             self.release()
 
@@ -1394,8 +1281,10 @@ class _MtxEngine:
         self,
         batch_size: int,
     ) -> Generator[coo_matrix, None, None]:
-        if self._csrData is None or self._csrIndices is None or self._csrIndptr is None:
-            raise RuntimeError("Feature-major CSR preparation is unavailable")
+        # consume prepares the CSR arrays before it reads them.
+        assert self._csrData is not None
+        assert self._csrIndices is not None
+        assert self._csrIndptr is not None
         for start in range(0, self.nCells, batch_size):
             end = min(start + batch_size, self.nCells)
             pointers = np.asarray(self._csrIndptr[start : end + 1])
@@ -1455,7 +1344,7 @@ class _MtxEngine:
             selected = output_cells >= 0
             output_cells = output_cells[selected]
             features = features[selected]
-            values = values[selected]
+            values = self._checked_values(values[selected])
             if output_cells.size == 0:
                 continue
             batch_ids = output_cells // batch_size
@@ -1502,7 +1391,14 @@ class _MtxEngine:
 
 
 class MtxReader(CrReader):
-    """Read a selected Matrix Market triplet as cell-row sparse batches."""
+    """Read a selected Matrix Market triplet as cell-row sparse batches.
+
+    Construction reads the matrix once to validate it and to find its
+    coordinate order, the entries of each cell, and the largest count of each
+    kept cell and each feature, with duplicate coordinates summed. Batches hold
+    the counts in the narrowest unsigned dtype that holds the largest kept
+    count.
+    """
 
     def __init__(
         self,
@@ -1510,7 +1406,6 @@ class MtxReader(CrReader):
         feature_path: str | None = None,
         cell_path: str | None = None,
         *,
-        cell_metadata_path: str | None = None,
         feature_reference_path: str | None = None,
         cell_id_key: str | None = None,
         mtx_separator: str = " ",
@@ -1518,18 +1413,12 @@ class MtxReader(CrReader):
         is_filtered: bool = True,
         filtering_cutoff: int = 500,
         temp_dir: str | None = None,
-        dtype: DTypeLike = np.uint32,
     ) -> None:
         if isinstance(matrix_path, MtxCandidate):
             if feature_path is not None or cell_path is not None:
                 raise ValueError("Do not pass explicit sidecars with an MtxCandidate")
             candidate = replace(
                 matrix_path,
-                cellMetadataPath=(
-                    cell_metadata_path
-                    if cell_metadata_path is not None
-                    else matrix_path.cellMetadataPath
-                ),
                 featureReferencePath=(
                     feature_reference_path
                     if feature_reference_path is not None
@@ -1546,7 +1435,6 @@ class MtxReader(CrReader):
                 matrix_path,
                 feature_path,
                 cell_path,
-                cell_metadata_path=cell_metadata_path,
                 feature_reference_path=feature_reference_path,
             )
         self._engine = _MtxEngine(
@@ -1557,21 +1445,13 @@ class MtxReader(CrReader):
             is_filtered=is_filtered,
             filtering_cutoff=filtering_cutoff,
             temp_dir=temp_dir,
-            dtype=dtype,
         )
         self.validBarcodeIdx = self._engine.validCellIndexes
         self.matrixEntryCount = self._engine.matrixEntryCount
         self.coordinateOrder = self._engine.coordinateOrder
         self.selectedCellIdKey = self._engine.selectedCellIdKey
         self.temporaryDiskBytes = self._engine.temporaryDiskBytes
-        super().__init__(
-            {
-                "feature_ids": "feature_ids",
-                "feature_names": "feature_names",
-                "feature_types": "feature_types",
-                "cell_names": "cell_names",
-            }
-        )
+        super().__init__(self._handle_version())
         self.nCells = self._engine.nCells
 
     def _handle_version(self) -> dict[str, str]:
@@ -1582,41 +1462,54 @@ class MtxReader(CrReader):
             "cell_names": "cell_names",
         }
 
-    def _read_dataset(self, key: str | None = None) -> list[str]:
-        if key is None:
-            raise ValueError("Dataset key must be provided")
+    def _read_dataset(self, key: str) -> list[str]:
         values = {
             "feature_ids": self._engine.feature_ids,
             "feature_names": self._engine.feature_names,
             "feature_types": self._engine.feature_types,
             "cell_names": self._engine.cell_names,
         }
-        if key not in values:
-            raise KeyError(key)
         return values[key]()
 
     @property
     def matrix_dtype(self) -> np.dtype[Any]:
         return self._engine.matrixDtype
 
+    def count_value_ranges(
+        self, maxBytes: int, featureGroups: np.ndarray | None = None
+    ) -> list[CountValueRange]:
+        """Return the range of the counts of each group of features.
+
+        Matrix Market counts are non-negative integers, and construction
+        already scanned them with duplicate coordinates summed and kept the
+        largest count of each feature, so this does not use ``maxBytes``.
+        When the reader dropped cells, several groups need one more read of
+        the file to find the largest counts of the kept cells.
+        """
+        value_ranges = new_count_ranges(featureGroups)
+        if featureGroups is None or len(value_ranges) == 1:
+            value_ranges[0].maximum = self._engine.countMaximum
+            return value_ranges
+        maxima = self._engine.kept_feature_maxima()
+        for code, value_range in enumerate(value_ranges):
+            value_range.maximum = int(maxima[featureGroups == code].max(initial=0))
+        return value_ranges
+
     def consume(
         self,
         batch_size: int,
         lines_in_mem: int = 100000,
-        dtype: DTypeLike | None = None,
     ) -> Generator[coo_matrix, None, None]:
         """Yield chunks of cell rows from the Matrix Market file.
 
         Args:
             batch_size: Number of cells per yielded chunk.
             lines_in_mem: Number of Matrix Market lines parsed at a time.
-            dtype: Count dtype of the yielded chunks. None keeps the dtype
-                chosen when the reader was created.
 
         Yields:
-            scipy.sparse.coo_matrix chunks.
+            scipy.sparse.coo_matrix chunks in ``matrix_dtype``.
         """
-        yield from self._engine.consume(batch_size, lines_in_mem, dtype)
+        yield from self._engine.consume(batch_size, lines_in_mem)
 
     def max_window_nnz(self, window_rows: int) -> int:
         return self._engine.max_window_nnz(window_rows)

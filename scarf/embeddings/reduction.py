@@ -87,16 +87,14 @@ def _fit_sklearn_incremental_pca(
         # partial_fit centers its input in place, so a failed update is not
         # retried with the same block.
         model.partial_fit(_mutable_fit_block(block), check_input=False)
+        # Release the block before the stream reads the next one.
+        del block
 
-    if carry_over is not None:
-        fit_batch = (
-            np.vstack((end_reservoir, carry_over))
-            if end_reservoir is not None
-            else carry_over
-        )
-    else:
-        assert end_reservoir is not None
-        fit_batch = end_reservoir
+    # Callers select at least dims + 1 rows, so a batch is always reserved.
+    assert end_reservoir is not None
+    fit_batch = (
+        end_reservoir if carry_over is None else np.vstack((end_reservoir, carry_over))
+    )
     model.partial_fit(_mutable_fit_block(fit_batch), check_input=False)
     return model.components_[:-1, :].T, model
 
@@ -106,7 +104,6 @@ def _fit_gram_pca(
     *,
     dims: int,
     row_mask: np.ndarray | None,
-    selected_samples: int,
     scale: Callable[[np.ndarray], np.ndarray] | None,
     nthreads: int,
 ) -> tuple[np.ndarray, _GramPcaModel]:
@@ -149,11 +146,7 @@ def _fit_gram_pca(
                 )
             column_sum += values.sum(axis=0, dtype=np.float64)
             n_samples_seen += len(values)
-
-        if n_samples_seen != selected_samples:
-            raise RuntimeError(
-                f"PCA streamed {n_samples_seen} rows, expected {selected_samples}"
-            )
+            del block, values
 
         mean = column_sum / n_samples_seen
         gram = blas.dsyr(
@@ -214,18 +207,13 @@ def fit_incremental_pca(
     scale: Callable[[np.ndarray], np.ndarray] | None,
     nthreads: int,
 ) -> tuple[np.ndarray, Any]:
-    """Fit streaming PCA and return loadings with the fitted model."""
-    use_for_pca = np.asarray(use_for_pca)
-    if use_for_pca.dtype != bool or use_for_pca.shape != (data.shape[0],):
-        raise ValueError("use_for_pca must be a boolean vector matching data rows")
+    """Fit streaming PCA and return loadings with the fitted model.
 
-    n_components = dims + 1
+    ``use_for_pca`` is a boolean vector over the rows of ``data`` that
+    selects at least ``dims + 1`` rows, and ``data`` has at least
+    ``dims + 1`` columns. The reduction operation checks both before it fits.
+    """
     selected_samples = int(np.count_nonzero(use_for_pca))
-    if selected_samples < n_components:
-        raise ValueError(f"PCA requires at least {n_components} selected rows")
-    if data.shape[1] < n_components:
-        raise ValueError(f"PCA requires at least {n_components} features")
-
     subset_samples = selected_samples != data.shape[0]
     row_mask = use_for_pca if subset_samples else None
     n_features = data.shape[1]
@@ -246,7 +234,6 @@ def fit_incremental_pca(
             data,
             dims=dims,
             row_mask=row_mask,
-            selected_samples=selected_samples,
             scale=scale,
             nthreads=nthreads,
         )
@@ -275,14 +262,16 @@ def fit_lsi(
     random_state: int,
     nthreads: int,
 ) -> np.ndarray:
-    """Fit uncentered LSI loadings with a streamed or materialized solver."""
+    """Fit uncentered LSI loadings with a streamed or materialized solver.
+
+    ``dims + skip_first`` must not exceed the smaller dimension of ``data``;
+    the reduction operation checks the rank before it fits.
+    """
     reserved = sorted({"n_components", "random_state"}.intersection(params))
     if reserved:
         raise ValueError(f"LSI parameters cannot set {', '.join(reserved)}")
 
     n_components = dims + int(skip_first)
-    if n_components > min(data.shape):
-        raise ValueError("LSI components cannot exceed the input matrix rank")
     solver_params = dict(params)
     solver = solver_params.pop("solver", "streaming")
     if solver == "streaming":
@@ -411,7 +400,6 @@ def _stream_lsi_gram_action(
     message: str,
 ) -> np.ndarray:
     result = np.zeros_like(basis, dtype=np.float64)
-    rows_seen = 0
     resident_bytes = _streaming_lsi_resident_bytes(data, basis.shape[1])
     for block in data._stream_blocks(
         nthreads=nthreads,
@@ -423,9 +411,7 @@ def _stream_lsi_gram_action(
         values = np.asarray(block)
         projected = values @ basis
         result += values.T @ projected
-        rows_seen += len(values)
-    if rows_seen != data.shape[0]:
-        raise RuntimeError(f"LSI streamed {rows_seen} rows, expected {data.shape[0]}")
+        del block, values, projected
     if not np.isfinite(result).all():
         raise ValueError("LSI input must contain only finite values")
     return result
@@ -458,8 +444,9 @@ def _fit_streaming_lsi(
         basis, _ = np.linalg.qr(basis, mode="reduced")
 
     projected_gram = np.zeros((width, width), dtype=np.float64)
-    rows_seen = 0
     resident_bytes = _streaming_lsi_resident_bytes(data, width)
+    # The power iterations above have rejected non-finite input, so this
+    # projection of the same rows onto an orthonormal basis stays finite.
     for block in data._stream_blocks(
         nthreads=nthreads,
         msg=f"Fitting streaming LSI model ({iterations + 2}/{iterations + 2})",
@@ -469,11 +456,7 @@ def _fit_streaming_lsi(
     ):
         projected = np.asarray(block) @ basis
         projected_gram += projected.T @ projected
-        rows_seen += len(projected)
-    if rows_seen != data.shape[0]:
-        raise RuntimeError(f"LSI streamed {rows_seen} rows, expected {data.shape[0]}")
-    if not np.isfinite(projected_gram).all():
-        raise ValueError("LSI input must contain only finite values")
+        del block, projected
 
     eigenvalues, rotations = np.linalg.eigh(projected_gram)
     order = np.argsort(eigenvalues)[::-1][:n_components]

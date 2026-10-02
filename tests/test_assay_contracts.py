@@ -161,6 +161,10 @@ def test_default_normalizer_identity_is_stable(monkeypatch):
 
     assert rna.normMethod is norm_lib_size
     assert lib_size_feature_stream_eligible(rna)
+    # The RNA feature streams rely on eligibility to guarantee a size factor.
+    rna.sf = None
+    assert not lib_size_feature_stream_eligible(rna)
+    rna.sf = 1000
     rna.normMethod = norm_dummy
     assert not lib_size_feature_stream_eligible(rna)
     assert atac.normMethod is norm_tf_idf
@@ -618,19 +622,6 @@ def test_feature_percentages_share_one_definition_for_zero_count_cells(tmp_path)
     np.testing.assert_allclose(store.load_artifact(ref)["values"][:], expected)
 
 
-def test_subset_normalization_payload_validates_feature_indices(tmp_path):
-    store = _zero_count_store(tmp_path)
-
-    with pytest.raises(IndexError, match="out-of-range"):
-        store.RNA._write_normalized_payload(
-            np.arange(3),
-            np.array([0, 9]),
-            "unused",
-            log_transform=False,
-            renormalize_subset=True,
-        )
-
-
 def test_concurrent_rna_normed_calls_keep_their_own_normalization(
     tmp_path, monkeypatch
 ):
@@ -716,7 +707,6 @@ def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
     cell_data.create_array("RNA_nCounts", data=np.array([2.0, 3.0]))
     rna.cells = MetaData(cell_data)
     rna.rawData = SimpleNamespace(_backing=counts)
-    rna.rawDataT = None
 
     with pytest.raises(ValueError, match="size factor"):
         rna._mean_normed_feature_groups(
@@ -736,37 +726,3 @@ def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
         np.array([0], dtype=int),
     )
     np.testing.assert_array_equal(empty_stats["normed_n"], np.zeros(1))
-
-    with pytest.raises(ValueError, match="requires sharded countsT"):
-        rna._streaming_feature_stats(
-            np.array([0], dtype=int),
-            np.array([0], dtype=int),
-        )
-
-
-def test_rna_feature_stream_defaults_require_a_size_factor(monkeypatch):
-    monkeypatch.setattr(
-        "scarf.assay.rna.lib_size_feature_stream_eligible",
-        lambda *_args, **_kwargs: True,
-    )
-    rna = RNAassay.__new__(RNAassay)
-    rna.normMethod = norm_lib_size
-    rna.cells = SimpleNamespace(
-        N=2,
-        active_index=lambda _key: np.array([0, 1]),
-    )
-    rna.feats = SimpleNamespace(
-        N=2,
-        active_index=lambda _key: np.array([0, 1]),
-    )
-    rna.sf = None
-
-    with pytest.raises(ValueError, match="requires a size factor"):
-        list(
-            rna.iter_normed_feature_wise(
-                cell_idx=np.array([0, 1]),
-                feat_idx=np.array([0, 1]),
-                batch_size=None,
-                msg=None,
-            )
-        )

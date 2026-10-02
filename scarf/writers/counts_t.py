@@ -1,5 +1,6 @@
 """Helpers for mandatory RNA ``countsT`` at ingest and subset."""
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import zarr
@@ -11,7 +12,6 @@ from ..assay.classification import (
     resolve_persisted_assay_type,
 )
 from ..storage.budget import ResourceBudget, resolve_budget
-from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile
 from ..storage.schema import load_count_array
@@ -69,6 +69,28 @@ def seed_assay_type(
     root.attrs["assayTypes"] = types
 
 
+def counts_t_assays(
+    assay_names: Sequence[str],
+    assay_types: Mapping[str, str] | None = None,
+) -> frozenset[str]:
+    """Return the assays whose finalization writes ``countsT``: the RNA ones.
+
+    Args:
+        assay_names: Assay groups a writer creates.
+        assay_types: Optional mapping of assay name to preset type, as passed
+            to :func:`finalize_writer_counts_t_many`.
+
+    Returns:
+        The names of the assays whose resolved type is RNA.
+    """
+    type_map = assay_types or {}
+    return frozenset(
+        name
+        for name in assay_names
+        if is_rna_assay_type(resolve_persisted_assay_type(name, type_map.get(name)))
+    )
+
+
 def matrix_group_for_assay(
     z: zarr.Group,
     assay_name: str,
@@ -102,7 +124,6 @@ def finalize_writer_counts_t(
     profile: StorageProfile | None = None,
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
-    policy: CountMatrixPolicy | None = None,
     io: StorageIoPolicy | None = None,
 ) -> zarr.Array | None:
     """Write paired ``countsT`` when the assay type is RNA; seed ``assayTypes``.
@@ -110,7 +131,8 @@ def finalize_writer_counts_t(
     When ``assay_type`` is omitted, ``assay_name`` is used only if it is a
     recognized preset (``RNA``, ``ADT``, …). Unknown names persist as
     ``Assay`` and skip ``countsT``. Pass an explicit preset ``assay_type`` to
-    declare a custom assay group as RNA (or another modality).
+    declare a custom assay group as RNA (or another modality). ``countsT``
+    replays the layout persisted with ``counts``.
 
     Args:
         z: Root Zarr group.
@@ -121,8 +143,6 @@ def finalize_writer_counts_t(
         profile: Zarr encoding profile. When None, chosen from the store.
         mem_budget: Memory budget used when ``resources`` is omitted.
         nthreads: Worker budget used when ``resources`` is omitted.
-        policy: Count-matrix geometry policy. When None, the default plan
-                is used.
         io: Optional explicit read, compute, and write widths.
 
     Returns:
@@ -145,7 +165,6 @@ def finalize_writer_counts_t(
         group,
         profile=profile,
         resources=resources,
-        policy=policy,
         io=io,
         overwrite="countsT" in group,
         featureSets=default_feature_sets(logical),
@@ -162,7 +181,6 @@ def finalize_writer_counts_t_many(
     assay_types: dict[str, str] | None = None,
     resources: ResourceBudget | None = None,
     profile: StorageProfile | None = None,
-    policy: CountMatrixPolicy | None = None,
     io: StorageIoPolicy | None = None,
 ) -> dict[str, Any]:
     """Finalize ``countsT`` for each assay name (RNA only).
@@ -174,8 +192,6 @@ def finalize_writer_counts_t_many(
         assay_types: Optional mapping of assay name to preset type.
         resources: Optional resolved memory and worker budget.
         profile: Zarr encoding profile. When None, chosen from the store.
-        policy: Count-matrix geometry policy. When None, the default plan
-                is used.
         io: Optional explicit read, compute, and write widths.
 
     Returns:
@@ -191,7 +207,6 @@ def finalize_writer_counts_t_many(
             assay_type=type_map.get(name),
             resources=resources,
             profile=profile,
-            policy=policy,
             io=io,
         )
         if result is not None:

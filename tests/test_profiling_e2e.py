@@ -227,16 +227,12 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
 
     summary = _run_e2e(config)
 
-    assert sorted(stage for stage, _kwargs in calls) == sorted(CORE_STAGE_ORDER)
+    assert [stage for stage, _kwargs in calls] == list(CORE_STAGE_ORDER)
     assert all(
         kwargs["storeUri"] == config.storeUri(10_000) for _stage, kwargs in calls
     )
-    assert calls[0][0] == "createStore"
     assert calls[0][1]["localH5adPath"].is_file()
     assert all(kwargs["localH5adPath"] is None for _stage, kwargs in calls[1:])
-    assert {
-        stage for stage, kwargs in calls if not kwargs["recordStoreOperations"]
-    } == set(modal_app.BACKGROUND_OVERLAPS)
     assert all(kwargs["containerMemoryMb"] == 147_456 for _stage, kwargs in calls)
     assert all(kwargs["containerCpuRequest"] == 16.0 for _stage, kwargs in calls)
     assert all(kwargs["containerCpuLimit"] == 16.0 for _stage, kwargs in calls)
@@ -244,13 +240,7 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     assert all(kwargs["storageIo"] is None for _stage, kwargs in calls)
     assert all(kwargs["countMatrix"] is None for _stage, kwargs in calls)
     assert all(isinstance(kwargs["session"], dict) for _stage, kwargs in calls)
-    # Background stages are recorded when the first stage that needs them starts.
-    assert [result.stage for result in stage_results] == [
-        *CORE_STAGE_ORDER[: CORE_STAGE_ORDER.index("runUmap")],
-        "runLeiden",
-        "runUmap",
-        "findMarkers",
-    ]
+    assert [result.stage for result in stage_results] == list(CORE_STAGE_ORDER)
     assert summary["status"] == "ok"
     assert summary["storeBackend"] == "r2"
     assert (summary["datasetETag"], summary["datasetBytes"]) == ("etag-h5ad", 4)
@@ -716,72 +706,47 @@ def test_shared_session_counts_store_operations_per_stage(tmp_path: Path) -> Non
     assert all("keysTouched" not in counts for counts in operations.values())
 
 
-def test_funnel_overlaps_background_stages_like_the_pipeline(
+def test_funnel_runs_every_stage_in_order_on_the_calling_thread(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    import inspect
     import threading
 
-    config = _config(runTag="e2e-overlap")
-    _mock_e2e_dependencies(monkeypatch, tmp_path)
-    # Each background stage returns only once the stage it overlaps has run.
-    partners = {"runUmap": "runLeiden"}
-    ran = {stage: threading.Event() for stage in partners.values()}
-    threads: dict[StageName, threading.Thread] = {}
-    finished: list[StageName] = []
-
-    def run_stage(stage: StageName, **_kwargs: Any) -> StageRunResult:
-        threads[stage] = threading.current_thread()
-        if stage in ran:
-            ran[stage].set()
-        if stage in partners and not ran[partners[stage]].wait(30):
-            raise TimeoutError(f"{partners[stage]} did not run beside {stage}")
-        finished.append(stage)
-        return _stage_result(stage)
-
-    monkeypatch.setattr(modal_app, "run_stage", run_stage)
-
-    summary = _run_e2e(config)
-
-    assert summary["status"] == "ok"
-    assert summary["completedStages"] == list(CORE_STAGE_ORDER)
-    for background, partner in partners.items():
-        assert threads[background] is not threading.current_thread()
-        outcomes = {item["stage"]: item for item in summary["outcomes"]}
-        assert partner in outcomes[background]["concurrentStages"]
-        assert background in outcomes[partner]["concurrentStages"]
-    # Budget-planned findMarkers waits for UMAP, and UMAP waits for its input.
-    assert finished.index("runUmap") < finished.index("findMarkers")
-    assert finished.index("buildEmbeddingInitialization") < finished.index("runUmap")
-
-
-def test_funnel_seconds_include_a_trailing_background_stage(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    import time
-
-    config = _config(runTag="e2e-tail")
+    config = _config(runTag="e2e-sequential")
     _mock_e2e_dependencies(monkeypatch, tmp_path)
     # The local backend pins the storage profile for its whole process, so let
     # monkeypatch restore the variable after this test.
     monkeypatch.setenv("SCARF_ZARR_PROFILE", "fast_local")
+    signature = inspect.signature(stages.run_stage)
+    calls: list[tuple[StageName, threading.Thread, bool]] = []
 
-    def run_stage(stage: StageName, **_kwargs: Any) -> StageRunResult:
-        if stage == "runUmap":
-            time.sleep(0.3)
+    def run_stage(stage: StageName, **kwargs: Any) -> StageRunResult:
+        arguments = signature.bind(stage, **kwargs)
+        arguments.apply_defaults()
+        calls.append(
+            (
+                stage,
+                threading.current_thread(),
+                arguments.arguments["recordStoreOperations"],
+            )
+        )
         return _stage_result(stage)
 
     monkeypatch.setattr(modal_app, "run_stage", run_stage)
-    stages = list(CORE_STAGE_ORDER[: CORE_STAGE_ORDER.index("runLeiden") + 1])
 
     summary = modal_app.run_funnel_job.local(
-        config.model_dump(mode="python"), 10_000, "testsubmission", "local", stages
+        config.model_dump(mode="python"),
+        10_000,
+        "testsubmission",
+        "local",
+        list(CORE_STAGE_ORDER),
     )
 
     assert summary["status"] == "ok"
-    assert summary["completedStages"] == stages
-    assert summary["funnelSeconds"] >= 0.3
+    assert calls == [
+        (stage, threading.current_thread(), True) for stage in CORE_STAGE_ORDER
+    ]
 
 
 def test_funnel_refuses_stages_that_would_share_other_resources(

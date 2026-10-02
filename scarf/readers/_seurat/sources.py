@@ -1,8 +1,9 @@
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -17,7 +18,7 @@ from scipy.sparse import (
 from .errors import MatrixSourceError, ResourceLimitError
 from .values import decode_text_values, read_window
 from .._sparse import SparseRowStore
-from ...utils.arrays import has_duplicates
+from ...utils.arrays import cumulative_nnz, has_duplicates
 
 
 type MatrixBlock = NDArray[Any] | coo_matrix | csr_matrix
@@ -276,14 +277,13 @@ def _block_to_csr(
     *,
     dtype: DTypeLike | None = None,
 ) -> csr_matrix:
+    """Return a two-dimensional block from ``read_cells`` as CSR."""
     if issparse(block):
         result = csr_matrix(block)
         if dtype is not None:
             result = result.astype(dtype, copy=False)
         return result
     values = np.asarray(block)
-    if values.ndim != 2:
-        raise MatrixSourceError("matrix block must be two-dimensional")
     if dtype is not None:
         values = values.astype(dtype, copy=False)
     return csr_matrix(values)
@@ -294,9 +294,8 @@ def _block_to_dense(
     *,
     dtype: DTypeLike | None = None,
 ) -> NDArray[Any]:
+    """Return a two-dimensional block from ``read_cells`` as a dense array."""
     values = block.toarray() if issparse(block) else np.asarray(block)
-    if values.ndim != 2:
-        raise MatrixSourceError("matrix block must be two-dimensional")
     if dtype is not None:
         values = values.astype(dtype, copy=False)
     return values
@@ -384,7 +383,10 @@ def validate_compressed_pointers(
     *,
     label: str,
 ) -> int:
-    """Validate a nondecreasing pointer vector that starts at zero; return its end."""
+    """Validate a nondecreasing pointer vector that starts at zero; return its end.
+
+    ``read(start, stop)`` returns the ``stop - start`` pointers of that window.
+    """
     chunk = max(1, min(limits.compressedChunkNnz, count))
     previous: int | None = None
     final = 0
@@ -393,15 +395,14 @@ def validate_compressed_pointers(
         pointers = read(start, stop)
         if not np.issubdtype(pointers.dtype, np.integer):
             raise TypeError(f"{label} must contain integers")
-        if pointers.size > 1 and np.any(pointers[1:] < pointers[:-1]):
+        if np.any(pointers[1:] < pointers[:-1]):
             raise MatrixSourceError(f"{label} must be nondecreasing")
-        if previous is not None and pointers.size and int(pointers[0]) < previous:
+        if previous is not None and int(pointers[0]) < previous:
             raise MatrixSourceError(f"{label} must be nondecreasing")
-        if start == 0 and (not pointers.size or int(pointers[0]) != 0):
+        if start == 0 and int(pointers[0]) != 0:
             raise MatrixSourceError(f"{label} must start at zero")
-        if pointers.size:
-            previous = int(pointers[-1])
-            final = previous
+        previous = int(pointers[-1])
+        final = previous
     if final > limits.maxNnz:
         raise ResourceLimitError(f"{label} nnz {final} exceeds maxNnz={limits.maxNnz}")
     return final
@@ -425,7 +426,7 @@ def validate_minor_indexes(
             raise MatrixSourceError(f"{label} contains an out-of-range value")
 
 
-class BaseMatrixSource:
+class BaseMatrixSource(ABC):
     def __init__(
         self,
         shape: Sequence[int],
@@ -448,9 +449,12 @@ class BaseMatrixSource:
         self._column_names = _normalize_names(
             column_names, self._shape[1], "column", limits
         )
+        # The names never change, so their bytes are counted once rather than
+        # in every read estimate.
         metadata_size = _metadata_bytes(self._row_names) + _metadata_bytes(
             self._column_names
         )
+        self._metadataBytes = metadata_size
         if metadata_size > limits.maxMetadataBytes:
             raise ResourceLimitError(
                 f"matrix names exceed maxMetadataBytes={limits.maxMetadataBytes}"
@@ -494,10 +498,8 @@ class BaseMatrixSource:
 
     @property
     def resident_bytes(self) -> int:
-        return (
-            _metadata_bytes(self.row_names)
-            + _metadata_bytes(self.column_names)
-            + (0 if self._rowStore is None else self._rowStore.indptr.nbytes)
+        return self._metadataBytes + (
+            0 if self._rowStore is None else self._rowStore.indptr.nbytes
         )
 
     def _window(self, start: int, stop: int) -> tuple[int, int]:
@@ -554,18 +556,21 @@ class BaseMatrixSource:
         source_bytes: int = 0,
     ) -> SparseRowStore:
         if self._rowStore is None:
-            metadata = _metadata_bytes(self.row_names) + _metadata_bytes(
-                self.column_names
-            )
-            if (self.n_cells + 1) * 8 + metadata > self._limits.maxMetadataBytes:
+            if (
+                self.n_cells + 1
+            ) * 8 + self._metadataBytes > self._limits.maxMetadataBytes:
                 raise ResourceLimitError("Sparse row pointers exceed maxMetadataBytes")
             try:
+                # Cell rows keep the source dtype and their duplicate
+                # coordinates, as cell-compressed sources do, so the writer
+                # sums the duplicates without wrapping a narrow dtype.
                 self._rowStore = SparseRowStore(
                     chunks,
                     (self.n_cells, self.n_features),
                     self.dtype,
                     max_bytes=self._limits.maxBlockBytes - source_bytes,
                     max_nnz=self._limits.maxNnz,
+                    sum_duplicates=False,
                     temp_dir=self._tempDir,
                 )
             except MemoryError as error:
@@ -574,11 +579,13 @@ class BaseMatrixSource:
                 ) from error
         return self._rowStore
 
+    @abstractmethod
     def read_cells(self, start: int, stop: int) -> MatrixBlock:
-        raise NotImplementedError
+        """Return cells ``[start, stop)`` as a cell-by-feature block."""
 
+    @abstractmethod
     def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
-        raise NotImplementedError
+        """Return the memory that reading cells ``[start, stop)`` needs."""
 
 
 class CompressedMatrixSource(BaseMatrixSource):
@@ -616,13 +623,15 @@ class CompressedMatrixSource(BaseMatrixSource):
     def nnz(self) -> int:
         return self._nnz
 
+    @abstractmethod
     def _read_pointers(self, start: int, stop: int) -> NDArray[np.int64]:
-        raise NotImplementedError
+        """Return compressed pointers ``[start, stop)``."""
 
+    @abstractmethod
     def _read_entries(
         self, start: int, stop: int
     ) -> tuple[NDArray[Any], NDArray[np.int64]]:
-        raise NotImplementedError
+        """Return the values and minor indexes of entries ``[start, stop)``."""
 
     def _cell_bounds(
         self,
@@ -1141,14 +1150,9 @@ class TransposeMatrixSource(BaseMatrixSource):
 
 def _matching_names(
     sources: Sequence[MatrixSource],
-    axis: str,
+    axis: Literal["row_names", "column_names"],
 ) -> tuple[str, ...] | None:
-    if axis == "row_names":
-        first = sources[0].row_names
-    elif axis == "column_names":
-        first = sources[0].column_names
-    else:
-        raise ValueError("axis must be row_names or column_names")
+    first = sources[0].row_names if axis == "row_names" else sources[0].column_names
     for source in sources[1:]:
         current = source.row_names if axis == "row_names" else source.column_names
         if first is not None and current is not None and current != first:
@@ -1510,14 +1514,20 @@ class LayerStitchMatrixSource(BaseMatrixSource):
             column_parts.append(global_columns)
         if not data_parts:
             return csr_matrix((stop - start, self.n_features), dtype=self.dtype)
-        return coo_matrix(
+        # Layers never share a coordinate, so stitching only re-indexes their
+        # entries. A layer's duplicate coordinates are kept for the writer,
+        # which sums them without wrapping a narrow dtype.
+        rows = np.concatenate(row_parts)
+        columns = np.concatenate(column_parts)
+        order = np.lexsort((columns, rows))
+        return csr_matrix(
             (
-                np.concatenate(data_parts),
-                (np.concatenate(row_parts), np.concatenate(column_parts)),
+                np.concatenate(data_parts)[order],
+                columns[order],
+                cumulative_nnz(np.bincount(rows, minlength=stop - start)),
             ),
             shape=(stop - start, self.n_features),
-            dtype=self.dtype,
-        ).tocsr()
+        )
 
 
 class RenamedMatrixSource(BaseMatrixSource):

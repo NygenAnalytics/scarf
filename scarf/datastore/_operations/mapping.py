@@ -23,8 +23,19 @@ from ...mapping.artifact import (
     validate_mapping_reference_binding,
 )
 from ...mapping.features import AlignedFeatureStream
-from ...mapping.confidence import _LabelVotes, _label_vote_block, distance_weights
-from ...mapping.models import MappingResult
+from ...mapping.label_transfer import (
+    LabelTransferBlock,
+    ReferenceDistancePercentiles,
+    load_label_transfer,
+    plan_label_transfer,
+    plan_reference_labels,
+    read_reference_labels,
+    transfer_label_block,
+    validate_reference_label_source,
+    write_label_transfer,
+    write_reference_labels,
+)
+from ...mapping.models import LabelTransferResult, MappingResult
 from ...mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
     ProjectionWriter,
@@ -85,25 +96,6 @@ def _finite_in_range(
     if high is not None and resolved > high:
         raise ValueError(message)
     return resolved
-
-
-def _label_transfer_threshold(
-    reference_class_group: Any,
-    threshold_fraction: Any,
-    na_val: Any,
-) -> float:
-    """Validate shared label-transfer arguments and return the vote threshold."""
-    if not isinstance(reference_class_group, str) or not reference_class_group:
-        raise TypeError("reference_class_group must be a non-empty string")
-    threshold = _finite_in_range(
-        threshold_fraction,
-        "threshold_fraction must be between zero and one",
-        low=0.0,
-        high=1.0,
-    )
-    if not isinstance(na_val, str):
-        raise TypeError("na_val must be a string")
-    return threshold
 
 
 def _store_locations(datastore: Any) -> set[str]:
@@ -676,7 +668,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         reference: MappingReference,
         target_groups: np.ndarray | None = None,
         layout: ArtifactRef | None = None,
-        reference_class_group: str | None = None,
+        reference_labels: str | ArtifactRef | None = None,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -687,6 +679,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         np.ndarray | None,
         np.ndarray | None,
     ]:
+        """Return mapping scores and optional reference classes and layout.
+
+        Reference classes come from ``reference_labels``, a reference column or
+        label artifact; a reference cell without a usable label has class None.
+        """
+        if reference_labels is not None:
+            reference_labels = validate_reference_label_source(reference_labels)
         loaded = self.get_mapping_result(result, reference=reference, load_arrays=False)
         scores = list(
             self._mapping_scores(
@@ -700,10 +699,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
         )
         classes = None
-        if reference_class_group is not None:
-            classes, _ = loaded.reference._selected_cell_values(
-                reference_class_group, validate_binding=False
-            )
+        if reference_labels is not None:
+            values, usable = read_reference_labels(loaded.reference, reference_labels)
+            classes = np.asarray(values, dtype=object)
+            classes[~usable] = None
         coordinates = None if layout is None else loaded.reference._fetch_layout(layout)
         return loaded, scores, classes, coordinates
 
@@ -827,137 +826,64 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
             yield from zip(labels[batch], scores, strict=True)
 
-    @staticmethod
-    def _reference_label_codes(
-        reference: MappingReference, column: str
-    ) -> tuple[np.ndarray, np.ndarray]:
-        labels, valid = reference._fetch_cell_labels(column)
-        codes = np.full(len(labels), -1, dtype=np.int64)
-        valid_codes, categories = pd.factorize(labels[valid], sort=False)
-        codes[valid] = valid_codes
-        return np.asarray(categories, dtype=object), codes
-
-    def _label_transfer_codes(
+    def run_label_transfer(
         self,
-        result: ArtifactRef,
-        reference: MappingReference,
-        reference_class_group: str,
-    ) -> tuple[MappingResult, np.ndarray, np.ndarray]:
-        """Load a projection with its reference class labels and label codes."""
-        loaded = self.get_mapping_result(
-            result,
-            reference=reference,
-            load_arrays=False,
-        )
-        class_labels, reference_codes = self._reference_label_codes(
-            loaded.reference, reference_class_group
-        )
-        return loaded, class_labels, reference_codes
-
-    def _iter_label_votes(
-        self,
-        loaded: MappingResult,
-        reference_codes: np.ndarray,
-        threshold: float,
-        selected_rows: np.ndarray | None = None,
-    ) -> Generator[tuple[np.ndarray, np.ndarray, _LabelVotes], None, None]:
-        indices, distances, uninformative = self._projection_arrays(loaded.ref)
-        block_size = self._projection_block_size(indices)
-        for start in range(0, loaded.n_cells, block_size):
-            stop = min(start + block_size, loaded.n_cells)
-            if selected_rows is None:
-                offsets = np.arange(stop - start)
-            else:
-                left, right = np.searchsorted(selected_rows, (start, stop))
-                offsets = selected_rows[left:right] - start
-            if not offsets.size:
-                continue
-            block_uninformative = np.asarray(uninformative[start:stop], dtype=bool)
-            offsets = offsets[~block_uninformative[offsets]]
-            if not offsets.size:
-                continue
-            block_indices = np.asarray(indices[start:stop])[offsets]
-            block_distances = np.asarray(distances[start:stop])[offsets]
-            votes = _label_vote_block(
-                reference_codes[block_indices],
-                distance_weights(block_distances),
-                threshold,
-            )
-            yield start + offsets, block_distances[:, 0], votes
-
-    def get_target_classes(
-        self,
-        result: ArtifactRef,
-        reference_class_group: str,
+        projection: ArtifactRef,
         *,
         reference: MappingReference,
+        reference_labels: str | ArtifactRef,
         threshold_fraction: float = 0.5,
-        target_subset: list[int] | None = None,
-        na_val: str = "NA",
-    ) -> pd.Series:
-        """Transfer one reference label column to projected query cells."""
-        threshold = _label_transfer_threshold(
-            reference_class_group,
-            threshold_fraction,
-            na_val,
-        )
-        loaded, class_labels, reference_codes = self._label_transfer_codes(
-            result,
-            reference,
-            reference_class_group,
-        )
-
-        target_subset_set: dict[int, None] | None = None
-        if target_subset is not None:
-            if not isinstance(target_subset, list):
-                raise TypeError("target_subset must be a list or None")
-            target_subset_set = {}
-            for index in target_subset:
-                if isinstance(index, bool | np.bool_) or not isinstance(
-                    index,
-                    int | np.integer,
-                ):
-                    raise TypeError("target_subset entries must be integers")
-                resolved_index = int(index)
-                if not 0 <= resolved_index < loaded.n_cells:
-                    raise ValueError("target_subset contains an out-of-range index")
-                target_subset_set[resolved_index] = None
-
-        selected_rows = (
-            np.arange(loaded.n_cells, dtype=np.int64)
-            if target_subset_set is None
-            else np.asarray(sorted(target_subset_set), dtype=np.int64)
-        )
-        predictions = np.full(len(selected_rows), na_val, dtype=object)
-        for rows, _distances, votes in self._iter_label_votes(
-            loaded, reference_codes, threshold, selected_rows
-        ):
-            known = ~votes.is_unknown
-            positions = np.searchsorted(selected_rows, rows[known])
-            predictions[positions] = class_labels[votes.prediction_codes[known]]
-        return pd.Series(predictions.tolist(), index=selected_rows)
-
-    def get_target_label_evidence(
-        self,
-        result: ArtifactRef,
-        reference_class_group: str,
-        *,
-        reference: MappingReference,
-        threshold_fraction: float = 0.5,
-        na_val: str = "NA",
         max_distance: float | None = None,
-        calibration_nonconformity: np.ndarray | None = None,
-        conformal_alpha: float = 0.1,
-    ) -> pd.DataFrame:
-        """Return neighbor-vote evidence, novelty context, and unknown assignments.
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Transfer reference labels to projected query cells and save the result.
 
-        ``calibration_nonconformity`` optionally adds split-conformal prediction
-        sets. Its calibration rows must be exchangeable with future queries.
+        The reference labels are first frozen into this query datastore as a
+        ``reference_labels`` artifact, so a later change to the reference
+        cannot change a saved transfer. Each query cell then takes the label
+        with the largest share of its neighbors' inverse-distance weight. A
+        cell abstains, and its label is missing, when it is uninformative, no
+        neighbor has a usable label, two labels tie, the winning share is
+        below ``threshold_fraction``, or its nearest reference neighbor is
+        farther than ``max_distance``. A high vote share means that the
+        neighbors agree; it is not a calibrated probability.
+
+        A complete transfer with the same projection, reference labels, and
+        decision rule is reused.
+
+        Args:
+            projection: Query projection returned by :meth:`run_mapping`.
+            reference: The mapping reference that the projection used.
+            reference_labels: A cell-metadata column of the reference
+                datastore, or a cell-label artifact in it, such as
+                ``cluster_labels``, ``cluster_cut``, or ``smart_label``.
+            threshold_fraction: Smallest winning vote share that assigns a
+                label.
+            max_distance: Largest distance to the nearest reference neighbor
+                that assigns a label. ``None`` sets no distance limit.
+            invalidate_cache: Compute a new transfer even when a matching one
+                exists. Frozen reference labels with the same fingerprint are
+                still reused, because they are an exact copy.
+
+        Returns:
+            Reference to the immutable ``label_transfer`` artifact. Load it
+            with :meth:`get_label_transfer`, or use it wherever a cell-label
+            artifact is accepted, such as ``color_by`` of an embedding plot.
+
+        Raises:
+            PermissionError: If no matching transfer exists and the query
+                datastore is not opened with ``zarr_mode='r+'``.
         """
-        threshold = _label_transfer_threshold(
-            reference_class_group,
+        if not isinstance(projection, ArtifactRef):
+            raise TypeError("projection must be an ArtifactRef")
+        if not isinstance(reference, MappingReference):
+            raise TypeError("reference must be a MappingReference")
+        source = validate_reference_label_source(reference_labels)
+        threshold = _finite_in_range(
             threshold_fraction,
-            na_val,
+            "threshold_fraction must be between zero and one",
+            low=0.0,
+            high=1.0,
         )
         distance_limit = (
             None
@@ -968,100 +894,81 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 low=0.0,
             )
         )
-        loaded, class_labels, reference_codes = self._label_transfer_codes(
-            result,
-            reference,
-            reference_class_group,
+        if not isinstance(invalidate_cache, bool):
+            raise TypeError("invalidate_cache must be a boolean")
+        loaded = self.get_mapping_result(
+            projection,
+            reference=reference,
+            load_arrays=False,
         )
-
-        from ...mapping.confidence import (
-            _conformal_membership,
-            _validated_conformal_calibration,
+        frozen_labels = plan_reference_labels(self.zw, loaded.reference, source)
+        indices, distances, uninformative = self._projection_arrays(loaded.ref)
+        transfer = plan_label_transfer(
+            self.zw,
+            projection=loaded.ref,
+            cell_selection=loaded.cell_selection,
+            reference_labels=frozen_labels.ref,
+            categories=frozen_labels.categories,
+            n_cells=loaded.n_cells,
+            n_neighbors=int(indices.shape[1]),
+            threshold_fraction=threshold,
+            max_distance=distance_limit,
+            invalidate_cache=invalidate_cache,
         )
+        if transfer.reused:
+            return transfer.ref
+        self._require_writable("run_label_transfer")
+        write_reference_labels(self.zw, frozen_labels, profile=self.storageProfile)
+        reference_codes = frozen_labels.codes
+        distance_percentiles = ReferenceDistancePercentiles.from_reference(
+            loaded.reference
+        )
+        block_size = self._projection_block_size(indices)
 
-        prepared_calibration: np.ndarray | None = None
-        resolved_conformal_alpha = 0.0
-        if calibration_nonconformity is not None:
-            prepared_calibration, resolved_conformal_alpha = (
-                _validated_conformal_calibration(
-                    calibration_nonconformity,
-                    conformal_alpha,
+        def blocks() -> Generator[tuple[int, LabelTransferBlock], None, None]:
+            for start in range(0, loaded.n_cells, block_size):
+                stop = min(start + block_size, loaded.n_cells)
+                yield (
+                    start,
+                    transfer_label_block(
+                        reference_codes[np.asarray(indices[start:stop])],
+                        np.asarray(distances[start:stop]),
+                        np.asarray(uninformative[start:stop], dtype=bool),
+                        threshold_fraction=threshold,
+                        max_distance=distance_limit,
+                        distance_percentiles=distance_percentiles,
+                    ),
                 )
-            )
 
-        predictions = np.full(loaded.n_cells, na_val, dtype=object)
-        vote_fraction = np.full(loaded.n_cells, np.nan, dtype=np.float64)
-        vote_entropy = np.full(loaded.n_cells, np.nan, dtype=np.float64)
-        top_two_margin = np.full(loaded.n_cells, np.nan, dtype=np.float64)
-        best_distances = np.full(loaded.n_cells, np.nan, dtype=np.float64)
-        prediction_sets: list[tuple[Any, ...]] | None = (
-            [()] * loaded.n_cells if prepared_calibration is not None else None
+        return write_label_transfer(
+            self.zw,
+            transfer,
+            blocks(),
+            chunk_rows=block_size,
+            profile=self.storageProfile,
         )
-        is_unknown = np.ones(loaded.n_cells, dtype=bool)
-        for rows, distances, votes in self._iter_label_votes(
-            loaded, reference_codes, threshold
-        ):
-            unknown = votes.is_unknown.copy()
-            if distance_limit is not None:
-                unknown |= distances > distance_limit
-            known = ~unknown
-            predictions[rows[known]] = class_labels[votes.prediction_codes[known]]
-            vote_fraction[rows] = votes.vote_fraction
-            vote_entropy[rows] = votes.vote_entropy
-            top_two_margin[rows] = votes.top_two_margin
-            best_distances[rows] = distances
-            is_unknown[rows] = unknown
-            if prediction_sets is not None:
-                assert prepared_calibration is not None
-                for position in np.flatnonzero(votes.vote_fraction > 0):
-                    label_scores = np.zeros(len(class_labels), dtype=np.float64)
-                    valid = votes.class_codes[position] >= 0
-                    label_scores[votes.class_codes[position, valid]] = votes.fractions[
-                        position, valid
-                    ]
-                    prediction_mask = _conformal_membership(
-                        label_scores, prepared_calibration, resolved_conformal_alpha
-                    )
-                    prediction_sets[int(rows[position])] = tuple(
-                        class_labels[prediction_mask].tolist()
-                    )
 
-        distance_quantiles = loaded.reference.reference_distance_quantiles
-        distance_values = loaded.reference.reference_distance_values
-        unique_distance_values = np.unique(distance_values)
-        right_indices = (
-            np.searchsorted(distance_values, unique_distance_values, side="right") - 1
-        )
-        unique_distance_quantiles = distance_quantiles[right_indices]
-        distance_percentile = np.full(
-            loaded.n_cells,
-            np.nan,
-            dtype=np.float64,
-        )
-        informative = np.isfinite(best_distances)
-        if informative.any():
-            distance_percentile[informative] = np.interp(
-                best_distances[informative],
-                unique_distance_values,
-                unique_distance_quantiles,
-                left=0.0,
-                right=1.0,
-            )
-        feature_coverage = float(loaded.diagnostics["featureCoverage"])
-        evidence = pd.DataFrame(
-            {
-                "label": predictions,
-                "voteFraction": vote_fraction,
-                "voteEntropy": vote_entropy,
-                "topTwoMargin": top_two_margin,
-                "featureCoverage": feature_coverage,
-                "queryScaledDispersion": float(
-                    loaded.diagnostics["queryScaledDispersion"]
-                ),
-                "referenceDistancePercentile": distance_percentile,
-                "isUnknown": is_unknown,
-            }
-        )
-        if prediction_sets is not None:
-            evidence["predictionSet"] = prediction_sets
-        return evidence
+    def get_label_transfer(
+        self,
+        transfer: ArtifactRef,
+        *,
+        load_votes: bool = False,
+    ) -> LabelTransferResult:
+        """Load one complete label transfer from this query datastore.
+
+        Loading reads only this datastore, so the reference datastore is not
+        needed and later changes to it do not change the result.
+
+        Args:
+            transfer: Label transfer returned by :meth:`run_label_transfer`.
+            load_votes: Also load each cell's neighbor votes, which
+                ``label_vote_shares`` and ``prediction_sets`` need. The vote
+                matrices hold one column per saved neighbor, so they are
+                skipped by default.
+
+        Returns:
+            The transferred labels, their evidence, and the exact inputs.
+        """
+        if not isinstance(transfer, ArtifactRef):
+            raise TypeError("transfer must be an ArtifactRef")
+        return load_label_transfer(self.zw, transfer, load_votes=load_votes)

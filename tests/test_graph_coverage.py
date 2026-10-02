@@ -1649,9 +1649,8 @@ def test_ann_storage_fails_closed() -> None:
         kind="ann_index",
         artifact_id="1" * 64,
     )
-    with pytest.raises(ArtifactResolutionError) as caught:
-        store._resolve_ann_index(missing, "l2", 2)
-    assert caught.value.code == "missing_artifact"
+    with pytest.raises(KeyError, match="Artifact does not exist"):
+        store.query_neighbors(missing)
 
 
 def test_normalized_local_cache_cleans_up_after_failure(

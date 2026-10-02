@@ -190,18 +190,31 @@ def test_feature_alignment_rejects_duplicate_identifiers():
         )
 
 
+def _decided(codes, weights, threshold):
+    """Return the vote of a block and whether each row keeps its label."""
+    from scarf.mapping.confidence import _label_vote_block
+    from scarf.mapping.label_transfer import ASSIGNED, _abstention_reasons
+
+    votes = _label_vote_block(codes, weights)
+    reasons = _abstention_reasons(
+        votes,
+        np.zeros(len(codes)),
+        threshold_fraction=threshold,
+        max_distance=None,
+    )
+    return votes, reasons == ASSIGNED
+
+
 @pytest.mark.parametrize("n_neighbors", [1, 3, 11, 100])
 @pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0])
 def test_block_label_votes_match_scalar_categorical_votes(n_neighbors, threshold):
-    from scarf.mapping.confidence import _label_vote_block
-
     rng = np.random.default_rng(91)
     codes = rng.integers(-1, 9, (80, n_neighbors))
     weights = rng.uniform(size=codes.shape)
     weights[rng.random(codes.shape) < 0.2] = 0
     codes[0] = -1
     weights[1] = 0
-    actual = _label_vote_block(codes, weights, threshold)
+    actual, assigned = _decided(codes, weights, threshold)
     for row in range(len(codes)):
         mass = {}
         for code, weight in zip(codes[row], weights[row], strict=True):
@@ -209,7 +222,8 @@ def test_block_label_votes_match_scalar_categorical_votes(n_neighbors, threshold
                 mass[code] = mass.get(code, 0.0) + float(weight)
         labeled_total = sum(mass.values())
         if labeled_total <= 0:
-            assert actual.is_unknown[row]
+            assert not actual.has_labeled_votes[row]
+            assert not assigned[row]
             assert (
                 actual.vote_fraction[row]
                 == actual.vote_entropy[row]
@@ -229,32 +243,34 @@ def test_block_label_votes_match_scalar_categorical_votes(n_neighbors, threshold
             if value > 0
         )
         margin = top - (ordered[1][1] if len(ordered) > 1 else 0)
-        assert actual.is_unknown[row] == (top < threshold or len(winners) != 1)
-        if not actual.is_unknown[row]:
-            assert actual.prediction_codes[row] == winners[0]
+        assert actual.has_labeled_votes[row]
+        assert actual.is_tied[row] == (len(winners) != 1)
+        assert assigned[row] == (top >= threshold and len(winners) == 1)
+        if not actual.is_tied[row]:
+            assert actual.winner_codes[row] == winners[0]
         assert actual.vote_fraction[row] == top
         assert actual.top_two_margin[row] == margin
         assert actual.vote_entropy[row] == pytest.approx(entropy, rel=0, abs=1e-12)
 
 
 def test_label_votes_preserve_ties_thresholds_and_large_class_codes():
-    from scarf.mapping.confidence import _label_vote_block
-
     codes = np.array(
         [[1000000, 2000000, -1], [1000000, 1000000, -1], [1000000, 2000000, -1]]
     )
     weights = np.array(
         [[0.500001, 0.499999, 0], [0.1, 0.2, 0.7], [1e-12, 0, 1 - 1e-12]]
     )
-    votes = _label_vote_block(codes, weights, 0.0)
+    votes, assigned = _decided(codes, weights, 0.0)
     assert votes.fractions.shape == codes.shape
-    assert votes.is_unknown.tolist() == [True, False, True]
-    at_threshold = _label_vote_block(codes[1:2], weights[1:2], votes.vote_fraction[1])
-    above_threshold = _label_vote_block(
+    assert votes.is_tied.tolist() == [True, False, True]
+    assert assigned.tolist() == [False, True, False]
+    assert votes.winner_codes[1] == 1000000
+    _, at_threshold = _decided(codes[1:2], weights[1:2], votes.vote_fraction[1])
+    _, above_threshold = _decided(
         codes[1:2], weights[1:2], np.nextafter(votes.vote_fraction[1], np.inf)
     )
-    assert not at_threshold.is_unknown[0]
-    assert above_threshold.is_unknown[0]
+    assert at_threshold[0]
+    assert not above_threshold[0]
 
 
 def test_same_physical_store_matches_normalized_and_nested_locations(tmp_path):

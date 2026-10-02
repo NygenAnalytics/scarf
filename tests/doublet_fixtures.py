@@ -97,7 +97,6 @@ def write_doublet_target_zarr(
             group,
             profile=resolved_profile,
             resources=resources,
-            policy=policy,
             io=io,
         )
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")

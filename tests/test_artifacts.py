@@ -211,6 +211,8 @@ def test_artifact_kinds_cover_the_reviewed_taxonomy() -> None:
         "diffusion_operator",
         "mapping_reference",
         "projection",
+        "reference_labels",
+        "label_transfer",
         "integrated_graph",
         "imported_coordinates",
         "wnn_coordinates",
@@ -377,6 +379,50 @@ def test_external_artifact_ref_round_trips_strictly() -> None:
     } & set(serialized)
 
 
+def test_external_artifact_ref_names_an_anchor_assay_when_needed() -> None:
+    datastore_ref = ArtifactRef(
+        scope="datastore",
+        kind="smart_label",
+        artifact_id="c" * 64,
+    )
+    other_assay_ref = ArtifactRef(
+        scope="assay",
+        assay="ADT",
+        kind="cluster_labels",
+        artifact_id="e" * 64,
+    )
+    anchored = ExternalArtifactRef(
+        dataset_fingerprint="reference-dataset",
+        ref=datastore_ref,
+        anchor_assay="RNA",
+    )
+    serialized = {
+        "type": "external_artifact",
+        "dataset_fingerprint": "reference-dataset",
+        "ref": datastore_ref.to_dict(),
+        "anchor_assay": "RNA",
+    }
+
+    assert anchored.to_dict() == serialized
+    assert ExternalArtifactRef.from_dict(serialized) == anchored
+    assert anchored.fingerprint_assay == "RNA"
+    other_assay = ExternalArtifactRef("reference-dataset", other_assay_ref, "RNA")
+    assert other_assay.fingerprint_assay == "RNA"
+    assert ExternalArtifactRef.from_dict(other_assay.to_dict()) == other_assay
+    own_assay = ExternalArtifactRef("reference-dataset", _ref())
+    assert own_assay.fingerprint_assay == "RNA"
+    assert "anchor_assay" not in own_assay.to_dict()
+
+    with pytest.raises(ValueError, match="only when it differs"):
+        ExternalArtifactRef("reference-dataset", _ref(), anchor_assay="RNA")
+    with pytest.raises(ValueError, match="assay name"):
+        ExternalArtifactRef("reference-dataset", datastore_ref, anchor_assay="a/b")
+    with pytest.raises(TypeError, match="anchor_assay must be a string or None"):
+        ExternalArtifactRef("reference-dataset", datastore_ref, anchor_assay=3)
+    with pytest.raises(TypeError, match="anchor_assay must be a string"):
+        ExternalArtifactRef.from_dict({**serialized, "anchor_assay": None})
+
+
 def test_external_artifact_ref_rejects_malformed_values() -> None:
     assay_ref = _ref()
     datastore_ref = ArtifactRef(
@@ -386,7 +432,7 @@ def test_external_artifact_ref_rejects_malformed_values() -> None:
     )
     with pytest.raises(ValueError, match="non-empty"):
         ExternalArtifactRef(dataset_fingerprint="", ref=assay_ref)
-    with pytest.raises(ValueError, match="assay-scoped"):
+    with pytest.raises(ValueError, match="assay-scoped ArtifactRef or an anchor"):
         ExternalArtifactRef(
             dataset_fingerprint="reference-dataset",
             ref=datastore_ref,
@@ -407,13 +453,15 @@ def test_external_artifact_ref_rejects_malformed_values() -> None:
         )
     with pytest.raises(ValueError, match="type must be"):
         ExternalArtifactRef.from_dict({**serialized, "type": "artifact"})
-    with pytest.raises(ValueError, match="complete assay artifact"):
+    with pytest.raises(ValueError, match="declared scope"):
         ExternalArtifactRef.from_dict(
             {
                 **serialized,
                 "ref": {**assay_ref.to_dict(), "path": "reference.zarr"},
             }
         )
+    with pytest.raises(ValueError, match="anchor_assay"):
+        ExternalArtifactRef.from_dict({**serialized, "ref": datastore_ref.to_dict()})
     with pytest.raises(ValueError, match="declared scope"):
         ExternalArtifactRef.from_dict(
             {

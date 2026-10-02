@@ -1097,12 +1097,7 @@ def _pipeline_label_claim_namespaces(root: zarr.Group) -> tuple[str, ...]:
 
 
 def _store_supports_atomic_label_claims(store: Store) -> bool:
-    visited: set[int] = set()
     while isinstance(store, WrapperStore):
-        identity = id(store)
-        if identity in visited:
-            return False
-        visited.add(identity)
         store = store._store
     return isinstance(store, LocalStore | MemoryStore | ObjectStore)
 
@@ -1244,27 +1239,23 @@ def _copy_pipeline_label_claims(
     source: zarr.Group,
     destination: zarr.Group,
 ) -> None:
-    """Copy raw append-only claims in every nested datastore workspace."""
+    """Copy raw append-only claims in every nested datastore workspace.
+
+    ``destination`` already holds a copy of each claim container, as the
+    repack copy of ``source`` does.
+    """
 
     namespaces = _pipeline_label_claim_namespaces(source)
     source_prefix = _group_store_prefix(source)
     destination_prefix = _group_store_prefix(destination)
     for namespace in namespaces:
-        try:
-            destination_container = destination[namespace]
-        except KeyError as error:
-            raise ValueError(
-                f"Pipeline label claim container is missing: {namespace}"
-            ) from error
-        _require_label_claim_container(destination_container, location=namespace)
+        _require_label_claim_container(destination[namespace], location=namespace)
         claim_prefix = f"{namespace}/"
         source_claim_prefix = f"{source_prefix}{claim_prefix}"
         claim_keys = sorted(
             collect_aiterator(source.store.list_prefix(source_claim_prefix))
         )
         for source_key in claim_keys:
-            if not source_key.startswith(source_claim_prefix):
-                continue
             relative_claim = source_key[len(source_claim_prefix) :]
             match = _LABEL_CLAIM_KEY_PATTERN.fullmatch(relative_claim)
             if match is None:
@@ -1350,12 +1341,11 @@ def start_pipeline_stage_record(
     prior = _load_pipeline_stage_records_for_run(root, run)
     if any(item.ordinal >= ordinal for item in prior):
         raise FileExistsError(f"Pipeline stage {ordinal} already exists")
-    # Stages start in the persisted order. Earlier stages may still be running,
-    # but none may have failed or been interrupted.
     if len(prior) != ordinal or any(
-        item.status not in {"completed", "skipped", "running"} for item in prior
+        not item.complete or item.status not in {"completed", "skipped"}
+        for item in prior
     ):
-        raise ValueError("Pipeline stages must start in order after successful stages")
+        raise ValueError("Pipeline stages must start sequentially")
     record = PipelineStageRecord(
         stage=stage,
         ordinal=ordinal,

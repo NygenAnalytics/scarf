@@ -187,30 +187,31 @@ def _canonical_64bit_integer_sparse(coo: Any) -> Any:
 
 
 def canonicalize_sparse(coo: Any, dtype: Any | None = None) -> Any:
-    from scipy.sparse import coo_matrix
+    from scipy.sparse import coo_matrix, csr_matrix
 
     if bool(getattr(coo, "has_canonical_format", False)):
         if dtype is not None:
             coo.data = checked_sparse_cast(np.asarray(coo.data), dtype)
         return coo
     data = np.asarray(coo.data)
-    if data.dtype.kind in "biu":
-        if data.dtype.itemsize >= 8:
-            canonical = _canonical_64bit_integer_sparse(coo)
-        else:
-            accumulator_dtype = np.uint64 if data.dtype.kind in "bu" else np.int64
-            data = data.astype(accumulator_dtype)
-            canonical = coo_matrix(
-                (data, (coo.row, coo.col)),
-                shape=coo.shape,
-            )
-            canonical.sum_duplicates()
+    if data.dtype.kind in "biu" and data.dtype.itemsize >= 8:
+        canonical = _canonical_64bit_integer_sparse(coo)
     else:
-        canonical = coo_matrix(
-            (data, (coo.row, coo.col)),
-            shape=coo.shape,
-        )
-        canonical.sum_duplicates()
+        if data.dtype.kind in "biu":
+            data = data.astype(np.uint64 if data.dtype.kind in "bu" else np.int64)
+        # The CSR conversion sorts and sums in C++, far faster than the COO
+        # lexsort. Integer sums do not depend on the order, and neither does a
+        # matrix without duplicates. Other duplicates keep the COO sum, which
+        # adds them in source order.
+        canonical = csr_matrix((data, (coo.row, coo.col)), shape=coo.shape)
+        if data.dtype.kind not in "biu" and canonical.nnz != data.size:
+            canonical = coo_matrix((data, (coo.row, coo.col)), shape=coo.shape)
+            canonical.sum_duplicates()
+        else:
+            # A canonical CSR converts to a COO in canonical order, but SciPy
+            # marks that COO canonical only from 1.17.
+            canonical = canonical.tocoo()
+            canonical.has_canonical_format = True
     if dtype is not None:
         canonical.data = checked_sparse_cast(canonical.data, dtype)
     return canonical

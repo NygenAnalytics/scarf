@@ -826,12 +826,15 @@ def test_self_mapping_recovers_the_reference_graph_and_labels(
     )
     assert len(np.unique(indices)) > 0.9 * reference.selected_cell_count
 
-    transferred = query.get_target_classes(
-        result,
-        reference_class_group="mapping_labels",
-        reference=reference,
-        threshold_fraction=0.6,
-    ).to_numpy()
+    transfer = query.get_label_transfer(
+        query.run_label_transfer(
+            result,
+            reference=reference,
+            reference_labels="mapping_labels",
+            threshold_fraction=0.6,
+        )
+    )
+    transferred = transfer.labels.to_numpy()
     query_rows = read_stored_selection_indices(
         query.zw,
         query_selection,
@@ -840,17 +843,20 @@ def test_self_mapping_recovers_the_reference_graph_and_labels(
         assay=None,
         table_path="cellData",
     )
+    np.testing.assert_array_equal(transfer.cell_idx, query_rows)
     known = np.asarray(query.cells.fetch_all("mapping_labels"))[query_rows]
     assert (transferred == known).mean() > 0.95
 
-    evidence = query.get_target_label_evidence(
-        result,
-        reference_class_group="mapping_labels",
-        reference=reference,
-    )
+    evidence = query.get_label_transfer(
+        query.run_label_transfer(
+            result,
+            reference=reference,
+            reference_labels="mapping_labels",
+        )
+    ).evidence
     assert float(np.median(evidence["referenceDistancePercentile"])) == 0.0
     assert float(np.median(evidence["voteFraction"])) > 0.99
-    assert not evidence["isUnknown"].mean() > 0.05
+    assert not evidence["abstained"].mean() > 0.05
 
 
 def test_symphony_mapping_validates_batches_and_persists_diagnostics(
@@ -1025,23 +1031,23 @@ def test_zero_overlap_query_cells_are_uninformative(
     assert result.diagnostics["uninformativeCellCount"] == int(expected.sum())
     assert result.diagnostics["featureCoverage"] < 1
 
-    labels = query.get_target_classes(
-        result_ref,
-        "mapping_labels",
-        reference=reference,
-        threshold_fraction=0.0,
-    ).to_numpy()
-    assert (labels[expected] == "NA").all()
-    evidence = query.get_target_label_evidence(
-        result_ref,
-        "mapping_labels",
-        reference=reference,
-        threshold_fraction=0.0,
+    transfer = query.get_label_transfer(
+        query.run_label_transfer(
+            result_ref,
+            reference=reference,
+            reference_labels="mapping_labels",
+            threshold_fraction=0.0,
+        )
     )
-    assert evidence["isUnknown"].to_numpy()[expected].all()
+    labels = transfer.labels.to_numpy()
+    assert pd.isna(labels[expected]).all()
+    evidence = transfer.evidence
+    assert evidence["abstained"].to_numpy()[expected].all()
+    reasons = evidence["abstentionReason"].to_numpy()
+    assert (reasons[expected] == "uninformative_cell").all()
     assert evidence["voteFraction"].isna().to_numpy()[expected].all()
     assert evidence["voteFraction"].notna().to_numpy()[~expected].all()
-    assert (labels[~expected] != "NA").any()
+    assert pd.notna(labels[~expected]).any()
 
     groups = np.where(expected, "empty", "measured")
     scores = dict(

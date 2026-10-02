@@ -1,7 +1,20 @@
-from collections.abc import Callable, Iterator, Mapping, Sequence
+"""Normalization of stored counts.
+
+Library-size, CLR, and TF-IDF values are computed in float64 from the counts
+and float64 totals for bool, integer, and floating-point counts alike, so the
+count storage dtype never changes the arithmetic. A value that is persisted,
+or that marker search ranks under ``norm_lib_size``, is the single float32
+rounding of that float64 value; marker search ranks the values of every other
+normalization unrounded. Totals accumulate in float64. Sums over cells, such
+as the CLR log means, combine the partial sums of stored row blocks, so their
+last float64 bits follow the count layout, which byte targets make differ
+between dtypes of different widths.
+"""
+
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import zarr
@@ -42,7 +55,6 @@ if TYPE_CHECKING:
 type NormMethod = Callable[["Assay", ChunkedArray], ChunkedArray]
 
 NORMALIZATION_PARAM_NAMES = frozenset({"log_transform", "renormalize_subset"})
-_NORMALIZATION_WORK_BYTES = 256 * 1024**2
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +78,7 @@ def load_normalization_selections(
     )
     validated_features = validate_feature_selection(root, assay, features)
     mask = validated_features.mask
-    if validated_cells.selected_count < 1 or not np.any(mask):
+    if validated_cells.selected_count < 1:
         raise ValueError("Normalization requires selected cells and features")
     return NormalizationSelections(validated_cells, features, mask)
 
@@ -74,12 +86,12 @@ def load_normalization_selections(
 def load_normalized_inputs(
     root: zarr.Group, normalized: ArtifactRef
 ) -> tuple[zarr.Group, NormalizationSelections]:
-    if (
-        normalized.kind != "normalized"
-        or normalized.scope != "assay"
-        or normalized.assay is None
-    ):
-        raise ValueError("Expected an assay-scoped normalized artifact")
+    """Return a normalized artifact's group and its validated selections.
+
+    Callers have already resolved ``normalized`` as an assay-scoped
+    ``normalized`` artifact.
+    """
+    assert normalized.assay is not None
     status = require_complete_artifact(root, normalized)
     inputs = status.inputs or {}
     current = read_dataset_fingerprint(
@@ -151,20 +163,16 @@ def clr_values[T: (np.ndarray, ChunkedArray)](counts: T) -> T:
 
     Each column is divided by the exponential of its mean ``log1p`` value and
     then ``log1p`` transformed, so ``counts`` must hold every cell of the
-    normalization. Integer counts are logged in float64; floating-point counts
-    keep their dtype. A ``ChunkedArray`` is reduced once and returned lazily.
+    normalization. Every step runs in float64. A ``ChunkedArray`` is reduced
+    once and returned lazily.
 
     Args:
         counts: Counts with cells as rows and features as columns.
 
     Returns:
-        CLR values with the shape of ``counts``.
+        Float64 CLR values with the shape of ``counts``.
     """
-    # log1p of uint8 or uint16 counts is float16 or float32, whose sum over
-    # many cells overflows or loses precision. Integer counts are logged in
-    # float64, as 32- and 64-bit counts already were.
-    log_dtype = np.float64 if counts.dtype.kind in "iu" else None
-    scale = np.exp(np.log1p(counts, dtype=log_dtype).sum(axis=0) / len(counts))
+    scale = np.exp(np.log1p(counts, dtype=np.float64).sum(axis=0) / len(counts))
     # A ufunc of a ChunkedArray stays lazy, though NumPy types it as an array.
     values: Any = np.log1p(counts / scale.reshape(1, -1))
     return cast(T, values)
@@ -181,9 +189,9 @@ def term_frequencies[T: (np.ndarray, ChunkedArray)](
         term_totals: Nonzero term-frequency denominator of each row.
 
     Returns:
-        Term frequencies with the shape of ``counts``.
+        Float64 term frequencies with the shape of ``counts``.
     """
-    frequencies: Any = counts / np.asarray(term_totals).reshape(-1, 1)
+    frequencies: Any = counts / np.asarray(term_totals, dtype=np.float64).reshape(-1, 1)
     return cast(T, frequencies)
 
 
@@ -247,7 +255,7 @@ def stream_document_frequency(
     the ``resident_bytes`` that the caller keeps.
 
     Args:
-        counts: Counts with documents (cells) as rows.
+        counts: Counts with documents (cells) as rows, at least one of them.
         memory_bytes: Memory limit of the operation.
         nthreads: Threads that read row blocks.
         msg: Progress message.
@@ -268,8 +276,6 @@ def stream_document_frequency(
     term_frequency_sum = (
         None if term_totals is None else np.zeros(n_columns, dtype=np.float64)
     )
-    if n_rows == 0 or n_columns == 0:
-        return document_frequency, term_frequency_sum
     column_bytes = n_columns * np.dtype(np.float64).itemsize
     # The running counts and one column reduction per block stay resident.
     static_bytes = int(resident_bytes) + document_frequency.nbytes + column_bytes
@@ -310,24 +316,15 @@ def stream_document_frequency(
                 block, term_totals[row_offset:row_stop]
             ).sum(axis=0)
         row_offset = row_stop
-    expected_rows = n_rows if row_mask is None else int(np.count_nonzero(row_mask))
-    if row_offset != expected_rows:
-        raise RuntimeError(
-            f"{operation} streamed {row_offset} rows; expected {expected_rows}"
-        )
+        # Release the block before the stream reads the next one.
+        del block
     return document_frequency, term_frequency_sum
 
 
 def _library_size_scaled(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
-    """Scale each cell's counts by the size factor over its total.
-
-    Integer counts are promoted to float64 before multiplication to prevent
-    overflow. Floating-point counts keep their dtype and rounding.
-    """
+    """Scale each cell's counts by the size factor over its total in float64."""
     assert assay.sf is not None and assay.scalar is not None
     totals = assay.scalar.reshape(-1, 1)
-    if counts.dtype.kind not in "iu":
-        return assay.sf * counts / totals
     scale = partial(library_size_values, size_factor=assay.sf, dtype=np.float64)
     if isinstance(counts, ChunkedArray):
         return counts._binary(scale, totals, "left")
@@ -426,52 +423,6 @@ norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
 )
 
 
-COUNT_ARITHMETIC: Literal["float64"] = "float64"
-
-type NormalizedValueSource = Literal[
-    "normed", "payload", "feature_batches", "feature_scores", "feature_summary"
-]
-
-
-def normalizer_count_arithmetic(
-    assay: "Assay",
-    method: NormMethod,
-) -> Literal["float64"] | None:
-    """Return the count-arithmetic marker of values ``method`` computes.
-
-    Library-size scaling records the marker for every integer dtype because
-    the integer product could overflow. CLR records it only for integers
-    narrower than 32 bits, whose logarithms were not already float64.
-
-    Args:
-        assay: Assay whose counts ``method`` normalizes.
-        method: Normalization function applied to the counts.
-
-    Returns:
-        ``COUNT_ARITHMETIC``, or None when the arithmetic did not change.
-    """
-    if method not in (norm_lib_size, norm_lib_size_log, norm_clr):
-        return None
-    dtype = np.dtype(assay.rawData.dtype)
-    if dtype.kind not in "iu" or (method is norm_clr and dtype.itemsize >= 4):
-        return None
-    return COUNT_ARITHMETIC
-
-
-def recorded_count_arithmetic(parameters: Mapping[str, Any]) -> dict[str, str]:
-    """Validate the count-arithmetic marker a stored record may carry.
-
-    Returns:
-        ``{"count_arithmetic": COUNT_ARITHMETIC}`` when the record carries the
-        marker, or an empty mapping when it does not.
-    """
-    if "count_arithmetic" not in parameters:
-        return {}
-    if parameters["count_arithmetic"] != COUNT_ARITHMETIC:
-        raise ValueError(f"count_arithmetic must be {COUNT_ARITHMETIC!r} when recorded")
-    return {"count_arithmetic": COUNT_ARITHMETIC}
-
-
 def _feature_group_positions(
     feature_groups: Sequence[np.ndarray],
 ) -> tuple[np.ndarray, list[np.ndarray]]:
@@ -520,22 +471,28 @@ def iter_feature_group_means(
         msg=f"({assay.name}) Averaging feature groups",
     ):
         values = np.asarray(block, dtype=np.float64)
-        yield np.column_stack(
+        means = np.column_stack(
             [values[:, position].mean(axis=1) for position in positions]
         )
+        # The generator is suspended while its consumer writes, so release the
+        # blocks before yielding.
+        del block, values
+        yield means
 
 
 @njit(cache=True, nogil=True)
-def _normalize_integer_rows(
+def _normalize_rows(
     block: np.ndarray,
     row_sum: np.ndarray,
     scale: float,
     log_transform: bool,
     out: np.ndarray,
 ) -> None:
-    """Write library-size normalized counts with NumPy's float64 arithmetic.
+    """Write library-size normalized counts of any dtype into ``out``.
 
-    Zero counts stay zero, so the transform runs only on detected values.
+    Each value is computed in float64, as ``library_size_values`` computes
+    it, and rounded once to the dtype of ``out``. Zero counts stay zero, so
+    the transform runs only on detected values.
     """
     for row in range(block.shape[0]):
         total = np.float64(row_sum[row])
@@ -554,25 +511,11 @@ def _normalize_count_block(
     scaleFactor: float,
     logTransform: bool,
 ) -> np.ndarray:
-    row_sum = block.sum(axis=1)
+    """Return float32 library-size values of ``block`` over its own row totals."""
+    row_sum = block.sum(axis=1, dtype=np.float64)
     row_sum[row_sum == 0] = 1
     normalized = np.empty(block.shape, dtype=np.float32)
-    if block.dtype.kind in "iu":
-        _normalize_integer_rows(
-            block, row_sum, float(scaleFactor), bool(logTransform), normalized
-        )
-        return normalized
-    bytes_per_row = max(1, int(block.shape[1]) * max(8, block.dtype.itemsize))
-    rows_per_batch = max(1, _NORMALIZATION_WORK_BYTES // bytes_per_row)
-    for start in range(0, int(block.shape[0]), rows_per_batch):
-        end = min(start + rows_per_batch, int(block.shape[0]))
-        normalized[start:end] = library_size_values(
-            block[start:end],
-            row_sum[start:end],
-            scaleFactor,
-            dtype=block.dtype,
-            log_transform=logTransform,
-        )
+    _normalize_rows(block, row_sum, float(scaleFactor), bool(logTransform), normalized)
     return normalized
 
 
@@ -603,25 +546,24 @@ def _counts_t_renormalized_batches(
         cell_chunk * n_features * max(1, int(np.dtype(counts_t.dtype).itemsize))
     )
     normalized_band_bytes = cell_chunk * n_features * np.dtype(np.float32).itemsize
-    work_row_bytes = max(1, n_features * max(8, counts_t.dtype.itemsize))
-    work_rows = min(cell_chunk, max(1, _NORMALIZATION_WORK_BYTES // work_row_bytes))
     scratch_bytes = (
         2 * raw_band_bytes
         + normalized_band_bytes
-        + work_rows * work_row_bytes
-        + cell_chunk * (max(8, counts_t.dtype.itemsize) + 1)
+        # Float64 row totals and their zero mask.
+        + cell_chunk * (np.dtype(np.float64).itemsize + 1)
         + feature_destinations.nbytes
         + selected_cells.nbytes
         + selected_features.nbytes
     )
 
     raw: np.ndarray | None = None
-    current_cell_start: int | None = None
     completed_groups = 0
     metrics: dict[str, Any] = {}
 
-    def fill_band(band: Any) -> tuple[int, np.ndarray] | None:
-        nonlocal raw, current_cell_start, completed_groups
+    # The ordered cell-major stream hands over every feature group of a cell
+    # band before the next band, and the bands in cell order.
+    def fill_band(band: Any) -> np.ndarray | None:
+        nonlocal raw, completed_groups
         local_dest = feature_destinations[band.featStart + band.featureRows()]
         keep = local_dest >= 0
         if not np.any(keep):
@@ -643,11 +585,6 @@ def _counts_t_renormalized_batches(
             raw = np.empty(
                 (int(row_destinations.shape[0]), n_features), dtype=counts_t.dtype
             )
-            current_cell_start = band.cellStart
-        elif current_cell_start != band.cellStart:
-            raise RuntimeError(
-                "A countsT cell band ended before all its features arrived"
-            )
         selected = selected_feature_values(band.values, keep)
         destinations = local_dest[keep]
         raw[:, destinations] = selected[:, band.selectedLocal].T
@@ -656,12 +593,11 @@ def _counts_t_renormalized_batches(
             return None
         result = raw
         raw = None
-        current_cell_start = None
         completed_groups = 0
-        return row_start, result
+        return result
 
     next_row = 0
-    for item in map_feature_cell_bands(
+    for raw_values in map_feature_cell_bands(
         counts_t,
         fill_band,
         cell_idx=selected_cells,
@@ -673,11 +609,8 @@ def _counts_t_renormalized_batches(
         orderedCompute=True,
         cellMajorOrder=True,
     ):
-        if item is None:
+        if raw_values is None:
             continue
-        row_start, raw_values = item
-        if row_start != next_row:
-            raise RuntimeError("Normalized cell bands arrived out of order")
         normalized = _normalize_count_block(
             raw_values,
             scaleFactor=scaleFactor,
@@ -804,7 +737,8 @@ def write_renorm_subset_to_zarr(
         residentBytes=counts._resident_bytes(),
         producerBytes=(
             counts._with_block_size(array_shard_rows(output))._block_task_bytes()
-            + min(256 * 1024**2, array_shard_rows(output) * len(feat_idx) * 8)
+            # Float64 row totals and their zero mask.
+            + array_shard_rows(output) * (np.dtype(np.float64).itemsize + 1)
         ),
         resultBytes=2 * len(feat_idx) * 8 if stats_group is not None else 0,
         summarize=_feature_summary if stats_group is not None else None,

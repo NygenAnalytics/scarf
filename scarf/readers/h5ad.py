@@ -7,7 +7,12 @@ import h5py
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..utils.arrays import assay_feature_ranges, cumulative_nnz, max_window_nnz
+from ..utils.arrays import assay_feature_ranges, max_window_nnz
+from ..utils.count_values import (
+    CountValueRange,
+    compressed_count_ranges,
+    dense_count_ranges,
+)
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._assay_names import auto_name_feat_table, make_feat_table_from_types
@@ -55,9 +60,6 @@ class H5adReader:
         matrix_key: Group where in the sparse matrix resides (default: 'X')
         category_names_key: Looks up this group and replaces the values in `var` and 'obs' child datasets with the
                             corresponding index value within this group.
-        dtype: Numpy dtype of the matrix data. This dtype is enforced when streaming the data through `consume`
-               method. (Default value: Automatically determined). float16 is not a storage dtype, so float16
-               source values are read as float32.
         temp_dir: Parent directory for temporary CSC row storage. None uses the system temporary directory.
 
     Attributes:
@@ -73,7 +75,9 @@ class H5adReader:
         featNamesKey: Key in `var` group that contains feature names. (Default: gene_short_name)
         catNamesKey: Looks up this group and replaces the values in `var` and 'obs' child datasets with the
                      corresponding index value within this group.
-        matrixDtype: dtype of the matrix containing the data (as indicated by matrix_key)
+        sourceMatrixDtype: dtype in which the source holds the matrix values, in native byte order.
+                           float16 is not a count storage dtype, so float16 source values are read
+                           as float32.
         embedding_roles: Exact ``obsm`` keys to import as immutable UMAP or
                          t-SNE artifacts.
         cluster_keys: Exact ``obs`` keys to import as immutable cluster-label
@@ -91,7 +95,6 @@ class H5adReader:
         matrix_key: str = "X",
         obsm_attrs_key: str = "obsm",
         category_names_key: str = "__categories",
-        dtype: str | None = None,
         embedding_roles: Mapping[str, H5adEmbeddingRole] | None = None,
         cluster_keys: Sequence[str] = (),
         *,
@@ -119,21 +122,24 @@ class H5adReader:
                 if self.groupCodes[group] == 2:
                     column_order(self.h5[group])
             self.matrixOrientation = self._validate_sparse_matrix()
+            self.sourceMatrixDtype: Any = self._get_matrix_dtype()
             self._convertedCsr: SparseRowStore | None = None
             self._indptrCache: np.ndarray | None = None
-            self._cumulativeRowNnz: np.ndarray | None = None
+            matrix_shape = self._matrix_shape()
             self.nCells, self.nFeatures = (
-                self._get_n(self.cellAttrsKey),
-                self._get_n(self.featureAttrsKey),
+                self._get_n(self.cellAttrsKey, matrix_shape[0]),
+                self._get_n(self.featureAttrsKey, matrix_shape[1]),
             )
+            if (self.nCells, self.nFeatures) != matrix_shape:
+                raise ValueError(
+                    f"ERROR: Matrix `{self.matrixKey}` has shape {matrix_shape}, "
+                    f"but `{self.cellAttrsKey}` has {self.nCells} rows and "
+                    f"`{self.featureAttrsKey}` has {self.nFeatures} rows"
+                )
             self.cellIdsKey = self._fix_name_key(self.cellAttrsKey, cell_ids_key)
             self.featIdsKey = self._fix_name_key(self.featureAttrsKey, feature_ids_key)
             self.featNamesKey = feature_name_key
             self.catNamesKey = category_names_key
-            self.sourceMatrixDtype: Any = self._get_matrix_dtype()
-            self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
-            self.storageDtype: Any = self.matrixDtype
-            self._dtypeOverridden = dtype is not None
             self.embeddingRoles = self._validate_embedding_roles(embedding_roles)
             self.clusterKeys = self._validate_cluster_keys(cluster_keys)
         except BaseException:
@@ -151,7 +157,6 @@ class H5adReader:
             "matrix_key": self.matrixKey,
             "obsm_attrs_key": self.obsmAttrsKey,
             "category_names_key": self.catNamesKey,
-            "dtype": self.matrixDtype if self._dtypeOverridden else None,
             "embedding_roles": dict(self.embeddingRoles),
             "cluster_keys": self.clusterKeys,
             "temp_dir": self._tempDir,
@@ -163,7 +168,6 @@ class H5adReader:
             self._convertedCsr.close()
         self._convertedCsr = None
         self._indptrCache = None
-        self._cumulativeRowNnz = None
 
     @classmethod
     def from_inspect(
@@ -180,9 +184,6 @@ class H5adReader:
             return "dense"
 
         group = self.h5[self.matrixKey]
-        if not isinstance(group, h5py.Group):
-            return "dense"
-
         missing = SPARSE_KEYS.difference(group.keys())
         if missing:
             raise ValueError(
@@ -238,10 +239,11 @@ class H5adReader:
         return ret_val
 
     def _get_matrix_dtype(self) -> Any:
-        """Return the dtype in which the reader yields matrix values.
+        """Return the stored dtype in native byte order, with float16 as float32.
 
-        float16 is not a count storage dtype, and SciPy sparse matrices
-        cannot hold it, so float16 values are read as float32.
+        SciPy sparse matrices hold neither float16 nor another byte order, and
+        float16 is not a count storage dtype, so the reader yields matrix
+        values in this dtype.
         """
         if self.groupCodes[self.matrixKey] == 1:
             dtype = self.h5[self.matrixKey].dtype
@@ -251,7 +253,8 @@ class H5adReader:
             raise ValueError(
                 f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
             )
-        return np.dtype(np.float32) if dtype.newbyteorder("=") == np.float16 else dtype
+        dtype = dtype.newbyteorder("=")
+        return np.dtype(np.float32) if dtype == np.float16 else dtype
 
     def _matrix_values(self, node: h5py.Dataset, selection: slice) -> np.ndarray:
         """Read matrix values in ``sourceMatrixDtype``."""
@@ -260,13 +263,28 @@ class H5adReader:
         return np.asarray(node.astype(self.sourceMatrixDtype)[selection])
 
     def _matrix_shape(self) -> tuple[int, int]:
+        """Return the stored matrix shape after checking that it is consistent.
+
+        A sparse group must record its shape in an attribute, and its indptr
+        must hold one pointer per row (CSR) or column (CSC) of that shape.
+        """
         matrix = self.h5[self.matrixKey]
-        if isinstance(matrix, h5py.Dataset):
+        if self.matrixOrientation == "dense":
+            if matrix.ndim != 2:
+                raise ValueError(
+                    f"ERROR: Dense matrix `{self.matrixKey}` must be two-dimensional"
+                )
             return int(matrix.shape[0]), int(matrix.shape[1])
         shape = sparse_shape(matrix)
         if shape is None:
             raise ValueError(
                 f"ERROR: Sparse matrix group `{self.matrixKey}` has no shape attribute"
+            )
+        expected = ((shape[0] if self.matrixOrientation == "csr" else shape[1]) + 1,)
+        if matrix["indptr"].shape != expected:
+            raise ValueError(
+                f"ERROR: Sparse matrix group `{self.matrixKey}` of shape {shape} "
+                f"needs an indptr of shape {expected}; found {matrix['indptr'].shape}"
             )
         return shape
 
@@ -277,7 +295,8 @@ class H5adReader:
             group_code = self._validate_group(group)
             self.groupCodes[group] = group_code
         if group_code == 1:
-            if key in list(self.h5[group].dtype.names):
+            # A plain dataset has no fields, so it holds no named column.
+            if key in (self.h5[group].dtype.names or ()):
                 return True
         if group_code == 2:
             if key in self.h5[group].keys():
@@ -372,10 +391,7 @@ class H5adReader:
                     raise TypeError(
                         f"Cluster key {key!r} must contain one scalar value per cell"
                     )
-                fields = cell_attrs.dtype.fields
-                if fields is None or key not in fields:
-                    raise TypeError(f"Cluster key {key!r} is not an H5AD column")
-                field_dtype = np.dtype(fields[key][0])
+                field_dtype = np.dtype(cell_attrs.dtype.fields[key][0])
                 if field_dtype.subdtype is not None:
                     raise TypeError(
                         f"Cluster key {key!r} must contain one scalar value per cell; "
@@ -412,10 +428,10 @@ class H5adReader:
                 raise TypeError(f"Cluster key {key!r} uses unsupported dtype {dtype}")
         return resolved
 
-    def _get_n(self, group: str) -> int:
+    def _get_n(self, group: str, matrix_length: int) -> int:
+        """Return the row count of a table; an absent table takes the matrix's."""
         if self.groupCodes[group] == 0:
-            matrix_shape = self._matrix_shape()
-            return matrix_shape[0 if group == self.cellAttrsKey else 1]
+            return matrix_length
         if self.groupCodes[group] == 1:
             return int(self.h5[group].shape[0])
         table = self.h5[group]
@@ -539,34 +555,31 @@ class H5adReader:
         start: int,
         stop: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if start < 0 or stop < start or stop > self.nCells:
-            raise ValueError("H5AD cell-column block is outside the cell axis")
+        """Return rows of a cluster column with non-finite values marked missing.
+
+        The constructor validated each cluster column as one scalar per cell.
+        """
         values, missing = self._read_column(self.cellAttrsKey, key, start, stop)
-        if values.ndim != 1:
-            raise TypeError(
-                f"Cell column {key!r} must contain one scalar value per cell"
-            )
         if values.dtype.kind in "fc":
             missing = missing | ~np.isfinite(values)
         return values, missing
 
     def _cell_ids_block(self, start: int, stop: int) -> np.ndarray:
-        if self._check_exists(self.cellAttrsKey, self.cellIdsKey):
-            values, missing = self._cell_column_block(
-                self.cellIdsKey,
-                start,
-                stop,
-            )
-            if bool(missing.any()):
-                raise ValueError("H5AD cell IDs contain missing values")
-            return np.asarray(values)
-        return np.asarray([f"cell_{index}" for index in range(start, stop)])
+        """Return cell IDs ``[start, stop)`` as the text an import stores.
+
+        An import validates every ID with :meth:`cell_ids` before it reads
+        blocks.
+        """
+        if not self._check_exists(self.cellAttrsKey, self.cellIdsKey):
+            return np.asarray([f"cell_{index}" for index in range(start, stop)])
+        values, _ = self._read_column(self.cellAttrsKey, self.cellIdsKey, start, stop)
+        return np.asarray(
+            [as_text(value) for value in values.astype(object)], dtype=str
+        )
 
     def _obsm_array(self, key: str) -> h5py.Dataset:
-        node = self.h5[self.obsmAttrsKey][key]
-        if not isinstance(node, h5py.Dataset):
-            raise TypeError(f"Embedding key {key!r} is not a dense H5AD array")
-        return node
+        # The constructor validated each embedding key as a dense array.
+        return self.h5[self.obsmAttrsKey][key]
 
     def _iter_obsm_blocks(
         self,
@@ -653,6 +666,8 @@ class H5adReader:
         row_end: int | None = None,
     ) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         dset = self.h5[self.matrixKey]
         start = max(0, int(row_start))
         stop = int(dset.shape[0] if row_end is None else row_end)
@@ -662,99 +677,64 @@ class H5adReader:
             end = min(offset + batch_size, stop)
             yield coo_matrix(self._matrix_values(dset, slice(offset, end)))
 
-    def _sparse_indices_are_strictly_sorted(self, maxValues: int) -> bool:
-        group = self.h5[self.matrixKey]
-        if not isinstance(group, h5py.Group) or maxValues < 1:
-            return False
-        indptr_node = group["indptr"]
-        indices_node = group["indices"]
-        compressed_size = int(indptr_node.size) - 1
-        start = 0
-        while start < compressed_size:
-            pointer_end = min(compressed_size, start + maxValues)
-            pointers = np.asarray(indptr_node[start : pointer_end + 1])
-            base = int(pointers[0])
-            relative = pointers - base
-            vectors = int(np.searchsorted(relative, maxValues, side="right") - 1)
-            if vectors < 1:
-                return False
-            pointers = pointers[: vectors + 1]
-            end = start + vectors
-            indices = np.asarray(indices_node[base : int(pointers[-1])])
-            offsets = pointers - base
-            for left, right in zip(offsets[:-1], offsets[1:], strict=True):
-                vector = indices[int(left) : int(right)]
-                if vector.size > 1 and np.any(vector[1:] <= vector[:-1]):
-                    return False
-            start = end
-        return True
+    def count_value_ranges(
+        self, maxBytes: int, featureGroups: np.ndarray | None = None
+    ) -> list[CountValueRange]:
+        """Return the range of the canonical values of each group of features.
 
-    def infer_storage_dtype(self, maxScanBytes: int = 64 * 1024 * 1024) -> Any:
-        """Resolve the smallest lossless storage dtype.
+        Duplicate coordinates of a sparse matrix are summed, as the import
+        stores them, so the ranges depend neither on the order of distinct
+        coordinates, nor on orientation or encoding. Pass a range to
+        :func:`~scarf.storage.count_dtype.count_storage_dtype` to resolve the
+        storage dtype of its group's counts.
 
-        float16 values are read as float32, so a float16 source is stored as
-        float32 unless an unsigned integer dtype holds its values.
+        Args:
+            maxBytes: Memory available to the scan.
+            featureGroups: Group, numbered from zero, of each feature, such as
+                the assay that stores it. None puts every feature in one
+                group.
+
+        Raises:
+            MemoryError: If one compressed vector or dense row does not fit in
+                ``maxBytes``.
+            ValueError: If the matrix holds NaN or an infinite value.
         """
-        if (
-            self._dtypeOverridden
-            or self.groupCodes[self.matrixKey] != 2
-            or np.dtype(self.matrixDtype).kind != "f"
-        ):
-            return self.storageDtype
-        group = self.h5[self.matrixKey]
-        if not isinstance(group, h5py.Group):
-            return self.storageDtype
-
-        data_node = group["data"]
-        indices_node = group["indices"]
-        bytes_per_value = max(
-            64,
-            3 * int(data_node.dtype.itemsize)
-            + 3 * int(indices_node.dtype.itemsize)
-            + int(group["indptr"].dtype.itemsize),
-        )
-        check_values = min(
-            1024 * 1024,
-            max(0, int(maxScanBytes)) // bytes_per_value,
-        )
-        if not self._sparse_indices_are_strictly_sorted(check_values):
-            logger.debug(
-                "Keeping the H5AD source dtype because sparse coordinates are "
-                "not canonical within the dtype-scan memory limit"
+        node = self.h5[self.matrixKey]
+        if self.matrixOrientation == "dense":
+            return dense_count_ranges(
+                lambda start, stop: self._matrix_values(node, slice(start, stop)),
+                int(node.shape[0]),
+                int(node.shape[1]),
+                maxBytes=maxBytes,
+                groups=featureGroups,
             )
-            return self.storageDtype
+        csr = self.matrixOrientation == "csr"
+        return compressed_count_ranges(
+            node["indptr"],
+            node["indices"],
+            node["data"],
+            minorSize=self.nFeatures if csr else self.nCells,
+            maxBytes=maxBytes,
+            groups=featureGroups,
+            # Features are the minor axis of CSR and the vectors of CSC.
+            groupAxis=1 if csr else 0,
+        )
 
-        finite = True
-        integral = True
-        minimum = np.inf
-        maximum = -np.inf
-        for start in range(0, data_node.size, check_values):
-            values = np.asarray(data_node[start : start + check_values])
-            if not values.size:
-                continue
-            finite = finite and bool(np.isfinite(values).all())
-            integral = integral and bool(np.equal(values, np.trunc(values)).all())
-            minimum = min(minimum, float(values.min()))
-            maximum = max(maximum, float(values.max()))
+    @property
+    def consumeDtype(self) -> np.dtype[Any]:
+        """Return the dtype in which ``consume`` yields the matrix values.
 
-        source_dtype = np.dtype(self.matrixDtype)
-        storage_dtype = source_dtype
-        if finite and integral and minimum >= 0:
-            for candidate in (
-                np.dtype("uint8"),
-                np.dtype("uint16"),
-                np.dtype("uint32"),
-            ):
-                if (
-                    maximum <= np.iinfo(candidate).max
-                    and candidate.itemsize < source_dtype.itemsize
-                ):
-                    storage_dtype = candidate
-                    break
-
-        self.storageDtype = storage_dtype
-        logger.debug(f"Resolved H5AD storage dtype={storage_dtype}")
-        return storage_dtype
+        It is ``sourceMatrixDtype``, except that the converted rows of a CSC
+        integer source yield their duplicate-summed values in int64, or uint64
+        for unsigned and boolean sources.
+        """
+        source = (
+            self.sourceMatrixDtype
+            if self._convertedCsr is None
+            else self._convertedCsr.dtype
+        )
+        dtype: np.dtype[Any] = np.dtype(source)
+        return dtype
 
     def materialized_csr_bytes(self) -> int:
         """Return bytes retained by the materialized CSC-to-CSR conversion."""
@@ -773,36 +753,27 @@ class H5adReader:
             self._indptrCache = np.asarray(self.h5[self.matrixKey]["indptr"][:])
         return self._indptrCache
 
-    def _row_nnz_cumulative(self) -> np.ndarray | None:
-        indptr = self._csr_indptr()
-        if indptr is None:
-            return None
-        if self._cumulativeRowNnz is None:
-            self._cumulativeRowNnz = cumulative_nnz(np.diff(indptr))
-        return self._cumulativeRowNnz
-
     def _prepare_sparse_import(self) -> None:
-        self._row_nnz_cumulative()
+        self._csr_indptr()
 
     def _sparse_import_resident_bytes(self) -> int:
-        total = (
-            0 if self._cumulativeRowNnz is None else int(self._cumulativeRowNnz.nbytes)
-        )
+        """Return the bytes of cached CSR row pointers.
+
+        Converted CSC rows count under :meth:`materialized_csr_bytes`.
+        """
         if self._convertedCsr is None and self._indptrCache is not None:
-            total += int(self._indptrCache.nbytes)
-        return total
+            return int(self._indptrCache.nbytes)
+        return 0
 
     def max_batch_nnz(self, batch_size: int) -> int:
         """Return the largest contiguous row-window nnz without loading values."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         batch_rows = min(batch_size, self.nCells)
-        if self.matrixOrientation == "dense":
+        indptr = self._csr_indptr()
+        if indptr is None:
             return int(batch_rows * self.nFeatures)
-        cumulative = self._row_nnz_cumulative()
-        if cumulative is None:
-            return int(batch_rows * self.nFeatures)
-        return max_window_nnz(cumulative, batch_size)
+        return max_window_nnz(indptr, batch_size)
 
     def producer_batch_staging_bytes(self, batch_size: int) -> int:
         """Bound sparse row pointers retained while one batch is produced."""
@@ -817,12 +788,17 @@ class H5adReader:
         return int((rows + 1) * (2 * itemsize + normalized_itemsize))
 
     def materialize_csc(self, maxBytes: int = 64 * 1024 * 1024) -> None:
-        """Convert CSC into temporary row storage in bounded blocks."""
+        """Convert CSC into temporary row storage in bounded blocks.
+
+        The rows hold the source values with duplicate coordinates summed.
+        Floating-point values keep ``sourceMatrixDtype``; integers are held in
+        the 64-bit integer dtype in which their duplicates are summed, so a sum
+        past the range of a narrow source dtype is kept, as a CSR import keeps
+        it.
+        """
         if self.matrixOrientation != "csc" or self._convertedCsr is not None:
             return
         group = self.h5[self.matrixKey]
-        if not isinstance(group, h5py.Group):
-            raise TypeError("CSC matrix slot must be an HDF5 group")
         data_node = group["data"]
         metadata = (self.nCells + 1) * 32 + (self.nFeatures + 1) * 8
         if maxBytes < metadata + 384:
@@ -848,17 +824,20 @@ class H5adReader:
                     shape=shape,
                 )
 
+        source = np.dtype(self.sourceMatrixDtype)
         self._convertedCsr = SparseRowStore(
             chunks,
             shape,
-            self.storageDtype,
-            source_dtype=self.sourceMatrixDtype,
+            (
+                np.dtype(np.uint64 if source.kind in "bu" else np.int64)
+                if source.kind in "biu"
+                else source
+            ),
             max_bytes=maxBytes - indptr.nbytes,
+            source_dtype=source,
             temp_dir=self._tempDir,
         )
-        logger.debug(
-            f"Prepared H5AD row storage for conversion with dtype={self.storageDtype}"
-        )
+        logger.debug("Prepared H5AD row storage for the CSC conversion")
 
     def consume_group(
         self,
@@ -880,8 +859,7 @@ class H5adReader:
 
         grp = self.h5[self.matrixKey]
         source_indptr = self._csr_indptr()
-        if source_indptr is None:
-            raise RuntimeError("CSR row pointers are unavailable")
+        assert source_indptr is not None
         for offset in range(start, stop, batch_size):
             end = min(offset + batch_size, stop)
             indptr = source_indptr[offset : end + 1]
@@ -902,16 +880,13 @@ class H5adReader:
     def _consume_converted_csr(
         self,
         batch_size: int,
-        row_start: int = 0,
-        row_end: int | None = None,
+        start: int,
+        stop: int,
     ) -> Generator[coo_matrix, None, None]:
         """Yield row batches from the temporary CSC conversion."""
         if self._convertedCsr is None:
             self.materialize_csc()
-        if self._convertedCsr is None:
-            raise RuntimeError("CSC materialization did not produce a CSR matrix")
-        start = max(0, int(row_start))
-        stop = int(self.nCells if row_end is None else row_end)
+        assert self._convertedCsr is not None
         for offset in range(start, stop, batch_size):
             end = min(offset + batch_size, stop)
             yield self._convertedCsr.read(offset, end).tocoo(copy=False)
@@ -923,13 +898,11 @@ class H5adReader:
         row_end: int,
     ) -> Generator[coo_matrix, None, None]:
         """Yield source batches covering ``[row_start, row_end)``."""
+        # The constructor rejects a matrix slot that is neither a dataset nor
+        # a group.
         if self.groupCodes[self.matrixKey] == 1:
             return self.consume_dataset(batch_size, row_start, row_end)
-        if self.groupCodes[self.matrixKey] == 2:
-            return self.consume_group(batch_size, row_start, row_end)
-        raise ValueError(
-            f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
-        )
+        return self.consume_group(batch_size, row_start, row_end)
 
     def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""

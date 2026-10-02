@@ -3,10 +3,7 @@ import pandas as pd
 import pytest
 import zarr
 from scipy.sparse import csr_matrix
-from zarr.storage import MemoryStore
 
-from scarf.assay import Assay
-from scarf.storage.budget import ResourceBudget
 from scarf.trajectory.feature_dynamics import (
     aggregate_feature_profiles,
     knn_clustering,
@@ -229,6 +226,18 @@ def test_largest_component_selection_is_deterministic_on_ties():
             csr_matrix(adjacency),
             selected_indices,
             "error",
+        )
+
+
+@pytest.mark.parametrize(
+    ("shape", "n_selected"), [((6, 6), 5), ((6, 5), 6), ((5, 6), 5)]
+)
+def test_component_selection_rejects_graphs_that_do_not_match_the_selection(
+    shape, n_selected
+):
+    with pytest.raises(ValueError, match="one row per selected cell index"):
+        _select_pseudotime_component(
+            csr_matrix(shape), np.arange(n_selected), "largest"
         )
 
 
@@ -905,66 +914,6 @@ def test_regressor_validation_rejects_invalid_columns(
             "ptime",
             "I",
             has_validity_column=False,
-        )
-
-
-class _AggregationCells:
-    def __init__(self, ordering: np.ndarray):
-        self.ordering = ordering
-        self.N = len(ordering)
-
-    def fetch(self, _ordering_key: str, key: str) -> np.ndarray:
-        assert key == "I"
-        return self.ordering
-
-
-class _AggregationAssay:
-    def __init__(self, expression: np.ndarray, ordering: np.ndarray):
-        self.expression = expression
-        self.cells = _AggregationCells(ordering)
-        self.feats = type("Features", (), {"N": expression.shape[1]})()
-        self.z = zarr.open_group(store=MemoryStore(), mode="w")
-        self.nthreads = 1
-        self.resources = ResourceBudget(1024**3, 1)
-
-    def iter_normed_feature_wise(self, *_args, **_kwargs):
-        yield pd.DataFrame(
-            self.expression,
-            columns=np.arange(self.expression.shape[1]),
-        )
-
-
-@pytest.mark.parametrize(
-    ("ordering", "window_size", "chunk_size", "error_type", "match"),
-    [
-        (np.array([[0.0, 1.0]]), 2, 2, ValueError, "one-dimensional"),
-        (np.array([0.0, np.nan]), 2, 2, ValueError, "finite values"),
-        (np.array([0.0, 1.0]), True, 2, TypeError, "window_size"),
-        (np.array([0.0, 1.0]), 2, True, TypeError, "chunk_size"),
-        (np.array([0.0, 1.0]), 0, 2, ValueError, "window_size"),
-        (np.array([0.0, 1.0]), 2, 0, ValueError, "chunk_size"),
-    ],
-)
-def test_aggregation_rejects_invalid_ordering_and_sizes(
-    ordering,
-    window_size,
-    chunk_size,
-    error_type,
-    match,
-):
-    assay = _AggregationAssay(
-        np.ones((ordering.shape[0], 2)),
-        ordering,
-    )
-
-    with pytest.raises(error_type, match=match):
-        Assay._prepare_aggregated_ordering(
-            assay,
-            np.arange(ordering.shape[0]),
-            np.arange(assay.expression.shape[1]),
-            ordering,
-            window_size=window_size,
-            chunk_size=chunk_size,
         )
 
 

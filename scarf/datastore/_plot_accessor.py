@@ -326,7 +326,7 @@ class DataStorePlotAccessor:
         target_groups: Sequence[Any] | np.ndarray | None = None,
         layout: ArtifactRef | None = None,
         kind: Literal["embedding", "histogram", "box"] = "embedding",
-        reference_class_group: str | None = None,
+        reference_labels: str | ArtifactRef | None = None,
         size_by_score: bool = False,
         log_transform: bool = True,
         multiplier: float = 1000,
@@ -347,10 +347,8 @@ class DataStorePlotAccessor:
 
     def mapping_evidence(
         self,
-        result: ArtifactRef,
+        transfer: ArtifactRef,
         *,
-        reference: MappingReference,
-        reference_class_group: str,
         target_groups: Sequence[Any] | np.ndarray | None = None,
         metrics: Sequence[str] = (
             "voteFraction",
@@ -360,9 +358,6 @@ class DataStorePlotAccessor:
         ),
         kind: Literal["histogram", "box"] = "histogram",
         bins: int = 30,
-        threshold_fraction: float = 0.5,
-        na_val: str = "NA",
-        max_distance: float | None = None,
         categorical_scale: CategoricalScale | None = None,
         target: Any | None = None,
         figsize: tuple[float, float] | None = None,
@@ -370,22 +365,18 @@ class DataStorePlotAccessor:
         show_legend: bool = True,
         show: bool = True,
     ) -> PlotResult:
-        """Plot query-level label-transfer evidence."""
+        """Plot the saved evidence of one label transfer for query groups."""
         return self._forward(PlotResult, "mapping_evidence", locals())
 
     def mapping_confusion(
         self,
-        result: ArtifactRef,
+        transfer: ArtifactRef,
         *,
-        reference: MappingReference,
-        reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         normalize: Literal["none", "true", "predicted", "all"] = "true",
         known_order: Sequence[Any] | None = None,
         predicted_order: Sequence[Any] | None = None,
-        threshold_fraction: float = 0.5,
-        na_val: str = "NA",
-        max_distance: float | None = None,
+        abstention_label: str = "Abstained",
         color_scale: ColorScale | None = None,
         target: Any | None = None,
         figsize: tuple[float, float] | None = None,
@@ -393,29 +384,25 @@ class DataStorePlotAccessor:
         show_legend: bool = True,
         show: bool = True,
     ) -> PlotResult:
-        """Plot known query labels against transferred labels."""
+        """Plot known query labels against the labels of one saved transfer."""
         return self._forward(PlotResult, "mapping_confusion", locals())
 
     def mapping_calibration(
         self,
-        result: ArtifactRef,
+        transfer: ArtifactRef,
         *,
-        reference: MappingReference,
-        reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         metric: str = "voteFraction",
         direction: Literal["auto", "higher", "lower"] = "auto",
         thresholds: Sequence[float] | np.ndarray | None = None,
         n_thresholds: int = 50,
         chosen_threshold: float | None = None,
-        na_val: str = "NA",
-        max_distance: float | None = None,
         target: Any | None = None,
         figsize: tuple[float, float] | None = None,
         theme: str = "notebook",
         show: bool = True,
     ) -> PlotResult:
-        """Plot held-out label accuracy against retained mapping coverage."""
+        """Plot held-out label accuracy against retained coverage per threshold."""
         return self._forward(PlotResult, "mapping_calibration", locals())
 
     def dotplot(

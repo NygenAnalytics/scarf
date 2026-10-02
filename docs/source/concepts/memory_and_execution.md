@@ -3,7 +3,7 @@
 
 Scarf keeps large matrices in Zarr and streams planned blocks through memory.
 It does not load the full count matrix simply because a `DataStore` is opened.
-Memory use still depends on the operation: graph construction, clustering, and marker batches can hold structures in addition to the streamed count blocks.
+Memory use still depends on the operation: graph construction and clustering can hold structures in addition to the streamed count blocks.
 
 ## Resource controls
 
@@ -19,9 +19,14 @@ ds = scarf.DataStore(
 ```
 
 `mem_budget` accepts bytes, a size such as `"8G"`, or a fraction of detected system memory such as `"0.6"`.
-It bounds planned streaming blocks, concurrent writes, and automatically sized feature batches.
-It is a software planning budget, not a hard cap on total process resident memory.
-Python, native libraries, graph structures, and allocator overhead can take total RSS above the configured value, so leave host headroom.
+Each operation reserves within it the blocks it reads and what Zarr holds while it reads them: for a sharded array, such as the counts, a shard-level copy of the selection and the compressed chunks the read touches in a shard, and for every array the chunks it decodes.
+For a block transformed by a chain of element-wise steps, such as library-size scaling followed by a logarithm, it reserves the step of the chain that holds the most, one step's input beside its output.
+It also reserves its kernel scratch and results, and limits its concurrent reads and writes and the width of automatically sized feature batches to fit.
+Every count writer (the imports, subset, repack, merge, and grouped assays) also fits the count layout to it, writing smaller count shards when the default ones do not fit; the layout changes how the counts are stored, never the store's identity.
+It is an operation budget, not a hard cap on total process resident memory.
+Memory the process already holds when an operation starts, such as the interpreter, native libraries, graph structures, and earlier results, is not subtracted, so a process can peak at its resident memory plus the budget.
+Outside these reservations, a Zarr codec thread can keep a decoded chunk for a moment after its read, and decoding a chunk of an unsharded array, such as normalized data, also holds that chunk's compressed bytes; leave host headroom.
+glibc can also keep freed buffers of 32 MiB or less resident after an operation; setting the `MALLOC_MMAP_THRESHOLD_` environment variable, for example to `131072`, before Python starts returns them to the system.
 
 ### Worker concurrency
 

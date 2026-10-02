@@ -38,6 +38,12 @@
 
 Use this before `H5adReader` when you do not know which matrix and metadata keys an H5AD file uses.
 
+`H5adReader` checks the matrix shape against the lengths of `obs` and `var` when it is
+constructed, and a mismatch raises `ValueError`. Overriding `matrix_key`, for example with
+`raw/X`, in the constructor or through `H5adReader.from_inspect`, therefore also needs the
+matching `feature_attrs_key`, here `raw/var`. `inspect_h5ad(path, matrix_key="raw/X")` returns
+reader arguments that pair them.
+
 `H5adReader` decodes AnnData categorical columns and pandas nullable columns, including the
 nullable string arrays that AnnData writes for dataframe indexes. By default it reads the index
 that the dataframe's `_index` attribute names.
@@ -113,15 +119,57 @@ workflow mapping.
 
 Writers, merge, subset, and ``DataStore`` accept the same optional storage
 controls. ``profile`` chooses the physical encoding. ``policy`` chooses paired
-count-matrix geometry. ``io`` overrides automatic read, compute, and write
-widths. Unset values stay under automatic planning from ``mem_budget`` and
-``nthreads``.
+count-matrix geometry, and a writer uses it exactly. Without it, every count
+writer (the imports, subset, ``repack_zarr``, merge, and ``add_grouped_assay``)
+fits the geometry to ``mem_budget``: it halves the default ``unitBytes`` and
+``chunkBytes`` together until the counts write and the ``countsT`` transpose
+fit. Writers that choose their source batches (the sparse and Seurat imports,
+and merge) admit batches of one destination row band, so a fitted geometry
+never leaves the write narrower batches than its bands. A write that does not
+fit, with one-row count shards or with its explicit ``policy``, fails before it
+creates the destination: writers raise when they are constructed, and merge
+when it plans. ``MtxToZarr`` and ``CrToZarr`` take ``lines_in_mem`` in the
+constructor, so the fit reserves the Matrix Market parse buffer that the write
+uses. A resumed merge keeps the geometry of its completed counts. The geometry
+never changes the store's identity. ``io`` overrides automatic read, compute,
+and write widths. Unset values stay under automatic planning from
+``mem_budget`` and ``nthreads``.
 
 ```{eval-rst}
 .. autoclass:: scarf.storage.io_policy.StorageIoPolicy
     :members:
 
 .. autoclass:: scarf.storage.count_matrix.CountMatrixPolicy
+    :members:
+```
+
+### Count storage dtype
+
+Every import stores each assay's counts in a dtype resolved from the values of
+that assay, whatever the reader and source encoding, and no import takes a count
+dtype argument. When every canonical (duplicate-summed) value is a non-negative
+integer, the counts are stored in the narrowest of ``uint8``, ``uint16``,
+``uint32``, and ``uint64`` that holds them. Other counts keep their source
+dtype in native byte order, with ``float16`` read as ``float32``. Assays split from one source
+matrix (10x HDF5 and Matrix Market feature types, H5AD ``assay_split_key``)
+each resolve their own dtype. Each import reads every count once before it
+creates the destination: ``CrReader`` subclasses and ``H5adReader`` report the
+range of each group of features over the selected cells through
+``count_value_ranges``, ``CSVReader`` records it as ``countRange`` in its first
+pass, and ``SparseToZarr`` and ``SeuratToZarr`` scan their sources. Count
+matrices hold finite values, so imports reject NaN and infinity before they
+create the destination. Writers cast through a checked cast, so a count that
+the stored dtype cannot hold raises instead of wrapping.
+
+Subset and repack keep the source dtype. Merge stores the common type of the
+source count dtypes, widened so that features summed by name cannot overflow
+it, and rejects integer sources without a common integer dtype. Grouped and
+melded assays keep their ``float64`` values.
+
+```{eval-rst}
+.. autofunction:: scarf.storage.count_dtype.count_storage_dtype
+
+.. autoclass:: scarf.utils.count_values.CountValueRange
     :members:
 ```
 
@@ -241,9 +289,10 @@ Ordinary `to_h5ad` export writes a complete assay and live metadata. Run-aware e
 the completed run's frozen selections and fields, so export does not require physical result
 columns.
 
-`CrToZarr`, `MtxToZarr`, `H5adToZarr`, and `SparseToZarr` select source batch rows automatically when `batch_size` is omitted.
-The selection starts from the smallest destination row-shard height and shrinks only when required by the operation memory budget.
-Explicit positive values remain supported.
+`CrToZarr`, `MtxToZarr`, `H5adToZarr`, `SparseToZarr`, and `SeuratToZarr` select source batch
+rows automatically when `batch_size` is omitted, starting from the smallest destination
+row-shard height, which the fitted count layout admits. An explicit positive `batch_size` is
+capped at that height.
 
 ## Merge
 
@@ -271,7 +320,9 @@ aliases, contains, or lies inside a source store, or that already holds other co
 opening it as a `DataStore`, and it clears the recorded default assay.
 Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.
 A resume requires the same configuration and the same source counts; a completed `countsT` whose
-layout differs from the plan is not rewritten in place.
+layout differs from the plan is not rewritten in place. Completed counts keep the layout persisted
+with them, so a resume under another `mem_budget` reuses them, while counts that a resume rewrites
+get a layout fitted to its budget.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DataStoreMerge

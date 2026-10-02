@@ -576,6 +576,7 @@ def test_mapping_does_not_import_orchestration_or_general_io():
         "artifact.py",
         "confidence.py",
         "features.py",
+        "label_transfer.py",
         "models.py",
         "projection.py",
         "reference.py",

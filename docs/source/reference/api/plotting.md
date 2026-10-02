@@ -31,6 +31,7 @@ Granular workflows pass exact refs to the same datastore-owned plotting surface:
 | marker heatmap | `marker=marker_ref` |
 | pseudotime heatmap | `aggregation=aggregation_ref` |
 | mapping score | `mapping_score(result_ref, reference=reference, layout=embedding_ref)` |
+| label-transfer evidence, confusion, and calibration | `mapping_evidence(transfer_ref)`, `mapping_confusion(transfer_ref, known_labels=...)`, `mapping_calibration(transfer_ref, known_labels=...)` |
 
 `layout_key` and string forms on plotters that still accept them refer to deliberate live metadata
 inputs. Distribution grouping instead requires either an exact categorical artifact or an explicit

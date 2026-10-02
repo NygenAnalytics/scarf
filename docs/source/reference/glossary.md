@@ -112,6 +112,10 @@ mapping reference
   Immutable RNA mapping artifact built from a scaled PCA or Symphony neighbour chain with `build_mapping_reference(neighbors)`.
   A writable query datastore uses it to create query-owned projections without changing the reference.
 
+label transfer
+  Query-owned artifact from `run_label_transfer` that gives each projected query cell the reference label with the largest share of its neighbours' weight, or no label when the cell abstains.
+  The reference labels it uses are first frozen into the query datastore, so saved labels do not change when the reference is re-annotated.
+
 Paris clustering
   Hierarchical graph clustering in Scarf (`run_paris_clustering`).
   Supports fixed cuts and branch-adaptive cuts guarded by configuration-null modularity, plus cluster-tree visualization.

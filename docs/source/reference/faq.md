@@ -155,6 +155,12 @@ python -m scarf.tools.repack_zarr input.zarr output.zarr --data-only
 The rebuild keeps raw counts, annotations, and selection columns, omits saved analyses and retired
 state, and prepares the new store from its own counts. Afterward, recompute HVG, normalization,
 PCA, graph, and marker results with the current release.
+A grouped assay is stored as counts, so the rebuild copies the values that an earlier release
+computed for it. Those can be NaN for cells without counts or wrapped values from 16-bit counts in
+a grouped RNA assay, and means of CLR values computed in float32 or float16 in a grouped ADT assay.
+Build grouped assays again with `add_grouped_assay`, under a new `assay_label` in a rebuilt store.
+Count matrices must hold finite values, so a store whose grouped assay holds NaN cannot be rebuilt;
+re-import its source and build the grouped assay there.
 Non-RNA assays do not use `countsT`.
 See {doc}`../concepts/memory_and_execution`.
 

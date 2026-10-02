@@ -21,7 +21,10 @@ if TYPE_CHECKING:
         EnrichmentResult as EnrichmentResult,
         read_gmt as read_gmt,
     )
-    from .mapping.models import MappingResult as MappingResult
+    from .mapping.models import (
+        LabelTransferResult as LabelTransferResult,
+        MappingResult as MappingResult,
+    )
     from .mapping.reference import MappingReference as MappingReference
     from .storage.artifacts import ArtifactStatus as ArtifactStatus
     from .storage.errors import ArtifactResolutionError as ArtifactResolutionError
@@ -135,6 +138,7 @@ _LAZY_EXPORTS: dict[str, str] = {
     "SeuratInspectResult": ".readers",
     "SeuratReader": ".readers",
     "SeuratToZarr": ".writers",
+    "LabelTransferResult": ".mapping.models",
     "MappingReference": ".mapping.reference",
     "MappingResult": ".mapping.models",
     "mount_datastore": ".datastore.datastore",

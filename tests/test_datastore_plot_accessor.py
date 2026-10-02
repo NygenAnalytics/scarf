@@ -65,6 +65,12 @@ _PROJECTION_REF = ArtifactRef(
     kind="projection",
     artifact_id="e" * 64,
 )
+_TRANSFER_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="label_transfer",
+    artifact_id="f" * 64,
+)
 _EMBEDDING_REF = ArtifactRef(
     scope="assay",
     assay="RNA",
@@ -215,26 +221,18 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ),
         (
             "mapping_calibration",
-            (_PROJECTION_REF,),
-            {
-                "reference": object(),
-                "reference_class_group": "label",
-                "known_labels": ["a"],
-            },
+            (_TRANSFER_REF,),
+            {"known_labels": ["a"]},
         ),
         (
             "mapping_confusion",
-            (_PROJECTION_REF,),
-            {
-                "reference": object(),
-                "reference_class_group": "label",
-                "known_labels": ["a"],
-            },
+            (_TRANSFER_REF,),
+            {"known_labels": ["a"], "abstention_label": "none"},
         ),
         (
             "mapping_evidence",
-            (_PROJECTION_REF,),
-            {"reference": object(), "reference_class_group": "label"},
+            (_TRANSFER_REF,),
+            {"metrics": ("voteFraction",)},
         ),
         (
             "mapping_score",
@@ -306,8 +304,10 @@ def test_plot_accessor_forwards_to_canonical_function(
     expected_args = [store]
     if name == "distribution":
         expected_args.append(expected_kwargs.pop("keys"))
-    elif name.startswith("mapping_"):
+    elif name == "mapping_score":
         expected_args.append(expected_kwargs.pop("result"))
+    elif name.startswith("mapping_"):
+        expected_args.append(expected_kwargs.pop("transfer"))
     elif name == "run_recipe":
         expected_args.append(expected_kwargs.pop("recipe"))
 

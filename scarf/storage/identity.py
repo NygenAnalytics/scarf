@@ -86,7 +86,9 @@ class CountSummary:
     Writers fill rows from bands in any order while the values are in memory.
     The fingerprint depends only on each row's nonzero values, so chunk layout,
     band size, and byte order do not change it. Row sums and positive-entry
-    counts are the raw inputs for cell and feature summaries.
+    counts are the raw inputs for cell and feature summaries. Every count
+    writer passes its bands through ``update``, which rejects NaN and infinity
+    because count matrices hold finite values. Negative values are kept.
     """
 
     def __init__(self, counts: zarr.Array, rows: tuple[int, int] | None = None):
@@ -122,6 +124,12 @@ class CountSummary:
         return self.nbytes_for(len(self.rowSums), self.shape[1])
 
     def update(self, start: int, block: Any) -> None:
+        """Summarize the rows of ``block``, which start at row ``start``.
+
+        Raises:
+            ValueError: If the block has the wrong shape or holds NaN or
+                infinity.
+        """
         from ..utils.digest import summarize_rows
 
         values = np.ascontiguousarray(block, dtype=self.dtype)

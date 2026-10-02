@@ -98,9 +98,10 @@ mapping. These panels provide visual context, not biological validation.
 
 Values are elapsed seconds for each stage. All columns are means of three
 replicates. Stage values exclude orchestration, while dataset download is shown
-separately. UMAP runs in the background beside Leiden, as in
-`DataStore.pipeline`, so the two stages overlap in time and share their memory
-window.
+separately. In this measurement the profiling funnel ran UMAP on a background
+thread while Leiden ran in a child process, so the two stages overlapped in time
+and shared their memory window. `DataStore.pipeline` runs every stage in
+sequence, so its totals include both stages.
 
 | Stage | 10k | 50k | 100k | 500k | 1M | 5M | 10M |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -122,8 +123,8 @@ window.
 | Marker search | 41.7 | 32.1 | 32.3 | 47.0 | 72.8 | 149.8 | 409.9 |
 
 At 10M, UMAP was the largest stage and creating the count store was next.
-Leiden ran within the UMAP window, so its seconds overlap UMAP's instead of
-adding to the total. At the smallest sizes, fixed work dominates, so the 10k,
+Leiden ran within the UMAP window of the funnel, so its seconds overlap UMAP's
+instead of adding to the total. At the smallest sizes, fixed work dominates, so the 10k,
 50k, and 100k totals are similar despite the difference in cell count.
 
 (what-was-measured)=
@@ -140,7 +141,7 @@ adding to the total. At the smallest sizes, fixed work dominates, so the 10k,
 | Analysis | 1,000 highly variable features, 21 PCA dimensions, 11 neighbours, 1,000 embedding centroids |
 | Graph and clustering | Graph seed 4466; 300 UMAP epochs; UMAP and Leiden seed 4444; igraph Leiden at resolution 1.0 |
 | Filtering | 1st and 99th cell quantiles; minimum 10 features per cell and 20 cells per feature |
-| Execution | Parallel ANN and UMAP on S3-compatible object storage in the Modal EU region; one worker per CPU; 1 GB count-matrix units and 100 MB chunks; UMAP in the background beside Leiden |
+| Execution | Parallel ANN and UMAP on S3-compatible object storage in the Modal EU region; one worker per CPU; 1 GB count-matrix units and 100 MB chunks; funnel UMAP on a background thread beside a Leiden child process |
 | Memory planning | Scarf budget set to 75% of each container memory limit |
 
 - Machine size grew with input size. Compare rows only with their recorded

@@ -7,10 +7,30 @@ from typing import Any
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..utils.arrays import canonicalize_sparse, cumulative_nnz
+from ..utils.arrays import canonicalize_sparse, checked_sparse_cast, cumulative_nnz
+
+
+def _sorted_rows(records: np.ndarray, shape: tuple[int, int], dtype: Any) -> csr_matrix:
+    """Return records as rows sorted by column, keeping duplicate coordinates."""
+    records = records[np.lexsort((records["column"], records["row"]))]
+    return csr_matrix(
+        (
+            checked_sparse_cast(records["value"], dtype),
+            records["column"],
+            cumulative_nnz(np.bincount(records["row"], minlength=shape[0])),
+        ),
+        shape=shape,
+    )
 
 
 class SparseRowStore:
+    """Disk-backed cell rows of a sparse matrix that arrives in any order.
+
+    Rows hold ``dtype``. With ``sum_duplicates`` the duplicate coordinates of
+    a row are summed; otherwise they are kept, sorted by column, for a reader
+    that sums them later.
+    """
+
     def __init__(
         self,
         chunks: Callable[[], Iterator[coo_matrix]],
@@ -20,6 +40,7 @@ class SparseRowStore:
         max_bytes: int,
         max_nnz: int = np.iinfo(np.int64).max,
         source_dtype: Any | None = None,
+        sum_duplicates: bool = True,
         temp_dir: str | Path | None = None,
     ) -> None:
         self.shape = shape
@@ -115,16 +136,21 @@ class SparseRowStore:
                     path = directory / f"bucket-{bucket}"
                     if written[bucket]:
                         records = np.fromfile(path, dtype=record_dtype)
-                        matrix = canonicalize_sparse(
-                            coo_matrix(
-                                (
-                                    records["value"],
-                                    (records["row"], records["column"]),
+                        bucket_shape = (int(stop - start), shape[1])
+                        matrix = (
+                            canonicalize_sparse(
+                                coo_matrix(
+                                    (
+                                        records["value"],
+                                        (records["row"], records["column"]),
+                                    ),
+                                    shape=bucket_shape,
                                 ),
-                                shape=(int(stop - start), shape[1]),
-                            ),
-                            self.dtype,
-                        ).tocsr()
+                                self.dtype,
+                            ).tocsr()
+                            if sum_duplicates
+                            else _sorted_rows(records, bucket_shape, self.dtype)
+                        )
                         matrix.data.tofile(data_stream)
                         matrix.indices.astype(np.int64, copy=False).tofile(index_stream)
                         np.add(

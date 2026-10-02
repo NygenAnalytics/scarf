@@ -25,8 +25,9 @@ from scarf.storage.schema import (
 from scarf.tools.repack_zarr import repack_store
 from scarf.writers import SparseToZarr, create_zarr_count_assay
 
-# Four count shards of ten cells each, so one shard can fail on its own.
-_SMALL_SHARDS = CountMatrixPolicy(unitBytes=480, chunkBytes=96)
+# Four count shards of ten cells each, so one shard can fail on its own. The
+# counts store as uint8, one byte for each of the twelve features of a row.
+_SMALL_SHARDS = CountMatrixPolicy(unitBytes=120, chunkBytes=24)
 
 
 def _counts(n_cells: int = 40, n_features: int = 12, seed: int = 7) -> np.ndarray:
@@ -188,7 +189,9 @@ def test_repack_refuses_interrupted_derived_assay(tmp_path):
         store.z, "MODULES", None, operation="add_grouped_assay"
     )
     transaction = context.__enter__()
-    partial = transaction.create_counts(store.cells.N, ["group_1"], ["group_1"])
+    partial = transaction.create_counts(
+        store.cells.N, ["group_1"], ["group_1"], np.float64
+    )
     partial[:10] = 1.0
 
     for destination, data_only in (("data.zarr", True), ("full.zarr", False)):
@@ -220,7 +223,9 @@ def test_repack_refuses_unfinalized_writer_counts(tmp_path):
     path = tmp_path / "rna.zarr"
     _write_store(path, _counts())
     root = zarr.open_group(str(path), mode="r+")
-    extra = create_zarr_count_assay(root, "EXTRA", None, 40, ["a", "b"], ["a", "b"])
+    extra = create_zarr_count_assay(
+        root, "EXTRA", None, 40, ["a", "b"], ["a", "b"], np.uint8
+    )
     extra[:20] = 1
 
     assert extra.attrs["complete"] is False
@@ -252,7 +257,7 @@ def test_derived_assay_transaction_discards_on_keyboard_interrupt():
         with derived_assay_transaction(
             root, "SCORES", "ws", operation="add_melded_assay"
         ) as transaction:
-            counts = transaction.create_counts(3, ["f0"], ["f0"])
+            counts = transaction.create_counts(3, ["f0"], ["f0"], np.float64)
             assert "is_assay" not in transaction.group.attrs
             assert pending_assays(root) == [("SCORES", "ws", "add_melded_assay")]
             root["ws"].attrs["assayTypes"] = {"OTHER": "RNA", "SCORES": "RNA"}
@@ -271,13 +276,13 @@ def test_derived_assay_transaction_publishes_only_finalized_counts():
         with derived_assay_transaction(
             root, "SCORES", None, operation="add_grouped_assay"
         ) as transaction:
-            transaction.create_counts(3, ["f0"], ["f0"])
+            transaction.create_counts(3, ["f0"], ["f0"], np.float64)
     assert "SCORES" not in root
 
     with derived_assay_transaction(
         root, "SCORES", None, operation="add_grouped_assay"
     ) as transaction:
-        counts = transaction.create_counts(3, ["f0"], ["f0"])
+        counts = transaction.create_counts(3, ["f0"], ["f0"], np.float64)
         counts[:] = 2.0
         finalize_test_counts(counts)
         transaction.group.attrs["provenance"] = "kept"
@@ -313,8 +318,8 @@ def test_derived_assay_cannot_create_counts_twice():
         with derived_assay_transaction(
             root, "SCORES", None, operation="add_grouped_assay"
         ) as transaction:
-            transaction.create_counts(3, ["f0"], ["f0"])
-            transaction.create_counts(3, ["f1"], ["f1"])
+            transaction.create_counts(3, ["f0"], ["f0"], np.float64)
+            transaction.create_counts(3, ["f1"], ["f1"], np.float64)
 
     assert "SCORES" not in root
     assert pending_assays(root) == []
@@ -334,7 +339,7 @@ def test_failed_rollback_keeps_pending_assay_recoverable(monkeypatch):
             with derived_assay_transaction(
                 root, "SCORES", None, operation="add_grouped_assay"
             ) as transaction:
-                transaction.create_counts(3, ["f0"], ["f0"])
+                transaction.create_counts(3, ["f0"], ["f0"], np.float64)
                 raise RuntimeError("count write failed")
 
     assert pending_assays(root) == [("SCORES", None, "add_grouped_assay")]
@@ -346,7 +351,7 @@ def test_failed_rollback_keeps_pending_assay_recoverable(monkeypatch):
 def test_pending_assay_names_its_discard_path():
     root = _memory_root()
     context = derived_assay_transaction(root, "SCORES", None, operation="op")
-    context.__enter__().create_counts(3, ["f0"], ["f0"])
+    context.__enter__().create_counts(3, ["f0"], ["f0"], np.float64)
 
     with pytest.raises(ValueError, match=r"discard_interrupted_assay\('SCORES'\)"):
         validate_new_assay(root, "SCORES", None)
@@ -357,7 +362,7 @@ def test_pending_assay_names_its_discard_path():
 
     root = _memory_root("ws1")
     context = derived_assay_transaction(root, "SCORES", "ws1", operation="op")
-    context.__enter__().create_counts(3, ["f0"], ["f0"])
+    context.__enter__().create_counts(3, ["f0"], ["f0"], np.float64)
     with pytest.raises(ValueError, match=r"opened with workspace='ws1'"):
         validate_new_assay(root, "SCORES", "ws1")
     del context
@@ -579,3 +584,42 @@ def test_grouped_assay_from_aggregation_ignores_unclustered_features(
     expected = store.RNA.normed(cell_idx=cells, feat_idx=first).mean(axis=1).compute()
     np.testing.assert_allclose(_stored_counts(store, "MODULES")[:, 0], expected)
     assert store.MODULES.z.attrs["grouped_group_artifact"] == aggregation.to_dict()
+
+
+def test_add_grouped_assay_fits_the_count_layout_to_the_budget(tmp_path):
+    from scarf.storage.count_matrix import (
+        DEFAULT_COUNT_MATRIX_POLICY,
+        load_count_matrix_plan,
+        policy_from_payload,
+    )
+
+    path = tmp_path / "rna.zarr"
+    counts = _counts(n_cells=4_000, n_features=200, seed=3)
+    # Source chunks of 100 cells keep the reads of the group means small.
+    SparseToZarr(
+        csr_matrix(counts),
+        zarr_loc=str(path),
+        cell_ids=[f"c{i}" for i in range(4_000)],
+        feature_ids=[f"g{i}" for i in range(200)],
+        nthreads=1,
+        policy=CountMatrixPolicy(unitBytes=100_000, chunkBytes=20_000),
+    ).dump()
+    # The 3.2 MB of group means fit one default band, but the write of that
+    # band does not fit this budget.
+    store = DataStore(
+        str(path), default_assay="RNA", min_features_per_cell=0, mem_budget="8M"
+    )
+    modules = np.repeat(np.arange(100), 2)
+    store.RNA.feats.insert("module", modules, overwrite=True)
+    store.add_grouped_assay("module", assay_label="MODULES")
+
+    grouped = zarr.open_group(str(path), mode="r")["MODULES/counts"]
+    policy = policy_from_payload(load_count_matrix_plan(grouped))
+    assert policy.unitBytes < DEFAULT_COUNT_MATRIX_POLICY.unitBytes
+    assert grouped.metadata.shards[0] < 4_000
+    expected = _lib_size_group_means(
+        counts,
+        [np.flatnonzero(modules == value) for value in range(100)],
+        store.RNA.sf,
+    )
+    np.testing.assert_allclose(grouped[:], expected)

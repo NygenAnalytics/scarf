@@ -1,7 +1,6 @@
 import json
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -14,16 +13,6 @@ from .refs import ArtifactLocator, ArtifactRef, ExternalArtifactRef
 type LineageTarget = ArtifactRef | Mapping[str, ArtifactRef]
 
 
-@dataclass(frozen=True, slots=True)
-class _ExternalLineageRef:
-    dataset_fingerprint: str
-    source_assay: str
-    ref: ArtifactRef
-
-
-type _LineageLocator = ArtifactLocator | _ExternalLineageRef
-
-
 _DETAIL_ITEM_LIMIT = 12
 _DETAIL_VALUE_LIMIT = 160
 _OMITTED = object()
@@ -34,15 +23,16 @@ def _ref_sort_key(ref: ArtifactRef) -> tuple[str, str, str, str]:
 
 
 def _locator_sort_key(
-    locator: _LineageLocator,
-) -> tuple[str, str, str, str, str, str]:
-    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+    locator: ArtifactLocator,
+) -> tuple[str, str, str, str, str, str, str]:
+    if isinstance(locator, ExternalArtifactRef):
         return (
             "external",
             locator.dataset_fingerprint,
+            locator.anchor_assay or "",
             *_ref_sort_key(locator.ref),
         )
-    return ("local", "", *_ref_sort_key(locator))
+    return ("local", "", "", *_ref_sort_key(locator))
 
 
 def _input_path(parts: tuple[str, ...]) -> str:
@@ -163,14 +153,9 @@ def _normalize_external_roots(
 
 def _inspect_external_artifact(
     root: zarr.Group,
-    locator: ExternalArtifactRef | _ExternalLineageRef,
+    locator: ExternalArtifactRef,
 ) -> ArtifactStatus:
-    assay_name = (
-        locator.ref.assay
-        if isinstance(locator, ExternalArtifactRef)
-        else locator.source_assay
-    )
-    assert assay_name is not None
+    assay_name = locator.fingerprint_assay
     if assay_name not in root or not isinstance(root[assay_name], zarr.Group):
         raise ValueError(
             f"External root for dataset fingerprint "
@@ -198,13 +183,13 @@ def _build_graph(
     external_roots: Mapping[str, zarr.Group],
 ) -> nx.DiGraph:
     graph = nx.DiGraph()
-    visited: set[_LineageLocator] = set()
+    visited: set[ArtifactLocator] = set()
 
-    def visit(locator: _LineageLocator) -> None:
+    def visit(locator: ArtifactLocator) -> None:
         if locator in visited:
             return
         visited.add(locator)
-        if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+        if isinstance(locator, ExternalArtifactRef):
             external_root = external_roots.get(locator.dataset_fingerprint)
             status = (
                 None
@@ -224,31 +209,18 @@ def _build_graph(
             key=lambda item: (item[0], _locator_sort_key(item[1])),
         )
         for input_name, input_locator in dependencies:
-            dependency: _LineageLocator = input_locator
-            if isinstance(
-                locator,
-                ExternalArtifactRef | _ExternalLineageRef,
-            ) and isinstance(input_locator, ArtifactRef):
-                source_assay = (
-                    locator.ref.assay
-                    if isinstance(locator, ExternalArtifactRef)
-                    else locator.source_assay
+            dependency: ArtifactLocator = input_locator
+            if isinstance(locator, ExternalArtifactRef) and isinstance(
+                input_locator, ArtifactRef
+            ):
+                # A local input of an external artifact lives in the same
+                # external datastore, which the same assay fingerprint names.
+                anchor = locator.fingerprint_assay
+                dependency = ExternalArtifactRef(
+                    dataset_fingerprint=locator.dataset_fingerprint,
+                    ref=input_locator,
+                    anchor_assay=None if input_locator.assay == anchor else anchor,
                 )
-                assert source_assay is not None
-                if (
-                    input_locator.scope == "assay"
-                    and input_locator.assay == source_assay
-                ):
-                    dependency = ExternalArtifactRef(
-                        dataset_fingerprint=locator.dataset_fingerprint,
-                        ref=input_locator,
-                    )
-                else:
-                    dependency = _ExternalLineageRef(
-                        dataset_fingerprint=locator.dataset_fingerprint,
-                        source_assay=source_assay,
-                        ref=input_locator,
-                    )
             if graph.has_edge(dependency, locator):
                 labels = set(graph.edges[dependency, locator]["inputs"])
                 labels.add(input_name)
@@ -282,16 +254,16 @@ def _status_label(status: ArtifactStatus | None) -> str:
     return "complete"
 
 
-def _located_ref(locator: _LineageLocator) -> ArtifactRef:
-    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+def _located_ref(locator: ArtifactLocator) -> ArtifactRef:
+    if isinstance(locator, ExternalArtifactRef):
         return locator.ref
     return locator
 
 
-def _display_scope(locator: _LineageLocator) -> str:
+def _display_scope(locator: ArtifactLocator) -> str:
     ref = _located_ref(locator)
     scope = ref.assay if ref.assay is not None else "datastore"
-    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+    if isinstance(locator, ExternalArtifactRef):
         return f"external {locator.dataset_fingerprint[:12]} / {scope}"
     return ref.assay if ref.assay is not None else "datastore"
 
@@ -356,7 +328,7 @@ class ArtifactLineage:
     def outputs(self) -> Mapping[str, ArtifactRef]:
         return self._outputs
 
-    def _ordered_refs(self) -> list[_LineageLocator]:
+    def _ordered_refs(self) -> list[ArtifactLocator]:
         return list(
             nx.lexicographical_topological_sort(
                 self._graph,
@@ -434,7 +406,7 @@ class ArtifactLineage:
                     f"- Status: `{_status_label(status)}`",
                 ]
             )
-            if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+            if isinstance(locator, ExternalArtifactRef):
                 lines.append(f"- Dataset fingerprint: `{locator.dataset_fingerprint}`")
             if status is None:
                 lines.append("- Resolution: `No matching external root was supplied`")

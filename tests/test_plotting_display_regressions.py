@@ -438,19 +438,54 @@ def test_mapping_confusion_rejects_text_only_label_matches():
         {
             "label": np.asarray([1, 1, 2, 2], dtype=object),
             "voteFraction": [0.9, 0.8, 0.95, 0.7],
-            "isUnknown": [False] * 4,
+            "abstained": [False] * 4,
         }
     )
-    store = SimpleNamespace(get_target_label_evidence=lambda *a, **k: evidence)
+    transfer = SimpleNamespace(
+        evidence=evidence,
+        threshold_fraction=0.5,
+        max_distance=None,
+    )
+    store = SimpleNamespace(get_label_transfer=lambda *a, **k: transfer)
     with pytest.raises(ValueError, match="only equal their transferred labels"):
         splt.mapping_confusion(
             store,
             SimpleNamespace(assay="RNA"),
-            reference=None,
-            reference_class_group="cell_type",
             known_labels=np.asarray(["1", "1", "2", "2"], dtype=object),
             show=False,
         )
+
+
+def test_mapping_confusion_rejects_an_abstention_label_that_names_a_class():
+    evidence = pd.DataFrame(
+        {
+            "label": np.asarray(["Abstained", None], dtype=object),
+            "voteFraction": [0.9, 0.2],
+            "abstained": [False, True],
+        }
+    )
+    transfer = SimpleNamespace(
+        evidence=evidence,
+        threshold_fraction=0.5,
+        max_distance=None,
+    )
+    store = SimpleNamespace(get_label_transfer=lambda *a, **k: transfer)
+    with pytest.raises(ValueError, match="choose another abstention_label"):
+        splt.mapping_confusion(
+            store,
+            SimpleNamespace(assay="RNA"),
+            known_labels=np.asarray(["Abstained", "T"], dtype=object),
+            show=False,
+        )
+    plot = splt.mapping_confusion(
+        store,
+        SimpleNamespace(assay="RNA"),
+        known_labels=np.asarray(["Abstained", "T"], dtype=object),
+        abstention_label="No label",
+        show=False,
+    )
+    assert plot.tables["counts"].set_index("known").loc["T", "No label"] == 1
+    plot.close()
 
 
 def test_theme_applies_when_the_figure_is_created():

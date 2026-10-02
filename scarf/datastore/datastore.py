@@ -35,6 +35,14 @@ def mount_datastore(
     The target store receives copied cell and feature metadata plus all new
     analysis artifacts. Count matrices remain in the read-only source and are
     remounted automatically when the target is reopened with ``DataStore``.
+    The target also resolves the source's artifacts read only, after its own:
+    listing, loading, lineage, and reuse see the source's results, including
+    imported labels and embeddings, while every write goes to the target.
+    Pipeline runs and their labels stay with the store that holds them. Results
+    that reuse source artifacts need the source, as counts do;
+    ``scarf.tools.repack_zarr.repack_store`` copies a mount into a
+    self-contained store. The source must be prepared: open a fresh import once
+    with ``zarr_mode='r+'`` before mounting it.
 
     Args:
         source: Read-only store that owns the count matrices.
