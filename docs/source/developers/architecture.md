@@ -418,13 +418,18 @@ The complete hard-break inventory is:
   selected cells, so tight budgets admit fewer reads in flight and budgets that fitted only
   uncharged read buffers raise `MemoryError`. The marker search also reserves its result, the stored
   tables its writers finish, and kernel scratch. Read-group streams process one group at a time in
-  order while the next is read, and the library-size kernel runs every thread of that compute worker
-  over the features of a group, so marker memory no longer grows with the worker count. The band
-  reads of the two groups in flight share the requested read width,
-  `StorageIoPolicy(readWorkers=...)` or eight reads per worker, which `WorkShape.maxUnitsInFlight`
-  lets the planner split into inner reads, and an execution report names the cause in
-  `reductionReason` when memory or the band count leaves fewer reads in flight.
-  `map_feature_read_groups` loses its `orderedCompute` and `extraItemsize` arguments.
+  order while the next is read, or with `orderedCompute=False` up to the policy's compute workers
+  each process one group while one more is read, in completion order. The band reads of the groups
+  in flight share the requested read width, `StorageIoPolicy(readWorkers=...)` or eight reads per
+  worker, which `WorkShape.maxUnitsInFlight` lets the planner split into inner reads, and an
+  execution report names the cause in `reductionReason` when memory or the band count leaves fewer
+  reads in flight. The library-size kernel uses as many threads as `nthreads`, which now caps them,
+  and the budget admit: it splits the features of one group over the threads of one compute worker,
+  or, when groups are too narrow to keep those threads busy, ranks whole groups at once with one
+  serial kernel each. It reserves scratch for every kernel call that can run, so marker memory grows
+  with the threads only as far as the budget allows, and a search that cannot rank one group with
+  one thread raises `MemoryError` naming the bytes it needs. `map_feature_read_groups` loses its
+  `extraItemsize` argument, and its `orderedCompute` argument defaults to `True`.
 - `find_markers_by_regression`, which `run_pseudotime_marker_search` calls, scales the regressor and
   each feature's values by a power of two below one in magnitude before it sums them. Pearson r does
   not depend on that exact scale, so ordinary inputs give bit-identical results, but a regressor or
@@ -525,17 +530,20 @@ The complete hard-break inventory is:
   and `test` extras, pydantic-ai-slim 2.51.
 - Count layout: plans whose countsT chunks fell below half the chunk target (awkward cell counts
   such as primes) now use whole-target chunks, so stores written with those plans fail layout replay
-  and must be re-imported. Count assays require Zarr format 3. Every count writer fits the layout to
-  `mem_budget` before it creates its destination: `H5adToZarr`, `CrToZarr` and `MtxToZarr`,
-  `CSVtoZarr`, `SparseToZarr`, `SeuratToZarr`, `SubsetZarr`, `subset_assay_zarr`, `repack_zarr`,
-  `DataStoreMerge`, and `add_grouped_assay`, which wrote the default layout at every budget. Without
-  a `policy`, a writer halves the default `unitBytes` and `chunkBytes` together until the counts
-  write and the countsT transpose fit, and a write that does not fit with one-row count shards, or
-  with its explicit `policy`, raises MemoryError before the destination exists. Sparse writers admit
-  their sparse band writes and dense writers their dense row bands. Writers that choose their source
-  batches (the sparse imports, the Seurat imports, and merge) admit batches of one destination row
-  band, the batch their write starts from, so a fitted layout never starves the write to narrower
-  batches; only one-row shards get one-row batches. `add_melded_assay` keeps sizing its shards to
+  and must be re-imported. Count assays require Zarr format 3. Every count writer admits its layout
+  against `mem_budget` before it creates its destination: `H5adToZarr`, `CrToZarr` and
+  `MtxToZarr`, `CSVtoZarr`, `SparseToZarr`, `SeuratToZarr`, `SubsetZarr`, `subset_assay_zarr`,
+  `repack_zarr`, `DataStoreMerge`, and `add_grouped_assay`. The imports write the default layout
+  unless they are given a `policy`, as before, and a layout that does not fit raises MemoryError
+  naming the largest halving of it, with `unitBytes` and `chunkBytes` halved together, that fits.
+  The other writers, which wrote the default layout at every budget, now halve the default
+  `unitBytes` and `chunkBytes` together until the counts write and the countsT transpose fit, and
+  a write that does not fit with one-row count shards, or with its explicit `policy`, raises
+  MemoryError before the destination exists. Sparse writers admit their sparse band writes and
+  dense writers their dense row bands. Writers that choose their source batches (the sparse
+  imports, the Seurat imports, and merge) admit batches of one destination row band, the batch
+  their write starts from, so a layout never starves the write to narrower batches; only one-row
+  shards get one-row batches. `add_melded_assay` keeps sizing its shards to
   the melding band that fits `mem_budget`. The writers raise from their constructors, and
   `DataStoreMerge` from `plan`, instead of from `dump`; `SeuratToZarr` construction also prepares
   every selected source and reads its counts once, so source preparation errors surface there.
@@ -543,9 +551,9 @@ The complete hard-break inventory is:
   it, so the fit reserves the Matrix Market parse buffer that the write uses and a smaller buffer
   fits a smaller budget. An explicit `dump(batch_size=...)` reads at most one destination row band
   per batch, so it can no longer exceed what the fit admitted. Writers that write their assays one
-  at a time (Seurat, subset, repack, and merge) fit each assay on its own. The fitted layout depends
-  only on the budget, the data, the dtypes, and for Matrix Market imports `lines_in_mem`, never on
-  the worker count. A resumed merge keeps the layout persisted with its completed counts, so a
+  at a time (Seurat, subset, repack, and merge) admit each assay on its own. The fitted or named
+  layout depends only on the budget, the data, the dtypes, and for Matrix Market imports
+  `lines_in_mem`, never on the worker count. A resumed merge keeps the layout persisted with its completed counts, so a
   budget change between attempts cannot block it, and fits the layout of the counts it rewrites.
   Sparse imports admit the producer's buffering and the band writes as separate phases, so budgets
   that the summed plan refused now import. `write_counts_t`, `finalize_writer_counts_t`,

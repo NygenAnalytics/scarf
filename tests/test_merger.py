@@ -3924,7 +3924,7 @@ def _merged_policy(path) -> CountMatrixPolicy:
 
 def test_dataset_merge_fits_the_count_layout_to_its_budget(tmp_path):
     # The default layout does not fit, and it is refused while planning.
-    with pytest.raises(MemoryError, match="requested count-matrix policy"):
+    with pytest.raises(MemoryError, match="default count-matrix policy"):
         _large_merge(
             tmp_path / "default.zarr",
             mem_budget=_FITTED_BUDGET,

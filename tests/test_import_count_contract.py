@@ -1,12 +1,14 @@
-"""The count storage dtype and the fitted count layout of every import writer.
+"""The count storage dtype and the count layout of every import writer.
 
 Each writer stores counts in the dtype that ``count_storage_dtype`` resolves
-from their canonical (duplicate-summed) values, and fits the count layout to
-its budget before it creates the destination. Subset and repack keep the
-source dtype.
+from their canonical (duplicate-summed) values, and admits its count layout
+against its budget before it creates the destination: an import names the
+layout that fits when the default does not, and subset and repack fit it
+themselves. Subset and repack keep the source dtype.
 """
 
 import inspect
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -362,6 +364,14 @@ def _fingerprint(values: np.ndarray, dtype: Any) -> str:
 
 def _policy(root: zarr.Group) -> CountMatrixPolicy:
     return policy_from_payload(load_count_matrix_plan(root["RNA/counts"]))
+
+
+def _named_policy(error: BaseException) -> CountMatrixPolicy:
+    """Return the policy that a refused import names in its error."""
+    ((unit, chunk),) = re.findall(
+        r"policy=CountMatrixPolicy\(unitBytes=(\d+), chunkBytes=(\d+)\)", str(error)
+    )
+    return CountMatrixPolicy(unitBytes=int(unit), chunkBytes=int(chunk))
 
 
 _ENCODINGS = [
@@ -911,26 +921,42 @@ def _layout_import(
 
 
 @pytest.mark.parametrize("writer", list(_LAYOUT_CASES))
-def test_every_writer_fits_the_count_layout_to_its_budget(
+def test_every_writer_finds_the_count_layout_that_fits_its_budget(
     tmp_path, large_store, writer
 ):
     _encoding, shape, budget, _tiny = _LAYOUT_CASES[writer]
     values = _large_values(*shape)
-    if writer != "repack":
-        # The default layout does not fit, and it is refused before the
-        # destination exists.
-        with pytest.raises(MemoryError, match="requested count-matrix policy"):
-            _layout_import(
-                writer,
-                tmp_path / "default",
-                large_store,
-                mem_budget=budget,
-                policy=DEFAULT_COUNT_MATRIX_POLICY,
-            )
+    if writer in ("subset", "repack"):
+        if writer == "subset":
+            # The default layout does not fit, and it is refused before the
+            # destination exists.
+            with pytest.raises(MemoryError, match="default count-matrix policy"):
+                _layout_import(
+                    writer,
+                    tmp_path / "default",
+                    large_store,
+                    mem_budget=budget,
+                    policy=DEFAULT_COUNT_MATRIX_POLICY,
+                )
+            assert not (tmp_path / "default" / "counts.zarr").exists()
+        fitted = _layout_import(
+            writer, tmp_path / "fitted", large_store, mem_budget=budget
+        )
+    else:
+        # An import keeps the default layout, which does not fit. It is
+        # refused before the destination exists, naming the layout that fits.
+        with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+            _layout_import(writer, tmp_path / "default", large_store, mem_budget=budget)
         assert not (tmp_path / "default" / "counts.zarr").exists()
+        fitted = _layout_import(
+            writer,
+            tmp_path / "fitted",
+            large_store,
+            mem_budget=budget,
+            policy=_named_policy(refused.value),
+        )
 
     roomy = _layout_import(writer, tmp_path / "roomy", large_store, mem_budget="1G")
-    fitted = _layout_import(writer, tmp_path / "fitted", large_store, mem_budget=budget)
     assert _policy(roomy) == DEFAULT_COUNT_MATRIX_POLICY
     policy = _policy(fitted)
     halvings = DEFAULT_COUNT_MATRIX_POLICY.unitBytes // policy.unitBytes
@@ -959,13 +985,26 @@ def test_every_writer_below_one_row_shards_fails_before_the_destination_exists(
 
 
 @pytest.mark.parametrize("budget", [3_000_000, 6_000_000, 12_000_000])
-def test_the_fitted_layout_writes_one_band_per_source_batch(budget):
+def test_the_named_layout_writes_one_band_per_source_batch(budget):
     from scarf.storage.layout import array_shard_rows
 
     values = _large_values(2_000, 400)
+    with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+        _writer(
+            "sparse",
+            _sparse(values, "float32"),
+            MemoryStore(),
+            mem_budget=budget,
+            nthreads=1,
+        )
     store = MemoryStore()
     writer = _writer(
-        "sparse", _sparse(values, "float32"), store, mem_budget=budget, nthreads=1
+        "sparse",
+        _sparse(values, "float32"),
+        store,
+        mem_budget=budget,
+        nthreads=1,
+        policy=_named_policy(refused.value),
     )
     writer.dump()
     counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
@@ -976,7 +1015,7 @@ def test_the_fitted_layout_writes_one_band_per_source_batch(budget):
 
 
 @pytest.mark.parametrize("budget", [900_000, 2_100_000])
-def test_the_fitted_layout_reads_one_band_of_dense_seurat_cells_per_batch(
+def test_the_named_layout_reads_one_band_of_dense_seurat_cells_per_batch(
     tmp_path, budget
 ):
     from scarf.storage.layout import array_shard_rows
@@ -985,7 +1024,15 @@ def test_the_fitted_layout_reads_one_band_of_dense_seurat_cells_per_batch(
     with SeuratReader(
         _write_seurat(tmp_path / "counts.rds", values, "real"), reductions=[]
     ) as reader:
-        writer = SeuratToZarr(reader, MemoryStore(), mem_budget=budget, nthreads=1)
+        with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+            SeuratToZarr(reader, MemoryStore(), mem_budget=budget, nthreads=1)
+        writer = SeuratToZarr(
+            reader,
+            MemoryStore(),
+            mem_budget=budget,
+            nthreads=1,
+            policy=_named_policy(refused.value),
+        )
         writer.dump()
     shard_rows = array_shard_rows(writer.counts["RNA"])
     assert writer._lastDenseBatchRows["RNA"] == shard_rows < 600
@@ -1030,7 +1077,7 @@ def test_subset_assay_zarr_fits_the_count_layout_to_its_budget(tmp_path, large_s
     # The subset writes no countsT, so the default layout needs less than an
     # import does, but more than this budget.
     budget = 8 * 1024**2
-    with pytest.raises(MemoryError, match="requested count-matrix policy"):
+    with pytest.raises(MemoryError, match="default count-matrix policy"):
         subset("default", mem_budget=budget, policy=DEFAULT_COUNT_MATRIX_POLICY)
     # The source chunks that the subset reads do not fit at all.
     with pytest.raises(MemoryError, match="mem_budget"):
@@ -1047,10 +1094,11 @@ def test_subset_assay_zarr_fits_the_count_layout_to_its_budget(tmp_path, large_s
     np.testing.assert_array_equal(fitted[:], values)
 
 
-def test_the_fitted_layout_does_not_depend_on_the_worker_count(tmp_path):
+def test_the_named_layout_does_not_depend_on_the_worker_count(tmp_path):
     values = _large_values(2_000, 400)
-    layouts = {
-        _policy(
+    layouts = set()
+    for workers in (1, 4):
+        with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
             _import(
                 "cellranger",
                 tmp_path / str(workers),
@@ -1059,9 +1107,7 @@ def test_the_fitted_layout_does_not_depend_on_the_worker_count(tmp_path):
                 mem_budget=16 * 1024**2,
                 nthreads=workers,
             )
-        )
-        for workers in (1, 4)
-    }
+        layouts.add(_named_policy(refused.value))
     assert len(layouts) == 1
     assert next(iter(layouts)) != DEFAULT_COUNT_MATRIX_POLICY
 

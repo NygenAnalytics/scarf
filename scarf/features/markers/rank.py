@@ -354,7 +354,95 @@ def _gene_major_feature(
     return True
 
 
+@njit(cache=True, nogil=True)
+def _gene_major_slot(
+    raw: np.ndarray,
+    totals: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: float,
+    destination_rows: np.ndarray,
+    rows: np.ndarray,
+    slot: int,
+    n_slots: int,
+    out: np.ndarray,
+) -> int:
+    """Write the statistics of every ``n_slots``-th row of ``rows`` from ``slot``.
+
+    The slot owns one set of per-cell scratch arrays. Returns the position in
+    ``rows`` of the first row with a negative or non-finite normalized value,
+    or the number of rows when every value is valid.
+    """
+    n_cells = raw.shape[1]
+    nz_values = np.empty(n_cells, dtype=np.float32)
+    nz_cells = np.empty(n_cells, dtype=np.int64)
+    order = np.empty(n_cells, dtype=np.int64)
+    order_scratch = np.empty(n_cells, dtype=np.int64)
+    buckets = np.empty(2048, dtype=np.int64)
+    zero_g = np.zeros(group_counts.shape[0])
+    for position in range(slot, rows.shape[0], n_slots):
+        row = rows[position]
+        if not _gene_major_feature(
+            raw[row],
+            totals,
+            size_factor,
+            log_transform,
+            int_indices,
+            group_counts,
+            n_total,
+            out[destination_rows[row]],
+            nz_values,
+            nz_cells,
+            order,
+            order_scratch,
+            buckets,
+            zero_g,
+        ):
+            return position
+    return int(rows.shape[0])
+
+
 @njit(parallel=True, cache=True, nogil=True)
+def _gene_major_slots(
+    raw: np.ndarray,
+    totals: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: float,
+    destination_rows: np.ndarray,
+    rows: np.ndarray,
+    n_slots: int,
+    out: np.ndarray,
+) -> int:
+    """Run ``n_slots`` slots of ``rows`` on Numba threads.
+
+    Rows run in increasing order within a slot, so the smallest position a
+    slot returns is that of the first invalid row.
+    """
+    first_invalid = np.empty(n_slots, dtype=np.int64)
+    for slot in prange(n_slots):
+        first_invalid[slot] = _gene_major_slot(
+            raw,
+            totals,
+            size_factor,
+            log_transform,
+            int_indices,
+            group_counts,
+            n_total,
+            destination_rows,
+            rows,
+            slot,
+            n_slots,
+            out,
+        )
+    return int(first_invalid.min())
+
+
+@njit(cache=True, nogil=True)
 def _marker_stats_gene_major(
     raw: np.ndarray,
     totals: np.ndarray,
@@ -372,47 +460,44 @@ def _marker_stats_gene_major(
     Raw counts of any dtype are normalized by the float64 cell ``totals``.
     Up to ``threads`` slots each own one set of per-cell scratch arrays and
     take every slot-count-th selected row, and every row is computed alone,
-    so results do not depend on ``threads``. Rows with a negative
-    ``destination_rows`` entry are skipped. Returns the local row of the first
-    feature with a negative or non-finite normalized value, or -1 when every
-    value is valid.
+    so results do not depend on ``threads``. One slot runs on the calling
+    thread without Numba's parallel runtime, so concurrent callers can each
+    run one. Rows with a negative ``destination_rows`` entry are skipped.
+    Returns the local row of the first feature with a negative or non-finite
+    normalized value, or -1 when every value is valid.
     """
     rows = np.flatnonzero(destination_rows >= 0)
     n_rows = rows.shape[0]
     n_slots = min(max(1, threads), n_rows)
-    n_cells = raw.shape[1]
-    n_groups = group_counts.shape[0]
-    first_invalid = np.full(max(1, n_slots), n_rows, dtype=np.int64)
-    for slot in prange(n_slots):
-        nz_values = np.empty(n_cells, dtype=np.float32)
-        nz_cells = np.empty(n_cells, dtype=np.int64)
-        order = np.empty(n_cells, dtype=np.int64)
-        order_scratch = np.empty(n_cells, dtype=np.int64)
-        buckets = np.empty(2048, dtype=np.int64)
-        zero_g = np.zeros(n_groups)
-        for position in range(slot, n_rows, n_slots):
-            row = rows[position]
-            if not _gene_major_feature(
-                raw[row],
-                totals,
-                size_factor,
-                log_transform,
-                int_indices,
-                group_counts,
-                n_total,
-                out[destination_rows[row]],
-                nz_values,
-                nz_cells,
-                order,
-                order_scratch,
-                buckets,
-                zero_g,
-            ):
-                # Rows run in increasing order, so the smallest recorded
-                # position over all threads is the first invalid feature.
-                first_invalid[slot] = position
-                break
-    first = int(first_invalid.min())
+    if n_slots > 1:
+        first = _gene_major_slots(
+            raw,
+            totals,
+            size_factor,
+            log_transform,
+            int_indices,
+            group_counts,
+            n_total,
+            destination_rows,
+            rows,
+            n_slots,
+            out,
+        )
+    else:
+        first = _gene_major_slot(
+            raw,
+            totals,
+            size_factor,
+            log_transform,
+            int_indices,
+            group_counts,
+            n_total,
+            destination_rows,
+            rows,
+            0,
+            1,
+            out,
+        )
     return int(rows[first]) if first < n_rows else -1
 
 

@@ -1329,8 +1329,9 @@ def fit_count_layout(
     """Return the count-matrix layout an import writes within its budget.
 
     An explicit ``requested`` policy is used exactly: when its writes do not
-    fit, the MemoryError is raised before the writer creates its destination.
-    Otherwise ``unitBytes`` and ``chunkBytes`` of the default policy are halved
+    fit, the MemoryError is raised before the writer creates its destination
+    and names the largest halving of the policy that fits. Otherwise
+    ``unitBytes`` and ``chunkBytes`` of the default policy are halved
     together, keeping its chunks per shard, until the counts write of every
     assay and the ``countsT`` transpose of every transposed assay fit.
     Admission uses one worker, so the layout depends only on the budget, the
@@ -1374,39 +1375,59 @@ def fit_count_layout(
                 policy=policy,
             )
 
+    row_bytes = max(
+        [1, *(width * np.dtype(dtype).itemsize for width, dtype in assays.values())]
+    )
+
+    def largest_fit(policy: CountMatrixPolicy) -> CountMatrixPolicy:
+        """Return ``policy`` or its largest halving whose writes fit."""
+        while True:
+            try:
+                admit(policy)
+            except MemoryError as error:
+                if policy.unitBytes < 2 * row_bytes:
+                    raise MemoryError(
+                        "Count import does not fit mem_budget even with count "
+                        f"shards of one row. Increase mem_budget. {error}"
+                    ) from error
+                policy = CountMatrixPolicy(
+                    unitBytes=policy.unitBytes // 2,
+                    chunkBytes=max(1, policy.chunkBytes // 2),
+                )
+                continue
+            return policy
+
     if requested is not None:
         try:
             admit(requested)
         except MemoryError as error:
+            try:
+                smaller = largest_fit(requested)
+            except MemoryError:
+                advice = "Increase mem_budget; even count shards of one row do not fit."
+            else:
+                advice = (
+                    "Increase mem_budget, or pass policy=CountMatrixPolicy("
+                    f"unitBytes={smaller.unitBytes}, chunkBytes={smaller.chunkBytes})"
+                    " from scarf.storage.count_matrix, the largest smaller layout "
+                    "that fits. Smaller layouts make every later countsT read slower."
+                )
+            kind = (
+                "default" if requested == DEFAULT_COUNT_MATRIX_POLICY else "requested"
+            )
             raise MemoryError(
-                "The requested count-matrix policy does not fit mem_budget. "
-                f"Increase mem_budget or leave policy unset. {error}"
+                f"The {kind} count-matrix policy (unitBytes={requested.unitBytes}, "
+                f"chunkBytes={requested.chunkBytes}) does not fit mem_budget. "
+                f"{str(error).rstrip('.')}. {advice}"
             ) from error
         return requested
-    row_bytes = max(
-        [1, *(width * np.dtype(dtype).itemsize for width, dtype in assays.values())]
-    )
-    policy = DEFAULT_COUNT_MATRIX_POLICY
-    while True:
-        try:
-            admit(policy)
-        except MemoryError as error:
-            if policy.unitBytes < 2 * row_bytes:
-                raise MemoryError(
-                    "Count import does not fit mem_budget even with count shards "
-                    f"of one row. Increase mem_budget. {error}"
-                ) from error
-            policy = CountMatrixPolicy(
-                unitBytes=policy.unitBytes // 2,
-                chunkBytes=max(1, policy.chunkBytes // 2),
-            )
-            continue
-        if policy != DEFAULT_COUNT_MATRIX_POLICY:
-            logger.info(
-                f"Fitted the count layout to mem_budget: unitBytes={policy.unitBytes} "
-                f"chunkBytes={policy.chunkBytes}"
-            )
-        return policy
+    policy = largest_fit(DEFAULT_COUNT_MATRIX_POLICY)
+    if policy != DEFAULT_COUNT_MATRIX_POLICY:
+        logger.info(
+            f"Fitted the count layout to mem_budget: unitBytes={policy.unitBytes} "
+            f"chunkBytes={policy.chunkBytes}"
+        )
+    return policy
 
 
 def write_counts_t(

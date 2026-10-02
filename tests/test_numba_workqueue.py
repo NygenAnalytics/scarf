@@ -112,6 +112,32 @@ _WORKQUEUE_CHILD = textwrap.dedent(
             actual_markers.statistics, expected_markers.statistics
         )
 
+    # Two features in each read group of 128, so whole groups run at once,
+    # one serial kernel call each.
+    from scarf.features.markers import search
+
+    schedules = []
+    plan_schedule = search._gene_major_schedule
+
+    def recorded_schedule(*args, **kwargs):
+        schedules.append(plan_schedule(*args, **kwargs))
+        return schedules[-1]
+
+    search._gene_major_schedule = recorded_schedule
+    single.RNA.normMethod = norm_lib_size
+    parallel.RNA.normMethod = norm_lib_size
+    sparse_features = feat_idx[::64]
+    expected_markers = find_markers_by_rank(
+        single.RNA, groups, cell_idx, sparse_features, nthreads=1
+    )
+    actual_markers = find_markers_by_rank(
+        parallel.RNA, groups, cell_idx, sparse_features, nthreads=4
+    )
+    assert schedules == [(1, 1), (1, 4)]
+    np.testing.assert_array_equal(
+        actual_markers.statistics, expected_markers.statistics
+    )
+
     assert threading_layer() == "workqueue"
     print("WORKQUEUE_OK")
     """

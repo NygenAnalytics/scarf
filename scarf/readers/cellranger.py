@@ -355,7 +355,9 @@ class CrH5Reader(CrReader):
     ) -> np.ndarray:
         indptr = self._source_indptr()
         n_barcodes = len(indptr) - 1
-        if int(indptr[-1]) != int(self.grp["data"].shape[0]):
+        # One open dataset, whose chunk cache serves consecutive batches.
+        data_node = self.grp["data"]
+        if int(indptr[-1]) != int(data_node.shape[0]):
             raise ValueError("Cell Ranger matrix pointers do not match its data")
         valid = np.zeros(n_barcodes, dtype=bool)
         for start in iter_progress(
@@ -363,7 +365,7 @@ class CrH5Reader(CrReader):
             desc="Filtering out background barcodes",
         ):
             stop = min(start + batch_size, n_barcodes)
-            data = np.asarray(self.grp["data"][indptr[start] : indptr[stop]])
+            data = np.asarray(data_node[indptr[start] : indptr[stop]])
             rows = np.repeat(
                 np.arange(stop - start),
                 np.diff(indptr[start : stop + 1]),
@@ -476,6 +478,12 @@ class CrH5Reader(CrReader):
         valid_idx = self.validBarcodeIdx
         assert valid_idx is not None
         indptr = self._source_indptr()
+        # HDF5 caches decompressed chunks per open dataset. Reopening the
+        # datasets for every run of contiguous cells would decompress a chunk
+        # again for each run that reads part of it.
+        data_node = self.grp["data"]
+        indices_node = self.grp["indices"]
+        matrix_dtype = self.matrix_dtype
         for s in range(0, len(valid_idx), batch_size):
             v_pos = valid_idx[s : s + batch_size]
             starts = indptr[v_pos]
@@ -486,8 +494,8 @@ class CrH5Reader(CrReader):
                 counts,
             )
             nnz = int(counts.sum())
-            data = np.empty(nnz, dtype=self.matrix_dtype)
-            indices = np.empty(nnz, dtype=self.grp["indices"].dtype)
+            data = np.empty(nnz, dtype=matrix_dtype)
+            indices = np.empty(nnz, dtype=indices_node.dtype)
             boundaries = np.r_[
                 0, np.flatnonzero(starts[1:] != ends[:-1]) + 1, len(v_pos)
             ]
@@ -498,8 +506,8 @@ class CrH5Reader(CrReader):
                 if size:
                     source = np.s_[start:end]
                     destination = np.s_[offset : offset + size]
-                    self.grp["data"].read_direct(data, source, destination)
-                    self.grp["indices"].read_direct(indices, source, destination)
+                    data_node.read_direct(data, source, destination)
+                    indices_node.read_direct(indices, source, destination)
                     offset += size
             yield coo_matrix(
                 (data, (cell_idx, indices)), shape=(len(v_pos), self.nFeatures)

@@ -387,6 +387,43 @@ def test_crh5reader_preserves_filtered_values_dtype_and_batching(tmp_path):
     assert not reader.h5obj.id.valid
 
 
+def test_crh5reader_opens_matrix_datasets_once_per_stream(tmp_path, monkeypatch):
+    import h5py
+
+    from scarf.readers import CrH5Reader
+
+    # Background barcodes with counts below the cutoff split the cells into
+    # runs of one barcode each.
+    values = np.array([[5, 0, 5], [1, 0, 0]] * 4, dtype=np.uint16)
+    path = tmp_path / "runs.h5"
+    _write_cr_h5(path, values)
+    reader = CrH5Reader(str(path), is_filtered=False, filtering_cutoff=2)
+    opened: list[str] = []
+    get_item = h5py.Group.__getitem__
+
+    def counting_get_item(group, name):
+        node = get_item(group, name)
+        if isinstance(node, h5py.Dataset):
+            opened.append(node.name)
+        return node
+
+    def stream_opens(batch_size):
+        opened.clear()
+        observed = np.concatenate(
+            [chunk.toarray() for chunk in reader.consume(batch_size=batch_size)]
+        )
+        np.testing.assert_array_equal(observed, values[::2])
+        return opened.count("/matrix/data"), opened.count("/matrix/indices")
+
+    monkeypatch.setattr(h5py.Group, "__getitem__", counting_get_item)
+    try:
+        # Each open dataset has its own chunk cache, so the datasets are not
+        # reopened for each batch or run.
+        assert stream_opens(1) == stream_opens(4)
+    finally:
+        reader.close()
+
+
 def test_crh5reader_preserves_legacy_layout_values(tmp_path):
     from scarf.readers import CrH5Reader
 
@@ -829,6 +866,41 @@ def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
             np.vstack([chunk.toarray() for chunk in chunks]),
             values,
         )
+    finally:
+        reader.h5.close()
+
+
+def test_h5ad_reader_opens_matrix_datasets_once_per_stream(tmp_path, monkeypatch):
+    import h5py
+
+    from scarf.readers import H5adReader
+
+    values = np.arange(24, dtype=np.uint32).reshape(8, 3) % 5
+    file_name = tmp_path / "sparse.h5ad"
+    _write_sparse_h5ad(file_name, values)
+    reader = H5adReader(str(file_name), feature_name_key="feature_name")
+    opened: list[str] = []
+    get_item = h5py.Group.__getitem__
+
+    def counting_get_item(group, name):
+        node = get_item(group, name)
+        if isinstance(node, h5py.Dataset):
+            opened.append(node.name)
+        return node
+
+    def stream_opens(batch_size):
+        opened.clear()
+        chunks = list(reader.consume(batch_size=batch_size))
+        np.testing.assert_array_equal(
+            np.vstack([chunk.toarray() for chunk in chunks]), values
+        )
+        return opened.count("/X/data"), opened.count("/X/indices")
+
+    monkeypatch.setattr(h5py.Group, "__getitem__", counting_get_item)
+    try:
+        # Each open dataset has its own chunk cache, so the datasets are not
+        # reopened for each batch.
+        assert stream_opens(1) == stream_opens(len(values))
     finally:
         reader.h5.close()
 

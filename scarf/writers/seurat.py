@@ -20,7 +20,7 @@ from ..readers.seurat import (
 )
 from ..storage.arrays import MISSING_MASK_PREFIX
 from ..storage.count_dtype import count_storage_dtype
-from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.count_matrix import DEFAULT_COUNT_MATRIX_POLICY, CountMatrixPolicy
 from ..storage.artifact_writer import (
     ArrayRequirement,
     artifact_transaction,
@@ -121,11 +121,10 @@ class SeuratToZarr:
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
         policy: Count-matrix geometry policy, used exactly for every assay.
-                When None, each assay uses the default policy with unitBytes
-                and chunkBytes halved together until its counts write and
-                countsT transpose fit ``mem_budget``. Either way, an import
-                that does not fit raises MemoryError before the destination
-                is created.
+                When None, every assay uses the default policy. An import
+                that does not fit ``mem_budget`` raises MemoryError before
+                the destination is created, naming the largest smaller policy
+                that fits.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
 
@@ -760,7 +759,7 @@ class SeuratToZarr:
         storage_dtype: Any,
         requested: CountMatrixPolicy | None,
     ) -> CountMatrixPolicy:
-        """Return the layout whose counts write and ``countsT`` fit the budget.
+        """Return the requested or default layout if its writes fit the budget.
 
         Both writes read source batches of one destination row band, so the
         fit estimates the source once per band, not once per cell.
@@ -796,7 +795,7 @@ class SeuratToZarr:
                 if source.is_sparse
                 else dense_counts_admission(resident, staging)
             ),
-            requested=requested,
+            requested=DEFAULT_COUNT_MATRIX_POLICY if requested is None else requested,
         )
 
     def _write_counts(

@@ -82,15 +82,17 @@ def find_markers_by_rank(
     normalization from ``iter_normed_feature_wise``. The search reserves
     within the assay's memory budget everything it holds: its streamed blocks
     and their Zarr reads, kernel scratch, the result, and the stored tables
-    of ``writers`` groups that are finished from the result at once.
+    of ``writers`` groups that are finished from the result at once. The
+    library-size kernel uses as many threads as fit that budget, splitting
+    each read group's features over them or ranking whole read groups at once.
 
     Args:
         assay: Assay whose features are ranked.
         groups: Group label of each cell in ``cell_idx``.
         cell_idx: Unique assay cell indices.
         feat_idx: Unique assay feature indices.
-        nthreads: Thread limit for normalized feature batches, and the worker
-            count when the assay has no resource budget.
+        nthreads: Thread limit of the search, and the worker count when the
+            assay has no resource budget.
         writers: Groups whose stored tables are finished and written from the
             result at once.
         **norm_params: ``log_transform`` and ``renormalize_subset``.
@@ -106,6 +108,8 @@ def find_markers_by_rank(
             total of a selected cell (its ``<assay>_nCounts`` value, or with
             ``renormalize_subset`` its sum over the tested features) is
             negative or not finite.
+        MemoryError: If the library-size kernel cannot rank one read group
+            with one thread within the memory budget.
     """
     reject_unknown_normalization_params(
         norm_params,
@@ -190,14 +194,15 @@ def _rank_counts_t(
     held_bytes: int,
     norm_params: dict[str, Any],
 ) -> None:
-    """Rank ``countsT`` read groups in order with the threads of one worker."""
-    from ...storage.budget import resolve_budget
+    """Rank ``countsT`` read groups with the threads the budget admits."""
+    from ...storage.budget import ResourceBudget, resolve_budget
     from ...storage.feature_stream import (
         FeatureReadGroup,
         map_feature_read_groups,
         persisted_read_group,
         selected_feature_values,
     )
+    from ...storage.io_policy import StorageIoPolicy
 
     # Every adapter reads countsT, so its presence selects one.
     counts_t = assay.rawDataT
@@ -210,11 +215,12 @@ def _rank_counts_t(
     n_cells = len(codes)
     n_groups = len(group_sizes)
     resources = getattr(assay, "resources", None) or resolve_budget(workers=nthreads)
-    # One compute worker ranks each read group with all of its threads.
-    threads = min(
-        max(1, int(resources.workers)),
-        max(1, int(numba.config.NUMBA_NUM_THREADS)),
-    )
+    io = getattr(assay, "storageIo", None)
+    # nthreads caps every thread of the search. One compute worker ranks each
+    # read group with all of its threads unless whole groups run at once.
+    width = max(1, min(int(nthreads), int(resources.workers)))
+    threads = min(width, max(1, int(numba.config.NUMBA_NUM_THREADS)))
+    calls = 1
     group_features = min(len(feature_index), persisted_read_group(counts_t)[0])
     dest_of = np.full(int(counts_t.shape[0]), -1, dtype=np.int64)
     dest_of[feature_index] = np.arange(len(feature_index), dtype=np.int64)
@@ -253,7 +259,18 @@ def _rank_counts_t(
             )
         totals[totals == 0] = 1
         state_bytes = totals.nbytes
-        compute_bytes = gene_major_rank_scratch_bytes(
+        threads, calls = _gene_major_schedule(
+            counts_t,
+            cell_idx,
+            feature_index,
+            n_groups=n_groups,
+            group_features=group_features,
+            resident_bytes=held_bytes + dest_of.nbytes + state_bytes,
+            memory_bytes=int(resources.memoryBytes),
+            max_threads=threads,
+            max_calls=min(width, (io.computeWorkers if io else None) or width),
+        )
+        compute_bytes = calls * gene_major_rank_scratch_bytes(
             n_cells=n_cells,
             n_groups=n_groups,
             n_features=group_features,
@@ -330,19 +347,93 @@ def _rank_counts_t(
     logger.debug(
         f"Marker search read groups: features={len(feature_index)} "
         f"groups={n_groups} adapter={adapter} workers={resources.workers} "
-        f"threads={threads} memoryBytes={resources.memoryBytes}"
+        f"threads={threads} calls={calls} memoryBytes={resources.memoryBytes}"
     )
+    if calls > 1:
+        io = StorageIoPolicy(
+            readWorkers=io.readWorkers if io else None,
+            computeWorkers=calls,
+            writeWorkers=io.writeWorkers if io else None,
+        )
     for _ in map_feature_read_groups(
         counts_t,
         process_group,
         cell_idx=cell_idx,
         feat_idx=feature_index,
-        resources=resources,
+        resources=ResourceBudget(resources.memoryBytes, width),
         progress="Finding markers",
-        io=getattr(assay, "storageIo", None),
+        io=io,
         scratchBytes=held_bytes + dest_of.nbytes + state_bytes + compute_bytes,
+        orderedCompute=calls == 1,
     ):
         pass
+
+
+def _gene_major_schedule(
+    counts_t: Any,
+    cell_idx: np.ndarray,
+    feature_index: np.ndarray,
+    *,
+    n_groups: int,
+    group_features: int,
+    resident_bytes: int,
+    memory_bytes: int,
+    max_threads: int,
+    max_calls: int,
+) -> tuple[int, int]:
+    """Return the slots of each library-size kernel call and the calls at once.
+
+    Either one read group at a time splits its rows over up to
+    ``max_threads`` slots, or up to ``max_calls`` read groups run at once with
+    one slot each. Each schedule takes as many threads as fit
+    ``memory_bytes`` beside ``resident_bytes``, and the one with fewer
+    row-sized steps runs: a split group waits about one row for its slowest
+    slot, and the last of the concurrent groups can run alone.
+
+    Raises:
+        MemoryError: If one slot does not fit with one read group.
+    """
+    from ...storage.feature_stream import read_group_rows, read_group_stream_bytes
+
+    n_cells = len(cell_idx)
+    group_bytes, stream_bytes = read_group_stream_bytes(
+        counts_t, cell_idx=cell_idx, feat_idx=feature_index
+    )
+
+    def needed(slots: int, calls: int) -> int:
+        scratch = gene_major_rank_scratch_bytes(
+            n_cells=n_cells,
+            n_groups=n_groups,
+            n_features=group_features,
+            nthreads=slots,
+        )
+        return resident_bytes + stream_bytes + calls * (scratch + group_bytes)
+
+    if needed(1, 1) > memory_bytes:
+        raise MemoryError(
+            f"Marker search needs at least {needed(1, 1)} bytes to rank "
+            f"{n_cells} cells with one thread, but the operation limit is "
+            f"{memory_bytes} bytes. Increase mem_budget."
+        )
+    rows = read_group_rows(counts_t, feature_index)
+    slots = max(s for s in range(1, max_threads + 1) if needed(s, 1) <= memory_bytes)
+    calls = max(
+        k
+        for k in range(1, min(max_calls, len(rows)) + 1)
+        if needed(1, k) <= memory_bytes
+    )
+    split_steps = int(np.sum(-(-rows // slots))) + len(rows)
+    whole_steps = -(-int(rows.sum()) // calls) + int(rows.max())
+    if calls > 1 and whole_steps < split_steps:
+        threads, concurrent, limit = 1, calls, min(max_calls, len(rows))
+    else:
+        threads, concurrent, limit = slots, 1, max_threads
+    if threads * concurrent < limit:
+        logger.info(
+            f"Marker search uses {threads * concurrent} of {limit} threads "
+            f"within the {memory_bytes}-byte operation limit"
+        )
+    return threads, concurrent
 
 
 def _rank_normed_batches(

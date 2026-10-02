@@ -42,9 +42,9 @@ summed: integral non-negative counts use the narrowest unsigned dtype that holds
 fractional or negative counts keep their source dtype. The same counts therefore import alike
 from every format and encoding, and no writer takes a count dtype argument. Each import reads
 its counts once before it creates the store, and rejects NaN and infinite values there. Every
-writer also fits its count layout to `mem_budget`: when the default count shards do not fit, it
-writes smaller shards, and a write that cannot fit stops before it creates the store. Neither
-choice changes the stored values or the store's identity across budgets.
+import writes the default count layout unless it is given a `policy`: when the default count
+shards do not fit `mem_budget`, it stops before it creates the store and names the smaller
+`policy` that fits. Neither choice changes the stored values or the store's identity.
 
 ## Prerequisites
 
@@ -104,7 +104,7 @@ This tutorial writes downloads and converted stores below one temporary director
 Scarf stores data as dense, compressed chunks in Zarr.
 `CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
 Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
-`mem_budget` bounds the memory the conversion plans for, and the count layout is fitted to it.
+`mem_budget` bounds the memory the conversion plans for.
 Each assay gets the count dtype of its own counts over the selected barcodes, so an assay
 imports alike whichever other assays share the file.
 
@@ -226,10 +226,14 @@ Source read batches start from one destination row band, which the fitted count 
 and physical writes stay shard-aligned. An explicit positive `batch_size` remains available for
 controlled profiling and expert workflows; a batch holds at most one band.
 
-The count layout is fitted to the conversion memory budget. When the default count shards, the
-batches of one band that write them, or the gene-major `countsT` copy built from them, do not
-fit `mem_budget`, the import writes smaller shards; an import that cannot fit stops before it
-creates the store. The layout never changes the stored values or the store's identity.
+The import writes the default count layout unless it is given a `policy`. When the default count
+shards, the batches of one band that write them, or the gene-major `countsT` copy built from them,
+do not fit `mem_budget`, the import stops before it creates the store, and its error names the
+largest smaller policy that fits, such as
+`policy=CountMatrixPolicy(unitBytes=250_000_000, chunkBytes=25_000_000)` with `CountMatrixPolicy`
+from `scarf.storage.count_matrix`. Smaller shards make
+every later read of `countsT` slower, so prefer a larger `mem_budget` when the machine has the
+memory. The layout never changes the stored values or the store's identity.
 
 The stored count dtype follows the values, not the H5AD encoding, so raw counts saved as
 `float32`, `int32`, CSC, or dense arrays import alike, while fractional or negative values keep

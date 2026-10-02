@@ -858,6 +858,11 @@ class H5adReader:
             return
 
         grp = self.h5[self.matrixKey]
+        # HDF5 caches decompressed chunks per open dataset. Reopening the
+        # datasets for every batch would decompress a chunk again for each
+        # batch that reads part of it.
+        data = grp["data"]
+        indices = grp["indices"]
         source_indptr = self._csr_indptr()
         assert source_indptr is not None
         for offset in range(start, stop, batch_size):
@@ -869,8 +874,8 @@ class H5adReader:
             n_rows = end - offset
             batch = csr_matrix(
                 (
-                    self._matrix_values(grp["data"], slice(data_start, data_end)),
-                    np.asarray(grp["indices"][data_start:data_end]),
+                    self._matrix_values(data, slice(data_start, data_end)),
+                    np.asarray(indices[data_start:data_end]),
                     local_indptr,
                 ),
                 shape=(n_rows, self.nFeatures),

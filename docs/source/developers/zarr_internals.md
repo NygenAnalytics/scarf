@@ -167,22 +167,27 @@ are rejected rather than stored as floats. Derived assays (grouped and melded) k
 ### Count layout
 
 The layout policy (`unitBytes` and `chunkBytes`) is recorded in `scarf:countMatrixLayout`, and
-readers and `countsT` writers replay it. Every count writer (the H5AD, 10x HDF5, Matrix Market,
-CSV, sparse, and Seurat imports, subset, `repack_zarr`, merge, and `add_grouped_assay`) fits the
-policy to `mem_budget` before it creates its destination: when the default policy's counts write
-or `countsT` transpose does not fit, it halves `unitBytes` and `chunkBytes` together, keeping the
-chunks per shard, down to count shards of one row. Sparse writers admit the band writes of their
-sparse sources, and dense writers the dense row bands they write. Writers that choose their source
-batches (the sparse imports, the Seurat imports, and merge) admit batches of one destination row
-band, the batch their write starts from, so a fitted layout never leaves the write narrower
-batches than its bands. An explicit policy is used exactly or refused before the destination
-exists. `add_melded_assay` sizes its shards to the melding band that fits `mem_budget`. Writers
-that write their assays one at a time (Seurat, subset, repack, and merge) fit each assay on its
+readers and `countsT` writers replay it. The imports (H5AD, 10x HDF5, Matrix Market, CSV, sparse,
+and Seurat) write the default policy unless they are given one, so the layout of an imported store
+does not depend on the budget of its import. When the policy's counts write or `countsT` transpose
+does not fit `mem_budget`, an import refuses before it creates its destination and names the
+largest halving of the policy, with `unitBytes` and `chunkBytes` halved together, that fits; a
+smaller layout makes every later `countsT` read slower. Subset, `repack_zarr`, merge, and
+`add_grouped_assay` fit the policy to `mem_budget` before they create their destination: when the
+default policy's counts write or `countsT` transpose does not fit, they halve `unitBytes` and
+`chunkBytes` together, keeping the chunks per shard, down to count shards of one row. Sparse
+writers admit the band writes of their sparse sources, and dense writers the dense row bands they
+write. Writers that choose their source batches (the sparse imports, the Seurat imports, and
+merge) admit batches of one destination row band, the batch their write starts from, so a layout
+never leaves the write narrower batches than its bands. An explicit policy is used exactly or
+refused before the destination exists, with the largest halving that fits named. `add_melded_assay`
+sizes its shards to the melding band that fits `mem_budget`. Writers
+that write their assays one at a time (Seurat, subset, repack, and merge) admit each assay on its
 own. A resumed merge keeps the layout persisted with its completed counts, so a budget change
-between attempts cannot block it, and fits the layout of the counts it rewrites. A store built
-with a small budget therefore has smaller shards and more objects. The layout never changes
-identity: `content_fingerprint`, the counts fingerprint, and the dataset fingerprint are computed
-from the stored values, so only the layout fingerprint differs between budgets.
+between attempts cannot block it, and fits the layout of the counts it rewrites. A store written
+with a smaller policy, chosen or fitted, therefore has smaller shards and more objects. The layout
+never changes identity: `content_fingerprint`, the counts fingerprint, and the dataset fingerprint
+are computed from the stored values, so only the layout fingerprint differs between layouts.
 
 Existing stores are never rewritten under a new dtype or layout rule and keep their dtype, layout,
 and identity. A re-import of the same source can store a different dtype, and so get different

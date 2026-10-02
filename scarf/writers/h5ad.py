@@ -15,7 +15,7 @@ from ..readers.h5ad import _H5adAssayFeatures
 from ..storage import ArtifactRef
 from ..storage.budget import ResourceBudget
 from ..storage.count_dtype import count_storage_dtype
-from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.count_matrix import DEFAULT_COUNT_MATRIX_POLICY, CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
@@ -410,10 +410,9 @@ class H5adToZarr:
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
         policy: Count-matrix geometry policy, used exactly. When None, the
-                default policy is used with unitBytes and chunkBytes halved
-                together until the counts write and the countsT transpose
-                fit ``mem_budget``. Either way, an import that does not fit
-                raises MemoryError before the destination is created.
+                default policy is used. An import that does not fit
+                ``mem_budget`` raises MemoryError before the destination is
+                created, naming the largest smaller policy that fits.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
         analysis_assay: Imported assay that owns explicitly selected H5AD
@@ -998,7 +997,7 @@ class H5adToZarr:
     def _fit_count_layout(
         self, requested: CountMatrixPolicy | None
     ) -> CountMatrixPolicy:
-        """Return the count layout whose import and ``countsT`` fit the budget."""
+        """Return the requested or default count layout if its writes fit the budget."""
         from ..storage.sharding import fit_count_layout, sparse_counts_admission
         from .counts_t import counts_t_assays
 
@@ -1021,7 +1020,7 @@ class H5adToZarr:
                 producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
                 extraProducerBytes=extra_producer_bytes,
             ),
-            requested=requested,
+            requested=DEFAULT_COUNT_MATRIX_POLICY if requested is None else requested,
         )
 
     def _write_counts(self, batch_size: int | None = None) -> None:

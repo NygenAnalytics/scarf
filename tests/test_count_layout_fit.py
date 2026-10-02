@@ -1,5 +1,6 @@
-"""Fitting the count-matrix layout to the import memory budget."""
+"""Fitting or naming the count-matrix layout for a memory budget."""
 
+import re
 from pathlib import Path
 
 import h5py
@@ -71,6 +72,24 @@ def test_fit_halves_the_default_policy_until_the_counts_write_fits():
     assert workers == {1}
 
 
+def test_fit_names_the_largest_halving_of_a_requested_policy_that_fits():
+    def admit(specs, resources: ResourceBudget) -> None:
+        if specs[0].shards[0] > 100_000:
+            raise MemoryError("band too tall")
+
+    with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+        _fit(admit, requested=DEFAULT_COUNT_MATRIX_POLICY)
+    # The same halving that a fit without a policy chooses.
+    assert _named_policy(refused.value) == _fit(admit)
+
+
+def _named_policy(error: BaseException) -> CountMatrixPolicy:
+    ((unit, chunk),) = re.findall(
+        r"policy=CountMatrixPolicy\(unitBytes=(\d+), chunkBytes=(\d+)\)", str(error)
+    )
+    return CountMatrixPolicy(unitBytes=int(unit), chunkBytes=int(chunk))
+
+
 def test_fit_also_admits_the_counts_t_transpose():
     def admit(specs, resources: ResourceBudget) -> None:
         pass
@@ -136,24 +155,24 @@ def _policy(root: zarr.Group) -> CountMatrixPolicy:
     return policy_from_payload(load_count_matrix_plan(root["RNA/counts"]))
 
 
-def test_h5ad_import_fits_the_count_layout_to_its_budget(wide_counts, tmp_path):
+def test_h5ad_import_names_the_count_layout_that_fits_its_budget(wide_counts, tmp_path):
     path, values = wide_counts
     budget = 24 * 1024**2
-    # The default layout writes the whole matrix as one band, which does not
-    # fit this budget, and it fails before the destination exists.
-    with pytest.raises(MemoryError, match="requested count-matrix policy"):
-        _build(
-            path,
-            tmp_path / "default.zarr",
-            mem_budget=budget,
-            policy=DEFAULT_COUNT_MATRIX_POLICY,
-        )
+    # The import keeps the default layout, which writes the whole matrix as
+    # one band. That does not fit this budget, so it fails before the
+    # destination exists and names the layout that fits.
+    with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+        _build(path, tmp_path / "default.zarr", mem_budget=budget, nthreads=1)
     assert not (tmp_path / "default.zarr").exists()
+    named = _named_policy(refused.value)
 
     roomy = _build(path, tmp_path / "roomy.zarr", mem_budget="1G", nthreads=1)
-    fitted = _build(path, tmp_path / "fitted.zarr", mem_budget=budget, nthreads=1)
+    fitted = _build(
+        path, tmp_path / "fitted.zarr", mem_budget=budget, nthreads=1, policy=named
+    )
     assert _policy(roomy) == DEFAULT_COUNT_MATRIX_POLICY
     policy = _policy(fitted)
+    assert policy == named
     assert policy.unitBytes < DEFAULT_COUNT_MATRIX_POLICY.unitBytes
     assert policy.chunksPerShard == DEFAULT_COUNT_MATRIX_POLICY.chunksPerShard
     assert fitted["RNA/counts"].dtype == np.uint32
@@ -166,9 +185,10 @@ def test_h5ad_import_fits_the_count_layout_to_its_budget(wide_counts, tmp_path):
         == roomy["RNA/counts"].attrs["content_fingerprint"]
     )
 
-    # The fitted layout does not depend on the worker count.
-    parallel = _build(path, tmp_path / "parallel.zarr", mem_budget=budget, nthreads=4)
-    assert _policy(parallel) == policy
+    # The named layout does not depend on the worker count.
+    with pytest.raises(MemoryError, match="default count-matrix policy") as parallel:
+        _build(path, tmp_path / "parallel.zarr", mem_budget=budget, nthreads=4)
+    assert _named_policy(parallel.value) == named
 
 
 def test_h5ad_import_below_one_row_shards_fails_before_the_destination_exists(

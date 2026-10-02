@@ -7,7 +7,7 @@ import pandas as pd
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
 from ..storage.count_dtype import count_storage_dtype
-from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.count_matrix import DEFAULT_COUNT_MATRIX_POLICY, CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
@@ -34,10 +34,9 @@ class CSVtoZarr:
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
         policy: Count-matrix geometry policy, used exactly. When None, the
-                default policy is used with unitBytes and chunkBytes halved
-                together until the counts write and the countsT transpose
-                fit ``mem_budget``. Either way, an import that does not fit
-                raises MemoryError before the destination is created.
+                default policy is used. An import that does not fit
+                ``mem_budget`` raises MemoryError before the destination is
+                created, naming the largest smaller policy that fits.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
         assay_type: Preset assay type, such as ``RNA``, for an assay whose name
@@ -128,7 +127,7 @@ class CSVtoZarr:
     def _fit_count_layout(
         self, storage_dtype: Any, requested: CountMatrixPolicy | None
     ) -> CountMatrixPolicy:
-        """Return the count layout whose import and ``countsT`` fit the budget."""
+        """Return the requested or default count layout if its writes fit the budget."""
         from ..storage.sharding import dense_counts_admission, fit_count_layout
         from .counts_t import counts_t_assays
 
@@ -141,7 +140,7 @@ class CSVtoZarr:
             memoryBytes=self.resources.memoryBytes,
             transposed=counts_t_assays((self.assayName,), assay_types),
             admitCounts=dense_counts_admission(resident + producer_reserve),
-            requested=requested,
+            requested=DEFAULT_COUNT_MATRIX_POLICY if requested is None else requested,
         )
 
     def dump(self) -> None:

@@ -615,6 +615,26 @@ def _read_group_layout(
     )
 
 
+def read_group_stream_bytes(
+    counts_t: Any,
+    *,
+    cell_idx: np.ndarray | None = None,
+    feat_idx: Sequence[int] | np.ndarray | None = None,
+) -> tuple[int, int]:
+    """Return what ``map_feature_read_groups`` reserves per group and once.
+
+    Each read group in flight holds its destination over the selected cells
+    and at least one band read while Zarr decodes it, and the stream holds its
+    band indices once.
+    """
+    layout = _read_group_layout(
+        as_zarr_array(counts_t), cell_idx=cell_idx, feat_idx=feat_idx
+    )
+    if layout is None:
+        return 0, 0
+    return layout.unitBytes + layout.readBytes, layout.selection.indexBytes
+
+
 def read_group_stream_floor(
     counts_t: Any,
     *,
@@ -627,12 +647,27 @@ def read_group_stream_floor(
     flight, and the stream's band indices. Callers that size their own
     buffers up front leave this much of the budget to the stream.
     """
-    layout = _read_group_layout(
-        as_zarr_array(counts_t), cell_idx=cell_idx, feat_idx=feat_idx
+    return sum(read_group_stream_bytes(counts_t, cell_idx=cell_idx, feat_idx=feat_idx))
+
+
+def read_group_rows(
+    counts_t: Any,
+    feat_idx: Sequence[int] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Return how many selected features each ``map_feature_read_groups`` group holds.
+
+    The counts follow the stream's group order.
+    """
+    array = as_zarr_array(counts_t)
+    feature_width, _ = persisted_read_group(array)
+    groups = _feature_group_ranges(array, feat_idx=feat_idx, featureWidth=feature_width)
+    bounds = np.asarray(groups, dtype=np.int64).reshape(-1, 2)
+    if feat_idx is None:
+        return bounds[:, 1] - bounds[:, 0]
+    selected = np.sort(np.asarray(feat_idx, dtype=np.int64))
+    return np.searchsorted(selected, bounds[:, 1]) - np.searchsorted(
+        selected, bounds[:, 0]
     )
-    if layout is None:
-        return 0
-    return layout.unitBytes + layout.readBytes + layout.selection.indexBytes
 
 
 def _stream_units(
@@ -762,14 +797,18 @@ def map_feature_read_groups(
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
     scratchBytes: int = 0,
+    orderedCompute: bool = True,
 ) -> Iterator[T]:
-    """Map ``process`` over persisted read groups in order with bounded handoff.
+    """Map ``process`` over persisted read groups with bounded handoff.
 
-    A read group holds every selected cell, so one compute worker processes
-    the groups one at a time while the next group is read. The plan reserves
-    each group's destination over the selected cells, what each band read
-    holds while Zarr decodes it, the stream's band indices, and
-    ``scratchBytes`` for the caller.
+    A read group holds every selected cell. With ``orderedCompute`` one
+    compute worker processes the groups one at a time in order while the next
+    group is read. Otherwise up to the policy's compute workers each process
+    one group while one more group is read, and results arrive in completion
+    order. The plan reserves each group's destination over the selected cells,
+    what each band read holds while Zarr decodes it, the stream's band
+    indices, and ``scratchBytes`` for the caller, which must cover every
+    ``process`` call that can run at once.
     """
     array = as_zarr_array(counts_t)
     layout = _read_group_layout(array, cell_idx=cell_idx, feat_idx=feat_idx)
@@ -787,9 +826,14 @@ def map_feature_read_groups(
         if resolved_io.readWorkers is not None
         else auto_read_width(budget.workers)
     )
-    # One group is processed while the next one is read, and the band reads
-    # of the groups in flight share the requested read width.
-    requested_group_reads = min(requested_chunk_reads, 2)
+    # Each computing group has one more group read beside it, and the band
+    # reads of the groups in flight share the requested read width.
+    compute_width = (
+        1
+        if orderedCompute
+        else min(budget.workers, resolved_io.computeWorkers or budget.workers)
+    )
+    requested_group_reads = min(requested_chunk_reads, compute_width + 1)
     available_group_reads = max(1, min(len(merged), requested_group_reads))
     requested_inner_reads = min(
         max(1, len(bands)),
@@ -810,7 +854,7 @@ def map_feature_read_groups(
         maxInnerReads=requested_inner_reads,
         maxUnitsInFlight=requested_group_reads,
         chunksPerShard=max(1, geometry.axisShard(0) // geometry.axisChunk(0)),
-        ordered=True,
+        ordered=orderedCompute,
     )
     source = array.async_array
 
@@ -877,7 +921,7 @@ def map_feature_read_groups(
         process,
         plan=plan,
         unitKind="countsTReadGroup",
-        orderedCompute=True,
+        orderedCompute=orderedCompute,
         progress=progress,
         metrics=metrics,
         details={
