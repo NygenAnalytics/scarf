@@ -34,6 +34,7 @@ docs/jupyter_execute
 docs/source/scarf_datasets/
 docs/source/tutorials/scarf_datasets/
 docs/**/scarf_datasets/
+scarf_datasets/
 *.zarr/
 **/*.zarr/
 .coverage
