@@ -1,7 +1,7 @@
 """Offline, escaped reports derived entirely from saved agent records."""
 
+import base64
 import csv
-import html
 import io
 import json
 import os
@@ -206,102 +206,41 @@ def annotation_csv(rows: list[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-def _compact(value: Any, limit: int = 1800) -> str:
-    text = (
-        json.dumps(value, ensure_ascii=False, sort_keys=True)
-        if not isinstance(value, str)
-        else value
-    )
-    return text if len(text) <= limit else text[:limit] + " … [see saved records]"
+def _report_evidence(records: RunRecords, result: dict[str, Any]) -> dict[str, Any]:
+    """Join only the selected saved evidence; never reopen the numerical source."""
+    prepared = stage_data(records, "preprocess") or stage_data(records, "inspect") or {}
+    assessed = stage_data(records, "finalists") or {}
+    selected = (result["final"] or {}).get("selected")
+    finalist = assessed.get("finalists", {}).get(selected, {}) if selected else {}
+    candidates = []
+    for event in records.events():
+        if event["kind"] == "candidateMeasured":
+            evidence = records.read_json(event["evidence"])
+            candidates.append({**evidence, "candidateId": event["candidateId"]})
+    preview = None
+    path = records.path / "umap_clusters.png"
+    # A preview is optional. Do not follow links or read an unbounded image.
+    if not path.is_symlink() and path.is_file():
+        with path.open("rb") as stream:
+            image = stream.read(8 * 1024 * 1024 + 1)
+        if len(image) <= 8 * 1024 * 1024 and image.startswith(b"\x89PNG\r\n\x1a\n"):
+            preview = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+    return {
+        **result,
+        "prepared": prepared,
+        "clusterEvidence": finalist.get("clusters", []),
+        "candidateEvidence": candidates,
+        "currentMessage": (records.latest("status") or {}).get("message"),
+        "preview": preview,
+    }
 
 
 def render_report(records: RunRecords) -> Path:
-    """Render any saved outcome. No provider, core store, or plotting is opened."""
+    """Render any saved outcome with local assets and no provider or store access."""
+    from .report_html import build_report
+
     result = summary(records)
-    lines = [
-        "# Scarf RNA analysis",
-        "",
-        f"Status: {result['status']}",
-        f"Stage: {result['stage']}",
-        f"Run: {result['runId']}",
-        "",
-        "## Study",
-        "",
-        _compact(result["study"].get("context", "No context saved.")),
-        "",
-        _compact(result["study"].get("objective", "No objective saved.")),
-        "",
-        "## Outcome",
-        "",
-        f"Input cells: {result['inputCells']}; retained cells: {result['retainedCells']}.",
-        f"Completed pipeline invocations: {len(result['pipelineRuns'])}.",
-        f"Observed model requests: {result['modelRequests']}. Unavailable usage remains unknown.",
-        "",
-    ]
-    if result["final"]:
-        lines.extend(
-            [
-                f"Final pipeline: {result['final']['runId']}",
-                "",
-                f"Selected recipe: {_compact(result['selectedRecipe'])}",
-                "",
-            ]
-        )
-    sections = [
-        ("Pending questions", result["pendingQuestions"]),
-        ("Limitations", result["limitations"]),
-        (
-            "QC outlier summaries",
-            [
-                {"column": column, **flags}
-                for column, flags in result["qcFlags"].items()
-            ],
-        ),
-        ("Measured diagnostics", result["diagnostics"]),
-        ("Accepted decisions", result["decisions"]),
-        ("Failures and rejected decisions", result["errors"]),
-        ("Provisional annotations", result["annotations"]),
-        ("Pipeline invocations", result["pipelineRuns"]),
-        ("Recorded model usage", result["usage"]),
-    ]
-    for title, items in sections:
-        lines.extend([f"## {title}", ""])
-        lines.extend(f"- {_compact(item)}" for item in items[:100])
-        if not items:
-            lines.append("None recorded.")
-        if len(items) > 100:
-            lines.append(f"Additional entries: {len(items) - 100}; see saved records.")
-        lines.append("")
-    lines.extend(
-        [
-            "## Saved records",
-            "",
-            "[Manifest](run.json), [events](events/), [evidence](evidence/), "
-            "[model exchanges](calls/), [annotations](annotations.csv).",
-            "",
-            "Annotations are provisional; unassigned clusters remain explicit.",
-            "",
-        ]
-    )
-    markdown = "\n".join(lines)
-    links = " | ".join(
-        f'<a href="{target}">{name}</a>'
-        for name, target in (
-            ("Manifest", "run.json"),
-            ("Events", "events/"),
-            ("Evidence", "evidence/"),
-            ("Model exchanges", "calls/"),
-            ("Annotations", "annotations.csv"),
-            ("Markdown", "report.md"),
-        )
-    )
-    page = (
-        '<!doctype html><html lang="en"><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>Scarf RNA analysis</title><body>"
-        f'<nav>{links}</nav><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'
-        f"{html.escape(markdown)}</pre></body></html>\n"
-    )
+    page, markdown = build_report(_report_evidence(records, result))
     atomic_text(records.path / "annotations.csv", annotation_csv(result["annotations"]))
     atomic_text(records.path / "report.md", markdown)
     atomic_text(records.path / "report.html", page)

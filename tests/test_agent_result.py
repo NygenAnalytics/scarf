@@ -408,8 +408,8 @@ def test_report_uses_resolved_inputs_and_retains_diagnostic_limitations(
     assert "One partition could not be scored." in page
     assert "Rare populations may be absent" in page
     assert "Biological protection worsened." in page
-    assert "RNA_nFeatures" in page
-    assert "markerCoherence" in page
+    assert "Detected genes" in page
+    assert "Marker coherence" in page
 
 
 def test_source_rebinding_uses_latest_locator_and_respects_explicit_override(

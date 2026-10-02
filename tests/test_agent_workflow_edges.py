@@ -49,6 +49,74 @@ def test_resume_refuses_changed_procedure_before_any_new_work(
     assert len(science.calls) == 3
 
 
+def test_core_edit_rejects_resume_without_recording_answers_or_calling_provider(
+    science: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scarf.agent import records as record_module
+
+    package = tmp_path / "package" / "scarf"
+    agent_file = package / "agent" / "records.py"
+    agent_file.parent.mkdir(parents=True)
+    agent_file.write_text("# fixed agent implementation\n")
+    core_file = package / "normalization.py"
+    core_file.write_text("ARITHMETIC = 'original'\n")
+    monkeypatch.setattr(record_module, "__file__", str(agent_file))
+    monkeypatch.setattr(api, "procedure_identity", record_module.procedure_identity)
+    result = _analyze(
+        science, tmp_path, _model([], context_question="Which compartment?")
+    )
+    assert result.status == "needsInput"
+    question = result.pending_questions[0]
+    before = RunRecords(result.run_dir).events()
+    core_file.write_text("ARITHMETIC = 'updated'\n")
+    observed: list[Any] = []
+    with pytest.raises(ValueError, match="Scarf implementation or prompts changed"):
+        resume_rna(
+            result.run_dir,
+            model=_model(observed),
+            answers={question["questionId"]: "all populations"},
+        )
+    assert observed == [] and science.calls == []
+    assert RunRecords(result.run_dir).events() == before
+    assert open_analysis(result.run_dir).report().exists()
+    assert open_analysis(result.run_dir).status == "needsInput"
+
+
+def test_resume_rechecks_clean_store_before_first_pipeline(
+    science: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from scarf.storage.artifacts import ArtifactRef
+
+    complete = workflow._complete
+
+    def stop_after_preprocessing(records: Any, stage: str, result: Any) -> None:
+        complete(records, stage, result)
+        if stage == "preprocess":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(workflow, "_complete", stop_after_preprocessing)
+    with pytest.raises(asyncio.CancelledError):
+        _analyze(science, tmp_path, _model([]))
+    records = RunRecords(tmp_path / "analysis")
+    assert workflow.stage_result(records, "preprocess") is not None
+    assert records.latest("pipelinePlanned") is None
+    science.store.list_artifacts.return_value = [
+        ArtifactRef("assay", "normalized", "a" * 64, "RNA")
+    ]
+    science.store.inspect_artifact.return_value = SimpleNamespace(
+        complete=True, operation="run_normalization"
+    )
+    monkeypatch.setattr(workflow, "_complete", complete)
+    observed: list[Any] = []
+    result = resume_rna(records.path, model=_model(observed))
+    assert result.status == "failed"
+    assert "numerical artifacts" in records.latest("status")["message"]
+    assert records.latest("pipelinePlanned") is None
+    assert science.calls == [] and observed == []
+
+
 @pytest.mark.parametrize(
     ("field", "answer"),
     [("assay", "RNA"), ("organism", "mouse"), ("captureColumn", "capture")],

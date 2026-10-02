@@ -84,6 +84,7 @@ def metadata_source(
     store = SimpleNamespace(
         assay_names=["RNA"],
         get_assay=lambda name: assay,
+        list_artifacts=lambda **kwargs: [],
         cells=cells,
         summary=lambda: SimpleNamespace(
             default_assay="RNA", assays=[descriptor], total_cells=8

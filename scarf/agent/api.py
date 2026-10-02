@@ -136,7 +136,7 @@ async def resume_rna_async(
         records = RunRecords(destination)
         if records.manifest["procedureIdentity"] != procedure_identity():
             raise ValueError(
-                "Agent implementation or prompts changed; start a new run directory"
+                "Scarf implementation or prompts changed; start a new run directory"
             )
         supplied = Study.model_validate(records.manifest["study"])
         scientific = AnalysisConfig.model_validate(records.manifest["config"])
@@ -174,12 +174,6 @@ async def resume_rna_async(
                         raise ValueError(
                             "This answer would change scientific inputs; start a new run"
                         )
-            records.append("answers", answers=answers)
-            records.append(
-                "inputsResolved",
-                study=supplied.model_dump(mode="json"),
-                config=scientific.model_dump(mode="json"),
-            )
         elif result.status == "needsInput":
             return result
         with source_lock(result.source):
@@ -188,30 +182,81 @@ async def resume_rna_async(
                 verify_source(
                     result.source, inspected, supplied, scientific, operational
                 )
-                if source is not None:
-                    records.append(
-                        "sourceRebound",
-                        source=os.path.relpath(result.source, destination),
-                        fingerprint=inspected["fingerprint"],
-                    )
+            final = None
             if result.status == "completed":
                 final = stage_result(records, "finalize")
                 if not final:
                     raise ValueError("Completed analysis has no final pipeline record")
+            elif model is None:
+                raise ValueError("Supply a model to resume unfinished decisions")
+            if source is not None and inspected:
+                _validate_relocation(
+                    open_store(result.source, scientific, operational), records
+                )
+            elif final is not None:
                 validate_final(
                     open_store(result.source, scientific, operational), final
                 )
+            if answers:
+                records.append("answers", answers=answers)
+                records.append(
+                    "inputsResolved",
+                    study=supplied.model_dump(mode="json"),
+                    config=scientific.model_dump(mode="json"),
+                )
+            if source is not None and inspected:
+                records.append(
+                    "sourceRebound",
+                    source=os.path.relpath(result.source, destination),
+                    fingerprint=inspected["fingerprint"],
+                )
+            if result.status == "completed":
                 _report(result, records)
                 return result
-            if model is None:
-                raise ValueError("Supply a model to resume unfinished decisions")
             try:
                 await run_workflow(
                     records, result.source, model, supplied, scientific, operational
                 )
             finally:
+                if source is not None and inspected is None:
+                    # An initial inspection question has no frozen source yet.
+                    inspected = stage_result(records, "inspect")
+                    if inspected is not None:
+                        records.append(
+                            "sourceRebound",
+                            source=os.path.relpath(result.source, destination),
+                            fingerprint=inspected["fingerprint"],
+                        )
                 _report(result, records)
         return result
+
+
+def _validate_relocation(store: Any, records: RunRecords) -> None:
+    """Require saved numerical history before recording a replacement locator."""
+    from .evidence import require_clean_analysis
+    from .workflow import stage_result, validate_final
+
+    if records.latest("pipelinePlanned") is None:
+        inspected = stage_result(records, "inspect")
+        if inspected is not None:
+            require_clean_analysis(store, inspected["assay"])
+    for event in records.events():
+        if event["kind"] != "pipelineCompleted":
+            continue
+        try:
+            run = store.pipeline.open(run_id=event["runId"])
+        except (KeyError, ValueError, RuntimeError) as error:
+            raise ValueError(
+                "Replacement source cannot open a saved pipeline run; "
+                "relocate the complete analysis store, including its pipeline history"
+            ) from error
+        if run.status != "completed":
+            raise ValueError("Replacement source has an incomplete saved pipeline run")
+        if any(not store.inspect_artifact(ref).complete for ref in run.values()):
+            raise ValueError("Replacement source has incomplete saved artifacts")
+    final = stage_result(records, "finalize")
+    if final is not None:
+        validate_final(store, final)
 
 
 def open_analysis(

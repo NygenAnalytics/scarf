@@ -161,8 +161,10 @@ def science(tmp_path: Any, monkeypatch: Any) -> Any:
     store = SimpleNamespace(
         pipeline=SimpleNamespace(open=Mock(side_effect=open_pipeline)),
         inspect_artifact=Mock(return_value=SimpleNamespace(complete=True)),
+        list_artifacts=Mock(return_value=[]),
     )
     prepared = {
+        "assay": "RNA",
         "source": str(source),
         "fingerprint": "frozen-source",
         "inputCells": 40,

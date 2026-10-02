@@ -11,7 +11,13 @@ from .choices import (
     validate_choice,
     validate_context,
 )
-from .evidence import inspect_source, open_store, prepare_context, verify_source
+from .evidence import (
+    inspect_source,
+    open_store,
+    prepare_context,
+    require_clean_analysis,
+    verify_source,
+)
 from .execution import (
     execute_pipeline,
     finalist_evidence,
@@ -452,6 +458,11 @@ async def run_workflow(
             _complete(records, stage, prepared)
         prepared = {**prepared, "source": str(source)}
         verify_source(source, prepared, study, config, runtime)
+        if records.latest("pipelinePlanned") is None:
+            # A paused context decision does not reserve a clean store forever.
+            require_clean_analysis(
+                open_store(source, config, runtime), prepared["assay"]
+            )
         store = open_store(source, config, runtime, writable=True)
 
         stage = "explore"

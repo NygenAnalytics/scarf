@@ -25,12 +25,46 @@ the initial implementation. Core Scarf and external skills remain unchanged.
 
 ## Current validation
 
-The focused agent suite now contains **307 passing cases**, including **191
-additional cases** for the coverage requirement. Line coverage across the package
-increased from **86.47% to 98.99%**: 1,770 of 1,788 executable statements across
-all 12 agent modules. The explicit `--cov-fail-under=95` gate passes. No production
-code, coverage exclusions, dependency settings, or CI configuration changed to
-reach this result. Branch coverage was not measured.
+The report redesign adds **28 report cases**. The targeted agent suite passes
+**386 cases** with **99.19% line coverage**: 2,089 of 2,106 executable statements
+across 15 modules. The four reporting modules have 100% line coverage; every agent
+module exceeds 95%. Branch coverage was not measured.
+
+Checks cover readable headings and tables, all saved outcome statuses, exact
+selected-cluster evidence, missing measurements versus zeroes, retained
+correction diagnostics, escaping in HTML and Markdown, safe bounded image reads,
+embedded brand assets and the font license, complete CSV exports, numeric cluster
+ordering, and offline regeneration without changes to scientific records.
+
+| Report redesign check | Result |
+| --- | --- |
+| `pytest -n 0 tests/test_agent_*.py --cov=scarf/agent --cov-fail-under=95` | 386 passed; 99.19% line coverage |
+| Ruff check and format check on the agent package and changed report tests | Passed |
+| `mypy scarf/agent` | Passed; 15 source files checked |
+| Local Chromium at 1440 px and 390 px widths | Embedded Inter loaded; no page overflow; readable tables and marker details |
+| Keyboard access to wide tables | Focusable scroll regions with accessible names |
+
+All six reports under `cytebase_analysis/outputs/agent_rerun_20261001_1852` were
+regenerated. Hash comparisons confirmed that manifests, event histories,
+measured evidence, original images, and annotation CSV contents stayed unchanged.
+No provider or numerical store was opened by report regeneration. The complete
+repository suite was not run for this task, as requested. The results below
+predate the report redesign.
+
+## Master compatibility validation
+
+After the master merge and agent compatibility fixes, the focused suite contained
+**358 passing cases**. Line coverage is **99.07%**: 1,815 of 1,832 executable
+statements across all 12 agent modules. The explicit `--cov-fail-under=95` gate
+passes. No coverage exclusions, dependency settings, or CI configuration changed.
+Branch coverage was not measured.
+
+The 51 new regression cases cover the expanded Scarf source identity, rejection
+of complete numerical artifacts from earlier analyses, permitted imported labels
+and embeddings, cache inheritance through mounts, and validation before saving a
+replacement locator. They also cover relocation during inspection, unanswered
+questions, incomplete or missing pipeline history, and successful relocation of
+a complete store copy. Existing same-run pipeline and marker reuse tests pass.
 
 Additional cases exercise scientific input and QC validation, complete matched
 correction selection and rejection, source relocation, resumable questions,
@@ -45,23 +79,30 @@ numerical doubles supplement the existing real-store pipeline tests.
 | `execution` | 99.60% |
 | `workflow` | 99.27% |
 | `provider` | 98.79% |
-| `records` | 95.14% |
+| `records` | 95.55% |
 
 All modules individually exceed 95%. Remaining misses include platform-specific
 locking and defensive failure paths. Use the reproducible gate command in
 [README.md](README.md); the terminal report lists each uncovered line.
 
-| Check after adding coverage tests | Result |
+| Check after the master compatibility fixes | Result |
 | --- | --- |
-| Agent tests with `--cov=scarf/agent --cov-fail-under=95` | 307 passed; 98.99% line coverage |
-| Quick suite, `pytest -n 4 -m "not slow and not integration"` | 6,295 passed, 1 skipped |
-| Complete suite, `pytest -n 4` | 6,356 passed, 5 skipped |
+| Agent tests with `--cov=scarf/agent --cov-fail-under=95` | 358 passed; 99.07% line coverage |
+| Quick suite, `pytest -n 4 -m "not slow and not integration"` | 7,503 passed, 1 skipped |
+| Complete suite, `pytest -n 4` | 7,568 passed, 5 skipped |
 | `ruff check scarf profiling tests` | Passed |
-| `ruff format --check scarf profiling tests` | Passed; 529 files checked |
-| `mypy scarf profiling` | Passed; 290 source files checked |
+| `ruff format --check scarf profiling tests` | Passed; 554 files checked |
+| `mypy scarf profiling` | Passed; 292 source files checked |
 
-The complete suite discovered 6,361 tests. Its five skips have the same
-environment and opt-in causes described below; none was added for coverage.
+The complete suite discovered 7,573 tests. Its five skips have the same
+environment and opt-in causes described below; no tests were skipped or removed
+for these fixes. All changed files remain under `scarf/agent/` or are agent test
+modules under `tests/`.
+
+Before the master merge, the earlier coverage expansion reached 307 passing
+agent cases and 98.99% coverage, up from 86.47%. That revision passed 6,295 quick
+suite cases and 6,356 complete suite cases. Those are historical results; the
+compatibility checks above include the new upstream tests and agent regression cases.
 
 ## Test relocation validation
 

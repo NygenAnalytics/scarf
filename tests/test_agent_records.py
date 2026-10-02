@@ -3,6 +3,7 @@
 import json
 import errno
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -236,6 +237,96 @@ def test_hashes_are_stable_and_reject_nonfinite_values() -> None:
     with pytest.raises(RecordError):
         digest({"infinite": float("inf")})
     assert len(procedure_identity()) == 64
+
+
+@pytest.fixture
+def procedure_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import scarf.agent.records as records_module
+
+    package = tmp_path / "scarf"
+    sources = {
+        "__init__.py": "__version__ = '0.1'\n",
+        "agent/records.py": "def procedure_identity(): return 'example'\n",
+        "agent/prompts.py": "INSTRUCTIONS = 'Use measured evidence.'\n",
+        "datastore/pipeline.py": "DEFAULT_NEIGHBORS = 11\n",
+        "storage/artifacts.py": "ARTIFACT_KIND = 'cluster_labels'\n",
+    }
+    for relative, content in sources.items():
+        source = package / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(content)
+    monkeypatch.setattr(records_module, "__file__", str(package / "agent/records.py"))
+    return package
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "agent/records.py",
+        "agent/prompts.py",
+        "datastore/pipeline.py",
+        "storage/artifacts.py",
+    ],
+)
+def test_procedure_identity_covers_agent_and_core_source_changes(
+    procedure_package: Path, relative: str
+) -> None:
+    before = procedure_identity()
+    source = procedure_package / relative
+    original = source.read_bytes()
+    source.write_bytes(original + b"IMPLEMENTATION_CHANGE = True\n")
+    assert procedure_identity() != before
+    source.write_bytes(original)
+    assert procedure_identity() == before
+
+
+def test_procedure_identity_is_stable_when_package_is_relocated(
+    procedure_package: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scarf.agent.records as records_module
+
+    before = procedure_identity()
+    relocated = tmp_path / "different-installation" / "scarf"
+    shutil.copytree(procedure_package, relocated)
+    monkeypatch.setattr(records_module, "__file__", str(relocated / "agent/records.py"))
+    assert procedure_identity() == before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "agent/README.md",
+        "../docs/example.py",
+        "tests/test_pipeline.py",
+        "agent/tests/test_workflow.py",
+        "agent/__pycache__/records.py",
+        "datastore/__pycache__/pipeline.cpython-314.pyc",
+    ],
+)
+def test_procedure_identity_ignores_documentation_tests_and_bytecode(
+    procedure_package: Path, relative: str
+) -> None:
+    before = procedure_identity()
+    ignored = procedure_package / relative
+    ignored.parent.mkdir(parents=True, exist_ok=True)
+    ignored.write_text("Initial non-runtime content.\n")
+    assert procedure_identity() == before
+    ignored.write_text("Changed non-runtime content.\n")
+    assert procedure_identity() == before
+    ignored.unlink()
+    assert procedure_identity() == before
+
+
+def test_procedure_identity_includes_relative_module_names(
+    procedure_package: Path,
+) -> None:
+    before = procedure_identity()
+    source = procedure_package / "datastore/pipeline.py"
+    moved = source.with_name("different_pipeline.py")
+    source.rename(moved)
+    assert procedure_identity() != before
+    moved.rename(source)
+    assert procedure_identity() == before
 
 
 def test_json_numeric_overflow_is_not_accepted_on_read(tmp_path: Path) -> None:

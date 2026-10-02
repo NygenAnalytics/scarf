@@ -27,6 +27,36 @@ _LABEL_PATTERN = re.compile(
 )
 _MITO_PATTERN = r"(?i:^mt-)"
 _MAX_COLUMNS = 48
+_NUMERICAL_ARTIFACT_KINDS = frozenset(
+    {
+        "feature_summary",
+        "feature_selection",
+        "normalized",
+        "feature_scaling",
+        "reduction",
+        "batch_correction",
+        "ann_index",
+        "neighbors",
+        "connectivity_map",
+        "embedding_initialization",
+        "embedding",
+        "cluster_labels",
+        "cluster_cut",
+        "cluster_selection",
+        "marker_table",
+        "doublet_score",
+    }
+)
+_NONNUMERICAL_ARTIFACT_OPERATIONS = frozenset(
+    {
+        ("feature_selection", "create_all_features"),
+        ("feature_selection", "set_feature_selection"),
+        ("embedding", "import_dimreduc"),
+        ("cluster_labels", "import_cluster_labels"),
+        ("cluster_labels", "import_active_identity"),
+        ("cluster_labels", "snapshot_cluster_labels"),
+    }
+)
 
 
 def is_held_out_column(name: str, study: Study) -> bool:
@@ -73,6 +103,30 @@ def open_store(
             "Active source cells have invalid feature counts; repair the source first"
         )
     return DataStore(str(path), zarr_mode="r+", **options)
+
+
+def require_clean_analysis(store: Any, assay: str) -> None:
+    """Require a source without reusable numerical results for the RNA recipe.
+
+    The public listing includes artifacts inherited from a mounted source.
+    Incomplete results cannot be reused and do not block a new analysis.
+    Imported labels/embeddings and explicit feature selections are inputs, not
+    computations of this recipe. Metadata snapshots and other assays also
+    remain allowed. Call only before the run's first numerical invocation;
+    later verification must allow that run's own completed artifacts.
+    """
+    for ref in store.list_artifacts(from_assay=assay, complete_only=True):
+        if ref.kind not in _NUMERICAL_ARTIFACT_KINDS:
+            continue
+        operation = store.inspect_artifact(ref).operation
+        if (ref.kind, operation) in _NONNUMERICAL_ARTIFACT_OPERATIONS:
+            continue
+        raise AnalysisInputError(
+            f"Prior complete numerical artifacts for RNA assay {assay!r} are "
+            f"unsupported ({ref.kind}, operation {operation!r}). Prepare a clean "
+            "store without prior numerical analysis. Mounting an analyzed "
+            "source also inherits its artifacts and does not make it clean."
+        )
 
 
 def _json_scalar(value: Any) -> Any:
@@ -394,6 +448,7 @@ def inspect_source(
     assay = config.assay or (assays[0] if len(assays) == 1 else None)
     if assay is None or assay not in assays:
         raise NeedsInput(f"Choose one RNA assay from {assays}.", field="assay")
+    require_clean_analysis(store, assay)
     declared = list(
         dict.fromkeys(
             [
