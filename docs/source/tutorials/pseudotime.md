@@ -11,15 +11,15 @@ kernelspec:
   language: python
   name: python3
 ---
+# Pseudotime Primer
 
-# Pseudotime analysis
+Pseudotime analysis refers to modeling and testing how molecular features, primarily gene expression, transcription factor activity, or pathway scores, change continuously along a reconstructed trajectory coordinate. Pseudotime allows us to not view cells as a static discrete cluster, but instead enable us to dynamically model cellular processes as continuous gene regulatory programs unfolding across a developmental, activation, or perturbation axis.
 
-Pseudotime is an oriented summary of graph structure. Source and sink choices supervise that
-orientation; Scarf does not infer terminal states or causal lineage.
+Pseudotime more specifically is a summary of the existing graph structure and the distance of a cell's transcriptional profile from a defined starting population along the graph.
 
-## 1. Open the prepared graph
+## Open the prepared graph
 
-```{code-cell} ipython3
+```{code-cell}
 import numpy as np
 import pandas as pd
 
@@ -41,13 +41,11 @@ graph = analysis_run["connectivity_map"]
 all_features = analysis_run["feature_universe"]
 ```
 
-The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
-exact graph, feature universe, and UMAP. The teaching store's literal `clusters` column supplies
-external endpoint labels; it is not the clustering selected by the pipeline run. Build a zero-sum
-source/sink vector over the graph rows. Ductal cells supply negative source mass; Alpha, Beta, and
-Delta cells share positive sink mass.
+From the completed analysis, we grab the existing computed graph, feature universe, and the UMAP.
 
-```{code-cell} ipython3
+For pseudotime analysis, we need to select a starting point for what we can use to calculate the distance of a cell from the starting population. For our dataset, based on the biological context, our starting population would be the ductal progeinerators cells. If you'd like to gain a more technical understanding of what the source & the sink vectors are, refer to {doc}`fate_mapping`.
+
+```{code-cell}
 labels = ds.cells.fetch("clusters", key="I")
 source = labels == "Ductal"
 sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
@@ -59,9 +57,11 @@ source_sink_vector[sink] = 1.0 / sink.sum()
 float(source_sink_vector.sum())
 ```
 
-## 2. Score pseudotime
+We define our sink vectors, or our endpoints, as Alpha, Beta, or Delta cells to define the endpoint of our axis, in which ductal cells are the starting point. With this supervised axis, each cell can then be scored: low means Ductal-like, high means terminus-like (Alpha/Beta/Delta). To go a step further and determine if a cell is likely to be a Alpha/Beta/Delta, access {doc}`fate_mapping`.
 
-```{code-cell} ipython3
+## Scoring Pseudotime
+
+```{code-cell}
 pseudotime_ref = ds.run_pseudotime_scoring(
     graph,
     ss_vec=source_sink_vector,
@@ -74,26 +74,20 @@ pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
 }
 ```
 
-The producer returns an artifact. The explicit loader returns values, a validity mask, graph ref,
-and cell-selection ref. No pseudotime or validity column is added to live metadata.
+After we perform our analysis, we can now visualize the pseudotime results.
 
-```{code-cell} ipython3
-plot_data = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
-plot_data["pseudotime"] = pseudotime.values
-plot_data.loc[pseudotime.valid].plot.scatter(
-    x="umap_1",
-    y="umap_2",
-    c="pseudotime",
-    colormap="viridis",
-    s=4,
-    figsize=(5, 4),
+```{code-cell}
+ds.cells.insert("pseudotime", pseudotime.values, key="I", overwrite=True)
+ds.plots.embedding(
+    layout=analysis_run["umap"],
+    color_by="pseudotime",
+    sort_values=True,
 )
 ```
 
-Values should progress from the ductal region toward endocrine endpoints. A disconnected or
-reversed pattern is a reason to revisit the graph and endpoint choices.
+With our known biological context, values should progress from the ductal region toward our endocrine cell endpoints. A disconnected or reversed pattern is something thats important to investigate. Remember, to assign our endpoints and our starting points, use gene markers to chracterize these bits.
 
-```{code-cell} ipython3
+```{code-cell}
 pd.DataFrame(
     {
         "cluster": labels[pseudotime.valid],
@@ -102,9 +96,11 @@ pd.DataFrame(
 ).groupby("cluster")["pseudotime"].describe()
 ```
 
+For each cluster, the table above reports how many cells it holds and how their pseudotime values distribute in comparison to the starting population, letting you validate thar your starting ductal cells sit near sit near zero, while our terminal cells like Alpha, Beta, and Delta cells sit near one. A cluster whose mean lands mid-axis, or whose spread spans the full range, deserves digging into the data further.
+
 ## 3. Search for pseudotime-associated features
 
-```{code-cell} ipython3
+```{code-cell}
 marker_ref = ds.run_pseudotime_marker_search(
     pseudotime_ref,
     features=all_features,
@@ -115,7 +111,7 @@ markers.table[["p_value", "p_value_adjusted"]].notna().sum()
 
 Untested features retain `NaN` p-values. Benjamini-Hochberg adjustment covers tested features only.
 
-```{code-cell} ipython3
+```{code-cell}
 tested = markers.table.loc[
     markers.table["p_value_adjusted"].notna(),
     ["feature_name", "r_value", "p_value_adjusted"],
