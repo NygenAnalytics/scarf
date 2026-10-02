@@ -436,6 +436,30 @@ def test_consume_uses_persisted_read_group_not_default_unit() -> None:
     assert int(metrics["featureWidth"]) == feature_width
 
 
+def test_read_group_rows_counts_the_selected_features_of_each_read_group() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups, read_group_rows
+
+    values = np.arange(40 * 300, dtype=np.uint16).reshape(40, 300)
+    counts_t = _counts_t_with_plan(values)
+    selected = np.arange(3, 300, 7)
+    for feat_idx in (None, selected):
+        bounds = list(
+            map_feature_read_groups(
+                counts_t,
+                lambda group: (group.featStart, group.featEnd),
+                feat_idx=feat_idx,
+                resources=ResourceBudget(8 * 1024**3, 2),
+            )
+        )
+        wanted = np.arange(300) if feat_idx is None else feat_idx
+        expected = [
+            np.count_nonzero((wanted >= start) & (wanted < end))
+            for start, end in bounds
+        ]
+        assert len(bounds) > 1
+        np.testing.assert_array_equal(read_group_rows(counts_t, feat_idx), expected)
+
+
 def test_persisted_read_group_requires_read_group_bytes() -> None:
     from scarf.storage.feature_stream import persisted_read_group
 

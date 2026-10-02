@@ -21,6 +21,8 @@ from scarf.features.markers import (
 from scarf.features.markers.rank import (
     _batch_stats,
     _gene_major_feature,
+    _gene_major_slot,
+    _gene_major_slots,
     _marker_stats_batch,
     _marker_stats_gene_major,
 )
@@ -769,7 +771,8 @@ def _gene_major_inputs(raw: np.ndarray) -> tuple[np.ndarray, ...]:
     )
 
 
-def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
+@pytest.mark.parametrize("threads", [1, 3])
+def test_gene_major_python_kernel_matches_compiled_kernel(threads: int) -> None:
     raw = np.array(
         [
             [0, 2, 0, 4],
@@ -779,7 +782,11 @@ def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
         ],
         dtype=np.uint32,
     ).T
-    args = (*_gene_major_inputs(raw), np.arange(raw.shape[0], dtype=np.int64), 3)
+    args = (
+        *_gene_major_inputs(raw),
+        np.arange(raw.shape[0], dtype=np.int64),
+        threads,
+    )
     compiled = np.zeros((raw.shape[0], 2, 8), dtype=np.float64)
     python = np.zeros_like(compiled)
 
@@ -788,6 +795,36 @@ def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
 
     np.testing.assert_array_equal(compiled, python)
     assert compiled.any()
+
+
+@pytest.mark.parametrize("invalid_row", [None, 2])
+def test_gene_major_slot_python_kernels_match_compiled_kernels(
+    invalid_row: int | None,
+) -> None:
+    raw = np.array(
+        [
+            [0, 2, 0, 4],
+            [1, 2, 0, 0],
+            [1, 0, 3, 4],
+            [0, 0, 3, 0],
+            [2, 0, 1, 0],
+        ],
+        dtype=np.float64,
+    )
+    if invalid_row is not None:
+        raw[invalid_row, 1] = -1.0
+    inputs = _gene_major_inputs(raw)
+    rows = np.arange(raw.shape[0], dtype=np.int64)
+    # Slot 0 of 2 takes rows 0, 2 and 4, so it stops at the invalid row, and
+    # the slots together report it as the first invalid position.
+    expected = raw.shape[0] if invalid_row is None else invalid_row
+    for kernel, slots in ((_gene_major_slot, (0, 2)), (_gene_major_slots, (2,))):
+        compiled = np.zeros((raw.shape[0], 2, 8), dtype=np.float64)
+        python = np.zeros_like(compiled)
+        assert kernel(*inputs, rows, rows, *slots, compiled) == expected
+        assert kernel.py_func(*inputs, rows, rows, *slots, python) == expected
+        np.testing.assert_array_equal(compiled, python)
+        assert compiled.any()
 
 
 @pytest.mark.parametrize(
@@ -2935,6 +2972,38 @@ def test_marker_search_fits_its_threads_to_the_memory_budget(
     np.testing.assert_array_equal(rank(roomy.memoryBytes, nthreads=2), expected)
     threads, calls = schedules[-1]
     assert threads * calls == 2
+
+
+def test_marker_search_ranks_narrow_read_groups_at_once(tmp_path, monkeypatch) -> None:
+    from scarf.features.markers import search
+    from scarf.storage.feature_stream import persisted_read_group, read_group_rows
+
+    rng = np.random.default_rng(4)
+    values = rng.poisson(0.3, size=(20_000, 64)).astype(np.uint16)
+    store = _layout_store(tmp_path, values, nthreads=8)
+    labels = rng.integers(0, 6, size=len(values))
+    cells = np.arange(len(values))
+    counts_t = store.RNA.rawDataT
+    # One feature of each read group leaves one row per kernel call, so whole
+    # groups run at once, one serial kernel each.
+    features = np.arange(0, values.shape[1], persisted_read_group(counts_t)[0])
+    groups = len(read_group_rows(counts_t, features))
+    assert groups > 1
+    schedules: list[tuple[int, int]] = []
+    schedule = search._gene_major_schedule
+
+    def recorded(*args, **kwargs):
+        schedules.append(schedule(*args, **kwargs))
+        return schedules[-1]
+
+    monkeypatch.setattr(search, "_gene_major_schedule", recorded)
+    expected = find_markers_by_rank(store.RNA, labels, cells, features).statistics
+    observed = find_markers_by_rank(
+        store.RNA, labels, cells, features, nthreads=8
+    ).statistics
+
+    assert schedules == [(1, 1), (1, groups)]
+    np.testing.assert_array_equal(observed, expected)
 
 
 _SCRATCH_CHILD = textwrap.dedent(
