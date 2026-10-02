@@ -22,6 +22,7 @@ from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.stores import (
     load_zarr,
     metadata_workers,
+    mount_artifact_namespace,
     resolve_matrix_source,
     run_concurrently,
 )
@@ -170,14 +171,13 @@ class BaseDataStore:
             self.workspace = workspace
         else:
             self._matrix_z, source_workspace = resolved
-            if workspace is None:
-                self.workspace = source_workspace
-            elif workspace != source_workspace:
+            if workspace is not None and workspace != source_workspace:
                 raise ValueError(
                     "workspace does not match the mounted matrixSource workspace"
                 )
-            else:
-                self.workspace = workspace
+            self.workspace = source_workspace
+            # A mount resolves its source's artifacts read only, after its own.
+            self.z = mount_artifact_namespace(self.z, self._matrix_z, self.workspace)
         import_source = self.zw.attrs.get("scarf:import_source")
         if import_source is not None and not bool(
             self.zw.attrs.get("scarf:import_complete", False)
@@ -194,10 +194,16 @@ class BaseDataStore:
         self._assayNames = tuple(assay_groups)
         for name, group in assay_groups.items():
             state = group.attrs.get("prepared")
-            if (state is not True and state is not False) or (
-                self.zw.read_only and state is not True
-            ):
+            if state is not True and state is not False:
                 raise ValueError(f"Assay {name!r} is not prepared. {REBUILD_REQUIRED}")
+            if state is False and self.zw.read_only:
+                # A fresh import is prepared by its first writable open.
+                raise ValueError(
+                    f"Assay {name!r} is not prepared yet. Open the store once with "
+                    "zarr_mode='r+' to prepare it before opening it read-only or "
+                    "mounting it; a store that cannot be written must be rebuilt "
+                    "into a fresh destination with repack_store(..., data_only=True)."
+                )
         legacy_state_paths = [
             f"{assay_name}/state"
             for assay_name, group in assay_groups.items()
@@ -346,7 +352,9 @@ class BaseDataStore:
         try:
             cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
         except KeyError as e:
-            raise KeyError(f"cellData not found in zarr file at {self.z.path}") from e
+            raise KeyError(
+                f"cellData not found in zarr file at {self.zw.store_path}"
+            ) from e
         return MetaData(cell_data)
 
     @property
@@ -511,11 +519,8 @@ class BaseDataStore:
                     logger.warning(caution_statement % i)
                     assay = Assay
                     assay_name = "Assay"
-                if i in z_attrs and assay_name == z_attrs[i]:
-                    pass
-                else:
-                    z_attrs[i] = assay_name
-                    logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
+                z_attrs[i] = assay_name
+                logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
             assays[i] = assay(
                 z=self.z,
                 workspace=self.workspace,
@@ -632,19 +637,83 @@ class BaseDataStore:
             inputs={},
         )
 
+    def snapshot_cluster_labels(
+        self,
+        labels: str | ArtifactRef,
+        *,
+        cell_selection: ArtifactRef,
+    ) -> ArtifactRef:
+        """Freeze one label per selected cell as an immutable label artifact.
+
+        Label consumers such as ``run_marker_search``, ``make_bulk``,
+        ``select_cells``, ``smart_label``, and ``metric_label_concordance``
+        take exact label artifacts. This method makes one from a cell
+        metadata column, such as an annotation or a condition, or narrows an
+        existing label artifact to some of its cells, such as the labelled
+        cells of an imported clustering or a few of its clusters. A consumer
+        that pairs the labels with another input, such as a graph in
+        ``calc_membership_strength`` or a second label artifact in
+        ``smart_label``, needs both inputs over one cell selection.
+
+        The labels are read for exactly the cells of ``cell_selection``. A
+        label artifact, such as ``cluster_labels``, ``cluster_cut``,
+        ``smart_label``, or ``label_transfer``, must have a cell selection
+        that contains ``cell_selection``. Every selected cell needs a label:
+        a missing label, including a row that a linked missing mask flags,
+        or a blank label is rejected. Select the labelled cells first, with
+        ``select_cells(labels, include=[...])`` for an artifact or with
+        ``snapshot_cell_selection`` of a boolean column that marks them.
+        Text labels are stored at the width of the selected labels, and
+        integer and boolean labels keep their dtype. Floating-point labels
+        that are whole numbers within the int64 range, such as the float64
+        ids that pandas writes for integer ids with missing values, are
+        stored as int64, and other floating-point labels are rejected.
+
+        The result is a datastore-scoped ``cluster_labels`` artifact over
+        ``cell_selection``. Its identity holds the source column name or the
+        source artifact, the cell selection, and a fingerprint of the stored
+        labels. The same labels reuse one artifact, also from a store opened
+        with ``zarr_mode='r'``, and changed labels create a new one while
+        earlier snapshots keep their values. A mounted store writes the
+        artifact to its target, never to the matrix source. The labels are
+        not checked against the marker-group naming rule;
+        ``run_marker_search`` rejects labels that cannot name a stored marker
+        group before it writes anything.
+
+        Args:
+            labels: Cell metadata column name, or a cell-label artifact.
+            cell_selection: Complete cell-selection artifact of the cells to
+                label, for example from ``snapshot_cell_selection`` or
+                ``select_cells``.
+
+        Returns:
+            A complete datastore-scoped ``cluster_labels`` artifact with one
+            label per cell of ``cell_selection``.
+
+        Raises:
+            TypeError: If ``labels`` is neither a column name nor an
+                ``ArtifactRef``, if ``cell_selection`` is not an
+                ``ArtifactRef``, or if a label is not a text, integer,
+                boolean, or whole-number value.
+            KeyError: If no cell metadata column is named ``labels``.
+            ValueError: If ``cell_selection`` is not a complete cell
+                selection, if the ``labels`` artifact holds no cell labels or
+                its cell selection does not contain ``cell_selection``, or if
+                a selected cell has no label.
+            PermissionError: If no matching snapshot exists and the store is
+                not opened with ``zarr_mode='r+'``.
+        """
+        from ..metadata.artifacts import snapshot_cluster_labels
+
+        return snapshot_cluster_labels(
+            self.zw, self.cells, labels, cell_selection=cell_selection
+        )
+
     def _selection_artifacts_match(
         self,
         first: ArtifactRef,
         second: ArtifactRef,
     ) -> bool:
-        if (
-            first.kind != second.kind
-            or first.scope != second.scope
-            or first.assay != second.assay
-        ):
-            return False
-        if first.kind != "cell_selection" or first.scope != "datastore":
-            return False
         table_path = "cellData"
         try:
             first_status = inspect_artifact(self.zw, first)
@@ -667,15 +736,10 @@ class BaseDataStore:
                 assay=second.assay,
                 table_path=table_path,
             )
+            # Both are complete and fingerprint the live cell rows, so equal
+            # values fingerprints select the same cells.
             first_inputs = first_status.inputs or {}
             second_inputs = second_status.inputs or {}
-            if (
-                not first_status.complete
-                or not second_status.complete
-                or first_inputs.get("ordered_row_ids_fingerprint")
-                != second_inputs.get("ordered_row_ids_fingerprint")
-            ):
-                return False
         except (KeyError, TypeError, ValueError):
             return False
         return first_inputs.get("values_fingerprint") == second_inputs.get(
@@ -781,22 +845,10 @@ class BaseDataStore:
         return vals
 
     def __repr__(self) -> str:
-        def formatter(label: str | None, iter_vals: Iterable[str]) -> str:
-            if label is None:
-                line = ""
-            else:
-                line = f"\n{stabs}{label}:"
-            line += (
-                "\n"
-                + dtabs
-                + "".join(
-                    [
-                        f"'{x}', " if n % 5 != 0 else f"'{x}', \n{dtabs}"
-                        for n, x in enumerate(iter_vals, start=1)
-                    ]
-                )
-            )
-            return line.rstrip("\n\t")[:-2]
+        def formatter(iter_vals: Iterable[str]) -> str:
+            values = [f"'{x}'" for x in iter_vals]
+            rows = [", ".join(values[i : i + 5]) for i in range(0, len(values), 5)]
+            return f"\n{dtabs}" + f", \n{dtabs}".join(rows) if rows else ""
 
         htabs = " " * 3
         stabs = htabs * 2
@@ -807,28 +859,12 @@ class BaseDataStore:
             f" {len(self.assay_names)} assays: {' '.join(self.assay_names)}"
         )
         res = res + f"\n{htabs}Cell metadata:"
-        res += formatter(None, self.cells.columns)
+        res += formatter(self.cells.columns)
         for i in self.assay_names:
             assay = self._get_assay(i)
             res += (
                 f"\n{htabs}{i} assay has {assay.feats.N} "
                 f"features and following metadata:"
             )
-            res += formatter(None, assay.feats.columns)
-            assay_group = as_zarr_group(self.zw[i], name=i)
-            if "projections" in assay_group:
-                targets: list[str] = []
-                layouts: list[str] = []
-                projections = as_zarr_group(
-                    assay_group["projections"], name="projections"
-                )
-                for j in projections:
-                    if isinstance(projections[j], zarr.Group):
-                        targets.append(j)
-                    else:
-                        layouts.append(j)
-                if len(targets) > 0:
-                    res += formatter("Projected samples", targets)
-                if len(layouts) > 0:
-                    res += formatter("Co-embeddings", layouts)
+            res += formatter(assay.feats.columns)
         return res

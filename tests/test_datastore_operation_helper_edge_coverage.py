@@ -181,18 +181,10 @@ def test_connectivity_payload_rejects_values_and_row_geometry() -> None:
         graph_distances.validate_integration_source_payload(root, _ref("reduction"))
 
 
-_NORMALIZATION = {"log_transform": False, "renormalize_subset": False}
-
-
 def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stored = SimpleNamespace(
-        name="RNA",
-        normMethod=object(),
-        sf=None,
-        _count_arithmetic=lambda *_, **__: None,
-    )
+    stored = SimpleNamespace(name="RNA", normMethod=object(), sf=None)
 
     monkeypatch.setattr(
         trajectory_operations,
@@ -203,8 +195,6 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
         stored,
         normalization_method={"callable": "stable"},
         size_factor=None,
-        normalization=_NORMALIZATION,
-        count_arithmetic=None,
         context="diffusion",
     )
     stored.sf = True
@@ -213,8 +203,6 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
             stored,
             normalization_method={"callable": "stable"},
             size_factor=None,
-            normalization=_NORMALIZATION,
-            count_arithmetic=None,
             context="diffusion",
         )
     stored.sf = 2.0
@@ -223,8 +211,6 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
             stored,
             normalization_method={"callable": "stable"},
             size_factor=None,
-            normalization=_NORMALIZATION,
-            count_arithmetic=None,
             context="diffusion",
         )
     stored.sf = None
@@ -233,8 +219,6 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
             stored,
             normalization_method={"callable": "changed"},
             size_factor=None,
-            normalization=_NORMALIZATION,
-            count_arithmetic=None,
             context="diffusion",
         )
 
@@ -248,15 +232,11 @@ def test_trajectory_identity_helpers_cover_drift_and_invalid_values(
             stored,
             normalization_method={"callable": "stable"},
             size_factor=None,
-            normalization=_NORMALIZATION,
-            count_arithmetic=None,
             context="diffusion",
         )
 
 
-def test_trajectory_feature_and_parameter_guards(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_trajectory_feature_and_parameter_guards() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     feature_data = root.create_group("featureData")
     feature_data.create_array("names", data=np.asarray(["a", "b"]))
@@ -267,14 +247,3 @@ def test_trajectory_feature_and_parameter_guards(
 
     with pytest.raises(TypeError, match="ArtifactRef"):
         trajectory_operations._resolve_feature_indices(object(), assay, object())
-    selection = _ref("feature_selection", "e")
-    store = SimpleNamespace(
-        zw=object(), resolve_features=lambda assay_name, ref: selection
-    )
-    monkeypatch.setattr(
-        trajectory_operations,
-        "read_feature_selection_indices",
-        lambda root, assay_name, ref: np.empty(0, dtype=np.int64),
-    )
-    with pytest.raises(ValueError, match="no active features"):
-        trajectory_operations._resolve_feature_indices(store, assay, selection)

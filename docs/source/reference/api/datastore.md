@@ -3,8 +3,8 @@
 `DataStore` is the primary analyst-facing object.
 It inherits graph, mapping, and assay helpers from the classes below.
 Use this page for analyst-facing methods and consult the inheritance appendix when extending Scarf.
-A `DataStore` is not designed for concurrent use from several threads; apart from the stage overlap
-that `DataStore.pipeline.run()` manages itself, call its methods from one thread at a time.
+A `DataStore` is not designed for concurrent use from several threads; call its methods from one
+thread at a time.
 
 Graph-construction methods are documented on {doc}`graph_construction`.
 Artifact and run inspection, including the metadata-only `DataStore.summary()`, is documented on {doc}`artifacts`.
@@ -125,8 +125,50 @@ label array, such as `phase` of a cell-cycle artifact or `labels` of a Paris cut
 `cell_selection=` may narrow, but never widen, that source selection. Cells whose value the
 artifact records as missing are never selected, and a selection that retains no cell raises.
 Doublet detection, `run_marker_search`, `calc_membership_strength`, and `smart_label` reject label
-artifacts with missing labels before reusing or writing a result. Select the labelled cells with
-`select_cells(labels, include=[...])` and derive complete labels for that selection.
+artifacts with missing labels before reusing or writing a result. For `run_marker_search`, select
+the labelled cells with `select_cells(labels, include=[...])` and freeze their labels with
+`snapshot_cluster_labels(labels, cell_selection=...)`. For `smart_label`, freeze both label
+artifacts over one selection of the cells labelled in both. Doublet detection and
+`calc_membership_strength` need a label for every cell of the graph. Build the graph over labelled
+cells only when some of its cells have no label, then freeze the labels over the cell selection
+that the graph was built from, such as `run["analysis_cell_selection"]` of a pipeline run.
+
+{py:meth}`scarf.datastore.datastore.DataStore.snapshot_cluster_labels` freezes one label for each
+cell of an explicit `cell_selection` into a datastore-scoped `cluster_labels` artifact. Label
+consumers accept it like a clustering, among them `run_marker_search`, `make_bulk`, `select_cells`,
+`run_statistical_testing`, `smart_label`, and `metric_label_concordance`. The labels come from a
+cell metadata column, such as an annotation or a condition, or from a cell-label artifact, such as
+a clustering, a Paris cut, or imported clusters. An artifact is read for a subset of its own cell
+selection, so its labels can be narrowed to the labelled cells or to some of its clusters.
+Floating-point labels that are whole numbers within the int64 range, such as the float64 ids that
+pandas writes for integer ids with missing values, are stored as int64, and other floating-point
+labels raise `TypeError`. Every selected cell needs a label: a missing label, including a row that
+a linked missing mask flags, or a blank label raises `ValueError`. Text is stored at the width of
+the selected labels, and integer and boolean labels keep their dtype. The identity holds the source
+column name or source artifact, the cell selection, and a fingerprint of the stored labels, so the
+same labels reuse one artifact, also from a read-only store, and changed labels create a new one
+while earlier snapshots keep their values. On a mounted store the
+artifact is written to the target. The labels are not checked against the marker-group naming
+rule; `run_marker_search` rejects a label that cannot name a stored marker group before it writes
+anything.
+
+For example, rank the genes that separate disease from normal cells within one annotated cell type
+of a mounted store:
+
+```python
+ds = scarf.mount_datastore(source_path, at=target_path, default_assay="RNA")
+cell_type = np.asarray(ds.cells.fetch_all("cell_type"), dtype=object)
+ds.cells.insert("is_t_cell", cell_type == "T cell", overwrite=True)
+t_cells = ds.snapshot_cell_selection("is_t_cell")
+disease = ds.snapshot_cluster_labels("disease", cell_selection=t_cells)
+screen = ds.run_marker_search(disease, features=ds.select_all_features(from_assay="RNA"))
+ds.get_markers(screen, group_id="COVID-19")
+```
+
+This screen is descriptive: it treats every cell as an independent observation, although cells of
+one donor are not. To test a condition, aggregate cells to donors, for example with
+`run_statistical_testing(genes, CellField("disease"), cell_selection=t_cells, sample_by="donor_id")`,
+as in {doc}`../../tutorials/condition_comparisons`.
 
 Nullable metadata columns keep a stored placeholder in each row that their linked missing mask
 flags. `cells.fetch` and `cells.fetch_all` return stored values, placeholders included.
@@ -143,6 +185,10 @@ natural order, so `"1_2"` precedes `"1_10"` and `"2_T"` precedes `"B cell"`.
 `export_markers_to_csv` uses the same column order. An unknown `group_id` raises an error.
 Fresh marker results include score, expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and Benjamini-Hochberg values adjusted within each one-versus-rest group over tested features.
 These are cell-level marker statistics, not replicate-aware differential expression.
+Marker search reads raw counts of any storage dtype. Library-size markers require finite
+non-negative counts and cell totals: a negative or non-finite normalized value of a tested feature,
+or total of a selected cell (its `<assay>_nCounts` value, or with `renormalize_subset=True` its sum
+over the tested features), raises `ValueError` before anything is written.
 
 {py:meth}`scarf.datastore.datastore.DataStore.run_pseudotime_marker_search` leaves untested features with `r_value` 0.0 and `NaN` for `p_value` and `p_value_adjusted`, and adjusts p-values over tested features only.
 

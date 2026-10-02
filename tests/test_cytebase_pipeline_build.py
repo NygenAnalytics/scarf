@@ -106,12 +106,20 @@ class DenseBuild:
     stages: list[tuple[str, dict[str, Any]]]
 
 
+# Counts above 255, so the dense store holds uint16 where the CSR fixture
+# store holds uint8.
+DENSE_COUNTS = COUNTS * 100
+
+
 @pytest.fixture(scope="module")
 def dense_build(tmp_path_factory) -> DenseBuild:
     """Convert a dense float32 H5AD without embeddings once for this module."""
     root = tmp_path_factory.mktemp("cytebase-dense")
     source = write_h5ad(
-        root / "source.h5ad", COUNTS.astype(np.float32), encoding="dense", umap=False
+        root / "source.h5ad",
+        DENSE_COUNTS.astype(np.float32),
+        encoding="dense",
+        umap=False,
     )
     manifest = full_manifest(source)
     stages: list[tuple[str, dict[str, Any]]] = []
@@ -365,10 +373,13 @@ def test_convert_local_preserves_dense_counts_without_embeddings(dense_build):
         "converting",
         "initializing_qc",
     ]
-    assert "preserving source dtype float32" in dense_build.stages[1][1]["message"]
+    assert dense_build.stages[1][1]["message"] == "Building RNA counts and countsT"
+    assert "storageDtypePolicy" not in converted["conversion"]
     verification = build.verify_store(str(dense_build.store), dense_build.manifest)
-    assert verification["countsDtype"] == "float32"
-    assert verification["countsBlock"] == COUNTS[:3].tolist()
+    # Integral float32 counts store unsigned, in the narrowest dtype that fits.
+    assert dense_build.manifest["countsDtype"] == "float32"
+    assert verification["countsDtype"] == "uint16"
+    assert verification["countsBlock"] == DENSE_COUNTS[:3].tolist()
 
 
 # build_local
@@ -619,7 +630,8 @@ def test_verify_store_reports_metadata_and_closes_stores(
     assert result == {
         "nObs": 6,
         "nVars": 5,
-        "countsDtype": "int32",
+        # The int32 source counts are small non-negative integers.
+        "countsDtype": "uint8",
         "countsTShape": [5, 6],
         "countsTComplete": True,
         "layoutFingerprint": layout["fingerprint"],
@@ -768,6 +780,12 @@ def test_verify_store_rejects_counts_t_that_disagrees_with_counts(
 def test_verify_store_rejects_published_metadata_that_differs_from_local(
     cytebase_build, dense_build, monkeypatch
 ):
+    # The stores share their dimensions and differ in their count dtype.
+    for store, dtype in (
+        (dense_build.store, "uint16"),
+        (cytebase_build.store, "uint8"),
+    ):
+        assert zarr.open_array(str(store / "RNA" / "counts"), mode="r").dtype == dtype
     opened = _track_stores(monkeypatch)
     with pytest.raises(ValueError, match="Published Scarf metadata differs"):
         build.verify_store(

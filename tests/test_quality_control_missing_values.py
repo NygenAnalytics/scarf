@@ -436,11 +436,20 @@ def test_label_producers_reject_missing_cluster_labels(tmp_path) -> None:
         ValueError, match="clusters contains missing labels.*select_cells"
     ):
         store.run_marker_search(clusters, features=features)
-    with pytest.raises(ValueError, match="clusters contains missing labels"):
+    with pytest.raises(
+        ValueError,
+        match=r"clusters contains missing labels\. Freeze the labels over the "
+        r"graph's cell selection",
+    ):
         store.calc_membership_strength(clusters, graph)
-    with pytest.raises(ValueError, match="to_relabel contains missing labels"):
+    both = (
+        r"contains missing labels\. Select the cells labelled in both artifacts "
+        r"with select_cells\(\.\.\., include=\[\.\.\.\]\) and freeze both over "
+        r"that selection with snapshot_cluster_labels\(\.\.\., cell_selection=\.\.\.\)$"
+    )
+    with pytest.raises(ValueError, match=f"^to_relabel {both}"):
         store.smart_label(clusters, complete)
-    with pytest.raises(ValueError, match="base_label contains missing labels"):
+    with pytest.raises(ValueError, match=f"^base_label {both}"):
         store.smart_label(complete, clusters)
     for kind in ("marker_table", "membership_strength", "smart_label"):
         assert store.list_artifacts(kind=kind) == []

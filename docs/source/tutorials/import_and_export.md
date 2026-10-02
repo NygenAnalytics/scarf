@@ -37,6 +37,15 @@ That second copy is what later HVG and marker stages stream from.
 Non-RNA assays write `counts` only.
 See {doc}`../concepts/memory_and_execution` for why the two orientations exist.
 
+Every import stores counts in a dtype chosen from their values, with duplicate coordinates
+summed: integral non-negative counts use the narrowest unsigned dtype that holds them, and
+fractional or negative counts keep their source dtype. The same counts therefore import alike
+from every format and encoding, and no writer takes a count dtype argument. Each import reads
+its counts once before it creates the store, and rejects NaN and infinite values there. Every
+writer also fits its count layout to `mem_budget`: when the default count shards do not fit, it
+writes smaller shards, and a write that cannot fit stops before it creates the store. Neither
+choice changes the stored values or the store's identity across budgets.
+
 ## Prerequisites
 
 - Scarf installed with the optional dependencies required by the source format
@@ -95,7 +104,9 @@ This tutorial writes downloads and converted stores below one temporary director
 Scarf stores data as dense, compressed chunks in Zarr.
 `CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
 Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
-This ATAC file needs `mem_budget="8G"` so one source row and one destination row band fit.
+`mem_budget` bounds the memory the conversion plans for, and the count layout is fitted to it.
+Each assay gets the count dtype of its own counts over the selected barcodes, so an assay
+imports alike whichever other assays share the file.
 
 ```{code-cell} ipython3
 atac_store = output_dir / "pbmc_atac.zarr"
@@ -128,19 +139,20 @@ candidates
 ```
 
 Select one candidate explicitly when inspection reports more than one.
-This example contains a count above the `uint32` range, so both the reader and writer use `uint64`:
+`MtxReader` reads the matrix once when it opens, to validate the coordinates and find the largest
+counts of the kept cells. This example contains a count above the `uint32` range, so the reader
+and the store hold `uint64` counts:
 
 ```{code-cell} ipython3
 mtx_store = output_dir / "xin_1K.zarr"
-reader = scarf.MtxReader(candidates[0], dtype="uint64")
+reader = scarf.MtxReader(candidates[0])
 scarf.MtxToZarr(
     reader,
     zarr_loc=str(mtx_store),
-    dtype="uint64",
 ).dump()
 ```
 
-Reopen the store and check that the count matrix kept the requested width and the candidate dimensions:
+Reopen the store and check that the count matrix holds `uint64` counts and the candidate dimensions:
 
 ```{code-cell} ipython3
 ds_mtx = scarf.DataStore(str(mtx_store))
@@ -151,6 +163,8 @@ Cell-major coordinates stream directly.
 Feature-major coordinates, including BD Rhapsody MEX output, are converted to a temporary disk-backed CSR matrix.
 The reader checks available capacity and reports the exact required bytes before creating those files.
 Pass `temp_dir` to `MtxReader` when the system temporary directory is too small.
+`MtxToZarr` parses 100,000 lines at a time, and its layout fit reserves that buffer; pass a
+smaller `lines_in_mem` to `MtxToZarr` when a small `mem_budget` cannot hold it.
 
 ### 3.1 Parse DGE directories
 
@@ -208,15 +222,25 @@ These values are not flattened into live cell metadata. Load them through the da
 their refs directly to consumers. Sparse, non-numeric, or row-mismatched selected embeddings are
 rejected.
 
-Source read batches are selected automatically from destination shard geometry and the conversion memory budget.
-Physical writes remain shard-aligned even when the selected source batch is smaller.
-An explicit positive `batch_size` remains available for controlled profiling and expert workflows.
+Source read batches start from one destination row band, which the fitted count layout admits,
+and physical writes stay shard-aligned. An explicit positive `batch_size` remains available for
+controlled profiling and expert workflows; a batch holds at most one band.
+
+The count layout is fitted to the conversion memory budget. When the default count shards, the
+batches of one band that write them, or the gene-major `countsT` copy built from them, do not
+fit `mem_budget`, the import writes smaller shards; an import that cannot fit stops before it
+creates the store. The layout never changes the stored values or the store's identity.
+
+The stored count dtype follows the values, not the H5AD encoding, so raw counts saved as
+`float32`, `int32`, CSC, or dense arrays import alike, while fractional or negative values keep
+their source dtype. NaN and infinite values are rejected before the store is created.
 
 10x feature types are retained in feature metadata when present.
 Stable multi-assay names (CRISPR guide, multiplexing, antigen, custom, RNA, antibody, and similar) require `assay_split_key` on `H5adToZarr` (for example `feature_types`).
 A plain `from_inspect` path without `assay_split_key` writes everything into one assay (default RNA).
 Inspection may set `assaySplitKey` and `suggestedAssays`, but `to_reader_kwargs` does not pass `assaySplitKey` through.
 Pass `assay_split_key` and optional `assay_name_map` on the writer to split.
+Each split assay gets the count dtype of its own counts.
 When selected analytical values accompany a multi-assay import, set `analysis_assay` to the assay
 that owns those artifacts.
 `reclassify_features` is a `CrReader` API (10x HDF5 / MEX), not `H5adReader`.
@@ -245,7 +269,10 @@ inspection.activeAssay
 
 Open a reader for the assays and reductions you want, then write the Zarr store.
 Omitting `reductions` selects every available reduction; `SeuratToZarr` raises if any selected reduction is not importable.
-Pass an empty sequence to skip reductions, or pass only importable names to import a subset:
+Pass an empty sequence to skip reductions, or pass only importable names to import a subset.
+`SeuratToZarr` prepares and reads each selected count layer once when it is created, so the
+integral counts that Seurat holds as R doubles are stored unsigned, and each assay gets its own
+count dtype and layout:
 
 ```python
 with scarf.SeuratReader(
@@ -399,17 +426,22 @@ scarf.CSVtoZarr(
     reader,
     zarr_loc=str(csv_zarr),
     assay_name="RNA",
-    dtype=np.dtype("uint16"),
 ).dump()
 ds_csv = scarf.DataStore(str(csv_zarr))
 ds_csv.cells.head()
 ```
 
 `quality` is cell metadata rather than a count column, which is what `cell_data_cols` is for.
+`CSVReader` finds the range of the counts in the pass that checks every row, so these counts,
+which pandas parses as `int64`, are stored as `uint8`. `CSVtoZarr` casts each batch to the
+stored dtype through a checked cast, so a count that changed after the reader's pass and no
+longer fits raises instead of wrapping.
 
 ## 9. Import sparse matrices
 
 `SparseToZarr` accepts a SciPy CSR matrix with matching cell and feature IDs.
+It scans the matrix, with duplicate coordinates summed, before it creates the store, so these
+`int64` counts are stored as `uint8`.
 
 ```{code-cell} ipython3
 from scipy.sparse import csr_matrix
@@ -465,6 +497,7 @@ writer.dump()
 
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
 - Reusing an existing Zarr output path without confirming that it can be overwritten
+- Passing a count dtype to a reader or writer; the stored dtype follows the values
 - Exporting normalized values when a downstream method requires raw counts
 - Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers

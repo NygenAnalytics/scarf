@@ -133,9 +133,8 @@ decision persistence. The reusable bounded silhouette comparison lives in
 the immutable decision. `metrics.cluster_selection` is not part of the public `scarf.metrics`
 facade. `datastore.pipeline_run` exposes the narrow durable `PipelineRun` handle and its frozen
 cell and feature views. Pipeline execution creates immutable artifacts and a strict run/stage
-ledger under `pipeline/runs`; it does not write live metadata. The ledger starts stages in recipe
-order and can run one on a worker thread (`utils.background`) while later stages run; it writes
-every record and callback from the calling thread. DataStore-owned plotting, marker
+ledger under `pipeline/runs`; it does not write live metadata. The ledger runs stages one at a
+time in recipe order on the calling thread. DataStore-owned plotting, marker
 loading, and export consume narrow frozen-run views. Completed runs can be reopened by their
 immutable label or exact run ID.
 
@@ -206,6 +205,14 @@ The complete hard-break inventory is:
 - Pipeline run and stage records are strict, exact, and unversioned. Adding, removing, or renaming
   a persisted field in a later release is an accepted hard break. Unknown or incomplete document
   shapes fail closed.
+- Pipeline stages run strictly in sequence. UMAP no longer runs on a worker thread beside the
+  Leiden, Paris, cluster-selection, and membership-strength stages; outputs and artifact
+  identities are unchanged. Durable stage records now attribute wall time and sampled memory to
+  one stage at a time, and starting a stage while an earlier stage of its run is incomplete
+  raises `ValueError`. Pipeline callbacks receive an enabled stage's `stage_started` and terminal
+  event before the next stage starts; earlier, UMAP's `stage_completed` arrived after the events
+  of those stages, with or without a worker thread. Earlier run records whose stage windows
+  overlap still read. `scarf.utils.background` is removed.
 - `DataStore.pipeline.run` takes a `params` mapping of per-stage settings. Every run records two
   more stages, `membership_strength` and `tsne`, skipped unless requested, and its configuration
   records `params`, `species`, `tsne`, `membershipStrength`, and the Leiden `selected`
@@ -237,6 +244,22 @@ The complete hard-break inventory is:
   `create_zarr_count_assay` carry `complete=False` until they are finalized. A pending group left
   by a hard kill blocks its name, and repack refuses it, until
   `DataStore.discard_interrupted_assay` removes it.
+- Mounted targets resolve their source's artifacts read only. From this release on, every mount,
+  including mounts created by earlier release candidates, lists, loads, traces, and reuses the
+  complete artifacts of its identity-checked source after its own, so a recipe that matches saved
+  provenance reuses the source's results instead of recomputing them, and labels and embeddings
+  imported into the source, such as the Cytebase `X_umap`, are visible on the mount. Nothing is
+  migrated because no record changes: `ArtifactRef` stays a location-free name with a random ID,
+  provenance and run records are unchanged, and `ExternalArtifactRef` stays the cross-dataset
+  identity. Every write goes to the target, and a write inside a source artifact group raises
+  `PermissionError`. Pipeline runs and their labels stay per store. The `matrixSource` top level is
+  exact (`location`, `workspace`, `assays`), so a mount record with any other field fails to open
+  and asks for a fresh target. `repack_zarr` reads a mount through the same namespace and writes a
+  self-contained store. A read-only open of an unprepared store, such as the source that
+  `mount_datastore` opens, asks for one writable open instead of a rebuild. `local_cache` follows
+  the store that holds the normalized artifact rather than the datastore location, so a local mount
+  stages a normalized artifact that it reuses from a remote source and never one that the target
+  holds; staging on stores that are not mounts is unchanged.
 - Public cell filters apply the pipeline filtering rules. `filter_cells` and `auto_filter_cells`
   exclude rows whose metric is missing and raise on missing sample labels among active cells,
   non-finite metrics used for automatic bounds, invalid bounds, duplicate attributes, and empty
@@ -258,6 +281,19 @@ The complete hard-break inventory is:
   column, and `silhouette_scoring` of a metadata column reject masked inputs before any reuse or
   write, so results from unmasked inputs keep their identities. `calc_membership_strength` and
   `smart_label` accept only categorical label kinds.
+- `DataStore.snapshot_cluster_labels(labels, cell_selection=...)` freezes a cell metadata column,
+  or a cell-label artifact read for a subset of its cell selection, into a datastore-scoped
+  `cluster_labels` artifact with operation `snapshot_cluster_labels`. Floating-point labels that
+  are whole numbers within the int64 range, such as the float64 ids that pandas writes for integer
+  ids with missing values, are stored as int64; other floating-point labels raise `TypeError`, and
+  missing, masked, and blank labels raise `ValueError`. Text is stored at the width of the selected
+  labels, and integer and boolean labels keep their dtype. The identity records `source_column` as
+  a parameter or `source_labels` as an input, the cell selection, and the `values_fingerprint` of
+  the stored labels, and a snapshot is reused only while its payload holds exactly those labels.
+  The missing-label errors of `run_marker_search`, `calc_membership_strength`, and `smart_label`
+  name this method and the cell selection that each consumer needs. The group-name error of
+  `run_marker_search` also names this method, and only `run_marker_search` applies the group-name
+  rule.
 - Query projections record the input `query_dataset_fingerprint`, which replaces
   `selected_expression_fingerprint`. A query cell with no counts in any shared reference feature
   is uninformative. The diagnostic `zeroNormCellCount` is renamed `uninformativeCellCount`, and
@@ -300,8 +336,8 @@ The complete hard-break inventory is:
   each solved sink column. Existing fate artifacts remain valid and are reused.
 - `scarf.neighbors.diffusion_operator` is removed; it formed a powered operator with no memory
   bound. `bounded_diffusion_operator` is the only powered builder, and
-  `neighbors.diffusion.transition_matrix` returns the graph-sized single step. Doublet scores and
-  every diffusion and pipeline artifact identity are unchanged.
+  `neighbors.diffusion.transition_matrix` returns the graph-sized single step. The removal
+  changes no doublet score and no diffusion or pipeline artifact identity.
 - Assays are no longer `DataStore` instance attributes. `ds.<name>` resolves an assay only when no
   `DataStore` attribute has that name and the name does not start with an underscore;
   `get_assay(name)` returns any assay. Assays named like members, such as `cells` or
@@ -315,28 +351,172 @@ The complete hard-break inventory is:
   `run_lsi` `skip_first` and `rand_state`, `run_custom_reduction` loadings, `run_harmony`
   parameters, `integrate_assays(chunk_size=...)`, `select_hvgs` keywords, `run_umap` array
   initializations, and `make_bulk` column names.
-- Library-size and CLR normalization promote integer counts to float64 before scaling or taking
-  logarithms, so uint8 and int8 stores no longer raise and uint16 and int16 stores no longer wrap.
-  Artifacts whose values `normed` computes record `count_arithmetic="float64"`, so earlier
-  results are not reused: library-size values from any integer counts, because the integer
-  product could overflow at any width, and CLR values from integer counts narrower than 32 bits.
-  This covers `run_normalization` payloads for RNA with `renormalize_subset=False` and for CLR,
-  marker tables on the fallback path, pseudotime markers and aggregations that call `normed`,
-  statistical tests of assay-normalized features, and cell-cycle scores computed through
-  `normed`. Identities on floating-point stores, CLR identities on 32- and 64-bit counts, and
-  every pipeline artifact identity are unchanged. Grouped ADT assays built from narrow counts
-  must be rebuilt.
-- RNA `normed` without subset renormalization maps a zero library total to 1, so zero-count cells
-  normalize to 0 instead of NaN. `run_normalization` records `zero_total_divisor="one"` for RNA
-  with `renormalize_subset=False` when the selection contains a zero-count cell, so normalizations
-  written earlier with NaN rows are not reused. Other normalization identities and every pipeline
-  artifact identity are unchanged. Grouped RNA assays built earlier hold NaN for zero-count cells
-  and must be rebuilt.
+- Normalization arithmetic no longer depends on the count storage dtype. Library-size, CLR, and
+  TF-IDF normalization compute in float64 from the counts and float64 totals for bool, integer, and
+  floating-point counts, so bool, uint8, and int8 stores no longer raise and uint16 and int16 stores
+  no longer wrap. A persisted normalized value, and a value that marker search ranks under
+  `norm_lib_size`, with or without `renormalize_subset`, is the single float32 rounding of its
+  float64 value; marker search ranks the values of every other normalization unrounded. Library
+  sizes, subset totals, TF-IDF term totals, and feature percentages accumulate in float64
+  (`ChunkedArray.sum` takes NumPy's `dtype` keyword). `Assay.score_features` with
+  `log_transform=True` takes the logarithms of assays without a normalization (CRISPR, ANTIGEN,
+  CUSTOM, and `Assay`) in float64 for every count dtype, so their scores no longer depend on the
+  storage dtype; NumPy took them in float16 for uint8 counts and in float32 for uint16 and float32
+  counts, which could bin different control features and change the scores. Sums over cells, such as
+  CLR log means and feature summaries, combine partial sums of the stored row blocks or `countsT`
+  cell bands, so their last float64 bits follow the count layout, and dtypes of different widths or
+  imports at different memory budgets can get different layouts. `make_bulk` sums of every assay and
+  synthetic doublet counts add integer counts in an integer dtype and floating-point counts in
+  float64, so integral counts sum exactly and `make_bulk` sums on float stores are float64; non-RNA
+  sums of float32 counts previously added in float32, so their values also change for non-integral
+  counts or sums above 2**24. RNA `normed` maps a zero library total to 1, so zero-count cells
+  normalize to 0 instead of NaN. Grouped assays are counts rather than artifacts, so nothing
+  recomputes them: grouped RNA assays that earlier releases built can hold NaN for cells without
+  counts or wrapped values from 16-bit counts, and grouped ADT assays can hold means of CLR values
+  computed in float32 or float16. Rebuild finite ones with `add_grouped_assay` under a new
+  `assay_label`. A store whose grouped RNA assay holds NaN cannot be rebuilt with `--data-only`,
+  because count writers reject NaN; re-import its source and build the grouped assay there. No
+  operation records `count_arithmetic`, `checked_integer_sum`, or `zero_total_divisor`. Artifacts
+  that earlier release candidates recorded with one of these fields, which includes every doublet
+  score, have different identities and are recomputed on request. `load_pseudotime_markers`,
+  `load_pseudotime_aggregation`, and loading or building a mapping reference reject such records and
+  ask for a recompute. Artifacts that earlier release candidates computed from float32 counts keep
+  their identities although current values differ: subset-renormalized library-size values by at
+  most one float32 ulp (a few ulps for non-integral counts or subset totals above 2**24), CLR values
+  by the error of their float32 log sums (typically 3e-5 relative at 8,000 cells and 8e-4 at
+  200,000), whole-library library-size values only for non-integral counts or counts whose float32
+  product with the size factor is inexact (above 134,217 at the default size factor of 1000),
+  feature percentages and subset-renormalized TF-IDF values only for non-integral counts or totals
+  above 2**24, and every result derived from them. Pseudotime markers and aggregations that stream
+  library-size values without subset renormalization compute them in float64 instead of float32 on
+  every store, so their results change at float32 resolution while their identities stay the same.
+  Statistical tests compare the fingerprints of their values and recompute by themselves; recompute
+  the other artifacts with `invalidate_cache=True`. Stores written by unreleased development builds
+  are unsupported.
+- Library-size marker search ranks raw counts of every storage dtype with one zero-aware kernel,
+  with or without `renormalize_subset`, so float, signed, and unsigned stores no longer take
+  different kernels, and subset-renormalized searches no longer rank unrounded float64 `normed`
+  values with the dense kernel. The kernel checks its input while it reads it: a negative or
+  non-finite normalized value of a tested feature, or a negative or non-finite total of a selected
+  cell (its `<assay>_nCounts` value, or with `renormalize_subset=True` its sum over the tested
+  features), raises `ValueError` naming the feature or the totals, and nothing is written;
+  subset-renormalized searches used to accept negative counts and totals. Rank statistics use
+  float64 group sizes instead of float32, so p-values and their adjusted values change in their low
+  digits once a group's size times its complement's exceeds 2**24 (two groups of about 4,100 cells;
+  about 1e-4 relative at a million cells), and the two groups of a two-group search now get equal
+  p-values. Marker tables keep their identities, layout, and attributes, but library-size statistics
+  now come from float64 values rounded once to float32 instead of float32 arithmetic, so values can
+  move at the fifth decimal; recompute earlier tables with `invalidate_cache=True`.
+  `scarf.features.find_markers_by_rank` returns a `RankMarkerResult` of the sorted group ids, their
+  sizes, the ascending feature index, and the features-by-groups rank statistics instead of one
+  DataFrame per group, and raises `IndexError` for a cell or feature index past the end of `countsT`
+  instead of ranking an unwritten column as a cell. A `RankMarkerResult` requires at least two
+  groups of at least two cells and at least one feature, as a saved marker table does, and its
+  `table` method gives the ranked table of one group, with the string `group_id`, that a saved
+  marker table reads back. Feature-stream plans charge what Zarr holds while it reads a band
+  (`ArrayGeometry.readBytes`) and the streams' band indices, and size read-group destinations by the
+  selected cells, so tight budgets admit fewer reads in flight and budgets that fitted only
+  uncharged read buffers raise `MemoryError`. The marker search also reserves its result, the stored
+  tables its writers finish, and kernel scratch. Read-group streams process one group at a time in
+  order while the next is read, and the library-size kernel runs every thread of that compute worker
+  over the features of a group, so marker memory no longer grows with the worker count. The band
+  reads of the two groups in flight share the requested read width,
+  `StorageIoPolicy(readWorkers=...)` or eight reads per worker, which `WorkShape.maxUnitsInFlight`
+  lets the planner split into inner reads, and an execution report names the cause in
+  `reductionReason` when memory or the band count leaves fewer reads in flight.
+  `map_feature_read_groups` loses its `orderedCompute` and `extraItemsize` arguments.
+- `find_markers_by_regression`, which `run_pseudotime_marker_search` calls, scales the regressor and
+  each feature's values by a power of two below one in magnitude before it sums them. Pearson r does
+  not depend on that exact scale, so ordinary inputs give bit-identical results, but a regressor or
+  feature values whose squared deviations overflowed float64 (magnitudes above about 1e150 to 1e154,
+  depending on the number of cells) now give their correlation instead of r = 0 with p = 1, or NaN,
+  and a regressor whose squared deviations underflowed (below about 1e-160) is tested instead of
+  reported as untested. Two-cell searches report r of exactly 1 or -1 instead of a least-squares
+  value that could round below one. Pseudotime marker identities are unchanged.
+- Row-block streams over a sharded array reserve what Zarr holds while it reads a block: a
+  shard-level copy of the selection, the compressed bytes of every chunk the block touches in a
+  shard, charged at their decoded size, and the one chunk decoded at a time, next to the block and
+  the output of its first operation. Each later operation of a chain holds the previous output
+  beside its own, and a block reserves the larger of these steps, so row blocks of log-normalized
+  RNA, CLR, and TF-IDF values, which hold two float64 outputs at once, reserve 16 bytes per value of
+  uint8 or uint16 counts instead of 10 or 12. Normalization writes, row-block streams, and
+  reductions over such values therefore run fewer blocks at once and raise `MemoryError` where only
+  the smaller reservation fitted; single operations, and chains over counts of 32 bits or more,
+  reserve what they did. `ArrayGeometry.readBytes` takes the number of chunks decoded at once and
+  charges an unsharded read only its result and decoded chunks, and `plan_feature_stream` sizes the
+  feature blocks of a sharded array by the same read. Normalization, PCA, LSI, graph construction,
+  quality control, export, subset, materialization, melding, and merge plan or size their row blocks
+  with these bytes, so a budget admits fewer blocks at once and raises `MemoryError` where only the
+  uncharged read buffers fitted; outputs and identities are unchanged. A row-block stream keeps no
+  block after it yields it, feature streams drop their own references to a unit before they release
+  its reservation, and the storage runner's pool workers keep neither a call nor its result once it
+  returns. HVG feature statistics reserve the selected cells' inverse totals, the outputs, every
+  band's partial statistics, and each compute worker's band scratch, and no longer keep the totals
+  beside their inverses. `make_bulk` means that stream normalized row blocks reserve their group
+  sums and divide them in place.
+- Sparse count imports that write several assays from one source, such as Cell Ranger, MTX, and H5AD
+  files with antibody or peak features, no longer raise `MemoryError` when a band of a wider assay
+  arrives while bands of a narrower assay are pending and every band fits on its own. The writer
+  writes the longest run of pending bands that fits, so the earlier bands are written first.
+- Storage operations run outside an event loop no longer chain their errors to a `RuntimeError: no
+  running event loop`, and a storage read that its own I/O loop cancels raises one `CancelledError`
+  instead of a group of two. `scarf.storage.async_execution.ensure_zarr_host_ceiling` loses its
+  `maxWorkers` argument, which nothing passed, and the `write_counts_t` metrics drop
+  `sourceRepeatedDecodeCount` and `sourceRepeatedDecodeBytes`, which paired count layouts always
+  left at 0 because every `countsT` shard holds whole `counts` chunks.
 - ATAC `normed` no longer leaves its fitted TF-IDF state (`n_term_per_doc`, `n_docs`,
   `n_docs_per_term`) on the assay after the call, and RNA `normed` never changes `normMethod`.
   A `DataStore` is not designed for concurrent use from several threads.
-- float16 is not a count storage dtype. Count writers reject it, and H5AD imports read float16
-  sources as float32.
+- Count storage dtype: each assay's counts are stored unsigned, in the narrowest of uint8, uint16,
+  uint32, and uint64 that holds the assay's largest value, exactly when every canonical
+  (duplicate-summed) value of the assay is a non-negative integer. Other counts keep their source
+  dtype: float32 or float64, or the signed integer dtype of a source with negative values. float16
+  is not a count storage dtype; count writers reject it, and H5AD imports read float16 sources as
+  float32. `scarf.storage.count_dtype` holds the one policy, and `scarf.utils.count_values` the
+  value scans that readers and writers share; a scan takes the group of each feature and returns one
+  range per group. Every import applies the policy to every encoding: H5AD, 10x HDF5 and Matrix
+  Market (`CrToZarr` and `MtxToZarr`), CSV, `SparseToZarr`, and `SeuratToZarr`. Integral float,
+  signed, and wider unsigned sources, unsorted or duplicate coordinates, CSC, and dense matrices
+  therefore store the same dtype and content fingerprint at any memory budget, and 10x HDF5 and
+  Matrix Market imports, which stored uint32, and Seurat imports, which kept float64, store the
+  narrowest unsigned dtype of each assay. Imports that split one source matrix into assays (10x HDF5
+  and Matrix Market feature types, H5AD `assay_split_key`) resolve each assay's dtype from its own
+  features, so an assay's dtype and identity do not depend on the other assays of the source: an
+  antibody, guide, or ATAC assay stores its own narrowest dtype beside RNA counts that need a wider
+  one, and integral assays stay unsigned beside an assay with fractional or negative values. The
+  count dtype arguments are removed: `CrToZarr` and `MtxToZarr` `dtype`, `MtxReader` `dtype` and its
+  `consume` `dtype`, `CSVtoZarr` `dtype`, `SparseToZarr` `matrix_dtype`, and `DataStoreMerge`
+  `dtype` (merge manifests no longer record it); `create_zarr_count_assay`,
+  `create_empty_zarr_count_assay`, and `DerivedAssayTransaction.create_counts` require the dtype.
+  `CrReader` subclasses implement `matrix_dtype` and `count_value_ranges(maxBytes,
+  featureGroups=None)`, which returns the range of each group of features over the selected cells,
+  and `H5adReader` has the same method. `MtxReader` scans the matrix once at construction for every
+  orientation and filter mode, which replaces its coordinate-order probe, and keeps the largest
+  count of each feature; it reads the file once more only when it dropped cells and an import splits
+  its features into several assays. Its batches hold the counts of the kept cells in the narrowest
+  unsigned dtype that holds them. `H5adReader` loses its `dtype` argument and its `matrixDtype`,
+  `storageDtype`, and `infer_storage_dtype` members, and `H5adToZarr.storageDtype` becomes
+  `storageDtypes`, the dtype of each imported assay; `consume` yields `sourceMatrixDtype` values for
+  every encoding, except that the converted rows of a CSC integer source hold their duplicate-summed
+  values in int64 or uint64 (`consumeDtype`), so duplicate sums past a narrow source dtype import as
+  they do from CSR. Seurat count sources compressed over features, transposed, or stitched from
+  Assay5 layers keep the duplicate coordinates of a cell in the source dtype, as sources compressed
+  over cells do, and the writer sums them in 64 bits: such duplicates no longer raise OverflowError,
+  and Assay5 duplicates whose sum exceeds a narrow source dtype, which were stored wrapped, store
+  their sums. Subset and repack keep the source dtype, because they rebuild an existing dataset
+  whose identity and copied artifacts must stay valid. Merges store the common type of the source
+  count dtypes, widened when features summed by name could overflow it, instead of float64 for
+  differing dtypes, and reject integer sources without a common integer dtype; an assay without
+  features in any source stores uint8 instead of uint32. Derived assays (grouped and melded) keep
+  their float64 values. Dense writers (CSV and dense Seurat counts) no longer cast batches before
+  the checked cast, so a count that the stored dtype cannot hold raises OverflowError instead of
+  wrapping. The Cytebase build no longer forces the source dtype, and its records drop
+  `storageDtypePolicy`. Count matrices hold finite values: every count writer, including subset,
+  merge, repack, and derived assays, rejects NaN and infinity, and the H5AD, 10x HDF5, Matrix
+  Market, CSV, sparse, and Seurat imports read every value and reject them before they create the
+  destination. Earlier stores whose counts hold them, including a store whose grouped RNA assay an
+  earlier release built with NaN rows for cells without counts, can no longer be subset, merged, or
+  repacked, even with `--data-only`; re-import their sources. Negative values stay storable.
 - Operations trust that prepared counts and artifacts do not change during a call. Writing to
   prepared data in place is outside the contract and is not detected.
 - Minimum versions rise to scipy 1.15, statsmodels 0.14.5 (earlier releases fail to import
@@ -344,8 +524,57 @@ The complete hard-break inventory is:
   SciPy wheels, so BLAS thread limits had no effect), huggingface-hub 2.0, and, for the `agent`
   and `test` extras, pydantic-ai-slim 2.51.
 - Count layout: plans whose countsT chunks fell below half the chunk target (awkward cell counts
-  such as primes) now use whole-target chunks, so stores written with those plans fail layout
-  replay and must be re-imported. Count assays require Zarr format 3.
+  such as primes) now use whole-target chunks, so stores written with those plans fail layout replay
+  and must be re-imported. Count assays require Zarr format 3. Every count writer fits the layout to
+  `mem_budget` before it creates its destination: `H5adToZarr`, `CrToZarr` and `MtxToZarr`,
+  `CSVtoZarr`, `SparseToZarr`, `SeuratToZarr`, `SubsetZarr`, `subset_assay_zarr`, `repack_zarr`,
+  `DataStoreMerge`, and `add_grouped_assay`, which wrote the default layout at every budget. Without
+  a `policy`, a writer halves the default `unitBytes` and `chunkBytes` together until the counts
+  write and the countsT transpose fit, and a write that does not fit with one-row count shards, or
+  with its explicit `policy`, raises MemoryError before the destination exists. Sparse writers admit
+  their sparse band writes and dense writers their dense row bands. Writers that choose their source
+  batches (the sparse imports, the Seurat imports, and merge) admit batches of one destination row
+  band, the batch their write starts from, so a fitted layout never starves the write to narrower
+  batches; only one-row shards get one-row batches. `add_melded_assay` keeps sizing its shards to
+  the melding band that fits `mem_budget`. The writers raise from their constructors, and
+  `DataStoreMerge` from `plan`, instead of from `dump`; `SeuratToZarr` construction also prepares
+  every selected source and reads its counts once, so source preparation errors surface there.
+  `CrToZarr` and `MtxToZarr` take `lines_in_mem` in the constructor, and `dump` no longer accepts
+  it, so the fit reserves the Matrix Market parse buffer that the write uses and a smaller buffer
+  fits a smaller budget. An explicit `dump(batch_size=...)` reads at most one destination row band
+  per batch, so it can no longer exceed what the fit admitted. Writers that write their assays one
+  at a time (Seurat, subset, repack, and merge) fit each assay on its own. The fitted layout depends
+  only on the budget, the data, the dtypes, and for Matrix Market imports `lines_in_mem`, never on
+  the worker count. A resumed merge keeps the layout persisted with its completed counts, so a
+  budget change between attempts cannot block it, and fits the layout of the counts it rewrites.
+  Sparse imports admit the producer's buffering and the band writes as separate phases, so budgets
+  that the summed plan refused now import. `write_counts_t`, `finalize_writer_counts_t`,
+  `finalize_writer_counts_t_many`, and the merge writer's `write_assay_counts_t` lose their `policy`
+  argument and replay the persisted layout. A `repack_zarr` that fails after it creates its
+  destination removes it, so a failed copy, such as an unreadable label claim copied last, no longer
+  leaves a store that opens without all its data. Identity does not depend on the layout: content,
+  counts, and dataset fingerprints are unchanged, and only the layout fingerprint in
+  `scarf:countMatrixLayout` differs. Existing stores are never rewritten and keep their dtype,
+  layout, and identity. A re-import can store a different dtype and therefore get different counts
+  and dataset fingerprints and new artifact ids; mounts and mapping references bound to a replaced
+  store fail closed.
+- `SubsetZarr` loses `overwrite_cell_data`. The parameter had no effect: the constructor always
+  opens the destination empty, so a subset never found cell data to keep or replace. Passing it now
+  raises TypeError. Explicit `cell_idx` values must be distinct. A repeated index previously wrote a
+  store whose cell IDs repeat, and `DataStore` opened that store; it now raises ValueError before
+  the destination is created or overwritten. Explicit `cell_idx` values must also be non-empty and
+  non-negative: an empty index failed inside Python's `max()`, and a negative index wrapped around
+  to a cell counted from the end, so `[0, -n]` repeated the first cell past the distinct-index
+  check; both now raise ValueError before the destination is created or overwritten. A `cell_key`
+  that selects no cells still writes a subset without cells. `subset_assay_zarr` applies the same
+  rules to `cells_idx` and `feat_idx` (one-dimensional distinct in-range integers, raising
+  IndexError, ValueError, or TypeError) and requires at least one feature, before it creates
+  `out_grp`; it wrapped negative indices and repeated duplicates before. The docstrings of
+  `H5adToZarr.dump`, `CrToZarr.dump` (and `MtxToZarr.dump`), `SparseToZarr`, and `CSVtoZarr.dump` no
+  longer list an AssertionError for a row-count mismatch, because that check could not fail. The
+  shard writers raise ValueError for a count stream with more or fewer rows than the destination, or
+  for a batch of another width. A CSV file that changes after the reader's pass reports this
+  ValueError, which `CSVtoZarr.dump` now documents.
 - Stored contracts are strict. ANN indexes carry their complete metadata record including
   `byte_length`; `query_neighbors` requires recorded `ann_ef` and `parallel_threads`; mapping
   references require `ann_ef`; building and loading a Symphony mapping reference require recorded
@@ -392,13 +621,12 @@ The complete hard-break inventory is:
   rows are scaled with an `(n_rows, 1)` operand. Scalar keys, other axes, ufunc keywords other
   than `dtype`, and arithmetic between two ChunkedArrays raise; zero-row reductions return NumPy
   shapes.
-- Identities that change and are not reused: feature summaries computed through `normed` for a
-  non-default `normMethod` on integer counts record `count_arithmetic="float64"`; `run_pca`
-  records `incremental_block_rows` for IncrementalPCA fits over several blocks; embedding
-  initialization records `algorithm_version="minibatch_kmeans_v3"`, seeds its PCA, and no longer
-  reassigns rarely used streamed k-means centroids; `smart_label` records `algorithm_version=3`;
-  default cell-cycle genes use CENPU, PIMREG, and JPT1 (mouse Cenpu, Pimreg, Jpt1); parameter
-  tuning's native doublet graphs use the candidate ANN seed.
+- Identities that change and are not reused: `run_pca` records `incremental_block_rows` for
+  IncrementalPCA fits over several blocks; embedding initialization records
+  `algorithm_version="minibatch_kmeans_v3"`, seeds its PCA, and no longer reassigns rarely used
+  streamed k-means centroids; `smart_label` records `algorithm_version=3`; default cell-cycle
+  genes use CENPU, PIMREG, and JPT1 (mouse Cenpu, Pimreg, Jpt1); parameter tuning's native
+  doublet graphs use the candidate ANN seed.
 - Results that change while identities stay the same, so earlier artifacts are reused and must be
   recomputed with `invalidate_cache=True`: Dunn tie corrections are exact for tie groups above
   about two million values; Welch reports `n1 + n2 - 2` degrees of freedom when neither group
@@ -420,12 +648,54 @@ The complete hard-break inventory is:
   that reverse the resolved group order. `run_mapping` rejects `query_batches` values that share
   text, such as `1` and `"1"`, and treats nested store locations as one store. `get_cell_vals`
   clipping covers every real numeric column. A stored `defaultAssay` must name an assay.
+- Validation corrections that change only which error is raised, never a result or an artifact
+  identity: `run_pseudotime_scoring` compares the graph's recorded cell count with its stored cell
+  selection, as `run_diffusion_operator` does, and `scarf.trajectory.select_pseudotime_component`
+  checks that the graph is square with one row per selected cell, so mismatches raise
+  `ValueError` instead of `IndexError`. `run_pseudotime_marker_search` raises `ValueError` when a
+  correlation is not finite (a raw pseudotime near the float64 limit) instead of writing an
+  unloadable table. `select_cells` raises `ValueError` for an `include` integer beyond the
+  float64 range on a floating artifact, instead of `OverflowError`. `integrate_assays` raises
+  `ValueError` for sources over different cell selections, whatever their sizes, instead of
+  reporting a healthy source as `corrupt_payload`. `query_neighbors` refuses exactly 2**32 cells,
+  which graph payloads cannot hold. `SCARF_ZARR_PROFILE` accepts only `fast_local` and `cloud`;
+  any other non-empty value, such as `Cloud`, raises `ValueError` instead of being ignored.
+- Feature selections must select at least one feature, and every reader applies that one rule. For a
+  stored selection that selects none, including the feature universe of an assay without features,
+  `DataStore.resolve_features` and every operation that takes a feature selection raise
+  `ArtifactResolutionError` (a `ValueError`) with code `corrupt_payload`: `Feature selection must
+  select at least one feature`. Before, such a selection resolved and its index read back empty, and
+  `run_waggr`, `run_aucell`, `run_marker_search`, `run_pseudotime_marker_search`,
+  `run_pseudotime_aggregation`, `run_normalization`, and `run_feature_percentage` each raised their
+  own error. No Scarf producer writes such a selection, so only records written or edited outside
+  Scarf are affected. `select_hvgs` and `select_detected_features` no longer read a reused selection
+  back to check it: a reused record that was emptied outside Scarf is returned, and its consumers
+  refuse it. Results and artifact identities do not change.
+- `run_waggr` raises the same `ValueError`s with clearer messages. A selected cell total that is
+  negative or not finite now reads `<assay>_nCounts holds negative or non-finite totals of selected
+  cells; WAGGR library-size normalization requires finite non-negative counts`; before, it said only
+  that the normalization scalars must be finite. An RNA assay whose `sf` is `None` now reads `WAGGR
+  requires a finite positive size factor` instead of claiming a non-default normalization. Results
+  and artifact identities do not change.
+- `run_lsi` with the streaming solver reduces its block so that both the fit and the coordinate
+  write fit the memory budget; budgets that logged a reduction and then raised `MemoryError`
+  finish with smaller blocks. The block size is an execution option, so identities do not change.
+  UMAP's layout runs on `min(nthreads, NUMBA_NUM_THREADS)` Numba threads even when the calling
+  thread had fewer, and `Assay.score_features` no longer warns for an empty CLR cell selection.
 - `DataStoreMerge` refuses destinations that alias, contain, or lie inside a source or that
   already hold content, and creates destinations with mode "w-". Source names cannot contain
   `__`. `overwrite=True` refuses destinations with a prepared assay and clears `defaultAssay`.
   Manifests record `sourceCountFingerprints`, so merges interrupted before this release restart
   with `overwrite=True`. Differing unordered cell-column `levels` are unioned; other differing
   attributes are dropped with a warning.
+- `DataStoreMerge` records the preset of each source assay's class: `RNA` for RNA-class assays,
+  `ATAC` for ATAC, `ADT` for ADT-class assays such as HTO, and `Assay` otherwise. Merged ADT and
+  ATAC assays therefore open as `ADTassay` and `ATACassay` and keep CLR and TF-IDF normalization;
+  before, every non-RNA source assay was recorded as the generic `Assay`. `plan()` reports a
+  destination whose prepared assay has incomplete counts as blocked (`canDump=False`, "A damaged
+  prepared assay requires a fresh destination"), the refusal that `dump()` already raised, instead
+  of planning a resume. A merged matrix group counts as complete only when its `complete` attribute
+  is `true`, as every other merge component does.
 - Imports: H5AD import stores missing categorical, nullable, and string values under linked
   masks and keeps nullable booleans as booleans. `inspect_h5ad` reads group-encoded AnnData
   indexes and prefers an ID column such as `gene_ids`, and reads a one-element `uns` text dataset
@@ -435,6 +705,53 @@ The complete hard-break inventory is:
   Peaks, and feature references are left-joined. Cell Ranger HDF5 reads `matrix` and rejects
   several genome groups. Import writers accept `assay_type`. RDS parsing rejects malformed
   character vectors and xz payloads that need more than 256 MiB of decoder memory.
+- Reader edge corrections: `CSVReader` raises `ValueError` for a file without count columns, where
+  every column is the ID column or is listed in `cell_data_cols` or `skip_cols`, instead of
+  importing an assay without features that `DataStore` cannot open, and it copies `pandas_kwargs`
+  instead of adding its `read_csv` settings, such as `chunksize`, to the caller's dictionary.
+  `CrH5Reader.matrix_dtype` is the stored dtype in native byte order, with float16 read as float32
+  as `H5adReader` reads it, and `consume` yields that dtype, so float16 and big-endian 10x HDF5
+  counts import (integral counts unsigned, other counts float32 or the native float dtype) instead
+  of failing in SciPy after the destination was created. `H5adReader.sourceMatrixDtype` is likewise
+  the stored dtype in native byte order, with float16 read as float32, so an H5AD file whose `X` is
+  big-endian (sparse `data` in CSR or CSC, or a dense matrix) imports with the count storage dtype
+  instead of failing in SciPy after the destination was created. `CrReader._read_dataset(key)` takes
+  a required key and returns a list: the base reader no longer accepts None from it, which no
+  shipped reader returned, so the unreachable fallback from missing feature names to feature IDs and
+  its warning are removed. A Matrix Market cell sidecar emptied after `inspect_mtx` raises the
+  cell-count mismatch error (`Cell sidecar has 0 rows, expected N`) instead of `Cell sidecar must
+  contain at least one column`.
+- CSV rows have the header's field count: `CSVReader` counts the fields of every row at construction
+  and raises ValueError naming the line (`CSV line 3 has 4 fields, but line 1 has 3`) for a row with
+  more or fewer fields than the header, or than the first row of a file without one. pandas reads
+  the file in chunks of `batch_size` rows and compares a row only with the row before it in the same
+  chunk, so a row that started a chunk lost its extra fields, a short row was padded with missing
+  values, and a header without a field for the row names, as R `write.table` writes it, made pandas
+  take the first column as an implicit index and drop the cell names; each of these files used to
+  import without an error. The check reads the text that `read_csv` opens, with the same
+  decompression, encoding, and byte order mark handling, after `skip_rows` rows and without blank
+  lines, and splits rows with `sep` and the `quotechar`, `quoting`, `doublequote`, `escapechar`, and
+  `skipinitialspace` settings of `pandas_kwargs`. `sep` must be one character, so a
+  regular-expression separator such as `\s+` raises ValueError, and `pandas_kwargs` cannot set
+  `comment`, `dialect`, or `lineterminator`. The check reads the file once more at construction,
+  about 16 percent of the reader's pandas pass. `CSVReader` raises KeyError for `skip_cols` names
+  that are not CSV columns, as it does for `cell_data_cols`. `CSVtoZarr` no longer compares the
+  reader's cell IDs with its row count, because a `CSVReader` returns one ID per row. `MtxReader`
+  loses `cell_metadata_path`, which had no effect: the reader extracted the named file from a ZIP
+  archive but never read it; passing it raises TypeError, and `MtxCandidate.cellMetadataPath` stays
+  as the inspection report of a Parse candidate's cell metadata file. `CrH5Reader` raises ValueError
+  (`filtering_cutoff cannot be negative`) for a negative `filtering_cutoff` before it opens the
+  file, as `MtxReader` does, whether or not `is_filtered` is set; an unfiltered read used to keep
+  every barcode with such a cutoff.
+- H5AD geometry: `H5adReader` checks the matrix geometry when it is constructed, before a writer
+  opens its destination. The matrix must be two-dimensional, a sparse group needs a stored shape
+  even when `obs` and `var` are present, its `indptr` must have one entry more than the rows (CSR)
+  or columns (CSC) of that shape, and the shape must equal the `obs` and `var` lengths; an absent
+  table takes the matrix's length. Such files used to import with the rows past `obs` dropped or an
+  empty feature for each extra `var` row, or failed after the destination existed. Dense `consume`
+  rejects a `batch_size` below one, as sparse `consume` does. An `obs` or `var` stored as a dataset
+  without fields reads as a table without columns, as `inspect_h5ad` reads it, and cell IDs that are
+  not text, such as an integer `cell_ids_key` column, import with embeddings.
 - Metadata column names: H5AD readers and inspection list dataframe columns from
   `column-order` and resolve each listed name as an HDF5 path, so columns that old AnnData
   versions nested under `/` are imported instead of skipped. Tables without `column-order`

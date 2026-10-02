@@ -161,12 +161,12 @@ class DerivedAssayTransaction:
         n_cells: int,
         feat_ids: np.ndarray | list[str],
         feat_names: np.ndarray | list[str],
-        dtype: str = "float",
+        dtype: Any,
         *,
         profile: StorageProfile | None = None,
         policy: CountMatrixPolicy | None = None,
     ) -> zarr.Array:
-        """Create the pending assay with incomplete counts and feature names."""
+        """Create the pending assay with incomplete counts in ``dtype``."""
         if self._counts is not None:
             raise RuntimeError("The derived assay counts were already created")
         self._counts = create_zarr_count_assay(
@@ -325,15 +325,17 @@ def create_zarr_count_assay(
     n_cells: int,
     feat_ids: np.ndarray | list[str],
     feat_names: np.ndarray | list[str],
-    dtype: str = "uint32",
+    dtype: Any,
     *,
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
     pending_operation: str | None = None,
 ) -> zarr.Array:
-    """Create an assay group and its incomplete ``counts`` array.
+    """Create an assay group and its incomplete ``counts`` array in ``dtype``.
 
-    The counts carry ``complete=False`` until the writer calls
+    Import writers pass the dtype that
+    :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves. The
+    counts carry ``complete=False`` until the writer calls
     ``finalize_counts``. With ``pending_operation``, the group carries the
     pending marker instead of ``is_assay``; use
     :func:`derived_assay_transaction` rather than passing it directly.
@@ -372,12 +374,12 @@ def create_empty_zarr_count_assay(
     n_features: int,
     feature_id_dtype: Any,
     feature_name_dtype: Any,
-    dtype: Any = "uint32",
+    dtype: Any,
     *,
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
 ) -> tuple[zarr.Array, zarr.Group]:
-    """Create an assay whose feature metadata can be filled blockwise."""
+    """Create an assay with counts in ``dtype`` and blockwise feature metadata."""
     counts, feature_group, resolved_profile = _create_count_assay(
         z,
         assay_name,
@@ -466,8 +468,6 @@ def create_empty_cell_data(
     profile: StorageProfile | None = None,
 ) -> zarr.Group:
     """Create cell metadata columns that can be filled blockwise."""
-    if n_cells < 0:
-        raise ValueError("n_cells must be non-negative")
     group = root.create_group(_cell_data_path(workspace))
     _create_empty_columns(
         group, n_cells, ids_dtype=id_dtype, names_dtype=name_dtype, profile=profile

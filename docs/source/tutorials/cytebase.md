@@ -454,10 +454,10 @@ If that build has changed, choose a new mount directory. Latest-only remote
 storage cannot guarantee an immutable source during an already-open session;
 a new `catalog.open_datastore` call revalidates the current published build.
 
-A fresh mount copies cell and feature metadata, but does not copy the source
-analysis artifacts. Keep using `ds` to plot the imported UMAP; `analysis_ds`
-holds the new artifacts you create. `cytebase.embeddings(analysis_ds)` reports
-only imported embeddings present in that local datastore.
+A fresh mount copies cell and feature metadata and resolves the published
+analysis artifacts read only, so `cytebase.embeddings(analysis_ds)` also finds
+the imported UMAP and `analysis_ds.plots.embedding(layout=...)` works on the
+mount. New artifacts you create are written to `./analysis.zarr`.
 
 The same search and plotting calls work for larger studies. A Tabula Sapiens
 plot can be substantially slower and require more memory. Hide its long tissue

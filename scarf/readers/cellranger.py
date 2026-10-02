@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
 
-from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._assay_names import (
     AUTO_ASSAY_NAMES,
@@ -20,6 +19,11 @@ from ..utils.arrays import (
     cumulative_nnz,
     has_duplicates,
     max_window_nnz,
+)
+from ..utils.count_values import (
+    CountValueRange,
+    compressed_count_ranges,
+    new_count_ranges,
 )
 
 
@@ -49,11 +53,11 @@ class CrReader(ABC):
 
     @abstractmethod
     def _handle_version(self) -> dict[str, Any]:
-        pass
+        """Return the dataset locations that the subclass passes as ``grp_names``."""
 
     @abstractmethod
-    def _read_dataset(self, key: str | None = None) -> list[Any] | None:
-        pass
+    def _read_dataset(self, key: str) -> list[Any]:
+        """Return the values of the ``grpNames`` dataset ``key``."""
 
     @abstractmethod
     def consume(
@@ -69,7 +73,6 @@ class CrReader(ABC):
         Yields:
             scipy.sparse.coo_matrix chunks.
         """
-        pass
 
     def max_window_nnz(self, window_rows: int) -> int:
         """Bound nnz in any source row window."""
@@ -78,9 +81,27 @@ class CrReader(ABC):
         return min(window_rows, self.nCells) * self.nFeatures
 
     @property
+    @abstractmethod
     def matrix_dtype(self) -> np.dtype[Any]:
-        """Return the count dtype yielded by the default consume call."""
-        return np.dtype(np.uint32)
+        """Return the dtype in which ``consume`` yields count values."""
+
+    @abstractmethod
+    def count_value_ranges(
+        self, maxBytes: int, featureGroups: np.ndarray | None = None
+    ) -> list[CountValueRange]:
+        """Return the range of the canonical values of each group of features.
+
+        The ranges cover the selected cells, with duplicate coordinates summed
+        as the import stores them. Pass a range to
+        :func:`~scarf.storage.count_dtype.count_storage_dtype` to resolve the
+        storage dtype of its group's counts.
+
+        Args:
+            maxBytes: Memory available to the scan.
+            featureGroups: Group, numbered from zero, of each feature, such as
+                the assay that stores it. None puts every feature in one
+                group.
+        """
 
     def producer_staging_bytes(
         self,
@@ -216,10 +237,7 @@ class CrReader(ABC):
         Args:
             assay: Select which assay to retrieve feature IDs from.
         """
-        vals = self._read_dataset("feature_ids")
-        if vals is None:
-            return []
-        return self._subset_by_assay(vals, assay)
+        return self._subset_by_assay(self._read_dataset("feature_ids"), assay)
 
     def feature_names(self, assay: str | None = None) -> list[str]:
         """Returns a list of features in the dataset.
@@ -227,22 +245,12 @@ class CrReader(ABC):
         Args:
             assay: Select which assay to retrieve features from.
         """
-        vals = self._read_dataset("feature_names")
-        if vals is None:
-            logger.warning("Feature names extraction failed using feature IDs")
-            vals = self._read_dataset("feature_ids")
-        if vals is None:
-            return []
-        return self._subset_by_assay(vals, assay)
+        return self._subset_by_assay(self._read_dataset("feature_names"), assay)
 
     def feature_types(self) -> list[str]:
         """Returns a list of feature types in the dataset."""
         if self.grpNames["feature_types"] is not None:
-            ret_val = self._read_dataset("feature_types")
-            if ret_val is not None:
-                feature_types = list(ret_val)
-            else:
-                feature_types = []
+            feature_types = list(self._read_dataset("feature_types"))
         else:
             feature_types = []
         if not feature_types:
@@ -254,10 +262,7 @@ class CrReader(ABC):
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
-        vals = self._read_dataset("cell_names")
-        if vals is None:
-            return []
-        return vals
+        return self._read_dataset("cell_names")
 
     def get_cell_columns(self) -> Iterator[tuple[str, np.ndarray]]:
         """Yield optional cell metadata columns supplied by the reader."""
@@ -293,6 +298,8 @@ class CrH5Reader(CrReader):
         is_filtered: bool = True,
         filtering_cutoff: int = 500,
     ) -> None:
+        if filtering_cutoff < 0:
+            raise ValueError("filtering_cutoff cannot be negative")
         self.h5obj: h5py.File = h5py.File(h5_fn, mode="r")
         self.grp: h5py.Group
         self.validBarcodeIdx: np.ndarray | None = None
@@ -381,12 +388,49 @@ class CrH5Reader(CrReader):
 
     @property
     def matrix_dtype(self) -> np.dtype[Any]:
-        dtype: np.dtype[Any] = np.dtype(self.grp["data"].dtype)
-        return dtype
+        """Return the stored dtype in native byte order, with float16 as float32.
 
-    def _read_dataset(self, key: str | None = None) -> list[str]:
-        if key is None:
-            raise ValueError("Dataset key must be provided")
+        SciPy sparse matrices hold neither float16 nor another byte order, so
+        ``consume`` reads the values in this dtype.
+        """
+        dtype: np.dtype[Any] = np.dtype(self.grp["data"].dtype).newbyteorder("=")
+        return np.dtype(np.float32) if dtype == np.float16 else dtype
+
+    def count_value_ranges(
+        self, maxBytes: int, featureGroups: np.ndarray | None = None
+    ) -> list[CountValueRange]:
+        """Return the range of the canonical values of each group of features.
+
+        Each barcode is one compressed vector of the matrix. Selected barcodes
+        whose values are contiguous in the matrix are scanned together, as
+        ``consume`` reads them; the barcodes between them hold no values.
+
+        Raises:
+            MemoryError: If one barcode holds more values than fit in
+                ``maxBytes``.
+            ValueError: If a value is NaN or infinite.
+        """
+        valid_idx = self.validBarcodeIdx
+        assert valid_idx is not None
+        value_ranges = new_count_ranges(featureGroups)
+        if valid_idx.size == 0:
+            return value_ranges
+        indptr = self._source_indptr()
+        gaps = indptr[valid_idx[1:]] != indptr[valid_idx[:-1] + 1]
+        bounds = np.r_[0, np.flatnonzero(gaps) + 1, valid_idx.size]
+        for left, right in zip(bounds[:-1], bounds[1:]):
+            compressed_count_ranges(
+                indptr[int(valid_idx[left]) : int(valid_idx[right - 1]) + 2],
+                self.grp["indices"],
+                self.grp["data"],
+                minorSize=self.nFeatures,
+                maxBytes=maxBytes,
+                groups=featureGroups,
+                valueRanges=value_ranges,
+            )
+        return value_ranges
+
+    def _read_dataset(self, key: str) -> list[str]:
         grp_key = self.grpNames[key]
         return [as_text(x) for x in self.grp[grp_key][:]]
 
@@ -442,13 +486,6 @@ class CrH5Reader(CrReader):
                 counts,
             )
             nnz = int(counts.sum())
-            if nnz == 0:
-                yield coo_matrix(
-                    ([], ([], [])),
-                    shape=(len(v_pos), self.nFeatures),
-                    dtype=self.matrix_dtype,
-                )
-                continue
             data = np.empty(nnz, dtype=self.matrix_dtype)
             indices = np.empty(nnz, dtype=self.grp["indices"].dtype)
             boundaries = np.r_[
@@ -489,13 +526,19 @@ class CrH5Reader(CrReader):
         self._selected_cumulative_nnz()
 
     def _sparse_import_resident_bytes(self) -> int:
-        arrays = (
-            self.validBarcodeIdx,
-            self._indptrCache,
-            self._cumulativeRowNnz,
-        )
+        """Return the bytes of the arrays that an import holds.
+
+        They are the selected barcodes, the matrix pointers, and the cumulative
+        entries of the selected barcodes, counted before they are loaded so
+        that an import can plan before it prepares.
+        """
+        valid_idx = self.validBarcodeIdx
+        assert valid_idx is not None
+        pointers = self.grp["indptr"]
         return int(
-            sum(array.nbytes for array in arrays if isinstance(array, np.ndarray))
+            valid_idx.nbytes
+            + int(pointers.shape[0]) * pointers.dtype.itemsize
+            + (valid_idx.size + 1) * np.dtype(np.int64).itemsize
         )
 
     def close(self) -> None:

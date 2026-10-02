@@ -123,8 +123,8 @@ print('Mounted shape:', mounted.RNA.rawData.shape)
 
 Run the standard RNA pipeline through the local mount. Count blocks are read from the separate
 local source, while the run record and its normalized data, reductions, graph, UMAP, and
-clusters are written only to the local target. Because that target is a local path, `local_cache`
-staging is skipped here; Section 3 makes that policy explicit.
+clusters are written only to the local target. Because the target and its source are both local,
+`local_cache` staging is skipped here; Section 3 makes that policy explicit.
 
 ```{code-cell} ipython3
 mounted_run = mounted.pipeline.run(
@@ -187,6 +187,13 @@ print(
 The mount records matrix shape, dtype, and source identity. Reopening fails if the source no
 longer matches that identity. Metadata is copied at mount time, so later source metadata changes
 are not synchronized into the target.
+
+The target also resolves the source's artifacts read only, after its own. Results already saved in
+the source, including labels and embeddings imported with it, can be listed, loaded, traced, and
+used as inputs on the mount, and a step whose provenance matches a saved result reuses it instead
+of writing a copy. New artifacts are still written only to the target, and pipeline runs and their
+labels stay with the store that holds them. Results that reuse source artifacts need the source,
+as counts do; `python -m scarf.tools.repack_zarr` copies a mount into a self-contained store.
 
 ## 2. Non-executed object-store templates
 
@@ -262,9 +269,10 @@ store. This page does not execute that step.
 ## 3. Local scratch for reductions
 
 PCA fitting and score projection make multiple passes over normalized expression.
-`local_cache` stages that normalized artifact to local disk when the *DataStore location* is remote (object-storage URI or non-local backend).
+`local_cache` stages that normalized artifact to local disk when the *store that holds it* is remote (object-storage URI or non-local backend).
 It does not key off whether counts alone are remote.
-A mounted local target already holds normalized artifacts locally, so staging is skipped there even when `counts` stream from a remote source.
+On a mounted target, the target holds the normalized artifacts it writes and the source holds the ones the target reuses from it.
+A local mount therefore stages a normalized artifact that it reuses from a remote source, and skips staging for one that it wrote, even when `counts` stream from a remote source.
 Harmony, ANN, and neighbor queries read persisted reduced coordinates and do not use normalized-expression scratch.
 
 | Value | Behavior |
@@ -274,7 +282,7 @@ Harmony, ANN, and neighbor queries read persisted reduced coordinates and do not
 | `False` | No staging; every pass reads the store URI |
 | `"/path/to/scratch"` | Persistent scratch keyed by artifact ID |
 
-The mounted target in this page is local, so normalized artifacts already live on local disk and Scarf skips staging even when a scratch path is supplied.
+The mounted target and its source in this page are both local, so normalized artifacts already live on local disk and Scarf skips staging even when a scratch path is supplied.
 This executable checkpoint makes that distinction explicit:
 
 ```{code-cell} ipython3

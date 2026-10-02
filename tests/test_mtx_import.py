@@ -171,22 +171,26 @@ def test_explicit_custom_triplet_paths_and_constructor_validation(
     with pytest.raises(ValueError, match="requires feature_path and cell_path"):
         MtxReader(str(matrix_path))
 
+    with pytest.raises(TypeError, match="dtype"):
+        MtxReader(  # type: ignore[call-arg]
+            str(matrix_path), str(feature_path), str(cell_path), dtype=np.uint16
+        )
+
     reader = MtxReader(
         str(matrix_path),
         str(feature_path),
         str(cell_path),
-        dtype=np.uint16,
     )
     try:
         observed = np.vstack([batch.toarray() for batch in reader.consume(1)])
-        assert reader.matrix_dtype == np.dtype(np.uint16)
+        assert reader.matrix_dtype == np.dtype(np.uint8)
         assert reader.feature_names() == ["gene-0", "gene-1"]
         assert reader.cell_names() == ["cell-0", "cell-1"]
     finally:
         reader.close()
     np.testing.assert_array_equal(
         observed,
-        np.array([[4, 3], [0, 5]], dtype=np.uint16),
+        np.array([[4, 3], [0, 5]], dtype=np.uint8),
     )
 
 
@@ -390,60 +394,67 @@ def test_cells_by_features_real_counts_zero_based_indices_and_dtype(
 
     with pytest.raises(ValueError, match="outside the declared dimensions"):
         MtxReader(candidate)
-    with pytest.raises(TypeError, match="must be an integer dtype"):
-        MtxReader(candidate, index_offset=0, dtype=np.float32)
 
-    reader = MtxReader(candidate, index_offset=0, dtype=np.uint16)
+    reader = MtxReader(candidate, index_offset=0)
     try:
         batches = list(reader.consume(2, lines_in_mem=1))
-        widened = list(reader.consume(3, lines_in_mem=2, dtype=np.uint64))
     finally:
         reader.close()
-    assert all(batch.dtype == np.dtype(np.uint16) for batch in batches)
-    assert widened[0].dtype == np.dtype(np.uint64)
+    # Real-valued integral counts are held like integer ones.
+    assert all(batch.dtype == np.dtype(np.uint8) for batch in batches)
     np.testing.assert_array_equal(
         np.vstack([batch.toarray() for batch in batches]),
         [[1, 0], [0, 2], [3, 0]],
     )
-    np.testing.assert_array_equal(
-        widened[0].toarray(),
-        [[1, 0], [0, 2], [3, 0]],
-    )
 
 
-def test_filtered_cell_major_stream_does_not_prescan_matrix(
+@pytest.mark.parametrize(
+    ("coordinates", "is_filtered", "order"),
+    [
+        ([(1, 1, 1), (3, 1, 2), (2, 2, 3), (4, 3, 4)], True, "cellMajor"),
+        ([(1, 1, 1), (2, 2, 3), (3, 1, 2), (4, 3, 4)], False, "featureMajor"),
+    ],
+)
+def test_construction_scans_the_matrix_once_for_every_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    coordinates: list[tuple[int, int, int]],
+    is_filtered: bool,
+    order: str,
 ) -> None:
-    _write_mex(
-        tmp_path,
-        [(1, 1, 1), (3, 1, 2), (2, 2, 3), (4, 3, 4)],
-        n_cells=3,
-    )
+    from scarf.readers.mtx import _MtxEngine
 
-    def unexpected_scan(*args, **kwargs):
-        raise AssertionError("filtered cell-major input must not be prescanned")
+    _write_mex(tmp_path, coordinates, n_cells=3)
+    scans: list[int] = []
+    original = _MtxEngine._scan_matrix
 
-    monkeypatch.setattr(
-        "scarf.readers.mtx._MtxEngine._scan_matrix",
-        unexpected_scan,
+    def counted_scan(self, lines_in_mem):
+        scans.append(lines_in_mem)
+        return original(self, lines_in_mem)
+
+    monkeypatch.setattr(_MtxEngine, "_scan_matrix", counted_scan)
+    reader = MtxReader(
+        inspect_mtx(tmp_path)[0], is_filtered=is_filtered, filtering_cutoff=0
     )
-    reader = MtxReader(inspect_mtx(tmp_path)[0])
     try:
+        # One scan fixes the order, the cells, and the count range.
+        assert len(scans) == 1
+        assert reader.coordinateOrder == order
+        assert reader.count_value_ranges(0)[0].maximum == 4
+        reader._prepare_sparse_import()
         observed = np.vstack(
             [batch.toarray() for batch in reader.consume(2, lines_in_mem=2)]
         )
     finally:
         reader.close()
+    assert len(scans) == 1
     np.testing.assert_array_equal(
         observed,
         [[1, 0, 2, 0], [0, 3, 0, 0], [0, 0, 0, 4]],
     )
 
 
-def test_matrix_market_count_dtype_overflow_requires_explicit_widening(
-    tmp_path: Path,
-) -> None:
+def test_matrix_market_counts_past_uint32_import_as_uint64(tmp_path: Path) -> None:
     value = int(np.iinfo(np.uint32).max) + 1
     _write_mex(
         tmp_path,
@@ -451,24 +462,33 @@ def test_matrix_market_count_dtype_overflow_requires_explicit_widening(
         n_features=1,
         n_cells=1,
     )
-    candidate = inspect_mtx(tmp_path)[0]
-
-    default_reader = MtxReader(candidate)
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
     try:
-        with pytest.raises(
-            OverflowError,
-            match="Matrix Market count exceeds dtype uint32",
-        ):
-            list(default_reader.consume(1))
+        assert reader.matrix_dtype == np.uint64
+        observed = list(reader.consume(1))[0].toarray()
+        store = MemoryStore()
+        MtxToZarr(reader, store, nthreads=1).dump()
     finally:
-        default_reader.close()
-
-    wide_reader = MtxReader(candidate, dtype=np.uint64)
-    try:
-        observed = list(wide_reader.consume(1))[0].toarray()
-    finally:
-        wide_reader.close()
+        reader.close()
     np.testing.assert_array_equal(observed, np.array([[value]], dtype=np.uint64))
+    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
+    assert counts.dtype == np.uint64
+    np.testing.assert_array_equal(counts[:], [[value]])
+
+
+def test_matrix_market_counts_that_change_after_the_scan_raise(
+    tmp_path: Path,
+) -> None:
+    _write_mex(tmp_path, [(1, 1, 200), (2, 2, 5)], n_features=2, n_cells=2)
+    reader = MtxReader(inspect_mtx(tmp_path)[0])
+    try:
+        assert reader.matrix_dtype == np.uint8
+        # The file is rewritten with a count that the scanned dtype cannot hold.
+        _write_mex(tmp_path, [(1, 1, 300), (2, 2, 5)], n_features=2, n_cells=2)
+        with pytest.raises(OverflowError, match="the file changed"):
+            list(reader.consume(1))
+    finally:
+        reader.close()
 
 
 def test_feature_major_disk_csr_parity_filtering_and_cleanup(tmp_path: Path) -> None:
@@ -508,15 +528,11 @@ def test_feature_major_disk_csr_parity_filtering_and_cleanup(tmp_path: Path) -> 
     assert feature_reader.coordinateOrder == "featureMajor"
     assert feature_reader.cell_names() == ["cell-0", "cell-1", "cell-2"]
     feature_reader._prepare_sparse_import()
-    assert feature_reader.temporaryDiskBytes == 64
+    # Four kept uint8 counts with int32 indices, and four int64 row pointers.
+    assert feature_reader.temporaryDiskBytes == 4 * (1 + 4) + 4 * 8
     prepared = list(feature_reader.consume(2, lines_in_mem=2))
     assert all(batch.tocsr().has_sorted_indices for batch in prepared)
-    widened = list(feature_reader.consume(2, lines_in_mem=2, dtype=np.uint64))
-    assert all(batch.dtype == np.dtype(np.uint64) for batch in widened)
-    np.testing.assert_array_equal(
-        np.vstack([batch.toarray() for batch in widened]),
-        np.vstack([batch.toarray() for batch in prepared]),
-    )
+    assert all(batch.dtype == np.dtype(np.uint8) for batch in prepared)
 
     stores = [MemoryStore(), MemoryStore()]
     MtxToZarr(
@@ -524,13 +540,15 @@ def test_feature_major_disk_csr_parity_filtering_and_cleanup(tmp_path: Path) -> 
         stores[0],
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
-    ).dump(lines_in_mem=2)
+        lines_in_mem=2,
+    ).dump()
     MtxToZarr(
         cell_reader,
         stores[1],
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
-    ).dump(lines_in_mem=2)
+        lines_in_mem=2,
+    ).dump()
 
     first = zarr.open_group(store=stores[0], mode="r")["RNA/counts"][:]
     second = zarr.open_group(store=stores[1], mode="r")["RNA/counts"][:]
@@ -577,7 +595,8 @@ def test_parse_orientation_duplicate_sum_and_metadata(tmp_path: Path) -> None:
         store,
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=16, chunkBytes=8),
-    ).dump(lines_in_mem=2)
+        lines_in_mem=2,
+    ).dump()
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(
@@ -915,15 +934,18 @@ def test_feature_major_cleanup_after_planning_and_write_failures(
     candidate = inspect_mtx(tmp_path)[0]
 
     planning_reader = MtxReader(candidate, temp_dir=str(tmp_path))
-    writer = MtxToZarr(
-        planning_reader,
-        MemoryStore(),
-        mem_budget=1,
-        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
-    )
-    with pytest.raises(MemoryError, match="one source row"):
-        writer.dump(lines_in_mem=1)
+    destination = tmp_path / "planning.zarr"
+    # The layout is admitted before the destination or temporary rows exist.
+    with pytest.raises(MemoryError, match="requested count-matrix policy"):
+        MtxToZarr(
+            planning_reader,
+            str(destination),
+            mem_budget=1,
+            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
+        )
     assert not list(tmp_path.glob("scarf-mtx-csr-*"))
+    assert not destination.exists()
+    planning_reader.close()
 
     write_reader = MtxReader(candidate, temp_dir=str(tmp_path))
 
@@ -944,9 +966,10 @@ def test_feature_major_cleanup_after_planning_and_write_failures(
         MemoryStore(),
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
+        lines_in_mem=1,
     )
     with pytest.raises(RuntimeError, match="injected cancellation"):
-        writer.dump(lines_in_mem=1)
+        writer.dump()
     assert not list(tmp_path.glob("scarf-mtx-csr-*"))
 
 
@@ -1017,7 +1040,8 @@ def test_multimodal_mex_names_feature_reference_and_related_files(
         store,
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
-    ).dump(lines_in_mem=2)
+        lines_in_mem=2,
+    ).dump()
 
     root = zarr.open_group(store=store, mode="r")
     assert set(root.group_keys()) == {
@@ -1069,7 +1093,7 @@ def test_bd_guide_reclassification_is_explicit(tmp_path: Path) -> None:
     assert tuple(reader.assayFeats.columns) == ("RNA", "CRISPR")
 
     store = MemoryStore()
-    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    MtxToZarr(reader, store, mem_budget="64M", lines_in_mem=2).dump()
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(
         root["CRISPR/featureData/feature_type"][:],
@@ -1095,7 +1119,7 @@ def test_feature_reference_covers_only_feature_barcode_features(
     )
     reader = MtxReader(inspect_mtx(tmp_path)[0])
     store = MemoryStore()
-    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    MtxToZarr(reader, store, mem_budget="64M", lines_in_mem=2).dump()
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(
@@ -1129,7 +1153,7 @@ def test_feature_reference_column_with_a_separator_is_renamed(
     )
     reader = MtxReader(inspect_mtx(tmp_path)[0])
     store = MemoryStore()
-    MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+    MtxToZarr(reader, store, mem_budget="64M", lines_in_mem=2).dump()
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["ADT/featureData/tag_x"][:], ["T1"])
@@ -1158,7 +1182,7 @@ def test_feature_reference_column_empty_for_every_feature_takes_no_key(
     messages: list[str] = []
     handler = logger.add(messages.append, level="WARNING", format="{message}")
     try:
-        MtxToZarr(reader, store, mem_budget="64M").dump(lines_in_mem=2)
+        MtxToZarr(reader, store, mem_budget="64M", lines_in_mem=2).dump()
     finally:
         logger.remove(handler)
 
@@ -1254,3 +1278,35 @@ def test_archive_parse_failure_removes_temporary_extraction(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="neither cell-major"):
         MtxReader(candidate, temp_dir=str(tmp_path))
     assert not list(tmp_path.glob("scarf-mtx-archive-*"))
+
+
+def test_mtx_import_fits_the_parse_buffer_that_it_reads(tmp_path):
+    values = np.arange(200 * 50).reshape(200, 50) % 7 + 1
+    coordinates = [
+        (feature + 1, cell + 1, int(values[cell, feature]))
+        for cell in range(200)
+        for feature in range(50)
+    ]
+    directory = tmp_path / "mex"
+    directory.mkdir()
+    _write_mex(directory, coordinates, n_features=50, n_cells=200)
+    reader = MtxReader(inspect_mtx(directory)[0])
+    store = MemoryStore()
+    try:
+        # The default buffer of 100,000 parsed lines needs about 9.7 MB, so the
+        # import is refused before the destination exists.
+        destination = tmp_path / "default.zarr"
+        with pytest.raises(MemoryError, match="count shards of one row"):
+            MtxToZarr(reader, str(destination), mem_budget="8M", nthreads=1)
+        assert not destination.exists()
+        with pytest.raises(ValueError, match="lines_in_mem must be positive"):
+            MtxToZarr(reader, str(tmp_path / "invalid.zarr"), lines_in_mem=0)
+        # A smaller buffer fits the same budget.
+        MtxToZarr(
+            reader, store, mem_budget="8M", nthreads=1, lines_in_mem=10_000
+        ).dump()
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(
+        zarr.open_group(store=store, mode="r")["RNA/counts"][:], values
+    )

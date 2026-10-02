@@ -42,6 +42,12 @@ See {doc}`../../concepts/provenance`, {doc}`pipeline`, and
     :members:
 ```
 
+An `ArtifactRef` is a location-free name: a scope, a kind, an assay for assay-scoped artifacts,
+and a random 256-bit `artifact_id`. Provenance, pipeline records, and lineage store refs, never
+paths or store locations, so the datastore decides which stores resolve a ref. A datastore
+resolves its own artifacts; a mounted target resolves its own and then, read only, its source's
+(see {ref}`mounted_targets`).
+
 Supported artifact kind names are listed in {py:data}`scarf.storage.ARTIFACT_KINDS`.
 
 ```{eval-rst}
@@ -165,11 +171,13 @@ This identifies the exact selections, normalization, coordinates, and graph behi
 shows where branches diverge.
 
 An input stored in another datastore, such as the mapping reference behind a query projection, is
-recorded as an `ExternalArtifactRef`. It names the other datastore by the prepared dataset
+recorded as an `ExternalArtifactRef`. It names the artifact's dataset by the prepared dataset
 fingerprint of one of its assays; `anchor_assay` names that assay when the artifact is
-datastore-scoped or belongs to another assay. Pass the mapping references to
+datastore-scoped or belongs to another assay. The fingerprint names a dataset, not a store, and a
+mount shares its source's. Pass the mapping references to
 `DataStore.lineage(target, references=...)` to follow such inputs into their datastores; without
-them, an external input is shown as unresolved.
+them, an external input is shown as unresolved. A mount records the source artifacts it uses as
+plain refs, because it resolves them itself.
 
 `ArtifactResolutionError` is a `ValueError` with a machine-readable `code` and JSON-safe
 `context`. Failures distinguish missing or incomplete artifacts, wrong kind/scope/assay, changed
@@ -207,7 +215,9 @@ Use `summary.to_dict()` for a deterministic JSON-safe record.
 ## Module-level helpers
 
 These functions accept a Zarr root group and are useful in tooling. Analysis notebooks should use
-the datastore methods above.
+the datastore methods above. The functions inspect exactly the group they are given: the `zw`
+group of a mounted datastore also resolves its source's artifacts, while a target group opened
+directly with `zarr.open_group` holds only the target's own.
 
 ```{eval-rst}
 .. autofunction:: scarf.storage.list_artifacts

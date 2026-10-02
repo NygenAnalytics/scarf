@@ -351,7 +351,7 @@ def create_zarr_count_assay(
     n_cells: int,
     feat_ids: np.ndarray | list[str],
     feat_names: np.ndarray | list[str],
-    dtype: str = "uint32",
+    dtype: Any,
     *,
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
@@ -365,7 +365,9 @@ def create_zarr_count_assay(
         n_cells: Number of cells (rows).
         feat_ids: Feature identifiers written to feature metadata.
         feat_names: Feature display names written to feature metadata.
-        dtype: Storage dtype for counts.
+        dtype: Storage dtype for counts. Import writers store the dtype that
+               :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves
+               from the canonical values.
         profile: Zarr encoding profile. When None, chosen from the store.
         policy: Count-matrix geometry policy. When None, the default plan
                 is used.

@@ -794,7 +794,9 @@ def test_dense_assay_import_round_trips_in_requested_batches(
 
     root = zarr.open_group(store=destination, mode="r")
     assert result.assayNames == ("RNA",)
-    assert reads == [(0, 2), (2, 3)]
+    # Construction reads the counts once to resolve their storage dtype.
+    assert reads == [(0, 3), (0, 2), (2, 3)]
+    assert root["RNA/counts"].dtype == np.uint8
     np.testing.assert_array_equal(
         root["RNA/counts"][:],
         [[1, 0], [0, 2], [3, 0]],
@@ -805,25 +807,22 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
     tmp_path: Path,
 ) -> None:
     source = _write_fixture(tmp_path / "dense-budget.rds")
-    destination = MemoryStore()
+    destination = _destination_with_sentinel()
 
     with SeuratReader(source, assays=["RNA"], reductions=[]) as reader:
-        writer = SeuratToZarr(
-            reader,
-            destination,
-            mem_budget="1K",
-            nthreads=1,
-            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
-        )
         with pytest.raises(
             MemoryError,
-            match="One unit needs.*operation limit",
+            match="requested count-matrix policy.*One unit needs.*operation limit",
         ):
-            writer.dump()
+            SeuratToZarr(
+                reader,
+                destination,
+                mem_budget="1K",
+                nthreads=1,
+                policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
+            )
 
-    root = zarr.open_group(store=destination, mode="r")
-    assert root.attrs["complete"] is False
-    assert root.attrs["scarf:import_complete"] is False
+    _assert_destination_untouched(destination)
 
 
 def test_source_preparation_budget_excludes_resident_count_summary(
@@ -837,20 +836,23 @@ def test_source_preparation_budget_excludes_resident_count_summary(
     admitted: list[int] = []
 
     with SeuratReader(source) as reader:
-        writer = _new_writer(reader, destination)
         original = reader._prepare_assay
 
         def tracked(name: str, max_bytes: int) -> None:
+            assays = [reader.get_assay(item) for item in reader.assayNames]
             others = sum(
                 max(0, int(assay.counts.resident_bytes))
-                for assay in writer._assays
+                for assay in assays
                 if assay.name != name
             )
-            summary_bytes = CountSummary.nbytes_for(*writer.counts[name].shape)
+            shape = reader.get_assay(name).counts.shape
+            summary_bytes = CountSummary.nbytes_for(shape[1], shape[0])
             admitted.append(max_bytes + others + summary_bytes)
             original(name, max_bytes)
 
+        # Construction prepares every source before it reads the counts.
         monkeypatch.setattr(reader, "_prepare_assay", tracked)
+        writer = _new_writer(reader, destination)
         writer.dump(batch_size=1)
 
     assert len(admitted) == len(writer.assayNames)
@@ -866,20 +868,23 @@ def test_fragment_preparation_obeys_import_budget(tmp_path: Path, mem_budget: st
     with SeuratReader(source, temp_dir=scratch) as reader:
         fragment = reader.get_assay("ATAC").counts._source.layers[0].source
         assert fragment._rowStore is None
-        writer = SeuratToZarr(
-            reader,
-            destination,
-            mem_budget=mem_budget,
-            nthreads=1,
-            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
-        )
+
+        def writer() -> SeuratToZarr:
+            return SeuratToZarr(
+                reader,
+                destination,
+                mem_budget=mem_budget,
+                nthreads=1,
+                policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
+            )
+
         if mem_budget == "1K":
             with pytest.raises(MemoryError, match="preparation exceeds mem_budget"):
-                writer.dump()
+                writer()
             assert fragment._rowStore is None
             assert not list(scratch.glob("scarf-sparse-*"))
         else:
-            writer.dump(batch_size=2)
+            writer().dump(batch_size=2)
             root = zarr.open_group(store=destination, mode="r")
             np.testing.assert_array_equal(
                 root["ATAC/counts"][:],
@@ -1000,3 +1005,174 @@ def test_malformed_assay_error_is_preserved_without_destination_mutation(
     assert error.value.code == "missing_slot"
     assert error.value.objectPath == "assays/RNA/cells"
     _assert_destination_untouched(destination)
+
+
+def _write_duplicate_seed_fixture(directory: Path, container: str, layout: str) -> Path:
+    """Write uint8 counts of two genes and three cells in an HDF5 sparse seed.
+
+    Cell c1 holds gene g1 twice, 200 and 100, so its count of 300 needs uint16.
+    The seed is compressed over cells (``csr``) or over features (``csc``).
+    """
+    import h5py
+
+    indptr, indices, data = {
+        "csr": ([0, 3, 4, 5], [0, 1, 0, 1, 0], [200, 7, 100, 3, 9]),
+        "csc": ([0, 3, 5], [0, 0, 2, 0, 1], [200, 100, 9, 7, 3]),
+    }[layout]
+    sidecar = directory / f"{container}-{layout}.h5"
+    with h5py.File(sidecar, "w") as handle:
+        group = handle.create_group("counts")
+        group.attrs["shape"] = (3, 2)
+        group.attrs["encoding-type"] = f"{layout}_matrix"
+        group.create_dataset("data", data=np.asarray(data, dtype=np.uint8))
+        group.create_dataset("indices", data=np.asarray(indices, dtype=np.int64))
+        group.create_dataset("indptr", data=np.asarray(indptr, dtype=np.int64))
+    wire = _Wire()
+    seed = wire.s4(
+        [
+            ("filepath", wire.string_vector([sidecar.name])),
+            ("group", wire.string_vector(["counts"])),
+            ("class", wire.string_vector(["H5SparseMatrixSeed"])),
+        ]
+    )
+    if container == "Assay5":
+        layer = wire.s4(
+            [
+                ("seed", seed),
+                ("class", wire.string_vector(["DelayedMatrix", "DelayedArray"])),
+            ]
+        )
+        assay = wire.s4(
+            [
+                ("layers", wire.vector([layer], names=["counts"])),
+                ("cells", wire.logmap([1, 1, 1], ["c1", "c2", "c3"], ["counts"])),
+                ("features", wire.logmap([1, 1], ["g1", "g2"], ["counts"])),
+                (
+                    "meta.data",
+                    wire.data_frame([("symbol", wire.string_vector(["G1", "G2"]))], 2),
+                ),
+                ("class", wire.string_vector(["Assay5"])),
+            ]
+        )
+    else:
+        counts = wire.s4(
+            [
+                ("seed", seed),
+                ("dimnames", wire.dimnames(["g1", "g2"], ["c1", "c2", "c3"])),
+                ("class", wire.string_vector(["DelayedMatrix", "DelayedArray"])),
+            ]
+        )
+        assay = wire.s4(
+            [
+                ("counts", counts),
+                (
+                    "meta.features",
+                    wire.data_frame(
+                        [("symbol", wire.string_vector(["G1", "G2"]))], ["g1", "g2"]
+                    ),
+                ),
+                ("class", wire.string_vector(["Assay"])),
+            ]
+        )
+    return _write_single_assay_fixture(
+        directory / f"{container}-{layout}.rds", wire=wire, assay=assay
+    )
+
+
+@pytest.mark.parametrize("container", ["Assay5", "Assay"])
+@pytest.mark.parametrize("layout", ["csr", "csc"])
+def test_duplicate_coordinates_import_their_sum_from_every_layout(
+    tmp_path: Path, container: str, layout: str
+) -> None:
+    source = _write_duplicate_seed_fixture(tmp_path, container, layout)
+    destination = MemoryStore()
+    with SeuratReader(source, reductions=[], temp_dir=tmp_path) as reader:
+        SeuratToZarr(reader, destination, mem_budget="64M", nthreads=1).dump(
+            batch_size=1
+        )
+    counts = zarr.open_group(store=destination, mode="r")["RNA/counts"]
+    # The sum is neither wrapped to 44 in uint8 nor refused.
+    assert counts.dtype == np.uint16
+    np.testing.assert_array_equal(counts[:], [[300, 7], [0, 3], [9, 0]])
+
+
+def test_layout_fit_estimates_the_source_once_per_band(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.readers.seurat import _OwnedMatrixSource
+
+    fixture = (
+        Path(__file__).resolve().parent / "datasets" / "seurat_assay5_synthetic.rds"
+    )
+    estimates: list[tuple[int, int]] = []
+    original = _OwnedMatrixSource.estimate_read_memory
+
+    def counted(self, start: int, stop: int):
+        estimates.append((start, stop))
+        return original(self, start, stop)
+
+    monkeypatch.setattr(_OwnedMatrixSource, "estimate_read_memory", counted)
+    with SeuratReader(fixture, reductions=[]) as reader:
+        n_cells = len(reader.cellIds)
+        SeuratToZarr(reader, MemoryStore(), mem_budget="1G", nthreads=1)
+    # A one-cell batch would estimate every cell; the default layout holds
+    # every cell in one band.
+    assert n_cells == 300
+    assert len(estimates) < 10
+
+
+def test_counts_that_cannot_be_read_one_cell_at_a_time_fail_at_construction(
+    tmp_path: Path,
+) -> None:
+    from scipy.sparse import csc_matrix
+
+    # Source preparation checks the first cell, which holds one value; the
+    # second cell holds 4,000 values, which a 100 KB budget cannot scan.
+    features = [f"g{index}" for index in range(4_000)]
+    cells = ["c1", "c2"]
+    values = np.zeros((4_000, 2))
+    values[0, 0] = 1
+    values[:, 1] = 1
+    matrix = csc_matrix(values)
+    wire = _Wire()
+    counts = wire.s4(
+        [
+            ("i", wire.integer_vector(matrix.indices.tolist())),
+            ("p", wire.integer_vector(matrix.indptr.tolist())),
+            ("Dim", wire.integer_vector(list(matrix.shape))),
+            ("Dimnames", wire.dimnames(features, cells)),
+            ("x", wire.real_vector(matrix.data.tolist())),
+            ("factors", wire.vector([])),
+            ("class", wire.string_vector(["dgCMatrix"])),
+        ]
+    )
+    assay = wire.s4(
+        [
+            ("counts", counts),
+            (
+                "meta.features",
+                wire.data_frame([("symbol", wire.string_vector(features))], features),
+            ),
+            ("class", wire.string_vector(["Assay"])),
+        ]
+    )
+    root = wire.s4(
+        [
+            ("assays", wire.vector([assay], names=["RNA"])),
+            (
+                "meta.data",
+                wire.data_frame([("group", wire.string_vector(["a", "b"]))], cells),
+            ),
+            ("active.assay", wire.string_vector(["RNA"])),
+            ("active.ident", wire.factor([1, 1], ["cells"], names=cells)),
+            ("reductions", wire.vector([], names=[])),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    source = tmp_path / "skewed.rds"
+    source.write_bytes(wire.document(root))
+    destination = tmp_path / "skewed.zarr"
+    with SeuratReader(source, reductions=[]) as reader:
+        with pytest.raises(MemoryError, match="cannot be read one cell at a time"):
+            SeuratToZarr(reader, str(destination), mem_budget=100_000, nthreads=1)
+    assert not destination.exists()

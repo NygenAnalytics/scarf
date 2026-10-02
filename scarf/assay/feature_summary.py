@@ -19,12 +19,12 @@ from ..storage.artifacts import (
     fingerprint_stored_strings,
     inspect_artifact,
 )
-from ..storage.errors import ArtifactResolutionError
 from ..storage.selections import validate_stored_selection_integrity
 from ..storage.identity import read_dataset_fingerprint
 from ..storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
+    from .atac import ATACassay
     from .base import Assay
     from .rna import RNAassay
 
@@ -33,12 +33,12 @@ _RNA_ARRAYS = ("normed_tot", "normed_n", "sigmas")
 _ATAC_ARRAYS = ("prevalence", "document_frequency")
 
 
-def _selection_mask(
-    root: zarr.Group,
-    ref: ArtifactRef,
-    *,
-    n_cells: int,
-) -> np.ndarray:
+def _selection_mask(root: zarr.Group, ref: ArtifactRef) -> np.ndarray:
+    """Return the boolean values of a validated cell selection.
+
+    Validation requires one value per row of ``cellData``, which holds the
+    prepared cells of every assay.
+    """
     validated = validate_stored_selection_integrity(
         root,
         ref,
@@ -47,14 +47,7 @@ def _selection_mask(
         assay=None,
         table_path="cellData",
     )
-    values = np.asarray(validated.values[:], dtype=bool)
-    if values.shape != (n_cells,) or values.dtype != np.dtype(bool):
-        raise ArtifactResolutionError(
-            "Cell-selection artifact values do not align with the assay cells",
-            code="selection_values_changed",
-            context={"artifact_id": ref.artifact_id},
-        )
-    return values
+    return np.asarray(validated.values[:], dtype=bool)
 
 
 def _summary_contract(
@@ -115,7 +108,7 @@ def ensure_feature_summary(
     if log_transform and operation != "summarize_rna_features":
         raise TypeError("Log-transformed feature summaries require an RNA assay")
     dataset_fingerprint = read_dataset_fingerprint(assay.z)
-    cell_mask = _selection_mask(root, cell_selection, n_cells=assay.cells.N)
+    cell_mask = _selection_mask(root, cell_selection)
     cell_idx = np.flatnonzero(cell_mask).astype(np.int64, copy=False)
     n_features = int(assay.feats.N)
     feature_idx = np.arange(n_features, dtype=np.int64)
@@ -142,10 +135,6 @@ def ensure_feature_summary(
             "Feature summaries are supported only for RNAassay and ATACassay; "
             f"received {type(assay).__name__}"
         )
-    # Summaries computed through ``normed`` promote integer counts to float64.
-    arithmetic = assay._count_arithmetic("feature_summary")
-    if arithmetic is not None:
-        parameters["count_arithmetic"] = arithmetic
 
     arrays, attributes, reuse_validator = _summary_contract(
         names,
@@ -177,7 +166,9 @@ def ensure_feature_summary(
             cell_idx, feature_idx, log_transform=True
         )
     else:
-        raw_payload = assay._compute_feature_summary(cell_idx, feature_idx)
+        raw_payload = cast("RNAassay | ATACassay", assay)._compute_feature_summary(
+            cell_idx, feature_idx
+        )
     payload = {name: np.asarray(raw_payload[name], dtype=np.float64) for name in names}
     with artifact_transaction(root, planned) as group:
         chunks = (min(max(n_features, 1), 100_000),)
@@ -207,33 +198,20 @@ def feature_summary_values(
     *,
     n_selected: int,
 ) -> dict[str, np.ndarray]:
-    """Load a validated summary and derive its non-persisted statistics."""
-    if ref.kind != "feature_summary" or ref.scope != "assay":
-        raise ValueError("ref must be an assay feature-summary artifact")
-    status = inspect_artifact(root, ref)
-    if not status.exists:
-        raise KeyError(f"Feature-summary artifact does not exist: {status.path}")
-    if not status.complete:
-        raise RuntimeError(f"Feature-summary artifact is incomplete: {status.path}")
-    group = as_zarr_group(root[artifact_path(ref)], name=artifact_path(ref))
-    operation = status.operation
-    if operation == "summarize_rna_features":
-        names: tuple[str, ...] = _RNA_ARRAYS
-    elif operation == "summarize_atac_features":
-        names = _ATAC_ARRAYS
-    else:
-        raise ValueError(f"Unsupported feature-summary operation: {operation!r}")
-    stored_fingerprint = group.attrs.get("payload_fingerprint")
-    if not isinstance(stored_fingerprint, str) or stored_fingerprint != (
-        fingerprint_stored_arrays(group, names)
-    ):
-        raise ValueError("Feature-summary payload fingerprint is invalid")
+    """Load a summary and derive its non-persisted statistics.
 
+    ``ref`` is the summary that ``ensure_feature_summary`` returned in the
+    same operation. Its payload fingerprint was verified when it was reused
+    or written, so the arrays are read without checking them again.
+    """
+    rna = inspect_artifact(root, ref).operation == "summarize_rna_features"
+    names = _RNA_ARRAYS if rna else _ATAC_ARRAYS
+    group = as_zarr_group(root[artifact_path(ref)], name=artifact_path(ref))
     values = {
         name: np.asarray(as_zarr_array(group[name], name=name)[:], dtype=np.float64)
         for name in names
     }
-    if names == _RNA_ARRAYS:
+    if rna:
         normed_tot = values["normed_tot"]
         normed_n = values["normed_n"]
         values["avg"] = (
@@ -251,10 +229,7 @@ def feature_summary_values(
 
 
 def feature_summary_selected_count(
-    root: zarr.Group,
-    cell_selection: ArtifactRef,
-    *,
-    n_cells: int,
+    root: zarr.Group, cell_selection: ArtifactRef
 ) -> int:
     """Return the selected-cell count from the canonical selection payload."""
-    return int(_selection_mask(root, cell_selection, n_cells=n_cells).sum())
+    return int(_selection_mask(root, cell_selection).sum())

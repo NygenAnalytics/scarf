@@ -57,6 +57,7 @@ from ...features.markers.table import (
     MARKER_METHOD,
     MARKER_STAT_COLUMNS,
     MARKER_TIE_CORRECTION,
+    RankMarkerResult,
     _validate_marker_slot,
     load_marker_table,
 )
@@ -395,36 +396,6 @@ def _reject_missing_statistical_values(
             )
 
 
-def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
-    shared: np.ndarray | None = None
-    populated_names: set[str] = set()
-    for cluster_id, vals in markers.items():
-        if len(vals) == 0:
-            continue
-        group_name = str(cluster_id)
-        if group_name in populated_names:
-            raise ValueError("Marker group labels must remain unique as strings")
-        populated_names.add(group_name)
-        raw_index = np.asarray(vals.index.values)
-        if raw_index.ndim != 1 or raw_index.dtype.kind not in {"i", "u"}:
-            raise ValueError(
-                "Marker feature indices must use a one-dimensional integer index"
-            )
-        if not vals.index.is_unique:
-            raise ValueError("Marker feature indices must be unique within each group")
-        index = raw_index.astype(np.int64, copy=False)
-        if (index < 0).any() or (index > np.iinfo(np.int32).max).any():
-            raise ValueError("Marker feature indices must fit non-negative int32")
-        ordered = np.sort(index)
-        if shared is None:
-            shared = ordered
-        elif not np.array_equal(ordered, shared):
-            raise ValueError("Marker groups must contain identical feature index sets")
-    if shared is None:
-        raise ValueError("Cannot save empty marker results")
-    return shared.astype(np.int32)
-
-
 def _read_arrays(
     group: zarr.Group, names: tuple[str, ...], *, workers: int
 ) -> list[np.ndarray]:
@@ -434,16 +405,6 @@ def _read_arrays(
         return lambda: np.asarray(as_zarr_array(group[name], name=name)[:])
 
     return run_concurrently([reader(name) for name in names], workers=workers)
-
-
-def _marker_stats_matrix(vals: pd.DataFrame, feature_index: np.ndarray) -> np.ndarray:
-    aligned = vals.reindex(feature_index)
-    stats = np.asarray(
-        aligned.loc[:, list(MARKER_STAT_COLUMNS)].to_numpy(dtype=np.float64)
-    )
-    if not np.isfinite(stats).all():
-        raise ValueError("Marker statistics must all be finite")
-    return stats
 
 
 def _write_compact_marker_stats(
@@ -473,8 +434,9 @@ def _validate_marker_group_name(name: str) -> None:
         raise ValueError(
             f"Marker group label {name!r} cannot name a stored marker group: "
             "labels must be non-blank, must not be '.' or '..', and must not "
-            "contain '/' or '\\'. Rename the labels or select labelled cells "
-            "with select_cells before running run_marker_search."
+            "contain '/' or '\\'. Rename the labels in a cell metadata column, "
+            "or leave these cells out with select_cells, then freeze the labels "
+            "with snapshot_cluster_labels before running run_marker_search."
         )
 
 
@@ -622,17 +584,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             execution_options={"invalidate_cache": invalidate_cache},
             invalidate_cache=invalidate_cache,
         )
-        if planned.reused:
-            detected_values = np.asarray(
-                _feature_selection_values(self.zw, planned.ref),
-                dtype=bool,
-            )
-        else:
-            n_selected = feature_summary_selected_count(
-                self.zw,
-                cell_selection,
-                n_cells=assay.cells.N,
-            )
+        if not planned.reused:
+            n_selected = feature_summary_selected_count(self.zw, cell_selection)
             summary = feature_summary_values(
                 self.zw,
                 summary_ref,
@@ -642,11 +595,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if detected is None:
                 detected = summary["document_frequency"]
             detected_values = np.asarray(detected >= min_cells, dtype=bool)
-        if not detected_values.any():
-            raise ValueError(
-                "Detected-feature selection contains no features; lower min_cells"
-            )
-        if not planned.reused:
+            if not detected_values.any():
+                raise ValueError(
+                    "Detected-feature selection contains no features; lower min_cells"
+                )
             _write_feature_selection(
                 self.zw,
                 planned,
@@ -691,11 +643,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_selection,
             invalidate_cache=invalidate_cache,
         )
-        n_selected = feature_summary_selected_count(
-            self.zw,
-            cell_selection,
-            n_cells=assay.cells.N,
-        )
+        n_selected = feature_summary_selected_count(self.zw, cell_selection)
         if max_cells is None:
             candidate_max = n_selected - HVG_UBIQUITOUS_SLACK
             if candidate_max <= min_cells:
@@ -765,7 +713,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         summary: dict[str, np.ndarray] | None = None
-        selected_values: np.ndarray
         if not planned.reused:
             summary = feature_summary_values(
                 self.zw,
@@ -804,15 +751,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 },
                 payload_names=("values", "corrected_variance"),
             )
-        else:
-            selected_values = np.asarray(
-                _feature_selection_values(self.zw, planned.ref),
-                dtype=bool,
-            )
-            if not selected_values.any():
-                raise ValueError(
-                    "HVG selection contains no features; adjust the HVG filters"
-                )
         if show_plot:
             if summary is None:
                 summary = feature_summary_values(
@@ -822,7 +760,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 )
             assay._plot_hvgs(
                 summary,
-                selected_values,
+                _feature_selection_values(self.zw, planned.ref),
                 _feature_selection_values(
                     self.zw,
                     planned.ref,
@@ -1041,8 +979,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         ).astype(np.int64, copy=False)
         if len(cell_index) == 0:
             raise ValueError("Cell selection contains no active cells")
-        if len(feature_index) == 0:
-            raise ValueError("Feature selection contains no active features")
         return assay, cell_index, feature_index, feature_selection
 
     def run_waggr(
@@ -1119,13 +1055,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             weighted=True,
             ambiguous_targets=ambiguous_targets,
         )
-        if not lib_size_feature_stream_eligible(assay):
+        if assay.normMethod is not norm_lib_size:
             raise ValueError(
                 "WAGGR requires the default norm_lib_size RNA normalization"
             )
-        if assay.sf is None:
-            raise ValueError("WAGGR requires a finite positive size factor")
         try:
+            # A missing size factor raises TypeError here.
             size_factor = float(assay.sf)
         except (TypeError, ValueError) as exc:
             raise ValueError("WAGGR requires a finite positive size factor") from exc
@@ -1151,10 +1086,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 dtype=np.float64,
             )
             if not np.isfinite(cell_scalars).all() or np.any(cell_scalars < 0):
-                raise ValueError("WAGGR cell normalization scalars must be finite")
+                raise ValueError(
+                    f"{assay.name}_nCounts holds negative or non-finite totals of "
+                    "selected cells; WAGGR library-size normalization requires "
+                    "finite non-negative counts"
+                )
             cell_scalars[cell_scalars == 0] = 1.0
             model = build_waggr_model(network)
             raw = assay.rawData[:, network.matched_feature_index][cell_index, :]
+            # The stream yields every selected cell once, in order.
             offset = 0
             for raw_block in raw.stream_blocks(
                 nthreads=self.nthreads,
@@ -1163,19 +1103,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             ):
                 block = np.asarray(raw_block, dtype=np.float64)
                 end = offset + block.shape[0]
-                if end > len(cell_scalars):
-                    raise ValueError(
-                        "WAGGR raw blocks exceed the active cell selection"
-                    )
                 values = size_factor * block / cell_scalars[offset:end].reshape(-1, 1)
                 if log_transform:
                     values = np.log1p(values)
                 yield score_waggr_block(values, model, mode=mode)
                 offset = end
-            if offset != len(cell_scalars):
-                raise ValueError(
-                    f"WAGGR streamed {offset} cells, expected {len(cell_scalars)}"
-                )
 
         return self._run_enrichment(
             assay=assay,
@@ -1295,27 +1227,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         def score_batches() -> Iterator[np.ndarray]:
             raw = assay.rawData[:, feature_index][cell_index, :]
-            offset = 0
             for raw_block in raw.stream_blocks(
                 nthreads=self.nthreads,
                 msg="Scoring AUCell",
                 prefetch=1,
             ):
-                scores = score_aucell_block(
+                yield score_aucell_block(
                     np.asarray(raw_block),
                     permutation,
                     sets,
                     n_up=resolved_n_up,
-                )
-                offset += scores.shape[0]
-                if offset > len(cell_index):
-                    raise ValueError(
-                        "AUCell raw blocks exceed the active cell selection"
-                    )
-                yield scores
-            if offset != len(cell_index):
-                raise ValueError(
-                    f"AUCell streamed {offset} cells, expected {len(cell_index)}"
                 )
 
         @contextmanager
@@ -1416,7 +1337,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> ArtifactRef:
         """Create or reuse one immutable marker-table artifact."""
         from ...features.markers import find_markers_by_rank
-        from ...features.markers.search import marker_count_arithmetic
         from ...storage.stores import metadata_workers
 
         reject_unknown_normalization_params(
@@ -1441,8 +1361,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError("Cluster values must contain one label per selected cell")
         if len(cell_index) == 0:
             raise ValueError("Cell selection contains no active cells")
-        if len(feature_index) == 0:
-            raise ValueError("Feature selection contains no active features")
         if nthreads is None:
             nthreads = self.nthreads
         resolved_norm_params = {
@@ -1453,21 +1371,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 False,
             ),
         }
-        group_sizes = pd.Series(labels).value_counts()
+        group_ids, group_sizes = np.unique(labels, return_counts=True)
         n_selected = int(len(labels))
-        group_cell_counts = {
-            group_id: (int(group_size), int(n_selected - group_size))
-            for group_id, group_size in group_sizes.items()
-        }
+        # The distinct values of one array have distinct string forms.
         expected_group_cell_counts: dict[str, tuple[int, int]] = {}
-        for group_id, counts in group_cell_counts.items():
+        for group_id, group_size in zip(group_ids, group_sizes, strict=True):
             group_name = str(group_id)
             _validate_marker_group_name(group_name)
-            if group_name in expected_group_cell_counts:
-                raise ValueError(
-                    "Marker group labels must remain unique after string conversion"
-                )
-            expected_group_cell_counts[group_name] = counts
+            expected_group_cell_counts[group_name] = (
+                int(group_size),
+                n_selected - int(group_size),
+            )
         expected_feature_index = np.flatnonzero(feature_values)
         resolved_feature_names = (
             np.asarray(assay.feats.fetch_all("names"))
@@ -1516,11 +1430,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 return False
             return True
 
-        count_arithmetic = marker_count_arithmetic(
-            assay,
-            log_transform=bool(resolved_norm_params["log_transform"]),
-            renormalize_subset=bool(resolved_norm_params["renormalize_subset"]),
-        )
         arguments = MarkerTableArguments(
             cell_selection=cell_selection,
             feature_selection=feature_selection,
@@ -1536,7 +1445,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             adjustment_scope=MARKER_ADJUSTMENT_SCOPE,
             nthreads=nthreads,
             invalidate_cache=invalidate_cache,
-            count_arithmetic=count_arithmetic,
         )
         record = arguments.to_record()
         inputs = dict(record.inputs)
@@ -1585,6 +1493,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_idx=cell_index,
             feat_idx=feature_index,
             nthreads=nthreads,
+            writers=io_workers,
             **resolved_norm_params,
         )
         t_save = time.perf_counter()
@@ -1593,11 +1502,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 remote_slot,
                 markers,
                 workers=io_workers,
-                group_cell_counts=group_cell_counts,
                 feature_names=resolved_feature_names,
                 feature_ids=resolved_feature_ids,
             )
-        logger.info(f"Stored marker results for {len(markers)} clusters")
+        logger.info(f"Stored marker results for {len(markers.group_ids)} clusters")
         logger.debug(
             f"Saved marker results to {artifact_path(planned.ref)} "
             f"in {time.perf_counter() - t_save:.1f}s"
@@ -1616,13 +1524,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> ArtifactRef:
         """Persist marker tables for an explicit clustering artifact.
 
+        Raw counts of any storage dtype are ranked. Library-size markers
+        require finite non-negative counts and cell totals.
+
         Args:
             from_assay: Name of the assay to be used. If no value is provided then the default assay will be used.
             clusters: Complete ``cluster_labels`` or ``cluster_cut`` artifact
                 with a label for every cell. Labels that its linked missing
                 mask flags raise ``ValueError``, as do labels that are blank,
                 ``'.'`` or ``'..'``, or contain ``'/'`` or ``'\\'``, because each label
-                names its stored marker group.
+                names its stored marker group. To compare the groups of a
+                cell metadata column, or only some cells or clusters, freeze
+                the labels over those cells with ``snapshot_cluster_labels``.
             features: Explicit feature-selection artifact.
             nthreads: Threads for marker search.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
@@ -1631,6 +1544,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             A complete immutable marker-table artifact.
 
         Raises:
+            ValueError: If a library-size normalized value of a selected cell
+                and feature, or the total of a selected cell (its
+                ``<assay>_nCounts`` value, or with ``renormalize_subset=True``
+                its sum over the selected features), is negative or not
+                finite. Nothing is written.
             PermissionError: If no matching result exists and the store is
                 not opened with ``zarr_mode='r+'``. The check runs before
                 the search.
@@ -1675,37 +1593,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     @staticmethod
     def _write_marker_slot(
         group: zarr.Group,
-        markers: dict[Any, pd.DataFrame],
+        markers: RankMarkerResult,
         *,
         workers: int = 1,
-        group_cell_counts: dict[Any, tuple[int, int]],
         feature_names: np.ndarray,
         feature_ids: np.ndarray,
     ) -> None:
+        """Write the marker tables of every group, each straight from the result.
+
+        Concurrent writers each finish one group's stored table at a time.
+        """
         from ...storage.arrays import create_metadata_column
         from ...storage.stores import run_concurrently
 
-        populated_groups = {
-            cluster_id for cluster_id, values in markers.items() if len(values)
-        }
-        missing_counts = populated_groups.difference(group_cell_counts)
-        if missing_counts:
-            raise ValueError(
-                "Marker writes require target and reference counts "
-                "for every populated group"
-            )
-        if any(
-            isinstance(count, bool) or not isinstance(count, int) or count < 2
-            for cluster_id in populated_groups
-            for count in group_cell_counts[cluster_id]
-        ):
-            raise ValueError("Marker target and reference counts must be integers >= 2")
-        feature_index = _shared_marker_feature_index(markers)
-        stats_by_group = {
-            cluster_id: _marker_stats_matrix(values, feature_index)
-            for cluster_id, values in markers.items()
-            if len(values)
-        }
+        # The result's feature indices ascend, so the last is the largest.
+        last_feature = int(markers.feature_index[-1])
+        if last_feature > np.iinfo(np.int32).max:
+            raise ValueError("Marker feature indices must fit non-negative int32")
+        if last_feature >= len(feature_names):
+            raise ValueError("Marker feature indices must index feature_names")
+        n_cells = int(markers.group_sizes.sum())
         group.attrs.update(
             {
                 "stat_columns": list(MARKER_STAT_COLUMNS),
@@ -1718,7 +1625,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             }
         )
         columns: dict[str, tuple[np.ndarray, Any]] = {
-            "feature_index": (feature_index, np.int32),
+            "feature_index": (markers.feature_index, np.int32),
             "feature_names": (np.asarray(feature_names).astype(str), None),
             "feature_ids": (np.asarray(feature_ids).astype(str), None),
         }
@@ -1732,20 +1639,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
             return write
 
-        def cluster_writer(cluster_id: Any) -> Callable[[], None]:
+        def cluster_writer(group_id: Any, n_group: int) -> Callable[[], None]:
             def write() -> None:
-                n_group, n_reference = group_cell_counts[cluster_id]
                 cluster_group = group.create_group(
-                    str(cluster_id),
-                    attributes={"n_group": n_group, "n_reference": n_reference},
+                    str(group_id),
+                    attributes={"n_group": n_group, "n_reference": n_cells - n_group},
                 )
-                _write_compact_marker_stats(cluster_group, stats_by_group[cluster_id])
+                _write_compact_marker_stats(
+                    cluster_group, markers.stored_statistics(group_id)
+                )
 
             return write
 
         run_concurrently(
             [column_writer(name) for name in columns]
-            + [cluster_writer(cluster_id) for cluster_id in stats_by_group],
+            + [
+                cluster_writer(group_id, int(n_group))
+                for group_id, n_group in zip(
+                    markers.group_ids, markers.group_sizes, strict=True
+                )
+            ],
             workers=workers,
         )
 
@@ -1974,7 +1887,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from ...storage.identity import CountSummary, finalize_counts
         from ...storage.layout import array_shard_rows
         from ...storage.schema import derived_assay_transaction
-        from ...storage.sharding import write_dense_from_row_batches
+        from ...storage.sharding import (
+            dense_counts_admission,
+            fit_count_layout,
+            write_dense_from_row_batches,
+        )
 
         self._require_writable("add_grouped_assay")
         provenance: dict[str, Any]
@@ -2001,9 +1918,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if not groups:
                 raise ValueError("groups metadata column must be non-empty")
             assay = self._get_assay(from_assay)
+            # Every column of the feature table has one value per feature, and
+            # valid_category_mask rejects a column that is not one-dimensional.
             group_values = np.asarray(assay.feats.fetch_all(groups))
-            if group_values.ndim != 1 or group_values.shape != (assay.feats.N,):
-                raise ValueError("groups must align with the complete feature axis")
             if exclude_values is None:
                 exclude_values = [-1]
             present = valid_category_mask(
@@ -2027,15 +1944,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if not group_set:
             raise ValueError("No feature groups remain after applying exclude_values")
 
+        # The distinct values of one column or artifact have distinct strings.
         module_ids = [f"group_{x}" for x in group_set]
-        if has_duplicates(module_ids):
-            duplicates = sorted(
-                {name for name in module_ids if module_ids.count(name) > 1}
-            )
-            raise ValueError(
-                "Feature group values produce duplicate module IDs: "
-                + ", ".join(duplicates)
-            )
         cell_idx = np.arange(assay.cells.N, dtype=np.int64)
         with derived_assay_transaction(
             self.z,
@@ -2043,12 +1953,27 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             self.workspace,
             operation="add_grouped_assay",
         ) as transaction:
+            # The writer holds one band of group means from the producer and
+            # the band it writes. A layout that does not fit fails here,
+            # before the pending assay exists.
+            layout = fit_count_layout(
+                {assay_label: (len(module_ids), np.float64)},
+                nCells=assay.cells.N,
+                profile=self.storageProfile,
+                memoryBytes=self.resources.memoryBytes,
+                transposed=(),
+                admitCounts=dense_counts_admission(
+                    CountSummary.nbytes_for(assay.cells.N, len(module_ids)),
+                    lambda rows: 2 * rows * len(module_ids) * 8,
+                ),
+            )
             g = transaction.create_counts(
                 assay.cells.N,
                 module_ids,
                 module_ids,
-                "float",
+                np.float64,
                 profile=self.storageProfile,
+                policy=layout,
             )
             # RNA reads one output band per call; other assays stream their
             # normalized blocks, which the writer aligns to output bands.
@@ -2341,11 +2266,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             sec_group_values: NDArray[Any] = np.array([None], dtype=object)
             sec_groups_set: list[Any] = [None]
         else:
-            sec_group_values, _secondary_selection, secondary_idx, sec_valid = (
-                resolve_groups(secondary_groups, resolved_selection)
+            # Sub-groups are read over the cells of the primary groups'
+            # selection, in the same order.
+            sec_group_values, _selection, _cells, sec_valid = resolve_groups(
+                secondary_groups, resolved_selection
             )
-            if not np.array_equal(secondary_idx, active_idx):
-                raise ValueError("Grouping artifacts use different ordered cells")
             sec_groups_set = sorted(set(sec_group_values[sec_valid]))
             labelled &= sec_valid
 
@@ -2442,6 +2367,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     nthreads=self.nthreads,
                 )
                 vals = {name: means[:, i] for i, name in enumerate(column_rows)}
+            # Raw sums are exact: integer counts keep NumPy's integer accumulator.
+            sum_dtype = np.float64 if assay.rawData.dtype.kind == "f" else None
             for col_name, idx in iter_progress(
                 column_rows.items(),
                 desc="Aggregating pseudo-replicates",
@@ -2454,7 +2381,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     continue
                 if aggr_type == "sum":
                     vals[col_name] = controlled_compute(
-                        assay.rawData[idx].sum(axis=0), self.nthreads
+                        assay.rawData[idx].sum(axis=0, dtype=sum_dtype), self.nthreads
                     )
                 if return_fraction:
                     fracs[col_name] = (assay.rawData[idx] > 0).mean(axis=0).compute()
@@ -2532,6 +2459,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             else None
         )
 
+        # Every value array holds one row per grouping cell.
         selection_mask = np.ones(len(groups_array), dtype=bool)
         if subset_values is not None:
             subset_array = np.asarray(subset_values)
@@ -2539,8 +2467,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 raise TypeError(
                     f"{subset_by!r} must be boolean; got {subset_array.dtype}"
                 )
-            if len(subset_array) != len(groups_array):
-                raise ValueError("subset_by length must match selected cells")
             selection_mask &= subset_array
             if subset_missing is not None:
                 selection_mask &= ~subset_missing
@@ -3024,13 +2950,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if source_assay_obj is not None and uses_assay_normalization
             else None
         )
-        # Assay-source feature values come from ``normed`` without keyword
-        # arguments, as ``fetch_normalized_feature_matrix`` reads them.
-        count_arithmetic = (
-            source_assay_obj._count_arithmetic("normed")
-            if source_assay_obj is not None and uses_assay_normalization
-            else None
-        )
         raw_size_factor = (
             getattr(source_assay_obj, "sf", None)
             if source_assay_obj is not None and uses_assay_normalization
@@ -3075,7 +2994,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 group_field=group_field.key if group_field is not None else None,
                 normalization_method=normalization_method_identity,
                 size_factor=size_factor_value,
-                count_arithmetic=count_arithmetic,
                 method=effective_method,
                 p_value_policy=(
                     MANN_WHITNEY_P_VALUE_POLICY
@@ -3106,59 +3024,34 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 candidate: zarr.Group,
             ) -> bool:
                 try:
-                    if candidate.attrs.get("key_labels") != list(key_labels):
-                        return False
-                    if candidate.attrs.get("method") != effective_method:
-                        return False
-                    if candidate.attrs.get("p_value_method") not in (
-                        ("exact", "asymptotic")
-                        if effective_method == "mann_whitney"
-                        else (None,)
-                    ):
-                        return False
-                    if candidate.attrs.get("posthoc") != posthoc:
-                        return False
-                    if candidate.attrs.get("adjustment_method") != adjustment:
-                        return False
-                    if candidate.attrs.get("n_groups") != n_groups:
-                        return False
-                    if candidate.attrs.get("n_cells") != n:
-                        return False
-                    if candidate.attrs.get("tested_features") != list(tested_features):
-                        return False
-                    if candidate.attrs.get("source_assays") != list(source_assays):
-                        return False
-                    if candidate.attrs.get("source_dataset_fingerprint") != (
-                        source_dataset_fingerprint
-                    ):
-                        return False
-                    if candidate.attrs.get("grouping") != (
-                        grouping_input.to_dict() if grouping_input is not None else None
-                    ):
-                        return False
-                    if candidate.attrs.get("group_field") != (
-                        group_field.key if group_field is not None else None
-                    ):
-                        return False
-                    if candidate.attrs.get("cell_selection") != (
-                        cell_selection_input.to_dict()
-                        if cell_selection_input is not None
-                        else None
-                    ):
-                        return False
-                    if candidate.attrs.get("cell_selection_fingerprint") != (
-                        cell_selection_fingerprint
-                    ):
-                        return False
-                    if candidate.attrs.get("stat_columns") != list(
-                        expected_stat_columns
-                    ):
-                        return False
-                    if candidate.attrs.get("posthoc_stat_columns") != list(
-                        expected_posthoc_columns
-                    ):
-                        return False
-                    secondary_guard = {
+                    # Attributes hold JSON values, which compare equal to the
+                    # native values the result records.
+                    expected_attributes = {
+                        "key_labels": list(key_labels),
+                        "method": effective_method,
+                        "posthoc": posthoc,
+                        "adjustment_method": adjustment,
+                        "n_groups": n_groups,
+                        "n_cells": n,
+                        "tested_features": list(tested_features),
+                        "source_assays": list(source_assays),
+                        "source_dataset_fingerprint": source_dataset_fingerprint,
+                        "grouping": (
+                            grouping_input.to_dict()
+                            if grouping_input is not None
+                            else None
+                        ),
+                        "group_field": (
+                            group_field.key if group_field is not None else None
+                        ),
+                        "cell_selection": (
+                            cell_selection_input.to_dict()
+                            if cell_selection_input is not None
+                            else None
+                        ),
+                        "cell_selection_fingerprint": cell_selection_fingerprint,
+                        "stat_columns": list(expected_stat_columns),
+                        "posthoc_stat_columns": list(expected_posthoc_columns),
                         "sample_stat": sample_stat,
                         "expression_cutoff": float(expression_cutoff),
                         "normalization": normalization_digest,
@@ -3172,12 +3065,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         "sample_fingerprint": sample_fingerprint,
                         "pair_fingerprint": pair_fingerprint,
                     }
-                    for attr_name, expected_value in secondary_guard.items():
-                        stored = candidate.attrs.get(attr_name)
-                        if isinstance(stored, np.generic):
-                            stored = native_value(stored)
-                        if stored != expected_value:
-                            return False
+                    if any(
+                        candidate.attrs.get(name) != value
+                        for name, value in expected_attributes.items()
+                    ):
+                        return False
+                    if candidate.attrs.get("p_value_method") not in (
+                        ("exact", "asymptotic")
+                        if effective_method == "mann_whitney"
+                        else (None,)
+                    ):
+                        return False
                     stored_value_fingerprints = candidate.attrs.get(
                         "value_fingerprints"
                     )
@@ -3622,9 +3520,8 @@ def _write_stats_array(
     key_group.attrs[f"{name}_dtypes"] = {
         column: str(table[column].dtype) for column in columns
     }
-    numeric = np.asarray(table.loc[:, columns].to_numpy(dtype=np.float64))
-    if numeric.ndim == 1:
-        numeric = numeric.reshape(-1, 1)
+    # Selecting a list of columns keeps the table two-dimensional.
+    numeric = np.asarray(table.loc[:, list(columns)].to_numpy(dtype=np.float64))
     if np.isnan(numeric).any():
         raise ValueError("Statistical test results must not contain NaN")
     finite_slots = [

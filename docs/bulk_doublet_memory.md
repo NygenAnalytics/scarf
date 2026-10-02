@@ -46,7 +46,8 @@ Two further reviewer suggestions need narrower treatment:
    exclusions, seeded pseudo-replicates, and feature labels. Exclude skipped
    cells before streaming and use each band's selected destinations for codes
    and scalars. Process sums, means, and expression fractions in the same pass.
-2. Preserve NumPy's promoted sum dtype, including integers above `2**53`.
+2. Sum integer counts in NumPy's promoted sum dtype, including integers above
+   `2**53`, and floating-point counts in float64, so raw sums are exact.
    Convert mean inputs to float64 before multiplying by the size factor. Read
    stored library totals. Preserve bulk's existing zero-total and NaN behavior.
    Emit matching zero fraction columns for empty groups and pseudo-replicates.
@@ -87,9 +88,9 @@ missing fractions for empty columns. Other normalizers retain existing behavior.
 
 Both `DataStore.run_doublet_detection` and the private pipeline entry point in
 `datastore/pipeline_accessor.py` use the same streamed core. Preserve
-`DoubletScoreArguments`, `count_arithmetic="checked_integer_sum"`, score schema,
-frozen selections, lineage, and cache identity. Final score comparisons use
-floating-point tolerances because reduction order changes.
+`DoubletScoreArguments`, score schema, frozen selections, lineage, and cache
+identity. Final score comparisons use floating-point tolerances because
+reduction order changes.
 
 Doublet execution no longer creates a temporary query store, projection, or
 diffusion artifact. It still builds or reuses the mapping reference. Explicit

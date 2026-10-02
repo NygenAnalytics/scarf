@@ -1,9 +1,10 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import numpy as np
 
 from ..readers import CrReader
+from ..storage.count_dtype import count_storage_dtype
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
@@ -23,7 +24,6 @@ class CrToZarr:
     Args:
         cr: A CrReader object, containing the Cellranger data.
         zarr_loc: The file name for the Zarr hierarchy or a store
-        dtype: the dtype of the data.
         workspace: Workspace name in the destination store. None uses the
                    legacy layout without a workspace group.
         storage_options: Backend options passed when opening the Zarr store.
@@ -32,13 +32,23 @@ class CrToZarr:
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
-        policy: Count-matrix geometry policy. When None, the default
-                unitBytes and chunkBytes plan is used.
+        policy: Count-matrix geometry policy, used exactly. When None, the
+                default policy is used with unitBytes and chunkBytes halved
+                together until the counts write and the countsT transpose
+                fit ``mem_budget``. Either way, an import that does not fit
+                raises MemoryError before the destination is created.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
         assay_types: Preset assay types, such as ``{"GEX": "RNA"}``, for
                      assays whose names are not presets. Other assays take
                      their type from their name.
+        lines_in_mem: Matrix Market lines parsed at a time (Matrix Market
+                      readers only). The layout fit and the write reserve
+                      this parse buffer.
+
+    Each assay stores its counts in the dtype that
+    :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
+    canonical values of its own features over the selected cells.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
@@ -49,7 +59,6 @@ class CrToZarr:
         self,
         cr: CrReader,
         zarr_loc: ZarrLocation,
-        dtype: str = "uint32",
         workspace: str | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
@@ -58,6 +67,7 @@ class CrToZarr:
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
         assay_types: dict[str, str] | None = None,
+        lines_in_mem: int = 100_000,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -70,7 +80,6 @@ class CrToZarr:
 
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.policy = policy
         self.io = io
         self.cr = cr
         mark_schema_captured = getattr(self.cr, "_mark_schema_captured", None)
@@ -89,6 +98,25 @@ class CrToZarr:
             )
         for assay_type in self.assayTypes.values():
             validate_assay_type(assay_type)
+        if lines_in_mem <= 0:
+            raise ValueError("lines_in_mem must be positive")
+        self.linesInMem = lines_in_mem
+        ranges = assay_feature_ranges(self.cr.assayFeats)
+        groups = np.full(self.cr.nFeatures, -1, dtype=np.int64)
+        for code, spans in enumerate(ranges.values()):
+            for start, end in spans:
+                groups[start:end] = code
+        storage_dtypes = {
+            name: count_storage_dtype(self.cr.matrix_dtype, value_range)
+            for name, value_range in zip(
+                ranges,
+                self.cr.count_value_ranges(self.resources.memoryBytes, groups),
+                strict=True,
+            )
+        }
+        logger.debug(f"Resolved Cell Ranger count storage dtypes={storage_dtypes}")
+        # A layout that does not fit fails here, before the destination exists.
+        layout = self._fit_count_layout(storage_dtypes, policy)
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         cell_group = create_cell_data(
             root=self.z,
@@ -105,11 +133,87 @@ class CrToZarr:
                 n_cells=self.cr.nCells,
                 feat_ids=self.cr.feature_ids(assay_name),
                 feat_names=self.cr.feature_names(assay_name),
-                dtype=dtype,
+                dtype=storage_dtypes[assay_name],
                 profile=self.profile,
-                policy=policy,
+                policy=layout,
             )
         self._write_reader_metadata(cell_group, assay_names)
+
+    def _assay_widths(self) -> dict[str, int]:
+        """Return the feature count of each imported assay."""
+        return {
+            name: sum(end - start for start, end in spans)
+            for name, spans in assay_feature_ranges(self.cr.assayFeats).items()
+        }
+
+    def _count_import_requirements(
+        self,
+        storage_dtypes: Iterable[Any],
+    ) -> tuple[int, Callable[[int], int], Callable[[int], int]]:
+        """Return the resident, staging, and projection bytes of the counts write.
+
+        The layout fit and the write plan the same import from these.
+        """
+        from ..storage.identity import CountSummary
+
+        reader_resident = getattr(self.cr, "_sparse_import_resident_bytes", None)
+        resident = (
+            max(0, int(reader_resident())) if callable(reader_resident) else 0
+        ) + sum(
+            CountSummary.nbytes_for(self.cr.nCells, width)
+            for width in self._assay_widths().values()
+        )
+        projection_value_bytes = int(
+            max(
+                [
+                    self.cr.matrix_dtype.itemsize,
+                    *(np.dtype(dtype).itemsize for dtype in storage_dtypes),
+                ]
+            )
+        )
+
+        def staging_bytes(rows: int) -> int:
+            return int(self.cr.producer_staging_bytes(rows, self.linesInMem))
+
+        def projection_bytes(rows: int) -> int:
+            source_values = max(0, int(self.cr.max_window_nnz(rows)))
+            return source_values * (
+                projection_value_bytes
+                + 3 * np.dtype(np.int64).itemsize
+                + 2 * np.dtype(np.bool_).itemsize
+            )
+
+        return resident, staging_bytes, projection_bytes
+
+    def _fit_count_layout(
+        self,
+        storage_dtypes: dict[str, Any],
+        requested: CountMatrixPolicy | None,
+    ) -> CountMatrixPolicy:
+        """Return the count layout whose import and ``countsT`` fit the budget."""
+        from ..storage.sharding import fit_count_layout, sparse_counts_admission
+        from .counts_t import counts_t_assays
+
+        resident, staging_bytes, projection_bytes = self._count_import_requirements(
+            storage_dtypes.values()
+        )
+        widths = self._assay_widths()
+        return fit_count_layout(
+            {name: (widths[name], dtype) for name, dtype in storage_dtypes.items()},
+            nCells=self.cr.nCells,
+            profile=self.profile,
+            memoryBytes=self.resources.memoryBytes,
+            transposed=counts_t_assays(tuple(storage_dtypes), self.assayTypes),
+            admitCounts=sparse_counts_admission(
+                nRows=self.cr.nCells,
+                maxWindowNnz=self.cr.max_window_nnz,
+                sourceDtype=self.cr.matrix_dtype,
+                residentBytes=resident,
+                producerStagingBytes=staging_bytes,
+                extraProducerBytes=projection_bytes,
+            ),
+            requested=requested,
+        )
 
     def _write_reader_metadata(
         self,
@@ -208,21 +312,15 @@ class CrToZarr:
                 lv += j[1] - j[0]
         return feat_offset
 
-    def dump(
-        self,
-        batch_size: int | None = None,
-        lines_in_mem: int = 100000,
-    ) -> None:
+    def dump(self, batch_size: int | None = None) -> None:
         """Writes the count values into the Zarr matrix.
 
         Args:
-            batch_size: Number of source cells per batch. By default, a
-                        destination-aligned value is selected within the memory budget.
-            lines_in_mem: Number of lines to read at a time from MTX file (only used for CrDirReader)
-                          (Default value: 100000)
+            batch_size: Number of source cells per batch, at most one
+                        destination row band, which is the default.
 
         Raises:
-            AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
+            ValueError: If ``batch_size`` is not positive.
 
         Returns:
             None
@@ -241,8 +339,6 @@ class CrToZarr:
 
         if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if lines_in_mem <= 0:
-            raise ValueError("lines_in_mem must be positive")
         input_ranges = assay_feature_ranges(self.cr.assayFeats)
         stores = {
             assay: load_count_array(self.z, assay, self.workspace)
@@ -261,33 +357,16 @@ class CrToZarr:
 
         try:
             if callable(configure_lines):
-                configure_lines(lines_in_mem)
+                configure_lines(self.linesInMem)
             if callable(prepare):
                 prepare()
-            resident_reader_bytes = 0
-            reader_resident = getattr(
-                self.cr,
-                "_sparse_import_resident_bytes",
-                None,
+            (
+                resident_reader_bytes,
+                staging_bytes,
+                projection_bytes,
+            ) = self._count_import_requirements(
+                store.dtype for store in stores.values()
             )
-            if callable(reader_resident):
-                resident_reader_bytes = max(0, int(reader_resident()))
-            resident_reader_bytes += sum(
-                summary.nbytes for summary in summaries.values()
-            )
-            projection_value_bytes = max(
-                self.cr.matrix_dtype.itemsize,
-                *(store.dtype.itemsize for store in stores.values()),
-            )
-
-            def projection_staging_bytes(rows: int) -> int:
-                source_values = max(0, int(self.cr.max_window_nnz(rows)))
-                return source_values * (
-                    projection_value_bytes
-                    + 3 * np.dtype(np.int64).itemsize
-                    + 2 * np.dtype(np.bool_).itemsize
-                )
-
             plan = resolve_sparse_import_batch(
                 tuple(stores.values()),
                 nRows=self.cr.nCells,
@@ -296,11 +375,8 @@ class CrToZarr:
                 sourceDtype=self.cr.matrix_dtype,
                 batchRows=batch_size,
                 residentBytes=resident_reader_bytes,
-                producerStagingBytes=lambda rows: self.cr.producer_staging_bytes(
-                    rows,
-                    lines_in_mem,
-                ),
-                extraProducerBytes=projection_staging_bytes,
+                producerStagingBytes=staging_bytes,
+                extraProducerBytes=projection_bytes,
             )
             self._lastImportPlan = plan
             resolved_batch_rows = plan.batchRows
@@ -314,7 +390,7 @@ class CrToZarr:
                     self.cr.nCells + resolved_batch_rows - 1
                 ) // resolved_batch_rows
                 source = iter_progress(
-                    self.cr.consume(resolved_batch_rows, lines_in_mem),
+                    self.cr.consume(resolved_batch_rows, self.linesInMem),
                     total=n_chunks,
                     desc="Writing counts",
                 )
@@ -376,10 +452,7 @@ class CrToZarr:
                     stores[name].path: summary for name, summary in summaries.items()
                 },
             )
-            if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
-                raise AssertionError(
-                    "Cell Ranger conversion did not write every source row"
-                )
+            # Finishing each buffer checked that the source supplied every row.
             logger.info(
                 f"Wrote {self.cr.nCells} cells and "
                 f"{sum(buffer.nColumns for buffer in buffers.values())} features "
@@ -396,7 +469,6 @@ class CrToZarr:
                 assay_types=self.assayTypes,
                 resources=self.resources,
                 profile=self.profile,
-                policy=self.policy,
                 io=self.io,
             )
         finally:

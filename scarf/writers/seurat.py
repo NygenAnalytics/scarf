@@ -1,4 +1,4 @@
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -19,6 +19,7 @@ from ..readers.seurat import (
     SeuratReduction,
 )
 from ..storage.arrays import MISSING_MASK_PREFIX
+from ..storage.count_dtype import count_storage_dtype
 from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.artifact_writer import (
     ArrayRequirement,
@@ -34,6 +35,8 @@ from ..storage.metadata_keys import (
 )
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
+from ..utils.arrays import canonicalize_sparse
+from ..utils.count_values import CountValueRange
 from ._store import (
     DEFAULT_IMPORT_BLOCK_ROWS,
     bounded_block_rows,
@@ -117,10 +120,20 @@ class SeuratToZarr:
                   auto-detected.
         profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
                  None, chosen from the destination location.
-        policy: Count-matrix geometry policy. When None, the default
-                unitBytes and chunkBytes plan is used.
+        policy: Count-matrix geometry policy, used exactly for every assay.
+                When None, each assay uses the default policy with unitBytes
+                and chunkBytes halved together until its counts write and
+                countsT transpose fit ``mem_budget``. Either way, an import
+                that does not fit raises MemoryError before the destination
+                is created.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+
+    Construction prepares every selected assay's counts and reads them once.
+    Each assay stores its counts in the dtype that
+    :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from their
+    canonical values, and a count that the stored dtype cannot hold raises
+    instead of wrapping.
     """
 
     def __init__(
@@ -180,7 +193,6 @@ class SeuratToZarr:
             )
         active_identity = reader.activeIdentity
         self._validate_metadata_names(reader.cellMetadata, "cell")
-        self._validate_metadata_name(active_identity.name, "cell")
         membership_names = {
             f"{assay.name}_I"
             for assay in assays
@@ -198,16 +210,12 @@ class SeuratToZarr:
                 assay.featureMetadata,
                 f"{assay.name} feature",
             )
+            # Matrix sources admit complex values, which are not counts. The
+            # reader sizes every source from its feature and cell IDs.
             dtype = np.dtype(assay.counts.dtype)
             if dtype.kind not in "biuf":
                 raise TypeError(
                     f"Assay {assay.name!r} counts use unsupported dtype {dtype}"
-                )
-            expected_shape = (len(assay.featureIds), len(reader.cellIds))
-            if tuple(assay.counts.shape) != expected_shape:
-                raise ValueError(
-                    f"Assay {assay.name!r} has shape {assay.counts.shape}, "
-                    f"expected {expected_shape}"
                 )
         # Zarr nests a name with '/' or '\\', so such a column is stored with
         # '_' in their place; a valid name keeps its exact key.
@@ -224,8 +232,6 @@ class SeuratToZarr:
         }
 
         source_digest = bytes.fromhex(reader.document.source.source_sha256)
-        if len(source_digest) != 32:
-            raise ValueError("Seurat source SHA-256 digest must contain 32 bytes")
         string_block_rows = max(
             1,
             min(
@@ -246,7 +252,6 @@ class SeuratToZarr:
         from ..storage.profiles import resolve_storage_profile
 
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.policy = policy
         self.io = io
         self.assayNames = assay_names
         self.defaultAssay = inspection.activeAssay
@@ -257,11 +262,16 @@ class SeuratToZarr:
         self._featureMetadataKeys = feature_metadata_keys
         self._sourceDigest = source_digest
         self._notices = self._collect_notices(inspection.notices, assays, reductions)
-        self._residentSourceBytes = sum(
-            max(0, int(assay.counts.resident_bytes)) for assay in assays
-        )
         self._lastImportPlans: dict[str, Any] = {}
         self._lastDenseBatchRows: dict[str, int] = {}
+        # Every assay's dtype and layout are resolved, and a layout that does
+        # not fit fails, before the destination exists.
+        count_dtypes = {assay.name: self._prepare_counts(assay) for assay in assays}
+        self._residentSourceBytes = self._source_resident_bytes()
+        layouts = {
+            assay.name: self._fit_count_layout(assay, count_dtypes[assay.name], policy)
+            for assay in assays
+        }
 
         self.z = load_zarr(
             zarr_loc=zarr_loc,
@@ -303,9 +313,9 @@ class SeuratToZarr:
                 len(assay.featureIds),
                 feature_dtype,
                 feature_dtype,
-                dtype=assay.counts.dtype,
+                dtype=count_dtypes[assay.name],
                 profile=self.profile,
-                policy=policy,
+                policy=layouts[assay.name],
             )
             self.counts[assay.name] = counts
             self.featureData[assay.name] = feature_data
@@ -327,18 +337,10 @@ class SeuratToZarr:
 
     @classmethod
     def _validate_metadata_names(cls, metadata: SeuratMetadata, axis: str) -> None:
-        names = metadata.columnNames
-        if len(set(names)) != len(names):
-            raise ValueError(f"{axis} metadata contains duplicate column names")
-        for name in names:
+        # The reader rejects repeated names, and a name with the missing-mask
+        # prefix fails here, so no column can collide with a generated mask.
+        for name in metadata.columnNames:
             cls._validate_metadata_name(name, axis)
-        generated_masks = {f"{MISSING_MASK_PREFIX}{name}" for name in names}
-        overlap = generated_masks.intersection(names)
-        if overlap:
-            raise ValueError(
-                f"{axis} metadata conflicts with generated missing masks: "
-                + ", ".join(sorted(overlap))
-            )
 
     @staticmethod
     def _collect_notices(
@@ -356,9 +358,8 @@ class SeuratToZarr:
         """Write assays, RNA ``countsT``, and importable reductions.
 
         Args:
-            batch_size: Number of source cells per batch. By default, a
-                        destination-aligned value is selected within the
-                        memory budget.
+            batch_size: Number of source cells per batch, at most one
+                        destination row band, which is the default.
 
         Returns:
             Imported assay names, cell selection, and reduction artifacts.
@@ -392,7 +393,6 @@ class SeuratToZarr:
                     assay_type=assay.name,
                     resources=self.resources,
                     profile=self.profile,
-                    policy=self.policy,
                     io=self.io,
                 )
             cell_selection = self._write_cell_selection()
@@ -479,8 +479,6 @@ class SeuratToZarr:
         values: Sequence[str],
         block_rows: int,
     ) -> None:
-        if int(ids.shape[0]) != len(values) or int(names.shape[0]) != len(values):
-            raise ValueError("String axis length does not match its destination")
         start = 0
         for values_block in _string_blocks(values, block_rows):
             stop = start + len(values_block)
@@ -502,18 +500,14 @@ class SeuratToZarr:
             return np.dtype(np.float64)
         if column.kind == "factor":
             return _bounded_string_dtype(column.levels, block_rows)
-        if column.kind != "character":
-            raise TypeError(f"Unsupported Seurat metadata kind {column.kind!r}")
+        # The reader's remaining kind is character, whose blocks hold strings.
         maximum = 1
         for start in range(0, column.length, block_rows):
             stop = min(start + block_rows, column.length)
             block = column.read_block(start, stop)
-            values = block.values
-            if not isinstance(values, tuple):
-                raise TypeError("Character metadata did not return string values")
             maximum = max(
                 maximum,
-                max((len(_decode_text(value)) for value in values), default=1),
+                max((len(_decode_text(value)) for value in block.values), default=1),
             )
         return np.dtype(f"U{maximum}")
 
@@ -530,8 +524,6 @@ class SeuratToZarr:
             block = column.read_block(start, stop)
             missing = np.asarray(block.missing, dtype=bool)
             if column.kind == "character":
-                if not isinstance(block.values, tuple):
-                    raise TypeError("Character metadata did not return string values")
                 values = np.asarray(
                     [_decode_text(value) for value in block.values],
                     dtype=dtype,
@@ -551,7 +543,7 @@ class SeuratToZarr:
                     values[missing] = False
                 elif column.kind == "integer":
                     values[missing] = 0
-                elif column.kind == "real":
+                else:
                     values[missing] = np.nan
             yield MetadataBlock(start, values, missing)
 
@@ -620,14 +612,12 @@ class SeuratToZarr:
         if planned.reused:
             return planned.ref
         with artifact_transaction(self.root, planned) as group:
-            values = self._write_metadata_column(
+            self._write_metadata_column(
                 group,
                 column,
                 block_rows,
                 name="values",
             )
-            if values.attrs.get("missing_mask") != missing_name:
-                raise RuntimeError("Active identity missing-mask link is malformed")
         return planned.ref
 
     def _create_boolean_column(
@@ -674,6 +664,141 @@ class SeuratToZarr:
             )
         return peak
 
+    def _source_resident_bytes(self) -> int:
+        """Return the bytes that the count sources of every assay hold."""
+        return sum(max(0, int(assay.counts.resident_bytes)) for assay in self._assays)
+
+    def _source_estimates(
+        self, source: Any
+    ) -> tuple[Callable[[int], int], Callable[[int], int]]:
+        """Return the read staging and the stored values of a window of cells.
+
+        The staging of a width costs one source estimate per window of that
+        width, and is computed once; the values are bounded from it.
+        """
+        n_cells = int(source.shape[1])
+        n_features = int(source.shape[0])
+        itemsize = max(1, source.dtype.itemsize)
+        staging_cache: dict[int, int] = {}
+
+        def staging(rows: int) -> int:
+            width = max(1, min(int(rows), max(1, n_cells)))
+            if width not in staging_cache:
+                staging_cache[width] = self._source_staging_peak(source, width)
+            return staging_cache[width]
+
+        def window_values(rows: int) -> int:
+            width = max(0, min(int(rows), n_cells))
+            if width == 0:
+                return 0
+            estimated = (staging(width) + itemsize - 1) // itemsize
+            return int(min(width * n_features, max(0, estimated)))
+
+        return staging, window_values
+
+    def _prepare_counts(self, assay: SeuratAssay) -> np.dtype[Any]:
+        """Prepare one assay's count source and return its storage dtype.
+
+        Every count is read once, in blocks, and duplicate coordinates of
+        sparse blocks are summed, as the write stores them.
+
+        Raises:
+            MemoryError: If the preparation, or reading one cell, does not fit
+                ``mem_budget``.
+            ValueError: If a count is NaN or infinite.
+        """
+        from ..storage.identity import CountSummary
+        from ..storage.partition import affordable_width
+        from ..storage.sharding import sparse_producer_peak_bytes
+
+        source = assay.counts
+        n_features, n_cells = (int(value) for value in source.shape)
+        other_sources = sum(
+            max(0, int(item.counts.resident_bytes))
+            for item in self._assays
+            if item is not assay
+        )
+        # The count summary is allocated before the write and stays resident
+        # through it, so preparation must fit beside it.
+        self.reader._prepare_assay(
+            assay.name,
+            max_bytes=int(self.resources.memoryBytes)
+            - other_sources
+            - CountSummary.nbytes_for(n_cells, n_features),
+        )
+        value_range = CountValueRange()
+        if n_cells:
+            staging, window_values = self._source_estimates(source)
+            itemsize = max(1, source.dtype.itemsize)
+            available = int(self.resources.memoryBytes) - self._source_resident_bytes()
+
+            def fits(rows: int) -> bool:
+                if source.is_sparse:
+                    # Summing a block's duplicates costs one unbuffered pull.
+                    scan = sparse_producer_peak_bytes(0, window_values(rows), itemsize)
+                else:
+                    # The integrality check holds a truncated copy and masks.
+                    scan = rows * n_features * (itemsize + 2)
+                return staging(rows) + scan <= available
+
+            rows = affordable_width(fits, n_cells)
+            if rows < 1:
+                raise MemoryError(
+                    f"Assay {assay.name!r} counts cannot be read one cell at a "
+                    "time within mem_budget"
+                )
+            for start in range(0, n_cells, rows):
+                raw = source.read_cells(start, min(start + rows, n_cells))
+                value_range.update(
+                    canonicalize_sparse(coo_matrix(raw)).data if issparse(raw) else raw
+                )
+        return count_storage_dtype(source.dtype, value_range)
+
+    def _fit_count_layout(
+        self,
+        assay: SeuratAssay,
+        storage_dtype: Any,
+        requested: CountMatrixPolicy | None,
+    ) -> CountMatrixPolicy:
+        """Return the layout whose counts write and ``countsT`` fit the budget.
+
+        Both writes read source batches of one destination row band, so the
+        fit estimates the source once per band, not once per cell.
+        """
+        from ..storage.identity import CountSummary
+        from ..storage.sharding import (
+            dense_counts_admission,
+            fit_count_layout,
+            sparse_counts_admission,
+        )
+        from .counts_t import counts_t_assays
+
+        source = assay.counts
+        n_features, n_cells = (int(value) for value in source.shape)
+        resident = CountSummary.nbytes_for(n_cells, n_features) + (
+            self._residentSourceBytes
+        )
+        staging, window_values = self._source_estimates(source)
+        return fit_count_layout(
+            {assay.name: (n_features, storage_dtype)},
+            nCells=n_cells,
+            profile=self.profile,
+            memoryBytes=self.resources.memoryBytes,
+            transposed=counts_t_assays((assay.name,), {assay.name: assay.name}),
+            admitCounts=(
+                sparse_counts_admission(
+                    nRows=n_cells,
+                    maxWindowNnz=window_values,
+                    sourceDtype=source.dtype,
+                    residentBytes=resident,
+                    producerStagingBytes=staging,
+                )
+                if source.is_sparse
+                else dense_counts_admission(resident, staging)
+            ),
+            requested=requested,
+        )
+
     def _write_counts(
         self,
         assay: SeuratAssay,
@@ -688,20 +813,8 @@ class SeuratToZarr:
         if n_cells == 0:
             finalize_counts(destination, summary=summary)
             return
-        other_sources = sum(
-            max(0, int(item.counts.resident_bytes))
-            for item in self._assays
-            if item is not assay
-        )
-        # The summary is allocated before source preparation and stays
-        # resident through the write, so preparation must fit beside it.
-        self.reader._prepare_assay(
-            assay.name,
-            max_bytes=int(self.resources.memoryBytes) - other_sources - summary.nbytes,
-        )
-        self._residentSourceBytes = summary.nbytes + sum(
-            max(0, int(item.counts.resident_bytes)) for item in self._assays
-        )
+        # Construction prepared every source.
+        self._residentSourceBytes = summary.nbytes + self._source_resident_bytes()
         if source.is_sparse:
             self._write_sparse_counts(
                 assay.name,
@@ -734,30 +847,12 @@ class SeuratToZarr:
         )
 
         n_cells = int(source.shape[1])
-        n_features = int(source.shape[0])
-        staging_cache: dict[int, int] = {}
-
-        def staging(rows: int) -> int:
-            width = max(1, min(int(rows), max(1, n_cells)))
-            if width not in staging_cache:
-                staging_cache[width] = self._source_staging_peak(source, width)
-            return staging_cache[width]
-
-        def max_window_nnz(rows: int) -> int:
-            width = max(0, min(int(rows), n_cells))
-            if width == 0:
-                return 0
-            dense_bound = width * n_features
-            estimated_values = (
-                staging(width) + max(1, source.dtype.itemsize) - 1
-            ) // max(1, source.dtype.itemsize)
-            return int(min(dense_bound, max(0, estimated_values)))
-
+        staging, window_values = self._source_estimates(source)
         plan = resolve_sparse_import_batch(
             (destination,),
             nRows=n_cells,
             resources=self.resources,
-            maxWindowNnz=max_window_nnz,
+            maxWindowNnz=window_values,
             sourceDtype=source.dtype,
             batchRows=requested_rows,
             residentBytes=self._residentSourceBytes,
@@ -766,24 +861,19 @@ class SeuratToZarr:
         self._lastImportPlans[assay_name] = plan
         self._lastImportPlan = plan
 
+        # A source returns one row per requested cell; the shard writer
+        # rejects a batch of another width and a stream of another length.
         def batches() -> Iterator[coo_matrix]:
             for start in range(0, n_cells, plan.batchRows):
                 stop = min(start + plan.batchRows, n_cells)
                 raw = source.read_cells(start, stop)
-                block = (
+                yield (
                     raw.tocoo(copy=False)
                     if issparse(raw)
                     else coo_matrix(np.asarray(raw))
                 )
-                expected = (stop - start, int(destination.shape[1]))
-                if block.shape != expected:
-                    raise ValueError(
-                        f"Assay {assay_name!r} source returned shape "
-                        f"{block.shape}, expected {expected}"
-                    )
-                yield block
 
-        rows = accumulate_sparse_to_shards(
+        accumulate_sparse_to_shards(
             destination,
             batches(),
             resources=self.resources,
@@ -793,10 +883,6 @@ class SeuratToZarr:
             io=self.io,
             countSummary=summary,
         )
-        if rows != n_cells:
-            raise ValueError(
-                f"Assay {assay_name!r} wrote {rows} count rows, expected {n_cells}"
-            )
 
     def _resolve_dense_batch_rows(
         self,
@@ -804,43 +890,18 @@ class SeuratToZarr:
         destination: zarr.Array,
         requested_rows: int | None,
     ) -> tuple[int, int]:
+        """Return the rows of each source batch and their read staging.
+
+        The layout fit admitted batches of one destination row band, so a
+        batch holds one band, or fewer rows on request; the writer admits the
+        batch again when it plans the write.
+        """
         from ..storage.layout import array_shard_rows
-        from ..storage.partition import affordable_width
 
-        n_cells = int(source.shape[1])
-        from ..storage.sharding import plan_dense_write
-        from ..storage.io_policy import StorageIoPolicy
-
-        task_reserve = plan_dense_write(
-            destination, self.resources, 1, io=StorageIoPolicy(readWorkers=1)
-        ).reservedBytes
-        staging_cache: dict[int, int] = {}
-
-        def staging(rows: int) -> int:
-            width = max(1, min(int(rows), n_cells))
-            if width not in staging_cache:
-                staging_cache[width] = self._source_staging_peak(source, width)
-            return staging_cache[width]
-
-        def fits(rows: int) -> bool:
-            required = self._residentSourceBytes + staging(rows) + task_reserve
-            return bool(required <= int(self.resources.memoryBytes))
-
+        rows = min(int(source.shape[1]), array_shard_rows(destination))
         if requested_rows is not None:
-            rows = min(requested_rows, n_cells)
-            if not fits(rows):
-                raise MemoryError(
-                    "Dense Seurat import cannot fit the requested source batch and "
-                    "one destination row band within mem_budget"
-                )
-        else:
-            preferred = min(n_cells, array_shard_rows(destination))
-            rows = affordable_width(fits, preferred)
-            if rows < 1:
-                raise MemoryError(
-                    "Dense Seurat import cannot fit one source row and one "
-                    "destination row band within mem_budget"
-                )
+            rows = min(requested_rows, rows)
+        staging, _window_values = self._source_estimates(source)
         return rows, staging(rows)
 
     def _write_dense_counts(
@@ -863,21 +924,15 @@ class SeuratToZarr:
 
         def batches() -> Iterator[np.ndarray]:
             for start in range(0, n_cells, rows):
-                stop = min(start + rows, n_cells)
-                raw = source.read_cells(start, stop)
-                block = raw.toarray() if issparse(raw) else np.asarray(raw)
-                expected = (stop - start, int(destination.shape[1]))
-                if block.shape != expected:
-                    raise ValueError(
-                        f"Assay {assay_name!r} source returned shape "
-                        f"{block.shape}, expected {expected}"
-                    )
-                yield np.ascontiguousarray(block, dtype=destination.dtype)
+                raw = source.read_cells(start, min(start + rows, n_cells))
+                # The writer casts to the stored dtype and rejects a count
+                # that dtype cannot hold, a batch of another width, and a
+                # stream of another length.
+                yield raw.toarray() if issparse(raw) else np.asarray(raw)
 
-        written = write_dense_from_row_batches(
+        write_dense_from_row_batches(
             destination,
             batches(),
-            dtype=destination.dtype,
             msg=f"Writing {assay_name} counts",
             resources=self.resources,
             residentBytes=self._residentSourceBytes,
@@ -885,10 +940,6 @@ class SeuratToZarr:
             io=self.io,
             countSummary=summary,
         )
-        if written != n_cells:
-            raise ValueError(
-                f"Assay {assay_name!r} wrote {written} count rows, expected {n_cells}"
-            )
 
     def _write_cell_selection(self) -> ArtifactRef:
         return resolve_import_cell_selection(

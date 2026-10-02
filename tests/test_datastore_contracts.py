@@ -16,6 +16,7 @@ _METHODS = {
         "list_artifacts",
         "load_artifact",
         "snapshot_cell_selection",
+        "snapshot_cluster_labels",
         "summary",
     ),
     GraphDataStore: (
@@ -94,7 +95,7 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "b0a25c0e7fcf56aeddafc4a7436f7cb049dcbf9175ba8cb41365c3d878ac30b0",
+    BaseDataStore: "ed758756696c842110d059b33078b31d7549044b0b5d9537bfe89cfc3563e4b8",
     GraphDataStore: "0e3510e49b10db97e8e0cda982d629791dcd748f4f5130e4d3ebcfb9d2b9fa7d",
     MappingDatastore: "a4839ac0372df95f021fd8c383c1ac2aff6796c6b093e05510c71ad7e8449a72",
     DataStore: "e3df7f866e8852021d53ca50bc0b6488923c59d8b8728542f639ba0063333944",

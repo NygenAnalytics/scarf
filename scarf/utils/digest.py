@@ -30,6 +30,10 @@ def summarize_rows(
     ``bits`` is the unsigned-integer view of ``values``. Zero entries are
     skipped, so digests depend only on each row's sparse content. Positive
     entries are counted per row and added to ``column_positive``.
+
+    Raises:
+        ValueError: If a value is NaN or infinite. Count matrices hold finite
+            values; the check compiles away for integer values.
     """
     for row in range(values.shape[0]):
         first = np.uint64(0x243F6A8885A308D3)
@@ -40,6 +44,10 @@ def summarize_rows(
         for column in range(values.shape[1]):
             value = values[row, column]
             if value != 0:
+                if not np.isfinite(value):
+                    raise ValueError(
+                        "Count matrices must hold finite values; found NaN or infinity"
+                    )
                 key = _mix(
                     ((np.uint64(column) + np.uint64(1)) * _GOLDEN)
                     ^ np.uint64(bits[row, column])

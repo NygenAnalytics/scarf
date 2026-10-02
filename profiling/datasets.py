@@ -1100,7 +1100,7 @@ def validate_prepared_h5ad(
             raise ValueError(
                 "Scarf H5adReader dimensions do not match prepared artifact"
             )
-        if np.dtype(reader.matrixDtype) != np.dtype(expectedDataDtype):
+        if np.dtype(reader.sourceMatrixDtype) != np.dtype(expectedDataDtype):
             raise ValueError("Scarf H5adReader sees an unexpected data dtype")
     finally:
         reader.h5.close()

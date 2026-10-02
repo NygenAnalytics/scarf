@@ -104,8 +104,9 @@ Counts are streamed in blocks.
 RNA assays also store a gene-major `countsT` copy so gene-wise stages such as highly variable feature selection and marker search can stream by gene.
 `mem_budget` shapes block size, write concurrency, and automatically sized feature batches.
 
-`mem_budget` is a planning input, not a hard cap on process memory.
-Graph structures, native libraries, Python objects, and allocator overhead consume memory in addition to the streamed blocks, so leave host headroom.
+Each operation reserves its streamed blocks, Zarr's copies of them and the chunks it decodes, kernel scratch, and results within `mem_budget`.
+Memory the process already holds when an operation starts is not subtracted, so a process can peak at its resident memory plus the budget.
+Zarr can also hold a decoded chunk or the compressed bytes of a chunk briefly outside these reservations, and glibc can keep freed buffers of 32 MiB or less resident unless `MALLOC_MMAP_THRESHOLD_` is set; leave host headroom.
 A smaller budget generally reduces peak memory and increases wall time.
 
 Measured end-to-end timings and peak memory across input sizes are in {doc}`concepts/benchmarks`.

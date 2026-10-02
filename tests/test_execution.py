@@ -51,6 +51,32 @@ def test_plan_operation_caps_inner_reads() -> None:
     assert plan.reservedBytes == 6 * 1024 * 1024
 
 
+def test_units_in_flight_share_the_requested_read_width() -> None:
+    shape = WorkShape(
+        nUnits=8,
+        unitBytes=100,
+        innerReadBytes=10,
+        maxInnerReads=16,
+        maxUnitsInFlight=2,
+        ordered=True,
+    )
+    request = StorageIoPolicy(readWorkers=32)
+
+    # The units in flight stop at two, and their inner reads make up the
+    # requested width instead of being capped at the unit count.
+    full = plan_operation(ResourceBudget(10_000, 4), shape, policy=request)
+    assert (full.readWorkers, full.innerReads) == (2, 16)
+    assert full.reservedBytes == 2 * 100 + 2 * 16 * 10
+    assert full.reductionReason is None
+
+    tight = plan_operation(ResourceBudget(400, 4), shape, policy=request)
+    assert (tight.readWorkers, tight.innerReads) == (2, 10)
+    assert tight.reservedBytes <= 400
+    assert tight.reductionReason == (
+        "20 reads used because each unit needs 100 bytes and each read 10 bytes"
+    )
+
+
 def test_plan_operation_couples_writers_to_memory_bounded_inner_reads() -> None:
     resources = ResourceBudget(10 * 1024 * 1024, 8)
     plan = plan_operation(
@@ -269,6 +295,8 @@ def test_detect_external_thread_caps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMP_NUM_THREADS", "not-an-int")
     caps = detect_external_thread_caps()
     assert "OMP_NUM_THREADS" not in caps
+    monkeypatch.setenv("OMP_NUM_THREADS", "0")
+    assert "OMP_NUM_THREADS" not in detect_external_thread_caps()
 
 
 def test_write_counts_t_records_execution_report() -> None:
@@ -310,7 +338,6 @@ def test_write_counts_t_records_execution_report() -> None:
         write_counts_t(
             counts,
             group,
-            policy=policy,
             resources=ResourceBudget(16 * 1024 * 1024, 4),
         )
     assert reports

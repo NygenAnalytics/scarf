@@ -1731,3 +1731,44 @@ def test_terminal_records_survive_a_wall_clock_step_back(monkeypatch) -> None:
 
     assert stage.finished_at_ns == started
     assert failed.finished_at_ns == started
+
+
+def test_completed_records_with_overlapping_stage_windows_still_read() -> None:
+    # Earlier releases ran UMAP beside later stages, so a stored run can hold
+    # stage windows that overlap.
+    root = _root()
+    run = create_pipeline_run_record(
+        root,
+        recipe="basic_rna_analysis",
+        requested_label=None,
+        assay="RNA",
+        config={},
+        stage_order=("umap", "leiden_1.0"),
+        scarf_version="1.0.0",
+        started_at_ns=100,
+    )
+    windows = [(110, 200), (120, 130)]
+    for ordinal, (started_at_ns, finished_at_ns) in enumerate(windows):
+        start_pipeline_stage_record(
+            root,
+            run_id=run.run_id,
+            ordinal=ordinal,
+            stage=run.stage_order[ordinal],
+            started_at_ns=started_at_ns,
+        )
+        finish_pipeline_stage_record(
+            root,
+            run_id=run.run_id,
+            ordinal=ordinal,
+            status="completed",
+            metrics=_metrics(),
+            finished_at_ns=finished_at_ns,
+        )
+    complete_pipeline_run_record(
+        root, run_id=run.run_id, outputs=(), fields=(), finished_at_ns=210
+    )
+
+    stages = load_pipeline_stage_records(root, run.run_id)
+    assert [(stage.started_at_ns, stage.finished_at_ns) for stage in stages] == windows
+    completed = PipelineRun(_Owner(root), load_pipeline_run_record(root, run.run_id))
+    assert completed.report()["run"]["status"] == "completed"
