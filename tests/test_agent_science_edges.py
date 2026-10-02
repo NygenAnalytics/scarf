@@ -450,7 +450,7 @@ def test_finalist_quantifies_mixing_support_and_doublets_from_frozen_rows(
     assert result["metrics"] == {
         "mixing": {"batch": 0.5},
         "protection": {"condition": {"cLISI": 0.9, "graphConnectivity": 0.8}},
-        "markerCoherence": 1.0,
+        "markerSupportFraction": 1.0,
         "markerSpecificityMedian": 0.8,
         "doubletHighScoreConcentration": 2.0,
         "crossUnitSupport": 1.0,
@@ -504,6 +504,9 @@ def test_incomplete_diagnostics_are_missing_evidence_not_correction_support(
         assert result["diagnosticScope"]["sampleCells"] == 2
         assert any("rare populations" in item for item in result["limitations"])
         assert result["clusters"][1]["doubletScoreMedian"] is None
+        # Sample support remains full-cohort even when the coordinate sample
+        # misses an entire cluster.
+        assert all(cluster["sampleCount"] == 2 for cluster in result["clusters"])
 
 
 @pytest.mark.parametrize("failure", ["missing", "blank", "single", "length"])
@@ -545,7 +548,7 @@ def test_sample_support_rejects_missing_or_unaligned_sample_identity(
         ("batch-value", "Batch mixing evidence is unavailable"),
         ("protection", "biological protection evidence is missing"),
         ("protection-value", "Biological protection cLISI is unavailable"),
-        ("coherence", "Matched markerCoherence evidence is unavailable"),
+        ("coherence", "Matched markerSupportFraction evidence is unavailable"),
         ("specificity", "Matched marker specificity evidence is unavailable"),
         ("specificity-harm", "Marker specificity worsened"),
     ],
@@ -565,7 +568,7 @@ def test_correction_gate_rejects_missing_or_wrong_direction_metrics(
     elif damage == "protection-value":
         corrected["metrics"]["protection"]["condition"]["cLISI"] = None
     elif damage == "coherence":
-        corrected["metrics"]["markerCoherence"] = None
+        corrected["metrics"]["markerSupportFraction"] = None
     elif damage == "specificity":
         corrected["metrics"]["markerSpecificityMedian"] = None
     else:

@@ -80,7 +80,7 @@ def _matched() -> tuple[dict[str, Any], dict[str, Any]]:
         "metrics": {
             "mixing": {"batch": 0.3},
             "protection": {"condition": {"cLISI": 0.9, "graphConnectivity": 0.9}},
-            "markerCoherence": 0.9,
+            "markerSupportFraction": 0.9,
             "markerSpecificityMedian": 0.8,
             "doubletHighScoreConcentration": 2.0,
             "crossUnitSupport": 0.9,
@@ -128,7 +128,7 @@ def test_harmony_rejects_mismatch_missing_evidence_and_harm(damage: str) -> None
     elif damage == "biology":
         corrected["metrics"]["protection"]["condition"]["cLISI"] = 0.7
     elif damage == "marker":
-        corrected["metrics"]["markerCoherence"] = 0.7
+        corrected["metrics"]["markerSupportFraction"] = 0.7
     elif damage == "sample":
         corrected["metrics"]["crossUnitSupport"] = 0.7
     else:
@@ -200,6 +200,9 @@ def test_candidate_summary_caps_silhouette_and_preserves_unscoreable_partitions(
         )
 
     monkeypatch.setattr(cluster_selection, "select_clusters_by_silhouette", selector)
+    monkeypatch.setattr(
+        "scarf.agent.execution.representation_diagnostics", lambda *args: {}
+    )
     evidence = summarize_candidate(
         store,
         run,

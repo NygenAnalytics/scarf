@@ -42,6 +42,20 @@ def annotations(records: RunRecords) -> list[dict[str, Any]]:
     return list(saved["annotations"])
 
 
+def exploration_coverage(records: RunRecords) -> dict[str, Any] | None:
+    """Read recorded exploration coverage without inferring historical checks."""
+    event = records.latest("explorationCoverage")
+    if event is not None:
+        return dict(event["coverage"])
+    explored = stage_data(records, "explore")
+    return explored.get("explorationCoverage") if explored else None
+
+
+def decision_resolutions(records: RunRecords) -> list[dict[str, Any]]:
+    """Keep policy resolutions distinct from accepted provider responses."""
+    return [event for event in records.events() if event["kind"] == "decisionResolved"]
+
+
 def summary(records: RunRecords) -> dict[str, Any]:
     """Collect inspectable provenance without contacting a numerical store."""
     events = records.events()
@@ -126,6 +140,9 @@ def summary(records: RunRecords) -> dict[str, Any]:
         "inputCells": prepared.get("inputCells"),
         "retainedCells": prepared.get("retainedCells"),
         "qcFlags": prepared.get("qcFlags", {}),
+        "explorationCoverage": exploration_coverage(records),
+        "decisionResolutions": decision_resolutions(records),
+        "resolvedRoles": prepared.get("resolvedRoles"),
         "diagnostics": diagnostics,
         "rejectedCorrections": rejected,
         "pendingQuestions": current.get("questions", [])

@@ -110,6 +110,20 @@ def test_missing_cached_finalist_rejects_relocation_before_recording_answers(
 
     async def ask_about_finalists(messages: Any, info: Any) -> ModelResponse:
         payload = json.loads(messages[-1].parts[-1].content)
+        if payload["stage"] == "explore":
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "decision",
+                        {
+                            "action": "shortlist",
+                            "optionIds": ["c0:r0.5", "c0:r0.75"],
+                            "evidenceIds": ["c0:r0.5", "c0:r0.75"],
+                            "rationale": "Compare both measured granularities",
+                        },
+                    )
+                ]
+            )
         if payload["stage"] == "finalists":
             return ModelResponse(
                 parts=[
@@ -118,7 +132,12 @@ def test_missing_cached_finalist_rejects_relocation_before_recording_answers(
                         {
                             "action": "defer",
                             "question": "Which compartment is the intended focus?",
-                            "rationale": "One essential study fact remains unresolved",
+                            "rationale": "Both measured granularities remain acceptable",
+                            "deferralReason": "ambiguousSelection",
+                            "acceptableOptionIds": payload["evidence"][
+                                "eligibleOptions"
+                            ],
+                            "evidenceIds": payload["evidence"]["eligibleOptions"],
                         },
                     )
                 ]
@@ -127,7 +146,7 @@ def test_missing_cached_finalist_rejects_relocation_before_recording_answers(
 
     result = _analyze(science, tmp_path, FunctionModel(ask_about_finalists))
     assert result.status == "needsInput"
-    assert len(science.calls) == 2
+    assert len(science.calls) == 3
     question = result.pending_questions[0]
     records = RunRecords(result.run_dir)
     before = records.events()
@@ -151,7 +170,7 @@ def test_missing_cached_finalist_rejects_relocation_before_recording_answers(
     assert reopened.source == science.source
     assert reopened.pending_questions == [question]
     assert observed == []
-    assert len(science.calls) == 2
+    assert len(science.calls) == 3
 
 
 def test_context_paused_relocation_rejects_old_artifacts_before_saving_answers(
@@ -260,7 +279,7 @@ def test_real_fresh_mount_cannot_replace_history_but_a_complete_copy_can(
             pcaDims=4,
             neighborsK=7,
             resolutions=(0.5,),
-            maxCandidates=1,
+            maxCandidates=4,
         ),
         runtime=RuntimeConfig(nthreads=2, memBudget="512M"),
     )
@@ -297,4 +316,4 @@ def test_real_fresh_mount_cannot_replace_history_but_a_complete_copy_can(
     appended = records.events()[len(before) :]
     assert [row["kind"] for row in appended] == ["sourceRebound"]
     copied = DataStore(str(relocated), zarr_mode="r", nthreads=2, mem_budget="512M")
-    assert len(copied.pipeline.list_runs()) == 3
+    assert len(copied.pipeline.list_runs()) == 5

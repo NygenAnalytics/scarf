@@ -57,10 +57,13 @@ async def analyze_rna_async(
     runtime: RuntimeConfig | None = None,
 ) -> AnalysisRun:
     """Notebook-compatible entry point; numerical pipeline calls are sequential."""
-    from .workflow import run_workflow
-
     supplied = Study.model_validate(study)
     scientific = config or AnalysisConfig()
+    if scientific.maxCandidates not in {4, 5}:
+        raise ValueError(
+            "New analyses require maxCandidates=4 or 5 for the four native probes; "
+            "older saved configurations remain readable"
+        )
     operational = runtime or RuntimeConfig()
     location = Path(source).expanduser().resolve()
     destination = Path(run_dir).expanduser().resolve()
@@ -70,6 +73,8 @@ async def analyze_rna_async(
         raise ValueError("run_dir must be outside the numerical store")
     if model is None:
         raise ValueError("Supply a configured model or model identifier")
+    from .workflow import run_workflow
+
     with run_lock(destination), source_lock(location):
         records = RunRecords.create(
             destination,

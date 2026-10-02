@@ -2,7 +2,7 @@
 
 `scarf.agent` runs a fixed RNA analysis procedure over a prepared local Scarf
 store. Scarf executes numerical operations; structured model decisions interpret
-context, choose registered experiments, select measured finalists, and propose
+context, choose a bounded PC probe, select measured finalists, and propose
 cluster annotations. The model cannot execute code or introduce arbitrary tools
 or pipeline settings.
 
@@ -131,22 +131,37 @@ ledger.
 | PCs | 21 |
 | Neighbors | 11 |
 | Leiden resolutions | 0.5, 0.75, 1.0, 1.25 |
-| Candidate representations | At most 3, including the baseline |
+| Candidate representations | Four planned native trials; at most one eligible Harmony trial |
+| `maxCandidates` | 5; new runs require 4 or 5 |
+| `interactionMode` | `"lenient"` |
 | Marker-assessed finalists | At most 2 |
 | Random seed | 4444 |
 | Doublet scoring | Disabled |
 | Cell-cycle scoring and Paris clustering | Disabled |
 
-Registered alternatives use 2,000/4,000 HVGs, 10/30 PCs, 21/41 neighbors, or
-eligible Harmony correction. Each alternative changes one setting from its named
-parent representation. Infeasible alternatives are excluded. A failed admitted
-candidate still occupies its candidate slot.
+The frozen native plan has four named slots: the configured baseline, one HVG
+probe, one PC probe, and one neighbor probe. All three alternatives change only
+one setting from the same baseline. The HVG probe uses the first feasible distinct
+value from 2,000, 4,000, and 1,000; the neighbor probe uses 21, 41, and 11 in that
+order. The model selects a feasible PC probe from 10 or 30 using baseline
+diagnostics. A sole feasible choice is deterministic; lenient unresolved choice
+prefers 30. The model cannot stop before feasible native trials are attempted.
+The optional fifth slot is an eligible Harmony comparison, not another native
+search or a combination of the three probes.
 
-There are at most **six normal pipeline invocations**: three candidate screens,
-two finalist assessments, and one finalization. A run can stop exploring earlier.
-An explicit recovery after a failed invocation may create another pipeline run;
-the six-invocation bound is not a retry, wall-time, or financial budget. Numerical
-artifacts completed by a previous attempt can be reused by core Scarf.
+Each slot records measured, infeasible, failed, or pending status with a reason.
+An admitted failed trial occupies its slot. A proposed larger HVG count that
+produces the same actual selected genes does not establish a distinct sensitivity
+comparison. Incomplete coverage stays explicit even when a usable analysis
+finishes. No Cartesian grid, sampled discovery, parameter-combination synthesis,
+or automatic scientific repair phase is implemented.
+
+There are at most **seven normal pipeline invocations without Harmony**, or
+**eight with Harmony**: four or five candidate screens, two finalist assessments,
+and one finalization. Infeasible trials can reduce that count. An explicit
+recovery after a failed invocation may create another pipeline run; these limits
+are not retry, wall-time, or financial budgets. Completed numerical artifacts
+remain reusable through core Scarf.
 
 Graphs and clusters use the whole retained cohort. Silhouette assessment uses at
 most 2,000 cells. Correction diagnostics build a separate nearest-neighbor graph
@@ -162,6 +177,11 @@ The procedure does not materialize the complete expression matrix.
 `qcPolicy="retain"` preserves the selected cohort and records QC outlier counts
 and thresholds where metrics exist. Flags do not remove cells. Missing optional
 metrics remain explicit limitations.
+
+The evidence also projects retention under the supported global policies using
+the same nullable QC measurements. Projected removal is distinguished from the
+configured executed policy. Group summaries are descriptive; no per-capture
+filtering thresholds are introduced.
 
 Two policies allow caller-selected additional filtering:
 
@@ -195,6 +215,22 @@ definitions. Additional `featureExclusions` are exact supplied names. HLA/H2,
 sex-linked, cell-cycle, and reporter features are preserved unless explicitly
 excluded.
 
+Gene-family audits compare actual name matches with the standard Scarf blacklist
+and the executed exclusions. Candidate diagnostics show selected-HVG composition,
+actual selected counts, leading PC genes and their families, and bounded
+PC associations with QC and supported covariates. An inferred sample/capture role
+is labelled diagnostic-only and cannot authorize correction or establish
+independent replication. Actual label cross-tabs are used for design evidence;
+equal marginal counts are not treated as proof of confounding.
+
+Parent/alternative partitions are compared on aligned cells at the same
+resolution using adjusted Rand index and directional overlap tables. These
+describe parameter sensitivity and population splits/merges; they do not prove
+biological correctness. Silhouette scores are compared within their own
+representation. Marker support is the fraction of clusters with at least one
+marker scoring at least 0.25 and expressed in at least 20% of cells. It does not
+measure coherent lineage identity, and marker scores depend on the partition.
+
 Recognized author-annotation columns and `excludedColumns` are held out from
 decision evidence. Do not also assign them technical or protected roles. Models
 receive measured summaries and are instructed to cite offered evidence IDs;
@@ -216,11 +252,26 @@ more than `0.05`; missing mandatory evidence prevents acceptance. These checks
 support a bounded decision, not a claim that correction is scientifically proven.
 Doublet scoring never removes cells automatically.
 
-Models are instructed to make conservative choices when optional information is
-missing. An explicit context question or deferred selection produces `needsInput`
-with a saved question, so an essential uncertainty is not silently converted into
-a numerical choice. Invalid model output or provider failures produce an
-operational failure rather than an invented scientific decision.
+`interactionMode="lenient"` applies a short, frozen set of conservative policies.
+Uncertain optional metadata remains unknown and disables dependent operations.
+When the model identifies multiple acceptable measured choices, a deterministic
+tie preference selects native before corrected, then frozen trial order, then
+configured resolution order. This preference is not evidence of superiority.
+The original accepted model response remains unchanged; a separate
+`decisionResolved` event records the policy, resolved action, and limitation.
+
+`interactionMode="strict"` instead retains structured questions for optional
+metadata or ambiguous acceptable choices. Missing essential input remains
+`needsInput` in both modes. Unsupported objectives remain explicitly unsupported.
+Lenient mode does not authorize filtering, invent study facts, infer technical
+permission, enable doublet scoring, change feature exclusions, or enlarge budgets.
+
+Only recognized PCA/Harmony convergence failures in optional candidates can be
+skipped in lenient mode, after verifying the terminal numerical record, source
+identity, and completed parent. Baseline failure, source/storage errors, missing
+or corrupt artifacts, unknown numerical errors, provider failure, exhausted
+request budgets, and invalid output after the bounded repair still stop the run.
+There is no automatic parameter repair or loop that retries until success.
 
 Cluster identities are provisional. A named identity must cite at least two
 observed markers with score at least `0.25` and expression fraction at least `0.2`
@@ -269,10 +320,33 @@ private Zarr namespace.
 | `memBudget` | `"0.5"`, interpreted by core Scarf |
 
 Repeated identical invalid outputs stop early. Existing model settings are
-preserved except explicit runtime overrides and enforcement of output limits.
+preserved except explicit runtime overrides, output limits, and the agent-wide
+reasoning-off policy.
 Unknown usage remains unknown. SDK-internal retries and post-response usage
 accounting mean these controls cannot guarantee a hard provider spending limit.
 Saved records exclude credentials, hidden reasoning, and opaque provider state.
+
+Every decision, annotation batch, and repair requests disabled reasoning. The
+provider adapter supplies `thinking=False` and these exact `extra_body` fields:
+
+```python
+{
+    "thinking": {"type": "disabled"},
+    "reasoning_effort": "none",
+    "chat_template_kwargs": {"thinking": False},
+    "reasoning": {"enabled": False},
+}
+```
+
+These fields override conflicting caller settings without modifying the caller's
+objects. Unrelated request settings and extra body fields are preserved. The
+controlled reasoning fields are saved with request provenance; arbitrary extra
+body fields remain excluded from the saved settings to protect credentials.
+Provider support varies: a model with mandatory reasoning may ignore disable
+settings, and a provider may reject unsupported fields. Such rejection remains
+an operational failure; the agent never retries with reasoning enabled.
+Truncation receives explicit feedback within the existing repair allowance.
+Token and request limits are not raised automatically.
 
 ### Inspect, resume, and rebind
 
@@ -284,6 +358,8 @@ print(run.status)
 print(run.pending_questions)
 print(run.pipeline_runs)
 print(run.candidates)
+print(run.exploration_coverage)
+print(run.decision_resolutions)
 ```
 
 Statuses are `running`, `needsInput`, `completed`, `failed`, and `interrupted`.
@@ -394,6 +470,16 @@ earlier recovered issues, and links to full records remain in a collapsed,
 unnumbered technical appendix. The Markdown companion contains all sections
 without collapsing them.
 
+The same six steps include exploration coverage, resolved metadata roles, QC
+projections, gene-family audits, candidate comparisons, and conservative policy
+resolutions when recorded. These additions do not reopen the numerical source or
+recompute missing diagnostics. Older saved runs remain inspectable and renderable:
+missing new evidence is labelled not recorded, and a presentation-only alias reads
+the old `markerCoherence` value as the same marker-support definition. Saved JSON
+is not migrated or rewritten. Changed procedure identities require a new run for
+execution or semantic replay; reading results and regenerating reports remains
+available, and numerical export still verifies the source and exact artifacts.
+
 An `Observed source metadata:` JSON summary in supplied context is presented as
 readable field summaries and expandable category counts, preserving the
 surrounding prose. Invalid or unrecognized summaries remain escaped source text.
@@ -481,6 +567,8 @@ The public interface is `scarf.agent`; the root `scarf` facade is unchanged.
 `api.py` owns entry points, `workflow.py` owns stage transitions, and `models.py`
 defines inputs and structured choices. `evidence.py`, `choices.py`, and
 `execution.py` prepare and validate evidence and adapt it to existing pipelines.
+`diagnostics.py` computes bounded descriptive summaries from frozen metadata
+and public artifacts.
 `provider.py` handles model calls; `prompts.py` contains their instructions.
 `records.py` persists local history. `result.py` and `rendering.py` expose results
 and derived outputs.

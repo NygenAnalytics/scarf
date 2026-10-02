@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .models import AnalysisConfig, AnalysisInputError, Candidate
+from .diagnostics import finalist_composition, representation_diagnostics
 
 _SILHOUETTE_CELLS = 2_000
 _DIAGNOSTIC_CELLS = 10_000
@@ -178,7 +179,7 @@ def summarize_candidate(
                 "clusterCountsTruncated": len(counts) > 64,
             }
         )
-    return {
+    result = {
         "candidateId": candidate.candidateId,
         "runId": run.run_id,
         "parameters": _parameters(candidate),
@@ -187,6 +188,75 @@ def summarize_candidate(
         "silhouetteSampleCells": int(sample_size),
         "limitations": list(dict.fromkeys(limitations)),
     }
+    result.update(representation_diagnostics(store, run, prepared, config.randomSeed))
+    return result
+
+
+def compare_candidates(
+    store: Any,
+    parent_run: Any,
+    run: Any,
+    parent_candidate: Candidate,
+    candidate: Candidate,
+    config: AnalysisConfig,
+) -> list[dict[str, Any]]:
+    """Compare full-cohort partitions only at the same registered resolution."""
+    from sklearn.metrics import adjusted_rand_score
+
+    if parent_run.status != "completed" or run.status != "completed":
+        raise AnalysisInputError("Candidate comparisons require completed pipelines")
+    if parent_run["analysis_cell_selection"] != run["analysis_cell_selection"]:
+        raise AnalysisInputError(
+            "Candidate comparisons must share the exact frozen cohort"
+        )
+    if not np.array_equal(parent_run.cells.fetch("ids"), run.cells.fetch("ids")):
+        raise AnalysisInputError("Candidate comparison cell ordering differs")
+
+    def overlaps(source: np.ndarray, target: np.ndarray) -> list[dict[str, Any]]:
+        result = []
+        # Label identifiers have no meaning across partitions; use maximum cell overlap.
+        for group in np.unique(source):
+            counts = pd.Series(target[source == group]).value_counts().sort_index()
+            best = str(counts.idxmax())
+            count = int(counts[best])
+            size = int((source == group).sum())
+            result.append(
+                {
+                    "clusterId": str(group),
+                    "matchedClusterId": best,
+                    "sourceCells": size,
+                    "intersectionCells": count,
+                    "fraction": count / size,
+                }
+            )
+        return result
+
+    result = []
+    for compared_resolution in config.resolutions:
+        key = f"leiden_{compared_resolution}"
+        if key not in parent_run or key not in run:
+            raise AnalysisInputError(
+                "Candidate comparison is missing a matched resolution"
+            )
+        left = np.asarray(parent_run.cells.fetch(key)).astype(str)
+        right = np.asarray(run.cells.fetch(key)).astype(str)
+        if left.shape != right.shape:
+            raise AnalysisInputError("Candidate partition lengths differ")
+        result.append(
+            {
+                "parentCandidateId": parent_candidate.candidateId,
+                "candidateId": candidate.candidateId,
+                "parentRunId": parent_run.run_id,
+                "runId": run.run_id,
+                "selection": run["analysis_cell_selection"].to_dict(),
+                "resolution": compared_resolution,
+                "adjustedRandIndex": float(adjusted_rand_score(left, right)),
+                "cellCount": len(left),
+                "parentToCandidate": overlaps(left, right),
+                "candidateToParent": overlaps(right, left),
+            }
+        )
+    return result
 
 
 def _measure(name: str, function: Any, limitations: list[str]) -> float | None:
@@ -291,9 +361,10 @@ def finalist_evidence(
     }
     if len(rows) < len(labels):
         limitations.append(
-            "Correction, doublet and sample-support diagnostics estimate the cohort on at most 10000 deterministic coordinate rows; rare populations may be absent from that sample."
+            "Correction and doublet diagnostics estimate the cohort on at most 10000 deterministic coordinate rows; rare populations may be absent from that sample. Sample composition uses the full retained cohort."
         )
     clusters: list[dict[str, Any]] = []
+    composition = finalist_composition(run, prepared, labels)
     specificities = []
     supported = 0
     for group, count in counts.items():
@@ -313,6 +384,7 @@ def finalist_evidence(
                     "gene": str(row["feature_name"]),
                     "score": _finite(row["score"]),
                     "fracExp": _finite(row["frac_exp"]),
+                    "fracExpDelta": _finite(row["frac_exp"] - row["frac_exp_rest"]),
                     **(
                         {"fracExpRest": _finite(row["frac_exp_rest"])}
                         if "frac_exp_rest" in row
@@ -332,6 +404,7 @@ def finalist_evidence(
                     "score": _finite(row["score"]),
                     "fracExp": _finite(row["frac_exp"]),
                     "fracExpRest": _finite(row["frac_exp_rest"]),
+                    "fracExpDelta": _finite(row["frac_exp"] - row["frac_exp_rest"]),
                 }
             )
         clusters.append(
@@ -341,12 +414,13 @@ def finalist_evidence(
                 "markers": markers,
                 "weakMarkers": weak,
                 "qualifyingMarkerCount": len(qualifying),
+                **composition[str(group)],
             }
         )
     metrics: dict[str, Any] = {
         "mixing": {},
         "protection": {},
-        "markerCoherence": supported / len(clusters) if clusters else None,
+        "markerSupportFraction": supported / len(clusters) if clusters else None,
         "markerSpecificityMedian": float(np.median(specificities))
         if specificities
         else None,
@@ -447,18 +521,18 @@ def finalist_evidence(
         elif series.nunique() < 2:
             limitations.append("Cross-unit support is unavailable for a single sample.")
         else:
-            units = series.astype(str).to_numpy()[rows]
+            units = series.astype(str).to_numpy()
             metrics["crossUnitSupport"] = float(
                 np.mean(
                     [
-                        len(np.unique(units[sample_labels == group])) >= 2
+                        len(np.unique(units[labels == group])) >= 2
                         for group in counts.index
                     ]
                 )
             )
             for cluster in clusters:
                 cluster["sampleCount"] = int(
-                    len(np.unique(units[sample_labels == cluster["clusterId"]]))
+                    len(np.unique(units[labels == cluster["clusterId"]]))
                 )
     selected_key = next(
         (
@@ -476,6 +550,8 @@ def finalist_evidence(
         "selection": run["analysis_cell_selection"].to_dict(),
         "features": run["highly_variable_features"].to_dict(),
         "clusters": clusters,
+        "diagnosticRoles": prepared.get("resolvedRoles", []),
+        "compositionScope": "fullRetainedCohort",
         "metrics": metrics,
         "requiredSampleSupport": sample_column is not None,
         "diagnosticScope": diagnostic_scope,
@@ -545,7 +621,7 @@ def validate_harmony(
                 reasons.append(
                     f"Biological protection {metric} worsened by more than 0.05 for {column}."
                 )
-    required = ["markerCoherence"]
+    required = ["markerSupportFraction"]
     if native_evidence.get("requiredSampleSupport") or corrected_evidence.get(
         "requiredSampleSupport"
     ):

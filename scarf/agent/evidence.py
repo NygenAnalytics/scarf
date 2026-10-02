@@ -17,6 +17,12 @@ from .models import (
     RuntimeConfig,
     Study,
 )
+from .diagnostics import (
+    design_diagnostics,
+    family_audit,
+    group_columns,
+    resolved_roles,
+)
 
 
 _LABEL_PATTERN = re.compile(
@@ -350,6 +356,107 @@ def _filtering(
     return options, result.retained, warnings, flags
 
 
+def _qc_projections(
+    store: Any,
+    active: np.ndarray,
+    assay: str,
+    config: AnalysisConfig,
+    flags: dict[str, Any],
+    roles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project explicit global policies without changing the chosen cohort."""
+    from scarf.quality_control.filtering import filter_cell_metrics
+
+    projections = []
+    group_data = {
+        column: store.cells.to_pandas_dataframe([column])[column]
+        for column in group_columns(roles)
+    }
+    for policy in ("retain", "gentleMad5", "manual"):
+        attrs = sorted(config.qcBounds) if policy == "manual" else list(flags)
+        bounds: dict[str, list[float | None]] = {}
+        limitations = []
+        available = True
+        retained = active.copy()
+        if policy == "manual" and not config.qcBounds:
+            available = False
+            limitations.append("No manual thresholds were supplied; none are invented.")
+        elif policy != "retain" and not attrs:
+            available = False
+            limitations.append("No available QC metrics support this projection.")
+        elif policy != "retain":
+            if policy == "manual":
+                bounds = {column: list(config.qcBounds[column]) for column in attrs}
+            else:
+                bounds = {
+                    column: [
+                        flags[column]["low"]
+                        if not column.endswith("percentMito")
+                        else None,
+                        flags[column]["high"]
+                        if column.endswith("percentMito")
+                        else None,
+                    ]
+                    for column in attrs
+                }
+            values = {
+                column: store.cells.to_pandas_dataframe([column])[column].to_numpy(
+                    dtype=float, na_value=np.nan
+                )
+                for column in attrs
+            }
+            retained = filter_cell_metrics(
+                values,
+                {column: ~np.isfinite(values[column]) for column in attrs},
+                active,
+                method="manual",
+                lows=[bounds[column][0] for column in attrs],
+                highs=[bounds[column][1] for column in attrs],
+                keep_bounds=True,
+            ).retained
+        groups = {}
+        if available:
+            for column, series in group_data.items():
+                missing = series.isna() | series.astype(str).str.strip().eq("")
+                counts = series.loc[active & ~missing].astype(str).value_counts()
+                rows = []
+                for value, count in counts.head(64).items():
+                    mask = (
+                        active
+                        & ~missing.to_numpy()
+                        & series.astype(str).eq(value).to_numpy()
+                    )
+                    kept = int((mask & retained).sum())
+                    rows.append(
+                        {
+                            "value": str(value),
+                            "inputCells": int(count),
+                            "retainedCells": kept,
+                            "removedCells": int(count) - kept,
+                        }
+                    )
+                groups[column] = {
+                    "levels": rows,
+                    "missingInputCells": int((active & missing.to_numpy()).sum()),
+                    "missingRetainedCells": int((retained & missing.to_numpy()).sum()),
+                    "omittedLevels": max(0, len(counts) - 64),
+                }
+        projections.append(
+            {
+                "policy": policy,
+                "available": available,
+                "executed": policy == config.qcPolicy,
+                "inputCells": int(active.sum()),
+                "retainedCells": int(retained.sum()) if available else None,
+                "removedCells": int((active & ~retained).sum()) if available else None,
+                "bounds": bounds,
+                "byGroup": groups,
+                "limitations": limitations,
+            }
+        )
+    return projections
+
+
 def _design(
     store: Any,
     retained: np.ndarray,
@@ -398,7 +505,7 @@ def _blacklist(exclusions: list[str]) -> str:
     return "|".join(
         [
             _MITO_PATTERN,
-            *(f"(?:^{re.escape(name)}$)" for name in sorted(set(exclusions))),
+            *(f"(?-i:^{re.escape(name)}$)" for name in sorted(set(exclusions))),
         ]
     )
 
@@ -509,7 +616,7 @@ def inspect_source(
         if name not in {"I", "ids", "names", config.cellKey}
         and not is_held_out_column(name, study)
     )
-    ordered = list(dict.fromkeys([*declared, *visible]))
+    ordered = list(dict.fromkeys([*declared, *flags, *visible]))
     shown = ordered[:_MAX_COLUMNS]
     if len(ordered) > len(shown):
         limitations.append(
@@ -519,6 +626,13 @@ def inspect_source(
         _profile(store.cells.to_pandas_dataframe([name])[name].loc[retained], name)
         for name in shown
     ]
+    roles = resolved_roles(study)
+    feature_audit = family_audit(features.fillna("").to_numpy(), blacklist)
+    active = store.cells.to_pandas_dataframe([config.cellKey])[config.cellKey].to_numpy(
+        dtype=bool
+    )
+    projections = _qc_projections(store, active, assay, config, flags, roles)
+    design_summary = design_diagnostics(store.cells, retained, roles)
     eligible, design, reasons = _design(
         store,
         retained,
@@ -547,6 +661,10 @@ def inspect_source(
         "qcFlags": flags,
         "study": study.model_dump(exclude={"excludedColumns", "referenceFiles"}),
         "columns": {row["column"]: row for row in profiles},
+        "resolvedRoles": roles,
+        "qcProjections": projections,
+        "featureAudit": feature_audit,
+        "designDiagnostics": design_summary,
         "design": design,
         "offeredFeatureExclusions": sorted(study.featureExclusions),
         "mitochondrialFeatures": sorted(
@@ -568,8 +686,13 @@ def inspect_source(
         "blacklist": blacklist,
         "qcFlags": flags,
         "qcOutliers": outliers,
+        "qcProjections": projections,
+        "featureAudit": feature_audit,
+        "resolvedRoles": roles,
+        "designDiagnostics": design_summary,
+        "diagnosticColumns": shown,
         "snapshotColumns": list(
-            dict.fromkeys([*study.technicalBatchColumns, *declared])
+            dict.fromkeys([*study.technicalBatchColumns, *declared, *shown])
         ),
         "technicalBatchColumns": list(study.technicalBatchColumns),
         "protectedColumns": list(study.protectedColumns),
@@ -601,17 +724,29 @@ def prepare_context(
         )
     protected = list(study.protectedColumns)
     for column, role in decision.columnRoles.items():
+        supplied_roles = {
+            entry["role"]
+            for entry in resolved_roles(study)
+            if entry["column"] == column
+        }
         if role == "technical" and column not in study.technicalBatchColumns:
             raise AnalysisInputError(
                 "A model cannot authorize a new technical batch column"
             )
-        if column in study.technicalBatchColumns and role not in {
-            "technical",
-            "ignore",
+        if column in study.technicalBatchColumns and role not in supplied_roles | {
+            "ignore"
         }:
             raise AnalysisInputError("A model cannot change a supplied technical role")
-        if column in study.protectedColumns and role != "protected":
+        if column in study.protectedColumns and role not in supplied_roles:
             raise AnalysisInputError("A model cannot remove a supplied protected role")
+        if role in {"sample", "capture"}:
+            supplied_column = (
+                study.sampleColumn if role == "sample" else study.captureColumn
+            )
+            if supplied_column is not None and column != supplied_column:
+                raise AnalysisInputError(
+                    "A model cannot replace a supplied sample or capture column"
+                )
         if role == "protected" and column not in protected:
             protected.append(column)
     # Caller-supplied sample/capture identity is authoritative. Model guesses
@@ -629,6 +764,46 @@ def prepare_context(
     )
     if fresh["fingerprint"] != prepared["fingerprint"]:
         raise AnalysisInputError("Source changed while resolving context")
+    roles = resolved_roles(study, decision.columnRoles, decision.evidenceIds)
+    fresh["resolvedRoles"] = roles
+    fresh["contextEvidence"]["resolvedRoles"] = roles
+    store = open_store(prepared["source"], config, runtime or RuntimeConfig())
+    _, retained, _, _ = _filtering(store, updated_study, config, fresh["assay"])
+    fresh["diagnosticColumns"] = list(
+        dict.fromkeys(
+            [
+                *group_columns(roles),
+                *fresh["qcFlags"],
+                *prepared["diagnosticColumns"],
+                *fresh["diagnosticColumns"],
+            ]
+        )
+    )[:_MAX_COLUMNS]
+    fresh["snapshotColumns"] = list(
+        dict.fromkeys(
+            [
+                *fresh["technicalBatchColumns"],
+                *fresh["snapshotColumns"],
+                *group_columns(roles),
+                *fresh["diagnosticColumns"],
+            ]
+        )
+    )
+    fresh["contextEvidence"]["columns"] = {
+        column: _profile(
+            store.cells.to_pandas_dataframe([column])[column].loc[retained], column
+        )
+        for column in fresh["diagnosticColumns"]
+    }
+    active = store.cells.to_pandas_dataframe([config.cellKey])[config.cellKey].to_numpy(
+        dtype=bool
+    )
+    fresh["designDiagnostics"] = design_diagnostics(store.cells, retained, roles)
+    fresh["qcProjections"] = _qc_projections(
+        store, active, fresh["assay"], config, fresh["qcFlags"], roles
+    )
+    fresh["contextEvidence"]["designDiagnostics"] = fresh["designDiagnostics"]
+    fresh["contextEvidence"]["qcProjections"] = fresh["qcProjections"]
     return fresh
 
 

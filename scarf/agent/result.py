@@ -12,6 +12,8 @@ from .rendering import (
     annotation_csv,
     annotations,
     atomic_text,
+    decision_resolutions,
+    exploration_coverage,
     render_report,
     stage_data,
     summary,
@@ -78,6 +80,16 @@ class AnalysisRun:
             for event in self._records.events()
             if event["kind"] == "candidateMeasured"
         ]
+
+    @property
+    def exploration_coverage(self) -> dict[str, Any] | None:
+        """Recorded trial coverage, or None when the saved procedure omitted it."""
+        return exploration_coverage(self._records)
+
+    @property
+    def decision_resolutions(self) -> list[dict[str, Any]]:
+        """Saved conservative policy resolutions, distinct from model choices."""
+        return decision_resolutions(self._records)
 
     def replay_decisions(self) -> list[dict[str, Any]]:
         """Revalidate accepted decisions without a provider or numerical store."""

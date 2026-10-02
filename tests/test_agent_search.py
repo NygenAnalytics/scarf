@@ -47,35 +47,35 @@ def test_registered_neighbor_experiment_keeps_graph_partitions_separate(
                 ]
             }
         elif "eligibleOptions" in evidence:
-            assert evidence["eligibleOptions"] == ["c1:r1"]
+            assert evidence["eligibleOptions"] == ["c3:r1"]
             answer = {
                 "action": "choose",
-                "optionIds": ["c1:r1"],
+                "optionIds": ["c3:r1"],
                 "rationale": "Use the measured alternative finalist",
-                "evidenceIds": ["c1:r1"],
+                "evidenceIds": ["c3:r1"],
             }
         else:
             searches.append(evidence)
-            if len(searches) == 1:
+            if evidence["decisionKind"] == "pcProbe":
                 options = {
                     key: row
                     for key, row in evidence["experiments"].items()
-                    if row["neighborsK"] == 21 and row["parentId"] == "c0"
+                    if row["pcaDims"] == 10
                 }
                 assert len(options) == 1
                 answer = {
                     "action": "experiment",
                     "optionIds": list(options),
-                    "rationale": "Compare one registered change in neighborhood size",
+                    "rationale": "Measure the registered PC probe independently of the neighbor probe",
                     "evidenceIds": ["c0"],
                 }
             else:
                 assert evidence["experiments"] == {}
                 answer = {
                     "action": "shortlist",
-                    "optionIds": ["c1:r1"],
+                    "optionIds": ["c3:r1"],
                     "rationale": "Assess markers on the alternative graph at resolution 1",
-                    "evidenceIds": ["c1:r1"],
+                    "evidenceIds": ["c3:r1"],
                 }
         return ModelResponse(parts=[ToolCallPart("decision", answer)])
 
@@ -92,7 +92,7 @@ def test_registered_neighbor_experiment_keeps_graph_partitions_separate(
             pcaDims=4,
             neighborsK=7,
             resolutions=(0.5, 1.0),
-            maxCandidates=2,
+            maxCandidates=4,
         ),
         runtime=RuntimeConfig(nthreads=2, memBudget="512M"),
     )
@@ -100,9 +100,9 @@ def test_registered_neighbor_experiment_keeps_graph_partitions_separate(
     assert result.status == "completed", records.events()[-5:]
     assert len(searches) == 2
     candidates = searches[-1]["candidates"]
-    assert [row["candidateId"] for row in candidates] == ["c0", "c1"]
-    assert [row["parameters"]["neighborsK"] for row in candidates] == [7, 21]
-    assert candidates[0]["selection"] == candidates[1]["selection"]
+    assert [row["candidateId"] for row in candidates] == ["c0", "c2", "c3"]
+    assert [row["parameters"]["neighborsK"] for row in candidates] == [7, 7, 21]
+    assert all(row["selection"] == candidates[0]["selection"] for row in candidates)
     for candidate in candidates:
         assert {row["resolution"] for row in candidate["partitions"]} == {0.5, 1.0}
         assert all(
@@ -118,20 +118,20 @@ def test_registered_neighbor_experiment_keeps_graph_partitions_separate(
         for row in records.events()
         if row["kind"] == "candidateAdmitted"
     ]
-    assert len(admissions) == 2
-    assert admissions[1]["parentId"] == "c0"
-    assert admissions[1]["neighborsK"] == 21
+    assert len(admissions) == 3
+    assert admissions[2]["parentId"] == "c0"
+    assert admissions[2]["neighborsK"] == 21
     calls = {
         row["operation"]: row
         for row in records.events()
         if row["kind"] == "pipelineCompleted"
     }
-    assert set(calls) == {"screen_c0", "screen_c1", "finalist_0", "final"}
+    assert set(calls) == {"screen_c0", "screen_c2", "screen_c3", "finalist_0", "final"}
     store = DataStore(
         str(agent_rna_source), zarr_mode="r", nthreads=2, mem_budget="512M"
     )
     baseline = store.pipeline.open(run_id=calls["screen_c0"]["runId"])
-    changed = store.pipeline.open(run_id=calls["screen_c1"]["runId"])
+    changed = store.pipeline.open(run_id=calls["screen_c3"]["runId"])
     finalist = store.pipeline.open(run_id=calls["finalist_0"]["runId"])
     final = result.pipeline
     assert baseline["pca"] == changed["pca"]
@@ -146,7 +146,7 @@ def test_registered_neighbor_experiment_keeps_graph_partitions_separate(
     )
     assert changed[selected_partition] == finalist["clusters"] == final["clusters"]
     assert finalist["markers"] == final["markers"]
-    assert records.read_json("evidence/finalize.json")["selected"] == "c1:r1"
+    assert records.read_json("evidence/finalize.json")["selected"] == "c3:r1"
 
 
 def test_cancelled_second_annotation_batch_resumes_without_repeating_first(

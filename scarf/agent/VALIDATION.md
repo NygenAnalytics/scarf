@@ -23,7 +23,112 @@ the initial implementation. Core Scarf and external skills remain unchanged.
 - The retired Loom import assertion also accepts an absent agent-ingestion parent
   package, so it works in a clean checkout without obsolete namespace directories.
 
-## Current validation
+## Bounded exploration and lenient policy validation
+
+The exploration update preserves the six-step report, its embedded assets,
+narrative formatting, source-metadata tables, UMAP/marker previews, annotated
+cluster-size SVG, accessibility, and offline rendering contract. New scientific
+evidence is displayed within the existing steps. Policy resolutions remain
+separate from accepted model responses. Missing historical coverage stays unknown.
+
+The report, context, cluster-size, and result suite passed **145 cases** during
+this update: all 136 existing cases plus nine focused additions. New cases cover recorded exploration coverage,
+conservative resolutions, the presentation-only legacy marker-support alias,
+zero versus missing measurements, QC projections, inferred roles, gene-family
+and PC diagnostics, aligned parent comparisons, and escaped evidence. These
+checks use saved temporary fixtures and do not open live providers or datasets.
+Ruff check/format and patch-whitespace checks passed for these changes. A focused
+mypy invocation found no errors in the reporting/result files; workflow checks
+remain part of integration validation.
+
+Integration checks for the exploration update passed:
+
+| Check | Result |
+| --- | --- |
+| Final targeted agent suite with the 95% package coverage gate | 584 passed; 98.57% line coverage; every module exceeds 95% |
+| Unchanged pipeline, artifacts, frozen-store, Cytebase, and plotting regressions | 185 passed |
+| Quick repository suite, `pytest -n 4 -m "not slow and not integration"` | 7,683 passed, 1 skipped |
+| Final complete repository suite, `pytest -n 4` | 7,794 passed, 5 skipped |
+| `ruff check scarf profiling tests` | Passed |
+| `ruff format --check scarf profiling tests` | Passed; 570 files checked |
+| `mypy scarf profiling` | Passed; 299 source files checked |
+
+The real numerical fixture exercises four native representations, seven pipeline
+invocations, exact marker reuse, unchanged live metadata, held-out labels, and a
+separately recorded lenient selection resolution. Large-prompt regression cases
+exercise the complete serialized provider request for four representations,
+two finalists, and an eight-cluster annotation batch against the 65,536-byte limit.
+Compaction preserves the complete original evidence and records omitted prompt
+detail. The final targeted aggregate also covers edited replay histories,
+misrouted deferrals, invalid artifacts, cohort/feature-axis mismatches, missing
+measurements, and excessive metadata categories. Diagnostics and report modules
+have 100% line coverage. The quick suite predates the final edge tests and live
+provider contract fixes; the final complete suite includes them and the
+reasoning-off policy. Branch coverage was not measured. The full suite also
+exposed an agent plotting test that assumed no unrelated figures were open. Its
+assertion now compares the complete pre-existing figure set before and after a
+failed plotting call. The 18-case plotting module and a reproduction with two
+unrelated figures passed before the final full-suite rerun; production plotting
+behavior was unchanged.
+
+Live evaluation exposed a context citation mismatch and an ambiguous PC action
+contract. Supplied role IDs now share the context validator's registered ID set,
+and requests expose their valid citations and actions explicitly. Truncated
+provider output receives actionable feedback within the existing single repair.
+These cases have offline regressions; retries, token limits, and scientific gates
+were not enlarged to accommodate them.
+
+The provider adapter now applies one reasoning-off request policy to every
+decision, annotation, semantic repair, and transport retry. It supplies the exact
+four controlled extra-body fields documented in the README, neutralizes supplied
+native reasoning overrides, preserves unrelated settings, and leaves caller
+objects unchanged. Mocked HTTP tests inspect the serialized provider payload;
+saved-request checks ensure only the controlled body fields enter provenance.
+This verifies what the agent requests, not internal reasoning in providers that
+ignore disable controls or always require reasoning.
+
+These offline checks do not establish biological quality or live-provider
+reliability. The prior numerical and coverage results below are historical.
+
+## Live evaluation with reasoning disabled
+
+Five fresh analyses used DeepSeek V4.1 Flash through the configured Baseten
+provider. Every one of the 38 saved requests contains the exact reasoning-off
+extra body, unified `thinking=False`, and native OpenAI reasoning effort `none`.
+Credentials were loaded without being displayed. Published sources were accessed
+read-only; intact local snapshots were prepared into fresh stores with existing
+public Scarf operations. Original mounts and prior analyses were preserved.
+
+| Dataset | Retained cells | Clusters | Unassigned clusters | Requests | Rejected responses | Explicit resumes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Szabo | 3,726 | 11 | 0 | 9 | 3 | 1 |
+| Tran | 11,202 | 19 | 9 | 7 | 0 | 0 |
+| Solé-Boldo | 15,457 | 15 | 1 | 6 | 0 | 0 |
+| Wilk | 44,721 | 16 | 0 | 9 | 3 | 1 |
+| Garrido-Trigo | 46,700 | 19 | 3 | 7 | 0 | 0 |
+
+All five completed with four measured native representations and seven pipeline
+invocations each. Cohort and feature ordering/selections match the original
+inputs. No QC removals, correction, or doublet scoring were requested. Final
+marker artifacts were reused exactly, saved decisions replay successfully, and
+exports and embedded report figures are aligned with their final clustering.
+
+First-attempt completion was three of five. Szabo stopped at finalist selection
+and Wilk at PC selection after exhausting semantic repair; each completed on one
+explicit operational resume with unchanged policy and budgets. These resumes
+were triggered by the evaluation operator, not automatically by the workflow.
+All prior pipeline invocations were reused, and failure events remain saved.
+
+The prior batch also required two explicit resumes. Compared with that batch,
+observed requests fell from 46 to 38, rejected responses from 14 to 6, input tokens
+from 522,249 to 373,243, and output tokens from 126,828 to 16,722. Token-limit
+rejections fell from 13 to zero; the six new rejections were structured-choice
+validation errors. First-attempt completion did not improve. Biological choices
+and some final partitions changed; annotations remain provisional and no label
+accuracy benchmark was run. This small evaluation covers one live provider.
+Count-byte read volume during numerical execution was not instrumented.
+
+## Previous report validation
 
 The report and plotting checks include **104 report cases** and **18 marker-plot
 cases**. The targeted agent suite passes **487 cases** with **99.31% line

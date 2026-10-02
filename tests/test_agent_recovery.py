@@ -192,14 +192,16 @@ def science(tmp_path: Any, monkeypatch: Any) -> Any:
         return {
             "candidateId": candidate.candidateId,
             "runId": run.run_id,
+            "parameters": candidate.model_dump(exclude={"candidateId", "parentId"}),
             "selection": run["analysis_cell_selection"].to_dict(),
             "partitions": [
                 {
-                    "optionId": "c0:r0.5",
-                    "candidateId": "c0",
-                    "resolution": 0.5,
+                    "optionId": f"{candidate.candidateId}:r{resolution:g}",
+                    "candidateId": candidate.candidateId,
+                    "resolution": resolution,
                     "score": 0.6,
                 }
+                for resolution in config.resolutions
             ],
         }
 
@@ -229,9 +231,18 @@ def science(tmp_path: Any, monkeypatch: Any) -> Any:
     monkeypatch.setattr(workflow, "execute_pipeline", execute)
     monkeypatch.setattr(workflow, "summarize_candidate", summarize)
     monkeypatch.setattr(workflow, "finalist_evidence", finalist)
+    # Recovery tests model durable calls, not alternative numerical graphs.
+    # Probe execution and comparisons have separate real-pipeline coverage.
+    monkeypatch.setattr(
+        workflow,
+        "native_probe_options",
+        lambda *args: {"hvgCount": {}, "pcaDims": {}, "neighborsK": {}},
+    )
+    monkeypatch.setattr(workflow, "compare_candidates", lambda *args: {})
     # Other implementation work can run concurrently; this test isolates run
     # recovery from implementation-identity validation covered separately.
     monkeypatch.setattr(api, "procedure_identity", lambda: "test-procedure")
+    monkeypatch.setattr(workflow, "procedure_identity", lambda: "test-procedure")
     return SimpleNamespace(
         source=source,
         calls=calls,
@@ -257,6 +268,10 @@ def _model(
         answer: dict[str, Any]
         if schema == "ContextDecision":
             answer = {"rationale": "Use supplied context", "question": context_question}
+            if context_question:
+                answer.update(
+                    deferralReason="uncertainMetadata", evidenceIds=["source:summary"]
+                )
         elif schema == "AnnotationDecision":
             answer = {
                 "annotations": [
@@ -273,12 +288,14 @@ def _model(
                 "action": "choose",
                 "optionIds": [measured["eligibleOptions"][0]],
                 "rationale": "A complete measured native finalist",
+                "evidenceIds": [measured["eligibleOptions"][0]],
             }
         else:
             answer = {
                 "action": "shortlist",
                 "optionIds": ["c0:r0.5"],
                 "rationale": "The bounded native baseline is sufficient",
+                "evidenceIds": ["c0:r0.5"],
             }
         return ModelResponse(parts=[ToolCallPart("decision", answer)])
 
@@ -294,13 +311,18 @@ def _analyze(science: Any, tmp_path: Any, model: Any, *, runtime: Any = None) ->
         model=model,
         study=_study(),
         config=AnalysisConfig(
-            hvgCount=20, pcaDims=4, neighborsK=7, resolutions=(0.5,), maxCandidates=1
+            hvgCount=20,
+            pcaDims=4,
+            neighborsK=7,
+            resolutions=(0.5, 0.75),
+            maxCandidates=4,
+            interactionMode="strict",
         ),
         runtime=runtime,
     )
 
 
-def test_essential_context_question_resumes_with_its_original_question(
+def test_strict_context_question_resumes_with_its_original_question(
     science: Any, tmp_path: Any
 ) -> None:
     initial: list[dict[str, Any]] = []

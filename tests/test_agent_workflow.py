@@ -73,6 +73,14 @@ def scripted_model(observed: Any) -> Any:
                 "action": "choose",
                 "optionIds": [evidence["eligibleOptions"][0]],
                 "rationale": "Selected a complete native finalist",
+                "evidenceIds": [evidence["eligibleOptions"][0]],
+            }
+        elif evidence.get("decisionKind") == "pcProbe":
+            answer = {
+                "action": "experiment",
+                "optionIds": [next(iter(evidence["experiments"]))],
+                "rationale": "Measure the registered PC probe",
+                "evidenceIds": ["c0"],
             }
         else:
             partitions = evidence["candidates"][0]["partitions"]
@@ -80,6 +88,7 @@ def scripted_model(observed: Any) -> Any:
                 "action": "shortlist",
                 "optionIds": [partitions[0]["optionId"]],
                 "rationale": "Bounded descriptive baseline",
+                "evidenceIds": [partitions[0]["optionId"]],
             }
         return ModelResponse(parts=[ToolCallPart("decision", answer)])
 
@@ -110,7 +119,7 @@ def test_real_pipeline_annotations_reuse_and_readonly_export(
             pcaDims=4,
             neighborsK=7,
             resolutions=(0.5, 1.0),
-            maxCandidates=1,
+            maxCandidates=4,
         ),
         runtime=RuntimeConfig(nthreads=2, memBudget="512M"),
     )
@@ -122,9 +131,12 @@ def test_real_pipeline_annotations_reuse_and_readonly_export(
     assert "HELD_OUT_ALPHA" not in json.dumps(observed)
     assert "doublets" not in result.artifacts
     calls = [row for row in records.events() if row["kind"] == "pipelineCompleted"]
-    assert len(calls) == 3
+    assert len(calls) == 5
     run = result.pipeline
-    finalist = before.pipeline.open(run_id=calls[1]["runId"])
+    finalist_id = next(
+        row["runId"] for row in calls if row["operation"] == "finalist_0"
+    )
+    finalist = before.pipeline.open(run_id=finalist_id)
     assert run["markers"] == finalist["markers"]
     assert run["clusters"] == finalist["clusters"]
     after = DataStore(
@@ -148,7 +160,7 @@ def test_real_pipeline_annotations_reuse_and_readonly_export(
     assert resumed.status == "completed"
     assert len(observed) == count
     assert open_analysis(result.run_dir).status == "completed"
-    assert len(result.candidates) == 1
+    assert [row["candidateId"] for row in result.candidates] == ["c0", "c2", "c3"]
     replayed = result.replay_decisions()
     assert len(replayed) == len(observed)
     assert all(row["valid"] for row in replayed)

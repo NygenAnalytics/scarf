@@ -3,43 +3,24 @@ from typing import Any
 import pytest
 
 from scarf.agent.choices import (
-    alternatives,
     validate_annotations,
     validate_choice,
     validate_context,
 )
 from scarf.agent.models import (
-    AnalysisConfig,
     AnnotationDecision,
-    Candidate,
     Choice,
     ContextDecision,
     Study,
 )
 
 
-def test_experiments_are_matched_single_changes_and_deduplicated() -> None:
-    baseline = Candidate(candidateId="c0", hvgCount=1000, pcaDims=21, neighborsK=11)
-    options = alternatives(
-        [baseline],
-        {"retainedCells": 200, "availableFeatures": 5000, "correctionEligible": True},
-        AnalysisConfig(scoreDoublets=True),
-    )
-    assert len(options) == 7
-    for candidate in options.values():
-        assert candidate.parentId == "c0"
-        assert (
-            sum(
-                getattr(candidate, field) != getattr(baseline, field)
-                for field in ("hvgCount", "pcaDims", "neighborsK", "useHarmony")
-            )
-            == 1
-        )
-
-
 def test_changed_graph_partition_ids_are_local_to_offered_set() -> None:
     value = Choice(
-        action="shortlist", optionIds=["c1:r0.5"], rationale="Measured marker coherence"
+        action="shortlist",
+        optionIds=["c1:r0.5"],
+        rationale="Measured marker coherence",
+        evidenceIds=["c1:r0.5"],
     )
     validate_choice(value, options={"c1:r0.5", "c1:r1.0"}, actions={"shortlist"})
     with pytest.raises(ValueError, match="unknown optionIds"):
@@ -99,26 +80,6 @@ def test_annotations_cover_every_cluster_once() -> None:
     value = AnnotationDecision.model_validate(dict(annotations=[]))
     with pytest.raises(ValueError, match="exactly these clusterIds"):
         validate_annotations(value, clusters=[{"clusterId": "0", "markers": []}])
-
-
-@pytest.mark.parametrize(
-    ("doublets", "finalists", "design", "expected"),
-    [
-        (False, 2, True, False),
-        (True, 1, True, False),
-        (True, 2, False, False),
-        (True, 2, True, True),
-    ],
-)
-def test_correction_requires_opt_in_doublets_and_native_control_budget(
-    doublets: Any, finalists: Any, design: Any, expected: Any
-) -> None:
-    options = alternatives(
-        [Candidate(candidateId="c0", hvgCount=1000, pcaDims=21, neighborsK=11)],
-        {"retainedCells": 200, "availableFeatures": 5000, "correctionEligible": design},
-        AnalysisConfig(scoreDoublets=doublets, maxFinalists=finalists),
-    )
-    assert any(candidate.useHarmony for candidate in options.values()) is expected
 
 
 def test_context_rejects_all_role_conflicts_before_acceptance() -> None:
@@ -262,41 +223,6 @@ def test_annotation_rejects_fabricated_marker_in_both_evidence_lists() -> None:
         )
 
 
-def test_experiments_do_not_branch_from_corrected_representations() -> None:
-    corrected = Candidate(
-        candidateId="c1", hvgCount=1000, pcaDims=21, neighborsK=11, useHarmony=True
-    )
-    options = alternatives(
-        [corrected],
-        {"retainedCells": 200, "availableFeatures": 5000, "correctionEligible": True},
-        AnalysisConfig(scoreDoublets=True),
-    )
-    assert options == {}
-
-
-def test_experiments_exclude_duplicates_and_infeasible_rank_and_neighbors() -> None:
-    baseline = Candidate(candidateId="c0", hvgCount=1000, pcaDims=10, neighborsK=11)
-    graph = Candidate(
-        candidateId="c1", parentId="c0", hvgCount=1000, pcaDims=10, neighborsK=21
-    )
-    options = alternatives(
-        [baseline, graph],
-        {"retainedCells": 30, "availableFeatures": 25},
-        AnalysisConfig(),
-    )
-    assert set(options) == {
-        "c0:hvgCount:2000",
-        "c0:hvgCount:4000",
-        "c1:hvgCount:2000",
-        "c1:hvgCount:4000",
-    }
-    for candidate in options.values():
-        parent = {"c0": baseline, "c1": graph}[candidate.parentId]
-        assert candidate.pcaDims < min(30, 25, candidate.hvgCount)
-        assert candidate.neighborsK == parent.neighborsK
-        assert candidate.useHarmony is False
-
-
 def test_choice_reports_all_action_cardinality_citation_and_option_errors() -> None:
     value = Choice(
         action="experiment",
@@ -333,9 +259,14 @@ def test_deferred_choice_requires_an_actionable_question_and_no_selection() -> N
         question="Which assay contains RNA counts?",
         evidenceIds=["source:summary"],
         rationale="Multiple assays are available",
+        deferralReason="missingEssentialInput",
     )
     validate_choice(
-        question, options=set(), actions={"defer"}, evidence_ids={"source:summary"}
+        question,
+        options=set(),
+        actions={"defer"},
+        evidence_ids={"source:summary"},
+        unresolved_fact_ids={"source:summary"},
     )
 
 

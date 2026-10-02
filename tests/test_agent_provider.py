@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import importlib.metadata
 import json
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -12,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.usage import RequestUsage
 
 from scarf.agent.models import RuntimeConfig
 from scarf.agent.provider import (
@@ -25,6 +27,14 @@ from scarf.agent.provider import (
     visible_response,
 )
 from scarf.agent.records import RunRecords
+
+
+DISABLED_REASONING_BODY = {
+    "thinking": {"type": "disabled"},
+    "reasoning_effort": "none",
+    "chat_template_kwargs": {"thinking": False},
+    "reasoning": {"enabled": False},
+}
 
 
 class Decision(BaseModel):
@@ -140,6 +150,78 @@ def test_structural_errors_are_aggregated(records: Any) -> None:
     assert len(errors) == 2
     assert any("choice" in error for error in errors)
     assert any("evidenceIds" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [[], [ToolCallPart("decision", '{"choice":"base')]],
+)
+def test_truncated_response_gets_actionable_feedback_with_unchanged_limits(
+    records: Any, parts: list[Any]
+) -> None:
+    prompts = []
+    settings = []
+
+    def model(messages: Any, info: Any) -> Any:
+        prompts.append(json.loads(messages[0].parts[-1].content))
+        settings.append(dict(info.model_settings))
+        if len(prompts) == 1:
+            return ModelResponse(
+                parts=parts,
+                finish_reason="length",
+                usage=RequestUsage(output_tokens=4096),
+            )
+        return response()
+
+    assert run_decision(scripted_model(model), records).choice == "baseline"
+    feedback = prompts[1]["validationErrors"]
+    assert "output-token limit" in feedback[0]
+    assert "finishReason=length" in feedback[0]
+    assert "complete, concise decision tool call" in feedback[0]
+    assert len(feedback) >= 2  # The original structural failure is still available.
+    assert len(settings) == 2
+    assert settings[0] == settings[1]
+    assert settings[0]["max_tokens"] == 4096
+    rejected = records.latest("decisionRejected")
+    assert rejected["errors"] == feedback
+    saved_request = next(
+        event for event in records.events() if event["kind"] == "modelRequest"
+    )
+    visible = records.read_json(saved_request["responsePath"])
+    assert visible["finishReason"] == "length"
+    assert visible["usage"]["outputTokens"] == 4096
+
+
+def test_repeated_truncation_remains_a_bounded_operational_failure(
+    records: Any,
+) -> None:
+    def model(messages: Any, info: Any) -> Any:
+        return ModelResponse(
+            parts=[], finish_reason="length", usage=RequestUsage(output_tokens=4096)
+        )
+
+    with pytest.raises(DecisionValidationError, match="identical invalid"):
+        run_decision(scripted_model(model), records)
+    assert sum(event["kind"] == "modelRequest" for event in records.events()) == 2
+    assert not any(event["kind"] == "decisionAccepted" for event in records.events())
+    assert all(
+        "output-token limit" in event["errors"][0]
+        for event in records.events()
+        if event["kind"] == "decisionRejected"
+    )
+
+
+def test_valid_decision_is_not_discarded_only_for_length_finish_reason(
+    records: Any,
+) -> None:
+    def model(messages: Any, info: Any) -> Any:
+        valid = response()
+        valid.finish_reason = "length"
+        return valid
+
+    assert run_decision(scripted_model(model), records).choice == "baseline"
+    assert sum(event["kind"] == "modelRequest" for event in records.events()) == 1
+    assert not any(event["kind"] == "decisionRejected" for event in records.events())
 
 
 def test_stops_repeated_invalid_response(records: Any) -> None:
@@ -596,8 +678,277 @@ def test_effective_output_limit_and_saved_settings_are_explicit(
     run_decision(client, records, runtime=runtime)
     assert observed[0]["max_tokens"] == expected
     request = records.read_json(records.events()[0]["requestPath"])
-    assert request["settings"] == {"max_tokens": expected, "temperature": 0.1}
+    assert request["settings"] == {
+        "max_tokens": expected,
+        "temperature": 0.1,
+        "thinking": False,
+        "openai_reasoning_effort": "none",
+        "extra_body": DISABLED_REASONING_BODY,
+    }
     assert "secret" not in json.dumps(request)
+
+
+@pytest.mark.parametrize("stage", ["context", "explore", "assess", "annotate"])
+def test_all_decisions_disable_reasoning_through_repair_and_transport_retry(
+    records: Any, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    supplied_settings = {
+        "thinking": "high",
+        "openai_reasoning_effort": "high",
+        "openrouter_reasoning": {"enabled": True, "effort": "high"},
+        "temperature": 0.2,
+        "seed": 42,
+        "extra_body": {
+            "thinking": {"type": "enabled", "budget": 500},
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"thinking": True},
+            "reasoning": {"enabled": True},
+            "callerPrivate": {"value": "do-not-record"},
+            "shared": "model",
+        },
+    }
+    runtime = RuntimeConfig(
+        modelSettings={
+            "thinking": True,
+            "openai_reasoning_effort": "low",
+            "temperature": 0.3,
+            "extra_body": {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "low",
+                "chat_template_kwargs": {"thinking": True},
+                "reasoning": {"enabled": True, "effort": "high"},
+                "runtimeOption": [1, 2],
+                "shared": "runtime",
+            },
+        }
+    )
+    before_settings = deepcopy(supplied_settings)
+    before_runtime = runtime.model_dump()
+    observed = []
+
+    def execute(messages: Any, info: Any) -> Any:
+        if len(observed) == 1:
+            return response("invalid")
+        if len(observed) == 2:
+            raise httpx.ConnectError("temporary transport failure")
+        return response()
+
+    client = scripted_model(execute, settings=supplied_settings)
+    original_request = client.request
+
+    async def request(messages: Any, settings: Any, parameters: Any) -> Any:
+        observed.append(deepcopy(settings))
+        return await original_request(messages, settings, parameters)
+
+    monkeypatch.setattr(client, "request", request)
+    result = asyncio.run(
+        decide(
+            client,
+            decision_id=f"{stage}-reasoning-policy",
+            stage=stage,
+            evidence={"evidence-1": {"score": 0.5}},
+            output_type=Decision,
+            validate=validate,
+            records=records,
+            runtime=runtime,
+            instructions="Choose a measured option.",
+        )
+    )
+    assert result.choice == "baseline"
+    assert len(observed) == 3
+    for settings in observed:
+        assert settings["thinking"] is False
+        assert settings["openai_reasoning_effort"] == "none"
+        assert settings["openrouter_reasoning"] == {"enabled": False}
+        assert settings["temperature"] == 0.3
+        assert settings["extra_body"] == {
+            **DISABLED_REASONING_BODY,
+            "callerPrivate": {"value": "do-not-record"},
+            "runtimeOption": [1, 2],
+            "shared": "runtime",
+        }
+    assert supplied_settings == before_settings
+    assert client.settings == before_settings
+    assert runtime.model_dump() == before_runtime
+    requests = [e for e in records.events() if e["kind"] == "modelRequest"]
+    assert len(requests) == 3
+    for event in requests:
+        saved = records.read_json(event["requestPath"])
+        assert saved["settings"]["extra_body"] == DISABLED_REASONING_BODY
+        assert saved["settings"]["thinking"] is False
+        assert saved["settings"]["seed"] == 42
+        assert "do-not-record" not in json.dumps(saved)
+        assert "runtimeOption" not in json.dumps(saved)
+
+
+@pytest.mark.parametrize("settings_location", ["model", "runtime"])
+def test_explicit_native_reasoning_settings_cannot_override_agent_policy(
+    records: Any, monkeypatch: pytest.MonkeyPatch, settings_location: str
+) -> None:
+    supplied = {
+        "anthropic_thinking": {"type": "enabled"},
+        "google_thinking_config": {"thinking_level": "HIGH"},
+        "groq_reasoning_effort": "high",
+        "groq_reasoning_format": "raw",
+        "xai_reasoning_effort": "high",
+        "snowflake_reasoning": {"effort": "high"},
+        "bedrock_additional_model_requests_fields": {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+            "reasoning_config": "high",
+            "top_k": 4,
+        },
+    }
+    original = deepcopy(supplied)
+    client = scripted_model(
+        lambda messages, info: response(),
+        settings=supplied if settings_location == "model" else {},
+    )
+    runtime = RuntimeConfig(
+        modelSettings=supplied if settings_location == "runtime" else {}
+    )
+    original_request = client.request
+
+    async def request(messages: Any, settings: Any, parameters: Any) -> Any:
+        assert settings["anthropic_thinking"] == {"type": "disabled"}
+        assert settings["google_thinking_config"] == {"thinking_budget": 0}
+        assert settings["groq_reasoning_effort"] == "none"
+        assert settings["groq_reasoning_format"] == "hidden"
+        assert settings["xai_reasoning_effort"] == "none"
+        assert settings["snowflake_reasoning"] == {"enabled": False}
+        assert settings["bedrock_additional_model_requests_fields"] == {"top_k": 4}
+        return await original_request(messages, settings, parameters)
+
+    monkeypatch.setattr(client, "request", request)
+    assert run_decision(client, records, runtime=runtime).choice == "baseline"
+    assert supplied == original
+
+
+@pytest.mark.parametrize("route", ["openai", "openrouter"])
+def test_http_request_contains_exact_reasoning_disable_body(
+    records: Any, route: str
+) -> None:
+    from pydantic_ai.models import override_allow_model_requests
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.models.openrouter import OpenRouterModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+    from pydantic_ai.providers.openrouter import OpenRouterProvider
+
+    payloads = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        assert {key: payload[key] for key in DISABLED_REASONING_BODY} == (
+            DISABLED_REASONING_BODY
+        )
+        assert payload["temperature"] == 0.3
+        assert payload["callerOption"] == "retained"
+        assert payload["runtimeOption"] == "retained"
+        return httpx.Response(
+            200,
+            json={
+                "id": "offline-response",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "provider": "offline-test-provider",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "offline-tool-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "decision",
+                                        "arguments": json.dumps(
+                                            {
+                                                "choice": "baseline",
+                                                "evidenceIds": ["evidence-1"],
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 10,
+                    "total_tokens": 20,
+                },
+            },
+        )
+
+    async def execute() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            provider_type = OpenAIProvider if route == "openai" else OpenRouterProvider
+            model_type = OpenAIChatModel if route == "openai" else OpenRouterModel
+            provider = provider_type(
+                api_key="offline-test-only",
+                http_client=http,
+                **(
+                    {"base_url": "https://model.invalid/v1"}
+                    if route == "openai"
+                    else {}
+                ),
+            )
+            client = model_type(
+                "test-model" if route == "openai" else "openai/test-model",
+                provider=provider,
+                settings={
+                    "thinking": "high",
+                    "openai_reasoning_effort": "high",
+                    "openrouter_reasoning": {"enabled": True, "effort": "high"},
+                    "extra_body": {
+                        "thinking": {"type": "enabled"},
+                        "reasoning_effort": "high",
+                        "chat_template_kwargs": {"thinking": True},
+                        "reasoning": {"enabled": True},
+                        "callerOption": "retained",
+                    },
+                },
+            )
+            with override_allow_model_requests(True):
+                return await decide(
+                    client,
+                    decision_id="wire-test",
+                    stage="explore",
+                    evidence={"evidence-1": {"score": 0.5}},
+                    output_type=Decision,
+                    validate=validate,
+                    records=records,
+                    runtime=RuntimeConfig(
+                        modelSettings={
+                            "openai_reasoning_effort": "low",
+                            "temperature": 0.3,
+                            "extra_body": {"runtimeOption": "retained"},
+                        }
+                    ),
+                    instructions="Choose a measured option.",
+                )
+
+    assert asyncio.run(execute()).choice == "baseline"
+    assert len(payloads) == 1
+
+
+@pytest.mark.parametrize("body", [[], "invalid"])
+def test_non_mapping_extra_body_stops_without_sending_request(
+    records: Any, body: Any
+) -> None:
+    client = scripted_model(
+        lambda messages, info: pytest.fail("Invalid settings must not be sent"),
+        settings={"extra_body": body},
+    )
+    with pytest.raises(ProviderError, match="extra_body must be a mapping"):
+        run_decision(client, records)
+    assert records.events() == []
 
 
 def test_missing_optional_distribution_version_is_saved_as_unknown(

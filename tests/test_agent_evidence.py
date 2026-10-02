@@ -153,7 +153,8 @@ def test_declared_crossed_design_and_sample_metadata_are_frozen_batch_first(
     )
     prepared = inspect_source(source, supplied, AnalysisConfig(), runtime())
     assert prepared["correctionEligible"]
-    assert prepared["snapshotColumns"] == ["batch", "condition", "sample"]
+    assert prepared["snapshotColumns"][:3] == ["batch", "condition", "sample"]
+    assert set(prepared["diagnosticColumns"]) <= set(prepared["snapshotColumns"])
     result = prepare_context(
         prepared,
         ContextDecision(
@@ -177,6 +178,39 @@ def test_confounded_design_cannot_authorize_harmony(source: Path) -> None:
     prepared = inspect_source(source, supplied, AnalysisConfig(), runtime())
     assert not prepared["correctionEligible"]
     assert any("not fully crossed" in value for value in prepared["limitations"])
+
+
+def test_inferred_sample_identity_is_frozen_for_diagnostics_without_authority(
+    source: Path,
+) -> None:
+    supplied = study(protectedColumns=["condition"])
+    config = AnalysisConfig()
+    inspected = inspect_source(source, supplied, config, runtime())
+    prepared = prepare_context(
+        inspected,
+        ContextDecision(
+            rationale="The available sample labels support descriptive comparisons.",
+            columnRoles={"sample": "sample", "condition": "protected"},
+            evidenceIds=["column:sample", "column:condition"],
+        ),
+        supplied,
+        config,
+        runtime(),
+    )
+    assert supplied.sampleColumn is None
+    assert prepared["sampleColumn"] is None
+    assert "sample" in prepared["snapshotColumns"]
+    role = next(row for row in prepared["resolvedRoles"] if row["column"] == "sample")
+    assert role["source"] == "inferred"
+    assert role["authority"] == "diagnosticOnly"
+    assert role["evidenceIds"] == ["column:sample", "column:condition"]
+    confirmed = next(
+        row for row in prepared["resolvedRoles"] if row["column"] == "condition"
+    )
+    assert confirmed["evidenceIds"] == ["study:protected"]
+    assert prepared["qcProjections"][0]["byGroup"]["sample"]["levels"]
+    assert prepared["designDiagnostics"]["crossTabs"]
+    assert not prepared["correctionEligible"]
 
 
 def test_annotation_columns_cannot_supply_qc_bounds(source: Path) -> None:

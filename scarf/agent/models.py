@@ -42,11 +42,12 @@ class AnalysisConfig(AgentModel):
     cellKey: str = "I"
     qcPolicy: Literal["retain", "gentleMad5", "manual"] = "retain"
     qcBounds: dict[str, tuple[float | None, float | None]] = Field(default_factory=dict)
+    interactionMode: Literal["strict", "lenient"] = "lenient"
     hvgCount: int = Field(default=1000, ge=2)
     pcaDims: int = Field(default=21, ge=2)
     neighborsK: int = Field(default=11, ge=2)
     resolutions: tuple[float, ...] = (0.5, 0.75, 1.0, 1.25)
-    maxCandidates: int = Field(default=3, ge=1, le=3)
+    maxCandidates: int = Field(default=5, ge=1, le=5)
     maxFinalists: int = Field(default=2, ge=1, le=2)
     scoreDoublets: bool = False
     randomSeed: int = Field(default=4444, ge=0)
@@ -133,11 +134,23 @@ class Candidate(AgentModel):
 class ContextDecision(AgentModel):
     columnRoles: dict[
         str, Literal["technical", "protected", "sample", "capture", "ignore"]
-    ] = Field(default_factory=dict)
+    ] = Field(
+        default_factory=dict,
+        description="Optional new roles. Supplied roles persist when omitted. The technical role is restricted to study.technicalBatchColumns; QC metrics are not authorized batches.",
+    )
     excludeFeatures: list[str] = Field(default_factory=list)
     rationale: str = Field(min_length=1)
     evidenceIds: list[str] = Field(default_factory=list)
     question: str | None = None
+    deferralReason: (
+        Literal[
+            "uncertainMetadata",
+            "ambiguousSelection",
+            "missingEssentialInput",
+            "unsupportedObjective",
+        ]
+        | None
+    ) = None
 
 
 class Choice(AgentModel):
@@ -146,6 +159,16 @@ class Choice(AgentModel):
     rationale: str = Field(min_length=1)
     evidenceIds: list[str] = Field(default_factory=list)
     question: str | None = None
+    deferralReason: (
+        Literal[
+            "uncertainMetadata",
+            "ambiguousSelection",
+            "missingEssentialInput",
+            "unsupportedObjective",
+        ]
+        | None
+    ) = None
+    acceptableOptionIds: list[str] = Field(default_factory=list)
 
 
 class ClusterAnnotation(AgentModel):

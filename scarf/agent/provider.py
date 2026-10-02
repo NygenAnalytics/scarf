@@ -10,7 +10,8 @@ import importlib.metadata
 import json
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import httpx
@@ -177,9 +178,57 @@ def _versions() -> dict[str, str]:
     return result
 
 
+def _disabled_reasoning_body() -> dict[str, Any]:
+    return {
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"thinking": False},
+        "reasoning": {"enabled": False},
+    }
+
+
 def _settings(model: Model, runtime: RuntimeConfig) -> ModelSettings:
     overrides = dict(runtime.modelSettings)
     existing = model.settings or {}
+    body: dict[str, Any] = {}
+    for supplied in (existing, overrides):
+        supplied_body = supplied.get("extra_body")
+        if supplied_body is not None:
+            if not isinstance(supplied_body, Mapping):
+                raise ProviderError("extra_body must be a mapping for agent requests")
+            body.update(deepcopy(supplied_body))
+    body.update(_disabled_reasoning_body())
+    overrides.update(
+        extra_body=body,
+        thinking=False,
+        openai_reasoning_effort="none",
+        # OpenRouter otherwise replaces extra_body.reasoning from its unified
+        # thinking translation, even when thinking is disabled.
+        openrouter_reasoning={"enabled": False},
+    )
+    # Explicit native controls take precedence over unified thinking in the
+    # installed SDK. Neutralize supplied conflicts without changing callers.
+    native_disabled: dict[str, Any] = {
+        "anthropic_thinking": {"type": "disabled"},
+        "google_thinking_config": {"thinking_budget": 0},
+        "groq_reasoning_effort": "none",
+        "groq_reasoning_format": "hidden",
+        "xai_reasoning_effort": "none",
+        "snowflake_reasoning": {"enabled": False},
+    }
+    for key, value in native_disabled.items():
+        if key in existing or key in overrides:
+            overrides[key] = value
+    additional = overrides.get(
+        "bedrock_additional_model_requests_fields",
+        existing.get("bedrock_additional_model_requests_fields"),
+    )
+    if isinstance(additional, Mapping):
+        overrides["bedrock_additional_model_requests_fields"] = {
+            key: deepcopy(value)
+            for key, value in additional.items()
+            if key not in {"thinking", "reasoning_effort", "reasoning_config"}
+        }
     # Preserve a caller's smaller configured output budget, and all their model
     # settings, unless the runtime limit was explicitly supplied.
     if "maxOutputTokens" in runtime.model_fields_set or not existing.get("max_tokens"):
@@ -205,11 +254,15 @@ def _safe_settings(model: Model, overrides: ModelSettings) -> dict[str, Any]:
         "thinking",
     }
     merged = {**(model.settings or {}), **overrides}
-    return {
+    safe: dict[str, Any] = {
         key: value
         for key, value in merged.items()
         if key in allowed and isinstance(value, str | int | float | bool | type(None))
     }
+    # Only these agent-controlled fields are public provenance. Arbitrary
+    # caller body fields may contain provider-private values or credentials.
+    safe["extra_body"] = _disabled_reasoning_body()
+    return safe
 
 
 def _matches(event: dict[str, Any], decision_id: str, identity: str) -> bool:
@@ -241,7 +294,15 @@ def _validate_response(
         output = _parse(visible, output_type)
         validate(output)
     except ValueError as exc:
-        return None, _errors(exc)
+        errors = _errors(exc)
+        if visible.get("finishReason") == "length":
+            errors.insert(
+                0,
+                "The provider stopped at its output-token limit (finishReason=length) without a valid decision. "
+                "Return one complete, concise decision tool call satisfying the supplied schema and validation rules; "
+                "shorten the rationale and omit extra prose.",
+            )
+        return None, errors
     return output, []
 
 

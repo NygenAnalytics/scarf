@@ -4,7 +4,6 @@ import math
 from typing import Any
 
 from .models import (
-    AnalysisConfig,
     AnnotationDecision,
     Candidate,
     Choice,
@@ -13,51 +12,101 @@ from .models import (
 )
 
 
-def alternatives(
-    candidates: list[Candidate], prepared: dict[str, Any], config: AnalysisConfig
-) -> dict[str, Candidate]:
-    """Offer single changes from completed native candidates, with no hidden search."""
-    result: dict[str, Candidate] = {}
-    seen = {
-        (row.hvgCount, row.pcaDims, row.neighborsK, row.useHarmony)
-        for row in candidates
-    }
+def native_probe_options(
+    baseline: Candidate, prepared: dict[str, Any]
+) -> dict[str, dict[str, Candidate]]:
+    """Offer feasible independent probes of the exact native baseline."""
+    if baseline.useHarmony:
+        raise ValueError("Native probes require an uncorrected baseline")
     cells = prepared["retainedCells"]
     features = prepared["availableFeatures"]
-    correction_eligible = (
-        prepared.get("correctionEligible", False)
-        and config.scoreDoublets
-        and config.maxFinalists >= 2
-    )
-    for parent in candidates:
-        if parent.useHarmony:
-            continue
-        for field, values in (
-            ("hvgCount", (2000, 4000)),
-            ("pcaDims", (10, 30)),
-            ("neighborsK", (21, 41)),
-            ("useHarmony", (True,) if correction_eligible else ()),
-        ):
-            for value in values:
-                data = parent.model_dump()
-                data.update({field: value, "parentId": parent.candidateId})
-                signature = (
-                    data["hvgCount"],
-                    data["pcaDims"],
-                    data["neighborsK"],
-                    data["useHarmony"],
-                )
-                if (
-                    signature in seen
-                    or data["pcaDims"] >= min(cells, features, data["hvgCount"])
-                    or data["neighborsK"] >= cells
-                ):
-                    continue
-                name = f"{parent.candidateId}:{field}:{value}"
-                data["candidateId"] = name
-                result[name] = Candidate.model_validate(data)
-                seen.add(signature)
+    result: dict[str, dict[str, Candidate]] = {}
+    for field, values in (
+        ("hvgCount", (2000, 4000, 1000)),
+        ("pcaDims", (10, 30)),
+        ("neighborsK", (21, 41, 11)),
+    ):
+        offered = {}
+        for value in values:
+            if value == getattr(baseline, field):
+                continue
+            data = baseline.model_dump()
+            data.update({field: value, "parentId": baseline.candidateId})
+            actual_features = (
+                features
+                if field == "hvgCount"
+                else min(features, prepared.get("actualHvgCount", baseline.hvgCount))
+            )
+            if (
+                field == "hvgCount"
+                and value > features
+                or data["pcaDims"] >= min(cells, actual_features, data["hvgCount"])
+                or data["neighborsK"] >= cells
+            ):
+                continue
+            option_id = f"{baseline.candidateId}:{field}:{value}"
+            data["candidateId"] = option_id
+            offered[option_id] = Candidate.model_validate(data)
+        result[field] = offered
     return result
+
+
+def _deferral_errors(
+    value: Choice | ContextDecision,
+    *,
+    unresolved_fact_ids: set[str] | None,
+) -> list[str]:
+    errors = []
+    if not value.question or not value.question.strip():
+        errors.append("defer requires an actionable question")
+    if value.deferralReason is None:
+        errors.append("defer requires a deferralReason")
+    if not value.evidenceIds:
+        errors.append("defer requires supplied evidenceIds")
+    if value.deferralReason == "missingEssentialInput" and not (
+        set(value.evidenceIds) & (unresolved_fact_ids or set())
+    ):
+        errors.append("missingEssentialInput must cite a deterministic unresolved fact")
+    return errors
+
+
+def resolve_deferral(
+    value: Choice | ContextDecision,
+    *,
+    interaction_mode: str,
+    option_order: list[str],
+    unresolved_fact_ids: set[str],
+) -> dict[str, Any] | None:
+    """Resolve a valid optional ambiguity without changing scientific gates."""
+    if interaction_mode not in {"strict", "lenient"}:
+        raise ValueError("interaction_mode must be strict or lenient")
+    if isinstance(value, Choice) and value.action != "defer":
+        raise ValueError("Only a deferred choice can receive a policy resolution")
+    errors = _deferral_errors(value, unresolved_fact_ids=unresolved_fact_ids)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if interaction_mode == "strict" or value.deferralReason in {
+        "missingEssentialInput",
+        "unsupportedObjective",
+    }:
+        return None
+    if isinstance(value, ContextDecision):
+        if value.deferralReason != "uncertainMetadata":
+            raise ValueError("Context can resolve only uncertainMetadata")
+        return {"action": "retainDeclaredRoles"}
+    if value.deferralReason != "ambiguousSelection":
+        raise ValueError("Choices can resolve only ambiguousSelection")
+    acceptable = set(value.acceptableOptionIds)
+    if (
+        len(acceptable) < 2
+        or len(acceptable) != len(value.acceptableOptionIds)
+        or not acceptable.issubset(option_order)
+    ):
+        raise ValueError("Ambiguity requires at least two distinct eligible options")
+    return {
+        "action": "choose",
+        "optionIds": [next(option for option in option_order if option in acceptable)],
+    }
 
 
 def validate_choice(
@@ -67,6 +116,7 @@ def validate_choice(
     actions: set[str],
     maximum: int = 1,
     evidence_ids: set[str] | None = None,
+    unresolved_fact_ids: set[str] | None = None,
 ) -> None:
     errors = []
     if value.action not in actions:
@@ -74,9 +124,28 @@ def validate_choice(
     if value.action == "defer":
         if value.optionIds:
             errors.append("a deferred decision must not select options")
-        if not value.question or not value.question.strip():
-            errors.append("defer requires an actionable question")
+        errors.extend(_deferral_errors(value, unresolved_fact_ids=unresolved_fact_ids))
+        if value.deferralReason == "uncertainMetadata":
+            errors.append("uncertainMetadata is a context deferral")
+        if value.deferralReason == "ambiguousSelection":
+            acceptable = set(value.acceptableOptionIds)
+            if (
+                len(acceptable) < 2
+                or len(acceptable) != len(value.acceptableOptionIds)
+                or not acceptable.issubset(options)
+            ):
+                errors.append(
+                    "ambiguousSelection requires at least two distinct eligible acceptableOptionIds"
+                )
+        elif value.acceptableOptionIds:
+            errors.append("acceptableOptionIds are only valid for ambiguousSelection")
     else:
+        if value.question is not None or value.deferralReason is not None:
+            errors.append("ordinary choices must not contain deferral fields")
+        if value.acceptableOptionIds:
+            errors.append("ordinary choices must not contain acceptableOptionIds")
+        if not value.evidenceIds:
+            errors.append("ordinary choices require supplied evidenceIds")
         if not 1 <= len(value.optionIds) <= maximum:
             errors.append(f"select between one and {maximum} optionIds")
         unknown = set(value.optionIds) - options
@@ -94,14 +163,49 @@ def validate_choice(
         raise ValueError("; ".join(errors))
 
 
+def context_evidence_ids(columns: set[str], study: Study) -> set[str]:
+    """Identify visible context evidence, including supplied role provenance."""
+    identifiers = {
+        "source:summary",
+        "design:correction",
+        *(f"column:{column}" for column in columns),
+        *(f"reference:{index}" for index in range(len(study.referenceFiles))),
+    }
+    for role, declared in (
+        ("technical", study.technicalBatchColumns),
+        ("protected", study.protectedColumns),
+        ("sample", [study.sampleColumn] if study.sampleColumn else []),
+        ("capture", [study.captureColumn] if study.captureColumn else []),
+    ):
+        if columns.intersection(declared):
+            identifiers.add(f"study:{role}")
+    return identifiers
+
+
 def validate_context(
     value: ContextDecision,
     *,
     columns: set[str],
     study: Study,
     evidence_ids: set[str] | None = None,
+    unresolved_fact_ids: set[str] | None = None,
 ) -> None:
     errors = []
+    if value.question is not None or value.deferralReason is not None:
+        errors.extend(_deferral_errors(value, unresolved_fact_ids=unresolved_fact_ids))
+        if value.deferralReason == "ambiguousSelection":
+            errors.append("ambiguousSelection is a selection deferral")
+    elif (value.columnRoles or value.excludeFeatures) and not value.evidenceIds:
+        errors.append("context changes require supplied evidenceIds")
+    for role in ("sample", "capture"):
+        proposed = [
+            column for column, selected in value.columnRoles.items() if selected == role
+        ]
+        supplied = getattr(study, f"{role}Column")
+        if len(proposed) > 1:
+            errors.append(f"at most one column may have the {role} role")
+        if supplied is not None and any(column != supplied for column in proposed):
+            errors.append(f"a model cannot replace the supplied {role} column")
     unknown = set(value.columnRoles) - columns
     if unknown:
         errors.append(f"unknown or held-out columns: {sorted(unknown)}")
@@ -111,27 +215,36 @@ def validate_context(
             f"feature exclusions must come from the supplied inventory: {sorted(unauthorized)}"
         )
     for column, role in value.columnRoles.items():
+        declared = {
+            name
+            for name, present in (
+                ("technical", column in study.technicalBatchColumns),
+                ("protected", column in study.protectedColumns),
+                ("sample", column == study.sampleColumn),
+                ("capture", column == study.captureColumn),
+            )
+            if present
+        }
         if role == "technical" and column not in study.technicalBatchColumns:
             errors.append(
                 f"{column}: a model cannot authorize a new technical batch column"
             )
-        if column in study.technicalBatchColumns and role not in {
-            "technical",
-            "ignore",
-        }:
+        if "technical" in declared and role not in declared:
             errors.append(f"{column}: a model cannot change a supplied technical role")
-        if column in study.protectedColumns and role != "protected":
+        if "protected" in declared and role not in declared:
             errors.append(f"{column}: a model cannot remove a supplied protected role")
+        for supplied_role in ("sample", "capture"):
+            if supplied_role in declared and role not in declared:
+                errors.append(
+                    f"{column}: a model cannot change a supplied {supplied_role} role"
+                )
     if evidence_ids is None:
-        evidence_ids = {
-            "source:summary",
-            "design:correction",
-            *(f"column:{column}" for column in columns),
-            *(f"reference:{index}" for index in range(len(study.referenceFiles))),
-        }
+        evidence_ids = context_evidence_ids(columns, study)
     unknown_evidence = set(value.evidenceIds) - evidence_ids
     if unknown_evidence:
-        errors.append(f"unknown evidenceIds: {sorted(unknown_evidence)}")
+        errors.append(
+            f"unknown evidenceIds: {sorted(unknown_evidence)}; offered: {sorted(evidence_ids)}"
+        )
     if errors:
         raise ValueError("; ".join(errors))
 

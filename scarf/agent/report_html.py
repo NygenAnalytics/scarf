@@ -49,6 +49,7 @@ _LABELS = {
     "neighborsK": "neighbors",
     "useHarmony": "Harmony correction",
     "markerCoherence": "marker coherence",
+    "markerSupportFraction": "marker support",
     "markerSpecificityMedian": "median marker specificity",
     "fracExpRest": "expression outside the cluster",
     "fracExp": "expression within the cluster",
@@ -366,6 +367,10 @@ def _overview(data: dict[str, Any]) -> _Content:
             else _STAGES.get(data["stage"], _UNKNOWN),
         ),
     ]
+    if "interactionMode" in data["config"]:
+        facts.append(
+            ("Uncertainty policy", str(data["config"]["interactionMode"]).capitalize())
+        )
     content.html.append('<dl class="facts">')
     for label, value in facts:
         content.html.append(f"<div><dt>{label}</dt><dd>{_escape(value)}</dd></div>")
@@ -376,6 +381,47 @@ def _overview(data: dict[str, Any]) -> _Content:
         data["study"].get("context") or "No study context supplied."
     )
     content.details("Supplied study context", context)
+    roles = data.get("resolvedRoles")
+    if roles is not None:
+        detail = _Content()
+        detail.table(
+            ["Metadata field", "Role", "Source", "Authority"],
+            [
+                [
+                    _metadata_label(row["column"]),
+                    row.get("role"),
+                    row.get("source"),
+                    "Diagnostic only"
+                    if row.get("authority") == "diagnosticOnly"
+                    else row.get("authority"),
+                ]
+                for row in roles
+            ],
+        )
+        detail.paragraph(
+            "Inferred groupings support descriptive checks. They do not authorize technical correction or establish independent biological samples.",
+            "caption",
+        )
+        design = data["prepared"].get("designDiagnostics", {})
+        for crossing in design.get("crossTabs", [])[:_LIMIT]:
+            detail.heading(
+                f"{_metadata_label(crossing['leftColumn'])} and {_metadata_label(crossing['rightColumn'])}"
+            )
+            detail.table(
+                ["First group", "Second group", "Cells"],
+                [
+                    [row.get("left"), row.get("right"), _number(row.get("count"))]
+                    for row in crossing.get("counts", [])
+                ],
+            )
+            detail.paragraph(
+                f"Rows with missing labels: {_number(crossing.get('rowsMissing'))}.",
+                "caption",
+            )
+        detail.omitted(len(design.get("crossTabs", [])))
+        if design.get("limitations"):
+            detail.bullets(design["limitations"])
+        content.details("Metadata roles and measured design", detail)
     return content
 
 
@@ -482,6 +528,47 @@ def _populations(data: dict[str, Any]) -> _Content:
             detail.paragraph(
                 "No qualifying marker measurements were saved for this cluster.",
                 "muted",
+            )
+        if "qc" in cluster:
+            detail.table(
+                [
+                    "Cluster QC metric",
+                    "Median",
+                    "10th percentile",
+                    "90th percentile",
+                    "Missing",
+                ],
+                [
+                    [
+                        _LABELS.get(column, column.replace("_", " ")),
+                        *[
+                            _number(values.get(key))
+                            for key in ("median", "q10", "q90", "missing")
+                        ],
+                    ]
+                    for column, values in cluster["qc"].items()
+                ],
+            )
+        for column, composition in list(cluster.get("groupComposition", {}).items())[
+            :_LIMIT
+        ]:
+            detail.heading(_metadata_label(column) + ": cluster composition")
+            detail.table(
+                ["Group", "Cells", "Fraction"],
+                [
+                    [
+                        row.get("value"),
+                        _number(row.get("count")),
+                        _number(row.get("fraction"), percent=True),
+                    ]
+                    for row in composition.get("levels", [])
+                ],
+            )
+            detail.paragraph(
+                f"Missing labels: {_number(composition.get('missing'))}. "
+                f"Additional groups omitted: {_number(composition.get('omittedLevels'))}. "
+                "Group composition is descriptive and does not establish independent replication.",
+                "caption",
             )
         content.details(
             f"Cluster {annotation['clusterId']} · {annotation.get('identity', _UNKNOWN)}",
@@ -592,6 +679,73 @@ def _quality(data: dict[str, Any]) -> _Content:
         "Flag boundaries are descriptive and are not necessarily removal thresholds.",
         "caption",
     )
+    projections = prepared.get("qcProjections")
+    if projections is not None:
+        content.heading("Quality strategy projections")
+        content.table(
+            ["Policy", "Projected retained cells", "Projected removed cells", "Use"],
+            [
+                [
+                    row.get("policy"),
+                    _number(row.get("retainedCells")),
+                    _number(row.get("removedCells")),
+                    "Configured for execution"
+                    if row.get("executed")
+                    else "Unavailable"
+                    if row.get("available") is False
+                    else "Projection only",
+                ]
+                for row in projections
+            ],
+        )
+        content.paragraph(
+            "These projections apply the recorded bounds to saved quality measurements. "
+            "A projected alternative does not mean that its cells were removed or its downstream analysis was run.",
+            "caption",
+        )
+        for row in projections[:_LIMIT]:
+            if row.get("limitations") or row.get("bounds") or row.get("byGroup"):
+                detail = _Content()
+                if row.get("bounds"):
+                    detail.table(
+                        ["Projected metric", "Lower bound", "Upper bound"],
+                        [
+                            [
+                                _LABELS.get(column, column),
+                                _number(bounds[0]),
+                                _number(bounds[1]),
+                            ]
+                            for column, bounds in row["bounds"].items()
+                        ],
+                    )
+                for column, groups in list(row.get("byGroup", {}).items())[:_LIMIT]:
+                    detail.heading(_metadata_label(column) + ": projected retention")
+                    detail.table(
+                        ["Group", "Input cells", "Retained cells", "Removed cells"],
+                        [
+                            [
+                                group.get("value"),
+                                *[
+                                    _number(group.get(key))
+                                    for key in (
+                                        "inputCells",
+                                        "retainedCells",
+                                        "removedCells",
+                                    )
+                                ],
+                            ]
+                            for group in groups.get("levels", [])
+                        ],
+                    )
+                    detail.paragraph(
+                        f"Missing group labels before filtering: {_number(groups.get('missingInputCells'))}; "
+                        f"retained: {_number(groups.get('missingRetainedCells'))}. "
+                        f"Additional groups omitted: {_number(groups.get('omittedLevels'))}.",
+                        "caption",
+                    )
+                if row.get("limitations"):
+                    detail.bullets(row["limitations"])
+                content.details(str(row.get("policy")) + ": projected evidence", detail)
     doublets = data["config"].get("scoreDoublets")
     content.paragraph(
         "Doublet scoring is requested; scores do not automatically remove cells."
@@ -618,11 +772,65 @@ def _quality(data: dict[str, Any]) -> _Content:
         content.paragraph(
             "The variable-gene exclusion policy was not recorded.", "muted"
         )
+    audit = prepared.get("featureAudit")
+    if audit is not None:
+        detail = _Content()
+        detail.table(
+            [
+                "Gene family",
+                "Matched genes",
+                "Excluded from HVGs",
+                "Standard blacklist matches",
+            ],
+            [
+                [
+                    row.get("family"),
+                    _number(row.get("matchedFeatures")),
+                    _number(row.get("excludedFeatures")),
+                    _number(row.get("standardExcludedFeatures")),
+                ]
+                for row in audit.get("families", [])
+            ],
+        )
+        detail.paragraph(
+            "Family matches inspect the supplied feature names. Standard-blacklist matches are a comparison, "
+            "not additional executed exclusions. Families may overlap; counts must not be added.",
+            "caption",
+        )
+        if audit.get("limitations"):
+            detail.bullets(audit["limitations"])
+        content.details("Gene-family audit", detail)
     return content
 
 
 def _exploration(data: dict[str, Any]) -> _Content:
     content = _Content()
+    coverage = data.get("explorationCoverage")
+    if coverage is None:
+        content.paragraph(
+            "Exploration coverage was not recorded by this procedure.", "caption"
+        )
+    else:
+        content.heading("Exploration coverage")
+        content.table(
+            ["Trial", "Changed setting", "Parent", "Outcome", "Reason"],
+            [
+                [
+                    _option(row["candidateId"]),
+                    _LABELS.get(row.get("axis"), row.get("axis")),
+                    _option(row["parentId"]) if row.get("parentId") else "Baseline",
+                    row.get("status"),
+                    row.get("reason") or "No additional reason recorded.",
+                ]
+                for row in coverage.get("slots", [])
+            ],
+        )
+        content.paragraph(
+            "All planned native comparisons were measured."
+            if coverage.get("nativeComplete") is True
+            else "Native sensitivity coverage is incomplete. Failed, infeasible, and pending trials do not establish robustness.",
+            "caption",
+        )
     if not data["candidateEvidence"]:
         content.paragraph("No candidate measurements have been saved yet.", "empty")
     for candidate_data in data["candidateEvidence"][:_LIMIT]:
@@ -657,7 +865,132 @@ def _exploration(data: dict[str, Any]) -> _Content:
             "which representation is biologically better.",
             "caption",
         )
+        detail = _candidate_diagnostics(candidate_data)
+        if detail.html:
+            content.details(
+                "Representation diagnostics: " + _option(candidate_data["candidateId"]),
+                detail,
+            )
     content.omitted(len(data["candidateEvidence"]))
+    return content
+
+
+def _candidate_diagnostics(candidate: dict[str, Any]) -> _Content:
+    content = _Content()
+    associations = candidate.get("covariateAssociations")
+    if associations is not None:
+        content.table(
+            ["Covariate", "Kind", "PC", "Association", "Rows used", "Missing rows"],
+            [
+                [
+                    _metadata_label(row["column"]),
+                    row.get("kind"),
+                    _number(row.get("component")),
+                    _number(row.get("association")),
+                    _number(row.get("rowsUsed")),
+                    _number(row.get("rowsMissing")),
+                ]
+                for row in associations
+            ],
+        )
+        content.paragraph(
+            "Associations are descriptive and do not establish a technical cause or authorize correction. "
+            "They use the recorded diagnostic sample; missing measurements do not mean no association.",
+            "caption",
+        )
+    if "actualHvgCount" in candidate:
+        content.paragraph(
+            f"Actual selected variable genes: {_number(candidate['actualHvgCount'])}.",
+            "caption",
+        )
+    audit = candidate.get("hvgAudit")
+    if audit is not None:
+        content.heading("Selected variable-gene families")
+        content.table(
+            ["Gene family", "Selected genes"],
+            [
+                [row.get("family"), _number(row.get("matchedFeatures"))]
+                for row in audit.get("families", [])
+            ],
+        )
+        if audit.get("limitations"):
+            content.bullets(audit["limitations"])
+    loadings = candidate.get("loadingFamilies")
+    if loadings is not None:
+        content.heading("Dominant principal-component features")
+        content.table(
+            ["PC", "Leading genes", "Gene-family counts among leading genes"],
+            [
+                [
+                    _number(row.get("component")),
+                    ", ".join(
+                        str(gene["gene"]) for gene in row.get("topGenes", [])[:20]
+                    ),
+                    "; ".join(
+                        f"{family}: {_number(count)}"
+                        for family, count in list(row.get("families", {}).items())[
+                            :_LIMIT
+                        ]
+                    ),
+                ]
+                for row in loadings
+            ],
+        )
+        content.paragraph(
+            "Dominant gene families can reflect biology or technical variation. Their presence alone is not a reason to exclude genes.",
+            "caption",
+        )
+    comparisons = candidate.get("comparisons")
+    if comparisons is not None:
+        content.heading("Matched parent comparisons")
+        content.table(
+            ["Parent", "Resolution", "Adjusted Rand index", "Compared cells"],
+            [
+                [
+                    _option(row["parentCandidateId"]),
+                    _number(row.get("resolution")),
+                    _number(row.get("adjustedRandIndex")),
+                    _number(row.get("cellCount")),
+                ]
+                for row in comparisons
+            ],
+        )
+        content.paragraph(
+            "Partitions are compared at the same resolution on aligned cells. Agreement measures sensitivity, not biological correctness. "
+            "Directional overlaps describe splits and merges without assuming cluster labels match.",
+            "caption",
+        )
+        for comparison in comparisons[:_LIMIT]:
+            detail = _Content()
+            for key, direction in (
+                ("parentToCandidate", "Parent to alternative"),
+                ("candidateToParent", "Alternative to parent"),
+            ):
+                detail.heading(direction)
+                detail.table(
+                    [
+                        "Cluster",
+                        "Best matching cluster",
+                        "Source cells",
+                        "Shared cells",
+                        "Source fraction",
+                    ],
+                    [
+                        [
+                            row.get("clusterId"),
+                            row.get("matchedClusterId"),
+                            _number(row.get("sourceCells")),
+                            _number(row.get("intersectionCells")),
+                            _number(row.get("fraction"), percent=True),
+                        ]
+                        for row in comparison.get(key, [])
+                    ],
+                )
+            content.details(
+                f"Cluster overlap at resolution {_number(comparison.get('resolution'))}",
+                detail,
+            )
+        content.omitted(len(comparisons))
     return content
 
 
@@ -688,19 +1021,24 @@ def _selection(data: dict[str, Any]) -> _Content:
     ]
     if finalists:
         content.heading("Marker evidence for the shortlisted results")
+        legacy_support = any(
+            "markerSupportFraction" not in row.get("metrics", {})
+            and "markerCoherence" in row.get("metrics", {})
+            for row in finalists
+        )
         content.table(
             [
                 "Clustering",
-                "Marker coherence",
+                "Marker coherence (marker support)"
+                if legacy_support
+                else "Marker support",
                 "Median marker specificity",
                 "Diagnostic sample",
             ],
             [
                 [
                     _option(row["optionId"]),
-                    _number(
-                        row.get("metrics", {}).get("markerCoherence"), percent=True
-                    ),
+                    _number(_marker_support(row.get("metrics", {})), percent=True),
                     _number(row.get("metrics", {}).get("markerSpecificityMedian")),
                     _number(row.get("diagnosticScope", {}).get("sampleCells")),
                 ]
@@ -708,11 +1046,18 @@ def _selection(data: dict[str, Any]) -> _Content:
             ],
         )
         content.paragraph(
-            "Marker coherence is the fraction of clusters with at least one marker scoring "
+            "Marker support is the fraction of clusters with at least one marker scoring "
             "at least 0.25 and expressed in at least 20% of cells. It is not annotation confidence. "
+            "Marker scores depend on the partition and can favor coarser groups. "
             "Diagnostic sampling can omit rare populations. Missing measurements are shown explicitly.",
             "caption",
         )
+        if legacy_support:
+            content.paragraph(
+                "Earlier records named this same measurement marker coherence. "
+                "The report reads that saved value without changing the scientific record.",
+                "caption",
+            )
         for row in finalists[:_LIMIT]:
             metrics = row.get("metrics", {})
             detail = _Content()
@@ -753,6 +1098,13 @@ def _selection(data: dict[str, Any]) -> _Content:
     return content
 
 
+def _marker_support(metrics: dict[str, Any]) -> Any:
+    """Read the renamed metric; the legacy key is a presentation-only alias."""
+    if "markerSupportFraction" in metrics:
+        return metrics["markerSupportFraction"]
+    return metrics.get("markerCoherence")
+
+
 def _decisions(data: dict[str, Any], stages: tuple[str, ...]) -> _Content:
     content = _Content()
     decisions = [
@@ -787,6 +1139,39 @@ def _decisions(data: dict[str, Any], stages: tuple[str, ...]) -> _Content:
         )
         content.details(title, detail)
     content.omitted(len(decisions))
+    resolutions = [
+        row for row in data.get("decisionResolutions", []) if row.get("stage") in stages
+    ]
+    for resolution in resolutions[:_LIMIT]:
+        detail = _Content()
+        reason = resolution.get("reason")
+        detail.paragraph(
+            {
+                "uncertainMetadata": "Optional metadata could not be resolved confidently.",
+                "ambiguousSelection": "Several measured choices remained acceptable.",
+            }.get(reason, reason or "Conservative policy applied.")
+        )
+        resolved = resolution.get("resolved", {})
+        options = resolved.get("optionIds", [])
+        detail.paragraph(
+            "Selected: " + "; ".join(_option(option) for option in options)
+            if options
+            else "Action: "
+            + (
+                "Retain declared metadata roles and leave uncertain roles unresolved."
+                if resolved.get("action") == "retainDeclaredRoles"
+                else _readable(resolved.get("action", _UNKNOWN))
+            )
+        )
+        if resolution.get("limitation"):
+            detail.paragraph(resolution["limitation"])
+        detail.paragraph(
+            "This is a recorded policy resolution, separate from the model response. "
+            "Rule: " + str(resolution.get("rule", _UNKNOWN)),
+            "caption",
+        )
+        content.details("Automatic conservative resolution", detail)
+    content.omitted(len(resolutions))
     return content
 
 

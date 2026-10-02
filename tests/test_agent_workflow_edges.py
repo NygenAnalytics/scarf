@@ -256,7 +256,23 @@ def test_deferred_selection_resumes_with_question_and_reuses_measurements(
 
     async def defer(messages: Any, info: Any) -> ModelResponse:
         payload = json.loads(messages[-1].parts[-1].content)
+        measured = payload["evidence"]
+        if stage == "finalists" and payload["stage"] == "explore":
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "decision",
+                        {
+                            "action": "shortlist",
+                            "optionIds": ["c0:r0.5", "c0:r0.75"],
+                            "evidenceIds": ["c0:r0.5", "c0:r0.75"],
+                            "rationale": "Compare both measured partitions before resolving preference",
+                        },
+                    )
+                ]
+            )
         if payload["stage"] == stage:
+            acceptable = measured.get("eligibleOptions", ["c0:r0.5", "c0:r0.75"])
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -264,7 +280,10 @@ def test_deferred_selection_resumes_with_question_and_reuses_measurements(
                         {
                             "action": "defer",
                             "question": "Which compartment is the intended focus?",
-                            "rationale": "The objective needs one essential clarification",
+                            "rationale": "Both measured partitions are acceptable but preference is unresolved",
+                            "deferralReason": "ambiguousSelection",
+                            "acceptableOptionIds": acceptable,
+                            "evidenceIds": acceptable,
                         },
                     )
                 ]
@@ -273,7 +292,7 @@ def test_deferred_selection_resumes_with_question_and_reuses_measurements(
 
     result = _analyze(science, tmp_path, FunctionModel(defer))
     assert result.status == "needsInput"
-    assert len(science.calls) == (1 if stage == "explore" else 2)
+    assert len(science.calls) == (1 if stage == "explore" else 3)
     question = result.pending_questions[0]
     assert question["stage"] == stage
     observed: list[Any] = []
@@ -289,10 +308,10 @@ def test_deferred_selection_resumes_with_question_and_reuses_measurements(
         ]
         == question["question"]
     )
-    assert len(science.calls) == 3
+    assert len(science.calls) == (3 if stage == "explore" else 4)
 
 
-def test_no_valid_partition_returns_a_reportable_question(
+def test_no_valid_partition_returns_a_reportable_scientific_failure(
     science: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     summarize = workflow.summarize_candidate
@@ -303,8 +322,12 @@ def test_no_valid_partition_returns_a_reportable_question(
     )
     observed: list[Any] = []
     result = _analyze(science, tmp_path, _model(observed))
-    assert result.status == "needsInput"
-    assert "No valid partitions" in result.pending_questions[0]["question"]
+    assert result.status == "failed"
+    assert (
+        "No valid baseline partitions"
+        in RunRecords(result.run_dir).latest("status")["message"]
+    )
+    assert result.pending_questions == []
     assert len(science.calls) == 1 and len(observed) == 1
     assert result.report().exists()
 
@@ -412,7 +435,7 @@ def test_correction_selection_uses_matched_measured_evidence(
             metrics={
                 "mixing": {"batch": 0.8 if candidate.useHarmony else 0.5},
                 "protection": {"condition": {"cLISI": 0.9, "graphConnectivity": 0.9}},
-                "markerCoherence": 0.6
+                "markerSupportFraction": 0.6
                 if scenario == "marker-harm" and candidate.useHarmony
                 else 0.9,
                 "markerSpecificityMedian": 0.8,
@@ -431,28 +454,23 @@ def test_correction_selection_uses_matched_measured_evidence(
         payload = json.loads(messages[-1].parts[-1].content)
         measured = payload["evidence"]
         if payload["stage"] == "explore":
-            if len(measured["candidates"]) == 1:
-                options = [
-                    key
-                    for key, value in measured["experiments"].items()
-                    if value["useHarmony"]
-                ]
-                assert len(options) == 1
-                answer = {
-                    "action": "experiment",
-                    "optionIds": options,
-                    "rationale": "Measure the matched correction",
-                }
-            else:
-                answer = {
-                    "action": "shortlist",
-                    "optionIds": ["c1:r0.5"],
-                    "rationale": "Assess correction against its required native control",
-                }
+            assert measured["decisionKind"] == "nativeShortlist"
+            options = [
+                key
+                for key, value in measured["experiments"].items()
+                if value["candidate"]["useHarmony"]
+            ]
+            assert options == ["c0:r0.5:harmony"]
+            answer = {
+                "action": "experiment",
+                "optionIds": options,
+                "rationale": "Measure the matched correction",
+                "evidenceIds": ["c0:r0.5"],
+            }
             return ModelResponse(parts=[ToolCallPart("decision", answer)])
         if payload["stage"] == "finalists":
             selection_evidence.append(measured)
-            desired = "c1:r0.5" if scenario == "accepted" else "c0:r0.5"
+            desired = "c4:r0.5" if scenario == "accepted" else "c0:r0.5"
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -478,7 +496,7 @@ def test_correction_selection_uses_matched_measured_evidence(
             pcaDims=4,
             neighborsK=7,
             resolutions=(0.5,),
-            maxCandidates=2,
+            maxCandidates=5,
             scoreDoublets=True,
         ),
     )
@@ -491,17 +509,19 @@ def test_correction_selection_uses_matched_measured_evidence(
         return
     assert result.status == "completed", records.latest("status")
     assert records.read_json("evidence/explore.json")["shortlist"] == [
-        "c1:r0.5",
         "c0:r0.5",
+        "c4:r0.5",
     ]
     selection = selection_evidence[0]
     if scenario == "marker-harm":
         assert selection["eligibleOptions"] == ["c0:r0.5"]
-        assert "markerCoherence" in " ".join(selection["rejectedOptions"]["c1:r0.5"])
+        assert "markerSupportFraction" in " ".join(
+            selection["rejectedOptions"]["c4:r0.5"]
+        )
     else:
-        assert selection["eligibleOptions"] == ["c0:r0.5", "c1:r0.5"]
+        assert selection["eligibleOptions"] == ["c0:r0.5", "c4:r0.5"]
         assert selection["rejectedOptions"] == {}
-    expected = "c1:r0.5" if scenario == "accepted" else "c0:r0.5"
+    expected = "c4:r0.5" if scenario == "accepted" else "c0:r0.5"
     assert records.read_json("evidence/finalize.json")["selected"] == expected
     assert len(science.calls) == 5
     assert [call["markers"] for call in science.calls] == [
@@ -520,5 +540,171 @@ def test_correction_selection_uses_matched_measured_evidence(
     ]
     assert len(result.annotations) == 1
     replayed = result.replay_decisions()
-    assert len(replayed) == 5
+    assert len(replayed) == 4
     assert all(row["valid"] for row in replayed)
+
+
+def test_corrected_probe_compares_only_its_pinned_resolution(
+    science: Any, records: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import numpy as np
+
+    from scarf.agent import RuntimeConfig
+    from scarf.agent.execution import compare_candidates
+
+    execute = workflow.execute_pipeline
+    config = AnalysisConfig(
+        hvgCount=20, pcaDims=4, neighborsK=7, resolutions=(0.5, 0.75)
+    )
+    baseline = Candidate(candidateId="c0", hvgCount=20, pcaDims=4, neighborsK=7)
+    corrected = baseline.model_copy(
+        update={"candidateId": "c4", "parentId": "c0", "useHarmony": True}
+    )
+
+    def numerical_run(*args: Any, **kwargs: Any) -> Any:
+        run = execute(*args, **kwargs)
+        resolutions = (
+            config.resolutions
+            if kwargs["resolution"] is None
+            else (kwargs["resolution"],)
+        )
+        values = {"ids": np.arange(40)}
+        for resolution in resolutions:
+            key = f"leiden_{resolution}"
+            run[key] = Ref(f"{run.run_id}-{key}")
+            values[key] = np.repeat([0, 1], 20)
+        run.cells = SimpleNamespace(fetch=lambda name: values[name])
+        return run
+
+    inspected: list[tuple[float, ...]] = []
+
+    def compare(*args: Any) -> Any:
+        inspected.append(args[-1].resolutions)
+        assert args[-1].resolutions == (0.75,)
+        return compare_candidates(*args)
+
+    monkeypatch.setattr(workflow, "execute_pipeline", numerical_run)
+    monkeypatch.setattr(workflow, "compare_candidates", compare)
+    prepared = science.inspect.return_value
+    measured = workflow._measure_candidate(
+        records,
+        science.source,
+        science.store,
+        prepared,
+        _study(),
+        config,
+        RuntimeConfig(),
+        baseline,
+    )
+    result = workflow._measure_candidate(
+        records,
+        science.source,
+        science.store,
+        prepared,
+        _study(),
+        config,
+        RuntimeConfig(),
+        corrected,
+        parent=measured,
+        parent_candidate=baseline,
+        resolution=0.75,
+    )
+    assert inspected == [(0.75,)]
+    assert [row["resolution"] for row in result["comparisons"]] == [0.75]
+    assert result["comparisons"][0]["adjustedRandIndex"] == 1.0
+    assert result["comparisons"][0]["cellCount"] == 40
+    assert "leiden_0.5" in science.runs["run-1"]
+    assert "leiden_0.5" not in science.runs["run-2"]
+
+
+@pytest.mark.parametrize(
+    ("doublets", "finalists", "design", "candidates", "expected"),
+    [
+        (False, 2, True, 5, False),
+        (True, 1, True, 5, False),
+        (True, 2, False, 5, False),
+        (True, 2, True, 4, False),
+        (True, 2, True, 5, True),
+    ],
+)
+def test_harmony_offer_requires_every_gate_in_the_active_workflow(
+    science: Any,
+    tmp_path: Path,
+    doublets: bool,
+    finalists: int,
+    design: bool,
+    candidates: int,
+    expected: bool,
+) -> None:
+    science.inspect.return_value["correctionEligible"] = design
+    observed: list[Any] = []
+    result = analyze_rna(
+        science.source,
+        run_dir=tmp_path / "gated-analysis",
+        model=_model(observed),
+        study=_study(),
+        config=AnalysisConfig(
+            hvgCount=20,
+            pcaDims=4,
+            neighborsK=7,
+            resolutions=(0.5,),
+            maxCandidates=candidates,
+            maxFinalists=finalists,
+            scoreDoublets=doublets,
+        ),
+    )
+    assert result.status == "completed", RunRecords(result.run_dir).latest("status")
+    shortlist = next(
+        row["payload"]["evidence"]
+        for row in observed
+        if row["payload"]["evidence"].get("decisionKind") == "nativeShortlist"
+    )
+    assert bool(shortlist["experiments"]) is expected
+    assert all(
+        row["candidate"]["useHarmony"] for row in shortlist["experiments"].values()
+    )
+    assert len(science.calls) == 3
+
+
+@pytest.mark.parametrize("stage", ["explore", "finalists"])
+@pytest.mark.parametrize("fault", ["mapping", "incomplete"])
+def test_resume_rejects_changed_cached_comparison_before_selection(
+    science: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    fault: str,
+) -> None:
+    import asyncio
+
+    decision = workflow._decision
+
+    async def stop_before_selection(*args: Any, **kwargs: Any) -> Any:
+        if kwargs["stage"] == stage:
+            raise asyncio.CancelledError
+        return await decision(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "_decision", stop_before_selection)
+    with pytest.raises(asyncio.CancelledError):
+        _analyze(science, tmp_path, _model([]))
+    records = RunRecords(tmp_path / "analysis")
+    measured = records.latest(
+        "candidateMeasured" if stage == "explore" else "finalistMeasured"
+    )
+    assert measured is not None
+    run_id = records.read_json(measured["evidence"])["runId"]
+    broken = science.runs[run_id]["clusters"]
+    if fault == "mapping":
+        science.runs[run_id]["clusters"] = Ref("changed-comparison-clusters")
+    else:
+        science.store.inspect_artifact.side_effect = lambda ref: SimpleNamespace(
+            complete=ref != broken
+        )
+    monkeypatch.setattr(workflow, "_decision", decision)
+    observed: list[Any] = []
+    before_calls = len(science.calls)
+    result = resume_rna(records.path, model=_model(observed))
+    assert result.status == "failed"
+    assert "Saved comparison evidence" in records.latest("status")["message"]
+    assert observed == []
+    assert len(science.calls) == before_calls

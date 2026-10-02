@@ -76,7 +76,7 @@ def test_manual_qc_accepts_asymmetric_bounds_but_rejects_inverted_ranges() -> No
 @pytest.mark.parametrize(
     "values",
     [
-        {"maxCandidates": 4},
+        {"maxCandidates": 6},
         {"maxCandidates": 0},
         {"maxFinalists": 3},
         {"maxFinalists": 0},
@@ -162,3 +162,37 @@ def test_requests_reject_unknown_fields_and_reassignment_of_frozen_policy() -> N
     with pytest.raises(ValidationError, match="Instance is frozen"):
         request.scoreDoublets = True
     assert request.scoreDoublets is False
+
+
+def test_lenient_native_probe_policy_is_frozen_and_old_budgets_remain_readable() -> (
+    None
+):
+    config = AnalysisConfig()
+    assert config.interactionMode == "lenient"
+    assert config.maxCandidates == 5
+    assert AnalysisConfig(interactionMode="strict", maxCandidates=4).maxCandidates == 4
+    for old_budget in (1, 2, 3):
+        assert (
+            AnalysisConfig.model_validate({"maxCandidates": old_budget}).maxCandidates
+            == old_budget
+        )
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        config.interactionMode = "strict"
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3])
+def test_new_runs_refuse_old_search_budgets_before_creating_records(
+    budget: int, tmp_path: Any
+) -> None:
+    from scarf.agent import analyze_rna
+
+    destination = tmp_path / "analysis"
+    with pytest.raises(ValueError, match="four native probes"):
+        analyze_rna(
+            tmp_path,
+            run_dir=destination,
+            model="unused-model",
+            study=Study(context="Observed cells", objective="Describe populations"),
+            config=AnalysisConfig(maxCandidates=budget),
+        )
+    assert not destination.exists()

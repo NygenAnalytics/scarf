@@ -186,9 +186,12 @@ def test_show_is_explicit_and_plot_failure_closes_only_its_figure(
     shown = []
     monkeypatch.setattr(PlotResult, "show", lambda self: shown.append(self))
     result = marker_dotplot(_Store(), _Run(), show=True)
-    assert shown == [result]
-    result.close()
+    try:
+        assert shown == [result]
+    finally:
+        result.close()
     existing = plt.figure()
+    figures_before_failure = set(plt.get_fignums())
 
     def fail(self: PlotResult) -> None:
         raise RuntimeError("display unavailable")
@@ -197,7 +200,7 @@ def test_show_is_explicit_and_plot_failure_closes_only_its_figure(
     try:
         with pytest.raises(RuntimeError, match="display unavailable"):
             marker_dotplot(_Store(), _Run(), show=True)
-        assert plt.get_fignums() == [existing.number]
+        assert set(plt.get_fignums()) == figures_before_failure
     finally:
         plt.close(existing)
 
