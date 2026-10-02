@@ -1,6 +1,7 @@
 """Human-readable presentation of saved evidence, without numerical execution."""
 
 import html
+import json
 import math
 import re
 from typing import Any
@@ -13,9 +14,18 @@ from .report_assets import (
     SCARF_LOGO,
 )
 from .report_style import STYLE
+from .report_text import narrative_html, normalize_narrative
 
 _LIMIT = 100
 _UNKNOWN = "Not recorded"
+_NYGEN_URL = "https://www.nygen.io/"
+_SCARF_URL = "https://github.com/nygenAnalytics/scarf"
+_PAPER_URL = "https://doi.org/10.1038/s41467-022-32097-3"
+_PAPER_CITATION = (
+    "Dhapola, P., Rodhe, J., Olofzon, R. et al. Scarf enables a highly "
+    "memory-efficient analysis of large-scale single-cell genomics data. "
+    "Nat Commun 13, 4616 (2022)."
+)
 _STAGES = {
     "inspect": "Inspect the supplied data",
     "context": "Establish study context",
@@ -105,9 +115,9 @@ class _Content:
         self.markdown: list[str] = []
 
     def paragraph(self, value: Any, style: str = "", limit: int = 4000) -> None:
-        text = html.escape(_text(value, limit))
-        self.html.append(f'<p class="{style}">{text}</p>')
-        self.markdown.extend([text, ""])
+        text = _text(value, limit)
+        self.html.append(f'<div class="narrative {style}">{narrative_html(text)}</div>')
+        self.markdown.extend([html.escape(normalize_narrative(text)), ""])
 
     def heading(self, title: str) -> None:
         self.html.append(f"<h3>{_escape(title)}</h3>")
@@ -122,13 +132,16 @@ class _Content:
     def bullets(self, values: list[str]) -> None:
         self.html.append("<ul>")
         for value in values[:_LIMIT]:
-            self.html.append(f"<li>{_escape(value)}</li>")
-            self.markdown.append(f"- {_escape(value)}")
+            text = _text(value)
+            self.html.append(f'<li class="narrative">{narrative_html(text)}</li>')
+            self.markdown.append(f"- {html.escape(normalize_narrative(text))}")
         self.html.append("</ul>")
         self.markdown.append("")
         self.omitted(len(values))
 
-    def table(self, headers: list[str], rows: list[list[Any]]) -> None:
+    def table(
+        self, headers: list[str], rows: list[list[Any]], *, prose: tuple[int, ...] = ()
+    ) -> None:
         if not rows:
             self.paragraph("No measurements recorded.", "empty")
             return
@@ -146,9 +159,23 @@ class _Content:
         )
         for row in rows[:_LIMIT]:
             self.html.append(
-                "<tr>" + "".join(f"<td>{_escape(v)}</td>" for v in row) + "</tr>"
+                "<tr>"
+                + "".join(
+                    f'<td class="narrative">{narrative_html(_text(v))}</td>'
+                    if index in prose
+                    else f"<td>{_escape(v)}</td>"
+                    for index, v in enumerate(row)
+                )
+                + "</tr>"
             )
-            cells = [_escape(v).replace("|", "\\|").replace("\n", " ") for v in row]
+            cells = [
+                html.escape(
+                    normalize_narrative(_text(v)) if index in prose else _text(v)
+                )
+                .replace("|", "\\|")
+                .replace("\n", " ")
+                for index, v in enumerate(row)
+            ]
             self.markdown.append("| " + " | ".join(cells) + " |")
         self.html.append("</tbody></table></div>")
         self.markdown.append("")
@@ -164,66 +191,166 @@ class _Content:
 
 
 def _section(
-    document: _Content, key: str, number: int, title: str, content: _Content
+    document: _Content,
+    key: str,
+    number: int,
+    title: str,
+    content: _Content,
+    *,
+    state: str,
+    outcome: str,
+    expanded: bool,
 ) -> None:
+    state_label = {
+        **_STATUSES,
+        "partial": "Incomplete",
+        "unavailable": "Not recorded",
+        "pending": "Not reached",
+    }[state]
     document.html.append(
         f'<section id="{key}" aria-labelledby="heading-{key}">'
-        f'<div class="section-heading"><span class="section-number" aria-hidden="true">{number:02}</span>'
-        f'<h2 id="heading-{key}">{_escape(title)}</h2></div>'
-        + "".join(content.html)
-        + "</section>"
+        f'<details class="workflow-step" data-stage-status="{state}"'
+        + (" open" if expanded else "")
+        + "><summary>"
+        f'<span class="section-number" aria-hidden="true">{number:02}</span>'
+        f'<h2 id="heading-{key}">{_escape(title)}</h2>'
+        f'<span class="step-status">{state_label}</span>'
+        f'<span class="step-outcome">{_escape(outcome)}</span></summary>'
+        '<div class="step-body">' + "".join(content.html) + "</div></details></section>"
     )
-    document.markdown.extend([f"## {title}", "", *content.markdown])
+    document.markdown.extend(
+        [
+            f"## {number:02}. {title}",
+            "",
+            f"{state_label}: {_escape(outcome)}",
+            "",
+            *content.markdown,
+        ]
+    )
+
+
+def _step_state(data: dict[str, Any], stages: tuple[str, ...]) -> str:
+    completed = set(data["completedStages"])
+    if data["stage"] in stages and data["status"] != "completed":
+        return str(data["status"])
+    if set(stages) <= completed:
+        return "completed"
+    if set(stages) & (completed | set(data["startedStages"])):
+        return "partial"
+    order = list(_STAGES)
+    later = set(order[order.index(stages[-1]) + 1 :])
+    if data["status"] == "completed" or later & (
+        completed | set(data["startedStages"])
+    ):
+        return "unavailable"
+    return "pending"
+
+
+def _outcomes(data: dict[str, Any]) -> dict[str, str]:
+    annotations = data["annotations"]
+    unassigned = sum(
+        row.get("identity", "").lower() == "unassigned" for row in annotations
+    )
+    candidates = len(data["candidateEvidence"])
+    selected = data.get("selectedOption")
+    return {
+        "overview": f"{_number(data['inputCells'])} supplied cells; study context and metadata.",
+        "quality": (
+            f"{_number(data['retainedCells'])} of {_number(data['inputCells'])} cells in the prepared cohort."
+            if "preprocess" in data["completedStages"]
+            else "Quality measurements and preparation policy."
+        ),
+        "exploration": f"Candidate analyses measured: {candidates}."
+        if candidates
+        else "No candidate measurements saved yet.",
+        "selection": f"Selected: {_option(selected)}."
+        if selected
+        else "No final clustering selected yet.",
+        "results": "Final UMAP, marker expression and cluster sizes."
+        if data["final"]
+        else "Final numerical results are not yet available.",
+        "populations": f"{len(annotations)} clusters reviewed; {unassigned} unassigned."
+        if annotations
+        else "Provisional cell identities are not yet available.",
+    }
+
+
+def _study_context(text: str) -> _Content:
+    """Present a supplied metadata summary without changing the saved context."""
+    content = _Content()
+    before, marker, after = text.partition("Observed source metadata:")
+    if not marker:
+        content.paragraph(text, "source-text")
+        return content
+    after = after.lstrip()
+    try:
+        metadata, end = json.JSONDecoder().raw_decode(after)
+    except (ValueError, RecursionError):
+        content.paragraph(text, "source-text")
+        return content
+    if not _is_metadata_summary(metadata):
+        content.paragraph(text, "source-text")
+        return content
+    if before.strip():
+        content.paragraph(before.strip(), "source-text")
+    content.heading("Observed source metadata")
+    fields = list(metadata.items())
+    content.table(
+        ["Field", "Distinct values", "Missing values"],
+        [
+            [
+                _metadata_label(name),
+                _number(summary.get("distinct")),
+                _number(summary.get("missing")),
+            ]
+            for name, summary in fields
+        ],
+    )
+    for name, summary in fields[:_LIMIT]:
+        counts = _Content()
+        counts.table(
+            ["Value", "Cells"],
+            [
+                [value, _number(count)]
+                for value, count in summary.get("levels", {}).items()
+            ],
+        )
+        content.details(f"{_metadata_label(name)}: category counts", counts)
+    if after[end:].strip():
+        content.paragraph(after[end:].strip(), "source-text")
+    return content
+
+
+def _metadata_label(value: str) -> str:
+    return re.sub(r"\bid\b", "ID", value.replace("_", " ").capitalize())
+
+
+def _is_metadata_summary(value: Any) -> bool:
+    """Recognize only the aggregate schema whose measurements can be displayed."""
+    if not isinstance(value, dict):
+        return False
+    for summary in value.values():
+        if not isinstance(summary, dict) or set(summary) - {
+            "distinct",
+            "missing",
+            "levels",
+        }:
+            return False
+        levels = summary.get("levels", {})
+        if not isinstance(levels, dict):
+            return False
+        counts = [summary.get("distinct"), summary.get("missing"), *levels.values()]
+        if any(
+            count is not None and (type(count) is not int or count < 0)
+            for count in counts
+        ):
+            return False
+    return True
 
 
 def _overview(data: dict[str, Any]) -> _Content:
     content = _Content()
-    annotations = data["annotations"]
-    clusters = data["clusterEvidence"]
-    cluster_count = (
-        len(clusters) if clusters else len(annotations) if annotations else None
-    )
-    unassigned = sum(
-        row.get("identity", "").lower() == "unassigned" for row in annotations
-    )
-    before, after = data["inputCells"], data["retainedCells"]
-    retained = after / before if before and after is not None else None
-    metrics = [
-        ("Cells in analysis cohort", _number(after)),
-        ("Supplied cells retained", _number(retained, percent=True)),
-        ("Clusters", _number(cluster_count)),
-        ("Unassigned clusters", _number(unassigned if annotations else None)),
-    ]
-    content.html.append('<div class="metrics">')
-    for label, value in metrics:
-        content.html.append(
-            f'<div class="metric"><span class="metric-value">{_escape(value)}</span>'
-            f'<span class="metric-label">{label}</span></div>'
-        )
-        content.markdown.append(f"- {label}: {value}")
-    content.html.append("</div>")
-    content.markdown.append("")
-    content.paragraph(
-        "Cell identities are provisional interpretations of measured markers. "
-        "Unassigned clusters remain explicit when the evidence is insufficient.",
-        "notice",
-    )
-    content.html.append('<div class="overview-grid">')
-    if data.get("preview"):
-        content.html.append(
-            f'<figure><img class="embedding" src="{data["preview"]}" '
-            'alt="Saved UMAP preview colored by the analysis clusters">'
-            "<figcaption>Saved UMAP preview. Nearby cells have similar profiles in this "
-            "projection; cluster identities remain provisional. This existing image "
-            "was included without recomputing the analysis.</figcaption></figure>"
-        )
-        content.markdown.extend(["![Saved UMAP preview](umap_clusters.png)", ""])
-    else:
-        content.paragraph(
-            "A UMAP preview is not available in the saved report files. "
-            "Numerical results, if finalized, remain available through the analysis.",
-            "empty",
-        )
+    before = data["inputCells"]
     facts = [
         ("Tissue", data["study"].get("tissue") or "Not supplied"),
         ("Organism", data["study"].get("organism") or "Not supplied"),
@@ -243,11 +370,10 @@ def _overview(data: dict[str, Any]) -> _Content:
     for label, value in facts:
         content.html.append(f"<div><dt>{label}</dt><dd>{_escape(value)}</dd></div>")
         content.markdown.append(f"- {label}: {_escape(value)}")
-    content.html.append("</dl></div>")
+    content.html.append("</dl>")
     content.markdown.append("")
-    context = _Content()
-    context.paragraph(
-        data["study"].get("context") or "No study context supplied.", "source-text"
+    context = _study_context(
+        data["study"].get("context") or "No study context supplied."
     )
     content.details("Supplied study context", context)
     return content
@@ -270,6 +396,10 @@ def _populations(data: dict[str, Any]) -> _Content:
             "No partial annotation batch is presented as a completed result.",
             "empty",
         )
+        content.heading("Interpretation limitations")
+        limitations = _limitations(data)
+        content.html.extend(limitations.html)
+        content.markdown.extend(limitations.markdown)
         return content
     content.paragraph(
         "Each row is a cluster in the final analysis. Confidence is qualitative, "
@@ -306,6 +436,10 @@ def _populations(data: dict[str, Any]) -> _Content:
         ],
         rows,
     )
+    content.html.append(
+        '<div class="actions"><a class="button primary" href="annotations.csv">Download annotations</a></div>'
+    )
+    content.markdown.extend(["[Download annotations](annotations.csv)", ""])
     content.heading("Evidence for each identity")
     for annotation in annotations[:_LIMIT]:
         detail = _Content()
@@ -353,6 +487,64 @@ def _populations(data: dict[str, Any]) -> _Content:
             f"Cluster {annotation['clusterId']} · {annotation.get('identity', _UNKNOWN)}",
             detail,
         )
+    content.heading("Interpretation limitations")
+    limitations = _limitations(data)
+    content.html.extend(limitations.html)
+    content.markdown.extend(limitations.markdown)
+    return content
+
+
+def _results(data: dict[str, Any]) -> _Content:
+    content = _Content()
+    if data.get("preview"):
+        content.html.append(
+            f'<figure><img class="embedding" src="{data["preview"]}" '
+            'alt="Saved UMAP preview colored by the analysis clusters">'
+            "<figcaption>Saved UMAP preview. Nearby cells have similar profiles in this "
+            "projection; cluster identities remain provisional. This existing image "
+            "was included without recomputing the analysis.</figcaption></figure>"
+        )
+        content.markdown.extend(["![Saved UMAP preview](umap_clusters.png)", ""])
+    else:
+        content.paragraph(
+            "A UMAP preview is not available in the saved report files. Numerical results, if finalized, remain available through the analysis.",
+            "empty",
+        )
+    content.heading("Marker expression")
+    if data.get("markerPreview"):
+        content.html.append(
+            '<figure class="marker-figure" tabindex="0" role="region" aria-label="Marker expression plot">'
+            f'<img class="marker-plot" src="{data["markerPreview"]}" '
+            'alt="Saved marker dotplot across the final clusters">'
+            "<figcaption>Saved marker dotplot. Dot size shows the fraction of cells "
+            "expressing each gene; color shows log(1 + mean normalized expression). "
+            "The panel uses qualifying markers from the final saved marker statistics. "
+            "Empty positions indicate zero expression; gray crosses mark unavailable measurements.</figcaption></figure>"
+        )
+        content.markdown.extend(["![Saved marker dotplot](marker_dotplot.png)", ""])
+    else:
+        content.paragraph(
+            "A marker dotplot preview is not available in the saved report files.",
+            "empty",
+        )
+    sizes = _Content()
+    if data.get("clusterSizeChart"):
+        sizes.html.append(
+            '<figure class="cluster-size-figure" tabindex="0" role="region" aria-label="Cell counts by final cluster">'
+            f'<img class="cluster-size-plot" src="{data["clusterSizeChart"]}" '
+            'alt="Bar chart of cell counts by final cluster, with counts annotated above each bar">'
+            "<figcaption>Cell counts in the final clustering, shown on a common scale starting at zero. "
+            "N/A means not recorded; it is not a zero count.</figcaption></figure>"
+        )
+        sizes.markdown.extend(
+            ["![Cell counts by final cluster](cluster_sizes.svg)", ""]
+        )
+        sizes.omitted(len(data["clusterEvidence"]))
+    else:
+        sizes.paragraph(
+            "Cluster sizes are not available in the saved evidence.", "empty"
+        )
+    content.details("Cluster sizes", sizes)
     return content
 
 
@@ -408,10 +600,68 @@ def _quality(data: dict[str, Any]) -> _Content:
         if doublets is False
         else "Doublet scoring policy was not recorded."
     )
+    content.heading("Feature selection policy")
+    if prepared.get("blacklist"):
+        content.paragraph(
+            "Mitochondrial genes identified by naming are excluded from variable-gene selection."
+        )
+        exclusions = (
+            prepared.get("contextEvidence", {})
+            .get("study", {})
+            .get("featureExclusions", [])
+        )
+        content.paragraph(
+            "Additional excluded genes: "
+            + (", ".join(exclusions) if exclusions else "None recorded.")
+        )
+    else:
+        content.paragraph(
+            "The variable-gene exclusion policy was not recorded.", "muted"
+        )
     return content
 
 
-def _methods(data: dict[str, Any]) -> _Content:
+def _exploration(data: dict[str, Any]) -> _Content:
+    content = _Content()
+    if not data["candidateEvidence"]:
+        content.paragraph("No candidate measurements have been saved yet.", "empty")
+    for candidate_data in data["candidateEvidence"][:_LIMIT]:
+        content.heading(_option(candidate_data["candidateId"]))
+        parameters = candidate_data.get("parameters", {})
+        content.paragraph(
+            f"{_number(parameters.get('hvgCount'))} variable genes · "
+            f"{_number(parameters.get('pcaDims'))} principal components · "
+            f"{_number(parameters.get('neighborsK'))} neighbors · "
+            + (
+                "Harmony correction"
+                if parameters.get("useHarmony")
+                else "No batch correction"
+            )
+        )
+        content.table(
+            ["Resolution", "Clusters", "Silhouette score", "Outcome"],
+            [
+                [
+                    _number(row.get("resolution")),
+                    _number(row.get("clusterCount")),
+                    _number(row.get("score")),
+                    "Evaluated",
+                ]
+                for row in candidate_data.get("partitions", [])
+            ],
+        )
+        content.paragraph(
+            f"Clustering used the full retained cohort. Silhouette calculations used up to "
+            f"{_number(candidate_data.get('silhouetteSampleCells'))} cells. "
+            "Compare resolutions within this representation; scores alone do not establish "
+            "which representation is biologically better.",
+            "caption",
+        )
+    content.omitted(len(data["candidateEvidence"]))
+    return content
+
+
+def _selection(data: dict[str, Any]) -> _Content:
     content = _Content()
     recipe = data["selectedRecipe"] or {}
     candidate = recipe.get("candidate") or {}
@@ -433,40 +683,6 @@ def _methods(data: dict[str, Any]) -> _Content:
         )
     else:
         content.paragraph("The final analysis settings are not yet available.", "empty")
-    for candidate_data in data["candidateEvidence"][:_LIMIT]:
-        content.heading(_option(candidate_data["candidateId"]))
-        parameters = candidate_data.get("parameters", {})
-        content.paragraph(
-            f"{_number(parameters.get('hvgCount'))} variable genes · "
-            f"{_number(parameters.get('pcaDims'))} principal components · "
-            f"{_number(parameters.get('neighborsK'))} neighbors · "
-            + (
-                "Harmony correction"
-                if parameters.get("useHarmony")
-                else "No batch correction"
-            )
-        )
-        content.table(
-            ["Resolution", "Clusters", "Silhouette score", "Outcome"],
-            [
-                [
-                    _number(row.get("resolution")),
-                    _number(row.get("clusterCount")),
-                    _number(row.get("score")),
-                    "Selected"
-                    if row.get("optionId") == (data["final"] or {}).get("selected")
-                    else "Evaluated",
-                ]
-                for row in candidate_data.get("partitions", [])
-            ],
-        )
-        content.paragraph(
-            f"Clustering used the full retained cohort. Silhouette calculations used up to "
-            f"{_number(candidate_data.get('silhouetteSampleCells'))} cells. "
-            "Compare resolutions within this representation; scores alone do not establish "
-            "which representation is biologically better.",
-            "caption",
-        )
     finalists = [
         row for row in data["diagnostics"] if row["kind"] == "finalistMeasured"
     ]
@@ -537,11 +753,17 @@ def _methods(data: dict[str, Any]) -> _Content:
     return content
 
 
-def _decisions(data: dict[str, Any]) -> _Content:
+def _decisions(data: dict[str, Any], stages: tuple[str, ...]) -> _Content:
     content = _Content()
-    decisions = data["decisions"]
-    if not decisions:
-        content.paragraph("No model decisions have been accepted yet.", "empty")
+    decisions = [
+        decision
+        for decision in data["decisions"]
+        if decision.get("stage") in stages
+        and (
+            "rationale" in decision.get("output", {})
+            or decision.get("output", {}).get("question")
+        )
+    ]
     for decision in decisions[:_LIMIT]:
         output = decision.get("output", {})
         stage = decision.get("stage")
@@ -661,6 +883,7 @@ def _provenance(data: dict[str, Any]) -> _Content:
                 ]
                 for row in errors
             ],
+            prose=(1,),
         )
     detail.heading("Saved files")
     links = [
@@ -686,7 +909,14 @@ def build_report(data: dict[str, Any]) -> tuple[str, str]:
     status = _STATUSES.get(data["status"], "Status unavailable")
     document = _Content()
     document.markdown.extend(
-        ["# Single-cell RNA analysis", "", f"Status: {status}", ""]
+        [
+            "# Single-cell RNA analysis",
+            "",
+            f"[Nygen · nygen.io]({_NYGEN_URL})",
+            "",
+            f"Status: {status}",
+            "",
+        ]
     )
     title = (
         data["study"].get("objective")
@@ -700,25 +930,25 @@ def build_report(data: dict[str, Any]) -> tuple[str, str]:
     document.html.append(
         '<header class="hero"><p class="eyebrow">Single-cell study report</p>'
         "<h1>Single-cell RNA analysis</h1>"
-        f'<p class="subtitle">{_escape(title)}</p><p class="study-label">{_escape(study_label)}</p>'
-        '<div class="actions"><a class="button primary" href="annotations.csv">Download annotations</a>'
-        "</div></header>"
+        f'<div class="subtitle narrative">{narrative_html(_text(title))}</div><p class="study-label">{_escape(study_label)}</p>'
+        "</header>"
     )
-    document.markdown.extend([_escape(title), "", _escape(study_label), ""])
+    document.markdown.extend(
+        [html.escape(normalize_narrative(_text(title))), "", _escape(study_label), ""]
+    )
     sections = [
-        ("overview", "Overview", _overview),
-        ("populations", "Cell populations", _populations),
-        ("quality", "Quality checks", _quality),
-        ("methods", "Analysis choices", _methods),
-        ("decisions", "Decision notes", _decisions),
-        ("limitations", "Limitations", _limitations),
-        ("provenance", "Technical records", _provenance),
+        ("overview", "Study and input data", _overview, ("inspect", "context")),
+        ("quality", "Quality and preparation", _quality, ("preprocess",)),
+        ("exploration", "Explore clustering", _exploration, ("explore",)),
+        ("selection", "Select the final analysis", _selection, ("finalists",)),
+        ("results", "Examine the results", _results, ("finalize",)),
+        ("populations", "Provisional cell identities", _populations, ("annotate",)),
     ]
     document.html.append(
         '<nav class="contents" aria-label="Report sections">'
         + "".join(
             f'<a href="#{key}"><span>{index:02}</span>{label}</a>'
-            for index, (key, label, _) in enumerate(sections, 1)
+            for index, (key, label, _, _) in enumerate(sections, 1)
         )
         + '</nav><main id="main">'
     )
@@ -737,8 +967,52 @@ def build_report(data: dict[str, Any]) -> tuple[str, str]:
                 "Provide the requested facts when resuming this analysis. The saved study and completed work remain available."
             )
         document.html.append("</aside>")
-    for index, (key, label, build) in enumerate(sections, 1):
-        _section(document, key, index, label, build(data))
+    document.paragraph(
+        "Follow the analysis step by step. Open a section to review its measurements and reasoning; cell identities are provisional.",
+        "caption",
+    )
+    opened = next(
+        (
+            key
+            for key, _, _, stages in sections
+            if data["status"] != "completed" and data["stage"] in stages
+        ),
+        "overview",
+    )
+    outcomes = _outcomes(data)
+    for index, (key, label, build, stages) in enumerate(sections, 1):
+        content = build(data)
+        decisions = _decisions(data, stages)
+        content.html.extend(decisions.html)
+        content.markdown.extend(decisions.markdown)
+        _section(
+            document,
+            key,
+            index,
+            label,
+            content,
+            state=_step_state(data, stages),
+            outcome=outcomes[key],
+            expanded=key == opened,
+        )
+    provenance = _provenance(data)
+    document.html.append(
+        '<section id="provenance" aria-label="Technical records">'
+        + "".join(provenance.html)
+        + "</section>"
+    )
+    document.markdown.extend(["## Technical records", "", *provenance.markdown])
+    document.markdown.extend(
+        [
+            "",
+            "## About Scarf",
+            "",
+            f"[Scarf on GitHub]({_SCARF_URL}) · [Scarf paper]({_PAPER_URL})",
+            "",
+            _PAPER_CITATION,
+            "",
+        ]
+    )
     document.html.append("</main>")
     page = (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -750,12 +1024,17 @@ def build_report(data: dict[str, Any]) -> tuple[str, str]:
         f"font-display:swap;src:url('{INTER_FONT}') format('woff2');}}{STYLE}</style></head>"
         '<body><a class="skip-link" href="#main">Skip to results</a><div class="shell">'
         '<div class="masthead"><div class="brand">'
-        f'<img src="{NYGEN_LOGO}" alt="Nygen logo"><div class="brand-name">Scarf'
-        "<small>Single-cell analysis</small></div></div>"
+        f'<img src="{NYGEN_LOGO}" alt="Nygen logo"><div class="brand-name">'
+        f'<a href="{_NYGEN_URL}">Nygen<small>nygen.io</small></a></div></div>'
         f'<span class="status">{_escape(status)}</span></div>'
         + "".join(document.html)
         + f'<footer class="footer"><img class="scarf-logo" src="{SCARF_LOGO}" alt="Scarf logo">'
-        "<span>Generated from saved analysis records.<br>Provisional identities require biological review.</span>"
+        '<div class="footer-info"><nav class="footer-links" aria-label="Scarf resources">'
+        f'<a href="{_SCARF_URL}">Scarf on GitHub</a>'
+        f'<a href="{_PAPER_URL}">Scarf paper</a></nav>'
+        f'<p class="paper-citation">{_PAPER_CITATION}</p>'
+        '<p class="footer-note">Generated from saved analysis records. '
+        "Provisional identities require biological review.</p></div>"
         "</footer></div></body></html>\n"
     )
     return page, "\n".join(document.markdown)

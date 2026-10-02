@@ -1,6 +1,8 @@
 """Public results that keep frozen numerical identity separate from local records."""
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -137,12 +139,55 @@ class AnalysisRun:
         return cast("pd.DataFrame", store.get_markers(marker=run["markers"], **kwargs))
 
     def plot_embedding(self, **kwargs: Any) -> Any:
-        """Plot frozen UMAP and run fields through the existing core accessor."""
+        """Plot the frozen UMAP with readable defaults; explicit options override them."""
         if {"run", "layout", "layout_key"}.intersection(kwargs):
             raise ValueError("Plot identity is pinned to the final pipeline UMAP")
         store, run = self._bound_pipeline()
-        options = {"color_by": "clusters", **kwargs}
+        options = {**_embedding_options(), **kwargs}
         return store.plots.embedding(run=run, layout="umap", **options)
+
+    def plot_markers(
+        self, *, top_n: int = 2, max_genes: int = 40, show: bool = False
+    ) -> Any:
+        """Plot saved marker means and expressing fractions for the final clusters."""
+        from .plots import marker_dotplot
+
+        store, run = self._bound_pipeline()
+        return marker_dotplot(store, run, top_n=top_n, max_genes=max_genes, show=show)
+
+    def save_plots(self) -> dict[str, Path]:
+        """Save 300-DPI UMAP and marker previews from the verified final artifacts.
+
+        This requires the source store, but never reads the count matrix or runs
+        a numerical pipeline. Call report() afterwards to embed the saved images.
+        """
+        from .plots import marker_dotplot
+
+        store, run = self._bound_pipeline()
+        outputs = {}
+        for name in ("umap_clusters", "marker_dotplot"):
+            path = self.run_dir / f"{name}.png"
+            if path.is_symlink():
+                raise RecordError(f"Refusing to replace a symlink plot: {path.name}")
+            plot = (
+                store.plots.embedding(run=run, layout="umap", **_embedding_options())
+                if name == "umap_clusters"
+                else marker_dotplot(store, run)
+            )
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=self.run_dir, prefix=f".{name}-", suffix=".png", delete=False
+                ) as stream:
+                    temporary = Path(stream.name)
+                plot.save(temporary, dpi=300, exact_size=False)
+                os.replace(temporary, path)
+                outputs[name] = path
+            finally:
+                plot.close()
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return outputs
 
     def report(self) -> Path:
         """Regenerate Markdown, HTML, and annotation CSV using only saved evidence."""
@@ -185,3 +230,16 @@ class AnalysisRun:
 
     def __repr__(self) -> str:
         return f"AnalysisRun(run_dir={str(self.run_dir)!r}, status={self.status!r})"
+
+
+def _embedding_options() -> dict[str, Any]:
+    return {
+        "color_by": "clusters",
+        "figsize": (8, 8),
+        "theme": "paper",
+        "point_edgewidth": 0,
+        "point_alpha": 0.85,
+        "legend_loc": "right",
+        "show_titles": False,
+        "show": False,
+    }

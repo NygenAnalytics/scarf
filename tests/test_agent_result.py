@@ -244,12 +244,149 @@ def test_numerical_access_verifies_relocated_source_and_pins_artifacts(
     assert result.plot_embedding(show=False) == "plot-result"
     assert observed[-1] == (
         "plot",
-        {"run": run, "layout": "umap", "color_by": "clusters", "show": False},
+        {
+            "run": run,
+            "layout": "umap",
+            "color_by": "clusters",
+            "figsize": (8, 8),
+            "theme": "paper",
+            "point_edgewidth": 0,
+            "point_alpha": 0.85,
+            "legend_loc": "right",
+            "show_titles": False,
+            "show": False,
+        },
     )
     with pytest.raises(ValueError, match="pinned"):
         result.get_markers(marker=run["markers"])
     with pytest.raises(ValueError, match="pinned"):
         result.plot_embedding(run=run)
+
+
+def test_plot_options_override_defaults_without_changing_the_final_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = _records(tmp_path)
+    run, observed = _bind(monkeypatch, records)
+    result = AnalysisRun(records.path)
+    result.plot_embedding(
+        figsize=(5, 5), point_alpha=1, legend_loc="on_data", show=True
+    )
+    options = observed[-1][1]
+    assert options["figsize"] == (5, 5)
+    assert options["point_alpha"] == 1
+    assert options["legend_loc"] == "on_data"
+    assert options["show"] is True
+    assert options["run"] is run
+    assert options["layout"] == "umap"
+
+
+def test_marker_plot_uses_the_verified_final_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scarf.agent.plots as plots
+
+    records = _records(tmp_path)
+    run, observed = _bind(monkeypatch, records)
+
+    def marker_plot(store: Any, pipeline: Any, **kwargs: Any) -> str:
+        assert pipeline is run
+        assert kwargs == {"top_n": 3, "max_genes": 12, "show": False}
+        return "marker-plot"
+
+    monkeypatch.setattr(plots, "marker_dotplot", marker_plot)
+    assert (
+        AnalysisRun(records.path).plot_markers(top_n=3, max_genes=12) == "marker-plot"
+    )
+    assert observed[-1] == ("openPipeline", "fixed-final")
+
+
+@pytest.mark.parametrize("failure", [None, "save", "markers", "symlink"])
+def test_saved_plots_are_high_resolution_atomic_and_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    import scarf.agent.plots as plots
+
+    records = _records(tmp_path)
+    result = AnalysisRun(records.path)
+    run, _ = _bind(monkeypatch, records)
+    closed = []
+    saved = []
+    expected = b"existing figure"
+    umap = records.path / "umap_clusters.png"
+    umap.write_bytes(expected)
+
+    class Figure:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def save(self, path: Path, **kwargs: Any) -> None:
+            assert kwargs == {"dpi": 300, "exact_size": False}
+            path.write_bytes(b"new " + self.name.encode())
+            if failure == "save":
+                raise OSError("Disk full")
+            saved.append(self.name)
+
+        def close(self) -> None:
+            closed.append(self.name)
+
+    def embedding(**kwargs: Any) -> Figure:
+        assert kwargs["run"] is run and kwargs["layout"] == "umap"
+        assert kwargs["show"] is False
+        return Figure("umap")
+
+    def marker_plot(store: Any, pipeline: Any) -> Figure:
+        assert pipeline is run
+        if failure == "markers":
+            raise ValueError("No qualifying markers")
+        return Figure("markers")
+
+    store = SimpleNamespace(plots=SimpleNamespace(embedding=embedding))
+    monkeypatch.setattr(result, "_bound_pipeline", lambda: (store, run))
+    monkeypatch.setattr(plots, "marker_dotplot", marker_plot)
+    if failure == "symlink":
+        umap.unlink()
+        target = tmp_path / "external.png"
+        target.write_bytes(expected)
+        umap.symlink_to(target)
+    if failure:
+        with pytest.raises((OSError, ValueError, RecordError)):
+            result.save_plots()
+    else:
+        paths = result.save_plots()
+        assert paths == {
+            "umap_clusters": umap,
+            "marker_dotplot": records.path / "marker_dotplot.png",
+        }
+        assert saved == ["umap", "markers"]
+    assert umap.read_bytes() == (
+        expected if failure in {"save", "symlink"} else b"new umap"
+    )
+    assert closed == (
+        [] if failure == "symlink" else ["umap"] if failure else ["umap", "markers"]
+    )
+    assert not list(records.path.glob(".*.png"))
+    assert result.status == "completed"
+
+
+def test_plot_failure_keeps_completed_status_and_still_renders_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scarf.agent.api import _report
+
+    records = _records(tmp_path)
+    result = AnalysisRun(records.path)
+
+    def fail() -> None:
+        raise ValueError("Marker statistics unavailable")
+
+    monkeypatch.setattr(result, "save_plots", fail)
+    _report(result, records)
+    assert result.status == "completed"
+    assert records.latest("reportError")["stage"] == "report"
+    assert (
+        "A report plot could not be saved" in (records.path / "report.html").read_text()
+    )
 
 
 def test_source_change_prevents_export_before_destination_creation(

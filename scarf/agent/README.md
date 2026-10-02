@@ -371,30 +371,74 @@ print(run.artifacts)  # Exact final core ArtifactRef objects.
 markers = run.get_markers(min_score=0.25, min_frac_exp=0.2)
 plot = run.plot_embedding(show=False)
 plot.close()
+markers = run.plot_markers()  # Saved means and expressing fractions; no count reads.
+markers.save("/path/to/markers.png", dpi=300, exact_size=False)
+markers.close()
+run.save_plots()  # Refresh both 300-DPI previews in the analysis directory.
+run.report()  # Embed the saved previews without opening the numerical store.
 export_dir = run.export("/path/to/new-export-directory")
 ```
 
 Reports work for every saved outcome using local evidence only, even if the source
-has moved or is unavailable. The HTML report leads with cohort counts, a saved
-UMAP preview when present, and a table of provisional cell identities. Expandable
-sections show each cluster's measured markers and reasoning, quality checks,
-analysis choices, and correction diagnostics. Questions and limitations remain
-explicit; earlier recovered issues are kept in the technical history rather than
-presented as current failures. Raw identifiers and links to full records are
-available in a collapsed technical section.
+has moved or is unavailable. Six expandable steps follow the analysis: study and
+input data, quality and preparation, clustering exploration, final selection,
+numerical results, and provisional cell identities. Each step shows its recorded
+progress and a short outcome before expansion. Completed reports open the first
+step; incomplete reports open the current step. Questions and failures remain
+visible above the steps. Missing stage records are labelled explicitly.
+
+Decision explanations accompany the step they informed. The results step shows
+the saved UMAP followed by the marker dotplot; identities, marker evidence,
+annotation downloads, and interpretation limitations come last. Raw identifiers,
+earlier recovered issues, and links to full records remain in a collapsed,
+unnumbered technical appendix. The Markdown companion contains all sections
+without collapsing them.
+
+An `Observed source metadata:` JSON summary in supplied context is presented as
+readable field summaries and expandable category counts, preserving the
+surrounding prose. Invalid or unrecognized summaries remain escaped source text.
+Cluster sizes use an annotated bar chart generated from the exact selected
+finalist's saved counts. Reports embed this chart and save `cluster_sizes.svg`
+for reuse. Missing counts are labelled N/A, distinct from recorded zeroes.
+
+Completed analyses automatically save UMAP and marker dotplot previews before
+rendering the report. A plot failure is recorded without changing scientific
+status, and the report still renders. `save_plots()` regenerates both previews
+from a verified source; `report()` itself remains offline. UMAP defaults use an
+8-inch figure, borderless points, a side legend, and slightly transparent colors;
+`plot_embedding(...)` accepts explicit overrides and keeps Scarf's automatic
+point sizing. These settings do not recompute or change the UMAP coordinates.
+
+The marker dotplot selects up to two markers per cluster with score at least
+0.25 and expressing fraction at least 0.2, capped at 40 distinct genes. Selection
+cycles through cluster ranks so that each cluster's first marker is considered
+before second markers. Every final cluster is displayed. Dot area shows the
+expressing fraction, and color shows `log(1 + mean normalized expression)` on a
+common scale. Gray crosses mean missing measurements; zero expression has no
+dot. Feature indices keep duplicate gene names distinct. Statistics come from
+the final immutable marker table, with one cluster table read at a time; no
+count matrix is read. `plot_markers(top_n=..., max_genes=...)` adjusts panel size.
 
 Reports embed Inter, the supplied Nygen and Scarf logos, and the favicon. The
 responsive layout uses Nygen's blue accent, regular headlines, light subheadlines,
 and 1.2 line spacing, with print styles and keyboard navigation. No script,
 stylesheet service, or font service is required. The Inter SIL Open Font License
-is retained in an HTML source comment. Supplied text is escaped in both HTML and Markdown.
+is retained in an HTML source comment. The masthead links to Nygen's website;
+the footer links to the Scarf repository and paper alongside its full citation.
+These are ordinary navigation links and do not load remote report assets.
+Narrative text supports paragraphs, line
+breaks, lists, emphasis, and inline code, including newline escapes in saved model
+responses. Inline code preserves literal identifiers and paths. In HTML, supplied
+markup is escaped, and narrative links and images remain inactive text.
 
 Only the exact selected finalist supplies displayed cluster counts and marker
 measurements. Missing measurements remain unknown; recorded zeroes stay zero.
 Each visible table or repeated section is limited to 100 entries; the annotation
 CSV and underlying saved records remain complete. An existing regular local
-`umap_clusters.png` of at most 8 MiB can be embedded as a saved preview. Reporting
-never computes a plot or follows a preview symlink. A rendering error cannot
+`umap_clusters.png` or `marker_dotplot.png` of at most 8 MiB can be embedded as a
+saved preview. Reporting derives the cluster-size chart from saved summaries;
+it never opens the numerical store, recomputes UMAP or markers, or follows a
+preview symlink. A rendering error cannot
 change scientific completion; analysis/resume record the report error separately.
 
 Numerical access requires an available source with a matching fingerprint and an

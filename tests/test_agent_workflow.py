@@ -133,6 +133,9 @@ def test_real_pipeline_annotations_reuse_and_readonly_export(
     assert list(after.cells.columns) == columns
     assert after.cells.to_pandas_dataframe(columns, key=None).equals(initial)
     assert result.report().exists()
+    for name in ("umap_clusters.png", "marker_dotplot.png"):
+        assert (result.run_dir / name).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert records.latest("reportError") is None
     result.export(tmp_path / "export")
     import pandas as pd
 

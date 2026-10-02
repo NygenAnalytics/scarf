@@ -25,31 +25,62 @@ the initial implementation. Core Scarf and external skills remain unchanged.
 
 ## Current validation
 
-The report redesign adds **28 report cases**. The targeted agent suite passes
-**386 cases** with **99.19% line coverage**: 2,089 of 2,106 executable statements
-across 15 modules. The four reporting modules have 100% line coverage; every agent
-module exceeds 95%. Branch coverage was not measured.
+The report and plotting checks include **104 report cases** and **18 marker-plot
+cases**. The targeted agent suite passes **487 cases** with **99.31% line
+coverage**: 2,440 of 2,457 executable statements across 18 modules. The reporting
+and plotting modules have 100% line coverage; every agent module exceeds 95%.
+Branch coverage was not measured.
 
 Checks cover readable headings and tables, all saved outcome statuses, exact
 selected-cluster evidence, missing measurements versus zeroes, retained
 correction diagnostics, escaping in HTML and Markdown, safe bounded image reads,
 embedded brand assets and the font license, complete CSV exports, numeric cluster
 ordering, and offline regeneration without changes to scientific records.
+Narrative regressions cover actual and escaped line breaks, paragraphs, nested
+lists, emphasis, inline code, Unicode, literal gene patterns and file paths,
+malformed markup, and inactive supplied links and images.
+Chronological report checks cover all six steps, outcomes visible before
+expansion, decisions beside the relevant evidence, plots before identities,
+current-step expansion, and visible questions or failures. Missing completion
+records stay explicit. A resumed failure takes precedence over an earlier stage
+completion without hiding the saved results. Markdown retains all step content.
+Source-context checks cover named JSON metadata summaries, readable field and
+category tables, surrounding prose, malformed-input fallback, escaping, and
+bounded output. Cluster-size checks verify annotated counts, relative bar sizes
+on a zero-based scale, missing values, natural ordering, exact finalist selection,
+deterministic standalone SVG output, offline generation, and symlink protection.
+Plot checks cover exact final-artifact binding, read-only access, bounded marker
+selection, duplicate gene names, missing statistics versus zero expression,
+fraction-to-area scaling, 300-DPI atomic saves, figure cleanup, user overrides,
+and plot failures that preserve completed scientific status. The real numerical
+workflow produces both report figures without extra pipeline invocations.
 
 | Report redesign check | Result |
 | --- | --- |
-| `pytest -n 0 tests/test_agent_*.py --cov=scarf/agent --cov-fail-under=95` | 386 passed; 99.19% line coverage |
+| `pytest -n 0 tests/test_agent_*.py --cov=scarf/agent --cov-fail-under=95` | 487 passed; 99.31% line coverage |
 | Ruff check and format check on the agent package and changed report tests | Passed |
-| `mypy scarf/agent` | Passed; 15 source files checked |
-| Local Chromium at 1440 px and 390 px widths | Embedded Inter loaded; no page overflow; readable tables and marker details |
+| `mypy scarf/agent` | Passed; 18 source files checked |
+| Local Chromium at 1440 px and 390 px widths | Embedded Inter loaded; no page overflow; readable tables, marker details, paragraphs, and lists |
 | Keyboard access to wide tables | Focusable scroll regions with accessible names |
+| Chronological steps in local Chromium | Keyboard Enter toggles sections; closed sections and nested evidence remain visible when printing |
+| Source metadata and cluster-size figures | Category tables retain exact counts; annotated bars remain readable on desktop, scroll within the mobile report, and fit print output |
+| Company and Scarf resource links | Correct masthead/footer destinations and complete citation; no external requests on load; desktop/mobile layout passes |
 
 All six reports under `cytebase_analysis/outputs/agent_rerun_20261001_1852` were
 regenerated. Hash comparisons confirmed that manifests, event histories,
 measured evidence, original images, and annotation CSV contents stayed unchanged.
+Each report also has a derived `cluster_sizes.svg` figure from saved counts.
 No provider or numerical store was opened by report regeneration. The complete
 repository suite was not run for this task, as requested. The results below
 predate the report redesign.
+
+The later attempt to refresh the six example figures could not open their
+mounted backing stores: each raised `GroupNotFoundError`, including with the
+original launcher's environment loaded. Their existing images were preserved;
+HTML and Markdown were regenerated offline. New UMAP and marker figures were
+validated against the local real numerical fixture. Once the backing stores are
+available, `open_analysis(path).save_plots()` followed by `.report()` refreshes
+the example figures.
 
 ## Master compatibility validation
 

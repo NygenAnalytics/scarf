@@ -267,6 +267,16 @@ def open_analysis(
 
 
 def _report(result: AnalysisRun, records: RunRecords) -> None:
+    if result.status == "completed":
+        try:
+            result.save_plots()
+        except Exception as error:
+            records.append(
+                "reportError",
+                stage="report",
+                errorType=type(error).__name__,
+                message="A report plot could not be saved; analysis results are unchanged. Regenerate figures with save_plots().",
+            )
     try:
         result.report()
     except Exception as error:

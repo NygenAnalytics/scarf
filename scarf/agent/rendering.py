@@ -206,6 +206,16 @@ def annotation_csv(rows: list[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
+def _preview(path: Path) -> str | None:
+    """Read an optional bounded PNG, without following a symbolic link."""
+    if not path.is_symlink() and path.is_file():
+        with path.open("rb") as stream:
+            image = stream.read(8 * 1024 * 1024 + 1)
+        if len(image) <= 8 * 1024 * 1024 and image.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+    return None
+
+
 def _report_evidence(records: RunRecords, result: dict[str, Any]) -> dict[str, Any]:
     """Join only the selected saved evidence; never reopen the numerical source."""
     prepared = stage_data(records, "preprocess") or stage_data(records, "inspect") or {}
@@ -213,34 +223,45 @@ def _report_evidence(records: RunRecords, result: dict[str, Any]) -> dict[str, A
     selected = (result["final"] or {}).get("selected")
     finalist = assessed.get("finalists", {}).get(selected, {}) if selected else {}
     candidates = []
-    for event in records.events():
+    events = records.events()
+    for event in events:
         if event["kind"] == "candidateMeasured":
             evidence = records.read_json(event["evidence"])
             candidates.append({**evidence, "candidateId": event["candidateId"]})
-    preview = None
-    path = records.path / "umap_clusters.png"
-    # A preview is optional. Do not follow links or read an unbounded image.
-    if not path.is_symlink() and path.is_file():
-        with path.open("rb") as stream:
-            image = stream.read(8 * 1024 * 1024 + 1)
-        if len(image) <= 8 * 1024 * 1024 and image.startswith(b"\x89PNG\r\n\x1a\n"):
-            preview = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
     return {
         **result,
         "prepared": prepared,
         "clusterEvidence": finalist.get("clusters", []),
         "candidateEvidence": candidates,
+        "selectedOption": selected or assessed.get("selected"),
+        "completedStages": [
+            event["stage"] for event in events if event["kind"] == "stageCompleted"
+        ],
+        "startedStages": [
+            event["stage"]
+            for event in events
+            if event["kind"] == "status" and event.get("stage")
+        ],
         "currentMessage": (records.latest("status") or {}).get("message"),
-        "preview": preview,
+        "preview": _preview(records.path / "umap_clusters.png"),
+        "markerPreview": _preview(records.path / "marker_dotplot.png"),
     }
 
 
 def render_report(records: RunRecords) -> Path:
     """Render any saved outcome with local assets and no provider or store access."""
+    from .report_charts import cluster_size_svg
     from .report_html import build_report
 
     result = summary(records)
-    page, markdown = build_report(_report_evidence(records, result))
+    evidence = _report_evidence(records, result)
+    chart = cluster_size_svg(evidence["clusterEvidence"])
+    if chart:
+        atomic_text(records.path / "cluster_sizes.svg", chart)
+        evidence["clusterSizeChart"] = "data:image/svg+xml;base64," + base64.b64encode(
+            chart.encode("utf-8")
+        ).decode("ascii")
+    page, markdown = build_report(evidence)
     atomic_text(records.path / "annotations.csv", annotation_csv(result["annotations"]))
     atomic_text(records.path / "report.md", markdown)
     atomic_text(records.path / "report.html", page)
