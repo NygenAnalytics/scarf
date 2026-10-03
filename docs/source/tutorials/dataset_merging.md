@@ -32,21 +32,32 @@ import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="ERROR", progress=False)
 
+# Connect to the repository of prepared documentation datasets.
 repository = scarf.cytebase.connect("scarf_docs")
+# Download the control PBMC store.
 ctrl_path = repository.download_dataset(
-    name="kang_15K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="kang_15K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-stim_path = repository.download_dataset(
-    name="kang_14K_ifnb-pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
-)
+```
 
+Download the stimulated sample from the same repository.
+
+```{code-cell} ipython3
+# Download the interferon-stimulated PBMC store.
+stim_path = repository.download_dataset(
+    name="kang_14K_ifnb-pbmc_rnaseq", destination="scarf_datasets", zarr=True
+)
+```
+
+Open both source stores before checking their axes.
+
+```{code-cell} ipython3
+# Open the control sample.
 ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
+# Open the stimulated sample.
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
@@ -55,6 +66,7 @@ feature axes; matching gene symbols alone do not establish compatible genome bui
 quantification conventions.
 
 ```{code-cell} ipython3
+# Compare assay types and cell and feature counts before merging.
 pd.DataFrame(
     [
         {
@@ -76,7 +88,9 @@ keeps imported metadata names distinct from columns authored in the merged store
 `reset_cell_filter=False` preserves the source quality-control selections.
 
 ```{code-cell} ipython3
+# Choose a separate path for the merged counts.
 merged_path = "scarf_datasets/kang_dataset_merging.zarr"
+# Write the prepared counts and metadata to the new store.
 scarf.DataStoreMerge(
     datasets=[ds_ctrl, ds_stim],
     zarr_path=merged_path,
@@ -88,7 +102,10 @@ scarf.DataStoreMerge(
     overwrite=True,
 ).dump()
 
+# Open the completed merge to inspect its cells and features.
 merged = scarf.DataStore(merged_path, nthreads=4)
+# Check the merged cell and feature dimensions.
+merged
 ```
 
 `sample_id` records the source label.
@@ -97,13 +114,10 @@ Columns imported from the sources keep the `orig_` prefix so their origin remain
 The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-merged.cells.to_pandas_dataframe(
-    ["sample_id", "orig_cluster_labels"],
-    key="I",
-).groupby("sample_id")["orig_cluster_labels"].agg(
-    cells="count",
-    cell_types="nunique",
-)
+# Count active cells and imported cell types from each source.
+merged.cells.to_pandas_dataframe(["sample_id", "orig_cluster_labels"], key="I").groupby(
+    "sample_id"
+)["orig_cluster_labels"].agg(cells="count", cell_types="nunique")
 ```
 
 ## 3. Inspect a prepared joint analysis
@@ -114,13 +128,15 @@ This is a separate store from `merged`, so the following plots do not run an ana
 you just created. The saved example run is named `docs_default`.
 
 ```{code-cell} ipython3
+# Download the separate, pre-analyzed joint example.
 prepared_path = repository.download_dataset(
-    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="kang_29K_ctrl-ifnb_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{prepared_path}/data.zarr", nthreads=4)
+# Open the prepared baseline for the comparisons below.
 baseline = ds.pipeline.open(label="docs_default")
+# List the results available in the separate prepared analysis.
 sorted(baseline)
 ```
 
@@ -131,6 +147,7 @@ One plotting call compares source identity, imported cell types, and the exact c
 on the same layout.
 
 ```{code-cell} ipython3
+# Compare source labels, imported cell types, and computed clusters.
 ds.plots.embedding(
     layout=baseline["umap"],
     color_by=["sample_id", "orig_cluster_labels", baseline["clusters"]],
@@ -141,11 +158,8 @@ ds.plots.embedding(
 A table of proportions shows whether each Leiden cluster contains cells from both sources.
 
 ```{code-cell} ipython3
-pd.crosstab(
-    baseline.cells.fetch("clusters"),
-    baseline.cells.fetch("sample_id"),
-    normalize="index",
-)
+# Compare the cell counts or fractions across the selected groups.
+pd.crosstab(baseline.cells.fetch("clusters"), baseline.cells.fetch("sample_id"), normalize="index")
 ```
 
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.

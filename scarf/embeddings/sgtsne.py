@@ -1,6 +1,7 @@
+import os
 import shutil
 import subprocess
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from uuid import uuid4
 
@@ -158,10 +159,12 @@ def run_sgtsne(
 
     # sgtsnepi's own silent mode closes descriptors 1 and 2 for the rest of
     # the process, so quiet runs redirect them around the call instead.
-    output: AbstractContextManager[None] = (
-        nullcontext() if verbose else suppress_native_output()
-    )
-    with output:
+    with ExitStack() as output:
+        if not verbose:
+            output.enter_context(suppress_native_output())
+            stream = output.enter_context(open(os.devnull, "w"))
+            output.enter_context(redirect_stdout(stream))
+            output.enter_context(redirect_stderr(stream))
         embedding = sgtsnepi(
             graph,
             y0=ini_embed.T,

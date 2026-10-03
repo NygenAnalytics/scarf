@@ -42,31 +42,36 @@ We set `min_features_per_cell=10` to retain low-feature cells for inspection bef
 stricter thresholds.
 
 ```{code-cell} ipython3
+# Arrange and save Matplotlib figures.
 import matplotlib.pyplot as plt
+# Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize cells and results in tables.
 import pandas as pd
 
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the raw 10x count file for quality control.
 counts = scarf.cytebase.connect("scarf_docs").download(
     "tenx_5K_pbmc_rnaseq/data.h5",
     destination="scarf_datasets",
 )[0]
 
+# Choose a separate store for this quality-control example.
 store = counts.with_name("quality_control.zarr")
+# Open a reader for the selected source format.
 reader = scarf.CrH5Reader(str(counts))
-scarf.CrToZarr(
-    reader,
-    zarr_loc=str(store),
-).dump()
+# Write the converted count store.
+scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
 
-ds = scarf.DataStore(
-    str(store),
-    nthreads=4,
-    min_features_per_cell=10,
-)
+# Open the count store for this analysis.
+ds = scarf.DataStore(str(store), nthreads=4, min_features_per_cell=10)
+# Inspect the opened store's cells and features.
+ds
 ```
 
 The `I` {term}`cell key` marks the cells retained when the store is opened. Filtering saves a new
@@ -78,16 +83,16 @@ Scarf prepares QC columns when a new store is first opened. These include total 
 features, and mitochondrial and ribosomal percentages when the gene names match their patterns.
 
 ```{code-cell} ipython3
+# Keep the quality measurements available in this store.
 qc_cols = [
     c
     for c in ("RNA_nCounts", "RNA_nFeatures", "RNA_percentMito", "RNA_percentRibo")
     if c in ds.cells.columns
 ]
+# Freeze the input cells before comparing filters.
 qc_cell_selection = ds.snapshot_cell_selection("I")
-ds.plots.distribution(
-    keys=qc_cols,
-    cell_selection=qc_cell_selection,
-)
+# Inspect the input distributions of the available quality measurements.
+ds.plots.distribution(keys=qc_cols, cell_selection=qc_cell_selection)
 ```
 
 Each violin uses an immutable snapshot of `I`, so cells already below `min_features_per_cell` from
@@ -101,9 +106,13 @@ MADs from the median. Counts and detected features use log1p values and two-side
 mitochondrial and ribosomal percentages use upper bounds only.
 
 ```{code-cell} ipython3
+# Filter cells with the default robust thresholds.
 automatic_selection = ds.auto_filter_cells(cell_selection=qc_cell_selection)
+# Load the cells retained by automatic filtering.
 automatic_mask = np.asarray(ds.load_artifact(automatic_selection)["values"][:], dtype=bool)
+# Count cells retained by automatic filtering.
 print(f"Cells after automatic filtering: {int(automatic_mask.sum())}")
+# Inspect the same quality measurements after automatic filtering.
 ds.plots.distribution(keys=qc_cols, cell_selection=automatic_selection)
 ```
 
@@ -119,16 +128,23 @@ The named QC columns are read from current cell metadata when the method is call
 explicitly named column is absent, filtering raises an error instead of silently omitting it.
 
 ```{code-cell} ipython3
+# Count cells before applying manual thresholds.
 n_before = int(ds.cells.fetch_all("I").sum())
+# Define the manual count, feature, and mitochondrial thresholds.
 manual_filter = {
     "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
     "highs": [15000, 4000, 15],
     "lows": [1000, 500, 0],
 }
+# Apply the manual thresholds to the input cells.
 manual_selection = ds.filter_cells(**manual_filter)
+# Load the cells retained by manual filtering.
 manual_mask = np.asarray(ds.load_artifact(manual_selection)["values"][:], dtype=bool)
+# Report the input cell count.
 print(f"Cells in input selection: {n_before}")
+# Report the retained cell count.
 print(f"Cells in filtered selection: {int(manual_mask.sum())}")
+# Summarize the selected values and their spread.
 pd.DataFrame({key: ds.cells.fetch_all(key)[manual_mask] for key in qc_cols}).describe()
 ```
 
@@ -150,6 +166,7 @@ Use a real sample column when the dataset contains multiple donors or batches. T
 same immutable-selection contract as the global filter:
 
 ```python
+# Estimate quality thresholds separately for each sample.
 sample_selection = ds.auto_filter_cells(
     cell_selection=qc_cell_selection,
     sample_column="sample_id",
@@ -163,6 +180,7 @@ cannot be estimated reliably. The same rule applies to a pooled selection with f
 The same options can be forwarded through the standard pipeline:
 
 ```python
+# Pass the sample-specific filtering choice through the pipeline.
 ds.pipeline.run(
     filtering={"sample_column": "sample_id"},
 )
@@ -188,16 +206,18 @@ explicit cell selection. The datastore method returns a `quality_metric` artifac
 a cell column:
 
 ```{code-cell} ipython3
+# Read the RNA feature names.
 feature_names = ds.RNA.feats.fetch_all("names").astype(str)
+# Select genes whose names start with HSP.
 stress_features = ds.set_feature_selection(
     from_assay="RNA",
     mask=np.char.startswith(feature_names, "HSP"),
 )
-stress_percentage = ds.run_feature_percentage(
-    manual_selection,
-    stress_features,
-)
+# Calculate the selected genes' count percentage in each retained cell.
+stress_percentage = ds.run_feature_percentage(manual_selection, stress_features)
+# Load the calculated percentages.
 stress_values = np.asarray(ds.load_artifact(stress_percentage)["values"][:])
+# Summarize the selected values and their spread.
 pd.Series(stress_values, name="percent stress features").describe()
 ```
 
@@ -212,6 +232,7 @@ cells automatically. Here we reuse the manual QC thresholds and the prepared PBM
 defaults. We skip cell-cycle scoring, Paris, and markers because they are not needed for this check.
 
 ```{code-cell} ipython3
+# Run the graph and clustering steps needed for doublet scoring.
 doublet_run = ds.pipeline.run(
     filtering={"method": "manual", **manual_filter},
     hvg_count=500,
@@ -222,20 +243,30 @@ doublet_run = ds.pipeline.run(
     doublets=True,
     markers=False,
 )
+# Keep the doublet-score artifact for further filtering.
 doublets = doublet_run["doublets"]
+# Read the doublet scores in the analysis cell order.
 scores = np.asarray(doublet_run.cells.fetch("doublet_score"))
-ds.plots.embedding(
-    run=doublet_run,
-    color_by="doublet_score",
-    sort_values=True,
-)
+# Name the scores for summaries and plots.
+scores_series = pd.Series(scores, name="doublet_score")
+# Summarize the selected values and their spread.
+scores_series.describe()
+```
+
+Locate high doublet scores on the embedding:
+
+```{code-cell} ipython3
+# Locate cells with high doublet scores on the UMAP.
+ds.plots.embedding(run=doublet_run, color_by="doublet_score", sort_values=True)
 ```
 
 Higher doublet scores mark cells that map near simulated doublets.
 Inspect the score distribution before applying a cutoff:
 
 ```{code-cell} ipython3
-pd.Series(scores, name="doublet_score").plot(kind="hist", bins=40)
+# Plot the doublet-score distribution.
+scores_series.plot(kind="hist", bins=40)
+# Display the completed figure.
 plt.show()
 ```
 
@@ -246,10 +277,11 @@ The teaching cutoff below identifies the upper 5% of scores on this PBMC run; re
 study-specific value when the upper-tail shape differs.
 
 ```{code-cell} ipython3
-scores_series = pd.Series(scores, name="doublet_score")
-print(scores_series.describe())
+# Use the 95th percentile as this example's upper cutoff.
 doublet_threshold = float(scores_series.quantile(0.95))
+# Report the selected doublet-score cutoff.
 print(f"Doublet threshold (95th percentile): {doublet_threshold:.4f}")
+# Count cells excluded by the cutoff.
 print(f"Cells above threshold: {int((scores > doublet_threshold).sum())}")
 ```
 
@@ -257,11 +289,9 @@ Compose the upper bound with the score artifact's stored input selection. This r
 the bound and leaves live metadata unchanged:
 
 ```{code-cell} ipython3
-doublet_filtered = ds.select_cells(
-    doublets,
-    high=doublet_threshold,
-    keep_bounds=True,
-)
+# Retain cells whose score is at or below the chosen cutoff.
+doublet_filtered = ds.select_cells(doublets, high=doublet_threshold, keep_bounds=True)
+# Count the cells retained after applying the cutoff.
 int(np.asarray(ds.load_artifact(doublet_filtered)["values"][:]).sum())
 ```
 

@@ -47,11 +47,16 @@ import pandas as pd
 import scarf
 from scarf.plotting import CellField, StudyDesign
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Choose a local folder for reusable input files.
 dataset_directory = Path(environ.get("SCARF_DOCS_DATA_DIR", "scarf_datasets"))
+# Create the local folder if it does not already exist.
 dataset_directory.mkdir(parents=True, exist_ok=True)
+# Name the local H5AD download.
 h5ad_path = dataset_directory / "binvignat_ra_pbmc.h5ad"
+# Name the reusable converted count store.
 source_store = dataset_directory / "binvignat_ra_pbmc.zarr"
 ```
 
@@ -59,18 +64,27 @@ Download to a temporary filename so an interrupted download is not mistaken for 
 complete H5AD file.
 
 ```{code-cell}
+# Reuse completed local work when it is already present.
 if not h5ad_path.exists():
+    # Use a temporary filename until the download finishes.
     partial_path = h5ad_path.with_suffix(".h5ad.part")
+    # Download the complete input file to the temporary filename.
     urlretrieve(
         "https://datasets.cellxgene.cziscience.com/3b751975-34bb-409a-a9b7-98380f0450ea.h5ad",
         partial_path,
     )
+    # Move the completed file or store to its reusable path.
     partial_path.replace(h5ad_path)
 
+# Inspect the available count matrix before conversion.
 inspection = scarf.inspect_h5ad(str(h5ad_path))
+# Verify that the count matrix is stored at raw/X.
 assert inspection.matrixKey == "raw/X"
+# Verify that the matrix contains integer-like counts.
 assert inspection.integerLike is True
+# Verify the published cell and gene counts.
 assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
+# Show the selected matrix and its cell and gene counts.
 inspection.matrixKey, inspection.nCells, inspection.nFeatures
 ```
 
@@ -83,20 +97,24 @@ Conversion uses a 6 GiB budget because the planned count layout needs about 5 GB
 finished store is moved into place only after conversion succeeds.
 
 ```{code-cell}
+# Reuse completed local work when it is already present.
 if not source_store.exists():
+    # Stage conversion in a temporary folder before publishing the completed store.
     with TemporaryDirectory(dir=dataset_directory) as conversion_directory:
+        # Convert into a temporary store until every write succeeds.
         staged_store = Path(conversion_directory) / source_store.name
+        # Read the count matrix and its cell and feature identifiers.
         reader = scarf.H5adReader.from_inspect(inspection)
+        # Ensure the input reader is closed even if conversion fails.
         try:
+            # Write the prepared counts and metadata to the new store.
             scarf.H5adToZarr(
-                reader,
-                zarr_loc=str(staged_store),
-                assay_name="RNA",
-                nthreads=4,
-                mem_budget="6G",
+                reader, zarr_loc=str(staged_store), assay_name="RNA", nthreads=4, mem_budget="6G"
             ).dump()
         finally:
+            # Close the figure or reader after its final use.
             reader.h5.close()
+        # Move the completed file or store to its reusable path.
         staged_store.replace(source_store)
 ```
 
@@ -105,15 +123,23 @@ selection and test results in a temporary working store while leaving the count 
 in its reusable source store.
 
 ```{code-cell}
+# Open the source without dropping cells before selecting the cohort.
 source = scarf.DataStore(
-    str(source_store),
-    default_assay="RNA",
-    min_features_per_cell=0,
-    nthreads=4,
+    str(source_store), default_assay="RNA", min_features_per_cell=0, nthreads=4
 )
+# Check that initialization retained all published cells.
 assert source.cells.N == 108_717
 
+# Inspect the initialized source store.
+source
+```
+
+Keep new selections and test results in a separate working store.
+
+```{code-cell} ipython3
+# Keep new analysis results in a temporary working folder.
 analysis_directory = TemporaryDirectory()
+# Open the datastore for the following analysis.
 ds = scarf.mount_datastore(
     str(source_store),
     at=str(Path(analysis_directory.name) / "condition_analysis.zarr"),
@@ -121,6 +147,8 @@ ds = scarf.mount_datastore(
     min_features_per_cell=0,
     nthreads=4,
 )
+# Inspect the store's assays and dimensions.
+ds
 ```
 
 ## Select the matched cells
@@ -130,20 +158,31 @@ The publication calls gamma-delta T cells `yd T cells` in `fine_annot`.
 and a recorded pair, then save the selection for both the test and plot.
 
 ```{code-cell}
+# Keep a consistent order for control and rheumatoid arthritis.
 GROUPS = ["normal", "rheumatoid arthritis"]
+# Read the published fine cell-type labels.
 fine_annotation = np.asarray(ds.cells.fetch_all("fine_annot"), dtype=object)
+# Read the matched-pair identifier for each cell.
 pair_index = np.asarray(ds.cells.fetch_all("pair_index_CW"), dtype=float)
+# Keep gamma-delta T cells with a recorded matched pair.
 matched_gamma_delta = np.isfinite(pair_index) & (fine_annotation == "yd T cells")
+# Save the values in cell metadata using the stated selection.
 ds.cells.insert("matched_yd_t_cells", matched_gamma_delta, overwrite=True)
+# Freeze the selected cells for both the statistical test and plot.
 cells = ds.snapshot_cell_selection("matched_yd_t_cells")
+# Check how many cells were retained for the paired analysis.
+{"selected cells": int(matched_gamma_delta.sum()), "total cells": ds.cells.N}
 ```
 
 Before testing, check that each donor belongs to one condition and one pair. Each pair
 must contain one donor from each condition.
 
 ```{code-cell}
+# Read the donor identity for each cell.
 donor_id = np.asarray(ds.cells.fetch_all("donor_id"), dtype=object)
+# Read each cell's biological condition.
 disease = np.asarray(ds.cells.fetch_all("disease"), dtype=object)
+# Reduce the selected metadata to one row per donor and pair.
 donor_design = pd.DataFrame(
     {
         "donor_id": donor_id[matched_gamma_delta],
@@ -151,19 +190,28 @@ donor_design = pd.DataFrame(
         "pair_index_CW": pair_index[matched_gamma_delta],
     }
 ).drop_duplicates()
+# Check the selected gamma-delta T-cell count.
 assert int(matched_gamma_delta.sum()) == 1_386
+# Require one design row per selected donor.
 assert len(donor_design) == donor_design["donor_id"].nunique() == 36
+# Require the expected 18 matched pairs.
 assert donor_design["pair_index_CW"].nunique() == 18
+# Require both comparison conditions in the selected design.
 assert set(donor_design["disease"]) == set(GROUPS)
+# Inspect the first four donor pairs and their disease labels.
+donor_design.sort_values(["pair_index_CW", "disease"]).head(8)
 ```
 
 ```{code-cell}
+# Count donors and conditions within each matched pair.
 pair_balance = donor_design.groupby("pair_index_CW", observed=True).agg(
-    donors=("donor_id", "nunique"),
-    conditions=("disease", "nunique"),
+    donors=("donor_id", "nunique"), conditions=("disease", "nunique")
 )
+# Require two donors in every matched pair.
 assert pair_balance["donors"].eq(2).all()
+# Require one donor from each condition in every pair.
 assert pair_balance["conditions"].eq(2).all()
+# Count the biological replicates in each condition.
 donor_design.groupby("disease", observed=True).size().rename("donors")
 ```
 
@@ -177,20 +225,20 @@ We use the same design again for the plot. Scarf averages normalized expression 
 donors by default, then aligns the pairs for a two-sided signed-rank test.
 
 ```{code-cell}
+# Choose the six genes for this exploratory comparison.
 panel = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
+# Use disease metadata to define the comparison groups.
 condition = CellField("disease")
-design = StudyDesign(
-    sample_by="donor_id",
-    condition_by="disease",
-    pair_by="pair_index_CW",
-)
+# Declare the donor, condition, and matched-pair columns.
+design = StudyDesign(sample_by="donor_id", condition_by="disease", pair_by="pair_index_CW")
+```
+
+Run the paired comparison on donor means.
+
+```{code-cell} ipython3
+# Compare paired donor means with the Wilcoxon signed-rank test.
 paired_result = ds.run_statistical_testing(
-    panel,
-    condition,
-    cell_selection=cells,
-    groups=GROUPS,
-    study_design=design,
-    test="wilcoxon",
+    panel, condition, cell_selection=cells, groups=GROUPS, study_design=design, test="wilcoxon"
 )
 ```
 
@@ -199,10 +247,11 @@ adjusted p-values alongside the donor distributions, rather than looking only fo
 threshold crossing.
 
 ```{code-cell}
+# Combine the per-gene tests into one results table.
 panel_table = pd.concat(
-    {gene: paired_result.tables[gene] for gene in panel},
-    names=["gene"],
+    {gene: paired_result.tables[gene] for gene in panel}, names=["gene"]
 ).reset_index(level="gene")
+# Inspect pair counts and adjusted p-values for the six genes.
 panel_table[["gene", "n_pairs", "statistic", "p_value", "p_value_adjusted"]]
 ```
 
@@ -213,6 +262,7 @@ brackets, so the displayed statistics come from the same comparison. Give the si
 enough space and enlarge the points so individual donors remain visible.
 
 ```{code-cell}
+# Compare distributions within the stated groups.
 ds.plots.distribution(
     panel,
     grouping=condition,

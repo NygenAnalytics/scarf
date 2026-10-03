@@ -28,32 +28,53 @@ import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Reuse the saved run and its frozen cell selection.
 analysis_run = ds.pipeline.open(label="docs_default")
+# Keep the graph used by the saved analysis.
 graph = analysis_run["connectivity_map"]
+# Use the complete feature universe for this assay.
 all_features = analysis_run["feature_universe"]
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 Use the published cell-type annotations to orient the graph. As in the pseudotime
 example, the source and pooled sinks each receive a total mass of one, with opposite signs.
 
 ```{code-cell}
+# Read the published cell-type labels for the selected cells.
 annotations = ds.cells.fetch("clusters", key="I")
+# Mark ductal cells as the source population.
 source = annotations == "Ductal"
+# Mark the pooled terminal populations.
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
+# Require at least one annotated source cell and one sink cell.
 if not source.any() or not sink.any():
     raise ValueError("Source and sink annotations must both be present")
+# Start every graph cell with zero source or sink mass.
 source_sink_vector = np.zeros(len(annotations), dtype=float)
+# Share total mass -1 among the source cells.
 source_sink_vector[source] = -1.0 / source.sum()
+# Share total mass +1 among the pooled sink cells.
 source_sink_vector[sink] = 1.0 / sink.sum()
+# Orient the graph using the chosen source and sinks.
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
+# Check how many cells anchor the two ends of the ordering.
+pd.Series({"source cells": int(source.sum()), "sink cells": int(sink.sum())})
 ```
 
 ## Group changing expression profiles
@@ -63,7 +84,9 @@ smooths each retained gene over a 200-cell window, summarizes it in 50 bins, and
 similar profiles into 10 modules.
 
 ```{code-cell}
+# Group genes with similar expression profiles along pseudotime.
 modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_features)
+# Display the ordered expression profiles and their modules.
 ds.plots.pseudotime_heatmap(aggregation=modules_ref)
 ```
 
@@ -80,10 +103,11 @@ not a claim that the process has ten biological programs.
 Load the saved result to see how many genes each module contains:
 
 ```{code-cell}
+# Load the saved gene-module assignments.
 modules = ds.load_pseudotime_aggregation(modules_ref)
-module_genes = pd.DataFrame(
-    {"gene": modules.feature_names, "module": modules.feature_clusters}
-)
+# Pair each retained gene with its module label.
+module_genes = pd.DataFrame({"gene": modules.feature_names, "module": modules.feature_clusters})
+# Count the genes assigned to each expression module.
 module_genes.groupby("module").size().rename("genes")
 ```
 
@@ -91,7 +115,9 @@ Choose a module from the heatmap, then list its genes. The example below selects
 first module label only to show the lookup; the returned genes are not ranked markers.
 
 ```{code-cell}
+# Choose the first module to demonstrate gene lookup.
 module_id = module_genes["module"].min()
+# Inspect the first twenty genes in the chosen module.
 module_genes.loc[module_genes["module"] == module_id, "gene"].head(20)
 ```
 
@@ -104,11 +130,8 @@ A wide window can hide a brief expression peak; a narrow one can retain more noi
 To explore a shorter window, repeat the call with one changed setting:
 
 ```python
-modules_ref = ds.run_pseudotime_aggregation(
-    pseudotime_ref,
-    features=all_features,
-    window_size=100,
-)
+# Group genes with similar expression profiles along pseudotime.
+modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_features, window_size=100)
 ```
 
 `n_clusters` controls the requested number of modules. `chunk_size` controls the number

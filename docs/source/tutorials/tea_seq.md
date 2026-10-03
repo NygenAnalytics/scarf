@@ -26,17 +26,24 @@ We use the 6,194 cells whose barcodes match the publication's Figure 4 labels. O
 6,333 labeled well-W3 cells, 139 are absent from this source object.
 
 ```{code-cell}
+# Open count stores and run Scarf analyses.
 import scarf
+# Select explicit fields and display options for plots.
 from scarf.plotting import CellField, FeatureRef
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "swanson_7K_pbmc_teaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="RNA", nthreads=4)
+# Inspect the opened store's cells and features.
+ds
 ```
 
 Import and preprocessing are already complete. RNA uses log-transformed library-size
@@ -50,14 +57,18 @@ and rearrange, so compare population neighborhoods rather than absolute position
 island sizes. A population's labels and cell count are the same in all three panels.
 
 ```{code-cell}
+# Inspect the RNA, ATAC, and protein views in turn.
 for assay in ("RNA", "ATAC", "ADT"):
+    # Select the saved layout for this assay; require exactly one match.
     [layout] = ds.list_artifacts(
         from_assay=assay,
         kind="embedding",
         operation="run_umap",
         complete_only=True,
     )
+    # Label the modality shown in the next figure.
     print(assay)
+    # Color this modality's UMAP by the publication cell types.
     ds.plots.embedding(layout=layout, color_by="tea_cell_type")
 ```
 
@@ -69,6 +80,7 @@ noise. A more compact population is not, by itself, evidence of a better analysi
 Select the saved WNN graph and the UMAP made from it:
 
 ```{code-cell}
+# Select the saved WNN graph; require exactly one match.
 [wnn_graph] = ds.list_artifacts(
     scope="datastore",
     kind="integrated_graph",
@@ -76,6 +88,7 @@ Select the saved WNN graph and the UMAP made from it:
     parameters={"method": "wnn"},
     complete_only=True,
 )
+# Select the saved WNN layout; require exactly one match.
 [wnn_layout] = ds.list_artifacts(
     scope="datastore",
     kind="embedding",
@@ -83,11 +96,14 @@ Select the saved WNN graph and the UMAP made from it:
     inputs={"graph": wnn_graph},
     complete_only=True,
 )
+# Inspect the selected WNN graph and its matching layout.
+{"WNN graph": wnn_graph, "WNN layout": wnn_layout}
 ```
 
 Now compare the publication labels with four measured protein markers on the joint map.
 
 ```{code-cell}
+# Compare publication labels with four protein markers on the WNN map.
 ds.plots.embedding(
     layout=wnn_layout,
     color_by=[
@@ -110,6 +126,7 @@ publication's layout.
 ## See which modality contributes locally
 
 ```{code-cell}
+# Show how much each modality contributes across the joint map.
 ds.plots.modality_weights(graph=wnn_graph, layout=wnn_layout)
 ```
 

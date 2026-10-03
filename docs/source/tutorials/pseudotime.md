@@ -24,22 +24,33 @@ Alpha, Beta, and Delta populations, then find genes associated with that orderin
 ## Open the prepared analysis
 
 ```{code-cell}
+# Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize cells and results in tables.
 import pandas as pd
 
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved pancreas analysis.
 analysis_run = ds.pipeline.open(label="docs_default")
+# Keep the graph from the saved analysis.
 graph = analysis_run["connectivity_map"]
+# Keep the full feature selection for marker testing.
 all_features = analysis_run["feature_universe"]
+# Inspect the opened store's cells and features.
+ds
 ```
 
 The saved analysis supplies the graph, UMAP, and feature selection. The store's live
@@ -57,27 +68,41 @@ All other cells receive zero. Sharing each total across its cells keeps source a
 mass balanced despite their different sizes.
 
 ```{code-cell}
+# Read the published cell types for the selected cells.
 labels = ds.cells.fetch("clusters", key="I")
+# Choose Ductal cells as the starting population.
 source = labels == "Ductal"
+# Choose the pooled endocrine endpoints.
 sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
+# Stop if either chosen endpoint population is absent.
 if not source.any() or not sink.any():
     raise ValueError("Source and sink labels must both be present")
+# Start with zero weight for cells outside the endpoints.
 source_sink_vector = np.zeros(len(labels), dtype=float)
+# Share a total weight of minus one across the source cells.
 source_sink_vector[source] = -1.0 / source.sum()
+# Share a total weight of plus one across the sink cells.
 source_sink_vector[sink] = 1.0 / sink.sum()
+# Check the endpoint sizes and balanced total weights.
+{
+    "source cells": int(source.sum()),
+    "sink cells": int(sink.sum()),
+    "source weight": source_sink_vector[source].sum(),
+    "sink weight": source_sink_vector[sink].sum(),
+}
 ```
 
 ## Score and view pseudotime
 
 ```{code-cell}
+# Score pseudotime using the chosen source and sink weights.
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
+# Load pseudotime scores and their validity mask.
 pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
+# Save the calculated values in the cell table.
 ds.cells.insert("pseudotime", pseudotime.values, key="I", overwrite=True)
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by="pseudotime",
-    sort_values=True,
-)
+# Show how pseudotime changes across the pancreas UMAP.
+ds.plots.embedding(layout=analysis_run['umap'], color_by='pseudotime', sort_values=True)
 ```
 
 Low values should lie toward the Ductal region and high values toward the endocrine
@@ -87,6 +112,7 @@ expected for intermediate populations; the spacing is not a clock.
 Check the score within each annotation, using only cells marked valid:
 
 ```{code-cell}
+# Summarize the selected values and their spread.
 pd.DataFrame(
     {
         "cell type": labels[pseudotime.valid],
@@ -102,14 +128,27 @@ is a reason to revisit the graph or endpoint choice.
 ## Find genes associated with the ordering
 
 ```{code-cell}
+# Test the selected genes for association with pseudotime.
 marker_ref = ds.run_pseudotime_marker_search(pseudotime_ref, features=all_features)
+# Load the marker table and adjusted p-values.
 markers = ds.load_pseudotime_markers(marker_ref)
+# Inspect the first few rows of the result.
+markers.table.head()
+```
+
+Keep tested genes, then compare the strongest increasing and decreasing associations:
+
+```{code-cell} ipython3
+# Keep genes with an adjusted p-value.
 tested = markers.table.loc[
     markers.table["p_value_adjusted"].notna(),
     ["feature_name", "r_value", "p_value_adjusted"],
 ]
+# Select the ten strongest positive correlations.
 increasing = tested.loc[tested["r_value"] > 0].nlargest(10, "r_value")
+# Select the ten strongest negative correlations.
 decreasing = tested.loc[tested["r_value"] < 0].nsmallest(10, "r_value")
+# Display increasing and decreasing genes together.
 pd.concat({"increasing": increasing, "decreasing": decreasing})
 ```
 

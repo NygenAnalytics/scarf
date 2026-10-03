@@ -42,18 +42,27 @@ we match below to reuse its results; `docs_default` is a saved label, not a prom
 setting is the API default.
 
 ```{code-cell} ipython3
+# Open count stores and run Scarf analyses.
 import scarf
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved analysis used to check reuse.
 baseline_run = ds.pipeline.open(label="docs_default")
+# Keep the cells used by the saved analysis.
 cell_selection = baseline_run["analysis_cell_selection"]
+# Keep the variable genes used by the saved analysis.
 hvg_ref = baseline_run["highly_variable_features"]
+# Inspect the opened store's cells and features.
+ds
 ```
 
 ## 1. Open and inspect the baseline chain
@@ -61,17 +70,31 @@ hvg_ref = baseline_run["highly_variable_features"]
 The completed run retains every immutable reference needed to keep side comparisons separate.
 
 ```{code-cell} ipython3
+# Reopen the saved normalized expression.
 normalized = baseline_run["normalized"]
+# Reopen the saved PCA result.
 pca = baseline_run["pca"]
+# Keep the saved nearest-neighbor index.
 ann = baseline_run["ann_index"]
+# Keep the saved 11-neighbor result.
 neighbors_k11 = baseline_run["neighbors"]
+# Keep the baseline connectivity graph.
 graph_k11 = baseline_run["connectivity_map"]
+# Inspect the saved chain from normalization to connectivity.
+{
+    "normalization": normalized,
+    "PCA": pca,
+    "neighbor index": ann,
+    "neighbors": neighbors_k11,
+    "graph": graph_k11,
+}
 ```
 
 The catalog can also find results by exact provenance predicates. It returns every match and never
 chooses a latest result, so one-item destructuring is an explicit cardinality check:
 
 ```{code-cell} ipython3
+# Find the exact saved graph from its neighbor input.
 [reopened_graph] = ds.list_artifacts(
     from_assay="RNA",
     kind="connectivity_map",
@@ -79,9 +102,12 @@ chooses a latest result, so one-item destructuring is an explicit cardinality ch
     inputs={"neighbors": neighbors_k11},
     complete_only=True,
 )
+# Check that the catalog returned the baseline graph.
 assert reopened_graph == graph_k11
 
+# Inspect the saved graph's operation, parameters, and inputs.
 status = ds.inspect_artifact(reopened_graph)
+# Inspect the graph operation and the exact inputs it records.
 {
     "operation": status.operation,
     "parameters": status.parameters,
@@ -96,9 +122,12 @@ A new neighbor count changes only the neighbors and connectivity {term}`provenan
 The normalization, PCA, and ANN references are unchanged.
 
 ```{code-cell} ipython3
+# Query the existing index with 15 neighbors per cell.
 neighbors_k15 = ds.query_neighbors(ann, k=15)
+# Build connectivity for the new neighbor count.
 graph_k15 = ds.build_connectivity_map(neighbors_k15)
 
+# Check which results were reused and which changed.
 {
     "normalization reused": ds.run_normalization(cell_selection, hvg_ref) == normalized,
     "PCA reused": ds.run_pca(normalized, dims=15) == pca,
@@ -118,11 +147,16 @@ ANN, neighbors, and connectivity that depend on the old reduction are not reused
 The earlier results remain available.
 
 ```{code-cell} ipython3
+# Fit a separate reduction with 20 principal components.
 pca_dims20 = ds.run_pca(normalized, dims=20)
+# Build a search index from the 20-component reduction.
 ann_dims20 = ds.build_ann_index(pca_dims20)
+# Find 11 neighbors using the new reduction.
 neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11)
+# Build the connectivity graph for this reduction.
 graph_dims20 = ds.build_connectivity_map(neighbors_dims20)
 
+# Check which results were reused and which changed.
 {
     "PCA recomputed": pca_dims20 != pca,
     "ANN index recomputed": ann_dims20 != ann,
@@ -143,11 +177,9 @@ exact immutable `cell_selection` and `feature_selection` inputs. It is not execu
 throwaway duplicate adds no evidence to the lineage figure.
 
 ```python
-forced = ds.run_normalization(
-    cell_selection,
-    hvg_ref,
-    invalidate_cache=True,
-)
+# Force normalization to create a new result with the same inputs.
+forced = ds.run_normalization(cell_selection, hvg_ref, invalidate_cache=True)
+# Check that forcing recomputation produced a distinct result.
 forced != normalized
 ```
 
@@ -157,6 +189,7 @@ Build one read-only report from both neighbour-count branches and the `dims=20` 
 Shared upstream nodes appear once; the forks show where each branch diverged.
 
 ```{code-cell} ipython3
+# Trace the shared inputs and differences between all three graphs.
 lineage = ds.lineage(
     {
         "k11 graph": graph_k11,
@@ -164,6 +197,7 @@ lineage = ds.lineage(
         "dims20 graph": graph_dims20,
     }
 )
+# Display the shared inputs and diverging analysis branches.
 lineage
 ```
 
@@ -176,7 +210,9 @@ Export the same report when it needs to travel with an analysis.
 the complete string elsewhere:
 
 ```{code-cell} ipython3
+# Export the displayed lineage report as Markdown.
 lineage_markdown = lineage.to_markdown()
+# Preview the opening lines of the exported report.
 lineage_markdown.splitlines()[:12]
 ```
 

@@ -28,11 +28,16 @@ For a filtered Cell Ranger H5 file, convert the counts to a Scarf store and run 
 ```python
 import scarf
 
+# Read the count matrix and its cell and feature identifiers.
 reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
+# Write the prepared counts and metadata to the new store.
 scarf.CrToZarr(reader, zarr_loc="analysis.zarr").dump()
 
+# Open the datastore for the following analysis.
 ds = scarf.DataStore("analysis.zarr")
+# Run the default RNA analysis and retain its results.
 run = ds.pipeline.run(label="baseline")
+# Color the new RNA embedding by its selected clusters.
 ds.plots.embedding(run=run, color_by="clusters")
 ```
 
@@ -52,13 +57,21 @@ Download an already analyzed dataset of about 5,000 blood cells:
 ```{code-cell} ipython3
 import scarf
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_5K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the downloaded store and inspect its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr")
+# Open the saved analysis and retain its exact results.
 run = ds.pipeline.open(label="docs_default")
+# Inspect the store's assays and dimensions.
+ds
 ```
 
 `pipeline.open` reads saved results; `pipeline.run` computes an analysis. Here `docs_default` is
@@ -66,6 +79,7 @@ the name of the prepared example. It used dataset-specific filtering, 500 variab
 15 PCs, so its labels and plots need not match a new run with the current defaults.
 
 ```{code-cell} ipython3
+# Color the prepared PBMC embedding by its saved clusters.
 ds.plots.embedding(run=run, color_by="clusters")
 ```
 

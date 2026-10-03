@@ -38,6 +38,7 @@ import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 ```
 
@@ -49,23 +50,26 @@ The store contains an analysis saved as `docs_default`. We use its selected cell
 we can focus on cell-cycle scoring.
 
 ```{code-cell} ipython3
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq", destination="scarf_datasets", zarr=True
 )
-ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
-    nthreads=4,
-)
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Reuse the saved run and its frozen cell selection.
 analysis_run = ds.pipeline.open(label="docs_default")
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    run=analysis_run,
-    color_by="clusters",
-)
+# Locate the saved pancreas clusters before scoring.
+ds.plots.embedding(run=analysis_run, color_by="clusters")
 ```
 
 ## 2. Run cell-cycle scoring
@@ -82,11 +86,18 @@ Cells with two negative scores are assigned G1. Otherwise, G2M wins when its sco
 score, and the remaining cells are assigned S.
 
 ```{code-cell} ipython3
+# Score the cell-cycle programs on the run's selected cells.
 cell_cycle_ref = ds.run_cell_cycle_scoring(analysis_run["analysis_cell_selection"])
+# Open the saved phase labels and scores.
 cell_cycle_values = ds.load_artifact(cell_cycle_ref)
+# Read each selected cell's S-phase score.
 s_score = np.asarray(cell_cycle_values["s_score"][:])
+# Read each selected cell's G2M-phase score.
 g2m_score = np.asarray(cell_cycle_values["g2m_score"][:])
+# Read the assigned phase in the same cell order.
 phase = np.asarray(cell_cycle_values["phase"][:]).astype(str)
+# Preview phase assignments alongside the two cell-cycle scores.
+pd.DataFrame({"S score": s_score, "G2M score": g2m_score, "phase": phase}).head()
 ```
 
 Two markers in the bundled G2M list are absent from this assay.
@@ -100,10 +111,8 @@ later. Scoring requires a writable datastore.
 Pass the result directly to the embedding plot to color cells by phase:
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by=cell_cycle_ref,
-)
+# Show the assigned cell-cycle phase on the saved UMAP.
+ds.plots.embedding(layout=analysis_run["umap"], color_by=cell_cycle_ref)
 ```
 
 Look for populations enriched for S or G2M. Cycling cells may be concentrated in one population
@@ -113,6 +122,7 @@ Phase composition for the pipeline's selected clustering shows which groups are 
 G2M relative to G1:
 
 ```{code-cell} ipython3
+# Compare the cell counts or fractions across the selected groups.
 pd.crosstab(analysis_run.cells.fetch("clusters"), phase, normalize="index")
 ```
 
@@ -123,16 +133,21 @@ Rows are cluster-wise phase fractions among the cells captured by the run.
 The S and G2M score arrays are stored in the same artifact.
 
 ```{code-cell} ipython3
+# Read the run's UMAP coordinates in the score arrays' cell order.
 umap = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+# Create one plotting axis for each comparison panel.
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
-for axis, values, title in (
-    (axes[0], s_score, "S score"),
-    (axes[1], g2m_score, "G2M score"),
-):
+# Draw each comparison on its own labeled axis.
+for axis, values, title in ((axes[0], s_score, "S score"), (axes[1], g2m_score, "G2M score")):
+    # Color each cell by the values for this panel.
     points = axis.scatter(umap["umap_1"], umap["umap_2"], c=values, s=3)
+    # Label the panel with the quantity being compared.
     axis.set_title(title)
+    # Show the value scale used to color the cells.
     figure.colorbar(points, ax=axis)
+# Adjust spacing so panel labels remain readable.
 figure.tight_layout()
+# Display the completed figure.
 figure
 ```
 
@@ -142,17 +157,15 @@ The rebuilt dataset retains cell-cycle scores calculated with Scanpy in the `S_s
 `G2M_score` metadata columns. Plot both on the pipeline run's exact UMAP.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by=["S_score", "G2M_score"],
-    n_columns=2,
-)
+# Show the imported Scanpy scores on the same UMAP.
+ds.plots.embedding(layout=analysis_run["umap"], color_by=["S_score", "G2M_score"], n_columns=2)
 ```
 
 The Scanpy scores look similar to Scarf's.
 Quantify the concordance:
 
 ```{code-cell} ipython3
+# Compare Scarf and Scanpy phase scores with Pearson correlation.
 pd.Series(
     {
         "S": np.corrcoef(s_score, ds.cells.fetch("S_score"))[0, 1],

@@ -371,6 +371,30 @@ def test_quiet_sgtsnepi_backend_keeps_standard_descriptors(tmp_path):
     assert "Number of vertices" not in completed.stderr
 
 
+def test_quiet_sgtsnepi_backend_suppresses_notebook_streams(monkeypatch, capsys):
+    pytest.importorskip("sgtsnepi")
+    monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
+    n_cells = 40
+    rows = np.repeat(np.arange(n_cells), 2)
+    columns = np.column_stack(
+        ((np.arange(n_cells) + 1) % n_cells, (np.arange(n_cells) - 1) % n_cells)
+    ).ravel()
+    graph = csr_matrix((np.ones(2 * n_cells) / 2, (rows, columns)))
+    initial = np.random.default_rng(0).normal(scale=1e-4, size=(n_cells, 2))
+    streams = sys.stdout, sys.stderr
+
+    embedding = sgtsne_module.run_sgtsne(
+        graph, initial, max_iter=10, early_iter=5, verbose=False
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert (sys.stdout, sys.stderr) == streams
+    assert embedding.shape == (2, n_cells)
+    assert np.isfinite(embedding).all()
+
+
 def test_run_sgtsne_requires_an_available_backend(monkeypatch):
     monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
     monkeypatch.setitem(sys.modules, "sgtsnepi", None)

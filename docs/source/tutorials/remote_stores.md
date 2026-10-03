@@ -57,32 +57,46 @@ Download the example to a temporary directory, then create a separate target for
 For your own work, use persistent paths and keep the count source available.
 
 ```{code-cell} ipython3
+# Manage local file and directory paths.
 from pathlib import Path
+# Create temporary directories for this example.
 from tempfile import TemporaryDirectory
 
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="ERROR", progress=False)
+# Connect to the public example-data repository.
 repository = scarf.cytebase.connect("scarf_docs")
+# Keep the local source and mounted target in one temporary directory.
 mount_directory = TemporaryDirectory()
+# Download a local count source for the mounting example.
 staged_dataset = repository.download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination=mount_directory.name,
     zarr=True,
 )
+# Locate the downloaded count store.
 source_path = staged_dataset / 'data.zarr'
+# Choose a separate path for writable analysis results.
 target_path = Path(mount_directory.name) / 'analysis.zarr'
+# Check that the count source and analysis target have distinct paths.
+{"count source": str(source_path), "analysis target": str(target_path)}
 ```
 
 The target path must not already exist:
 
 ```{code-cell} ipython3
+# Mount the count source into a separate writable target.
 mounted = scarf.mount_datastore(
     str(source_path),
     at=str(target_path),
     default_assay='RNA',
     nthreads=4,
 )
+# Inspect the opened store's cells and features.
+mounted
 ```
 
 Counts and RNA `countsT` stay in the downloaded count source.
@@ -103,10 +117,14 @@ clusters are written only to the local target. Because the target and its source
 `local_cache` staging is skipped here; Section 3 makes that policy explicit.
 
 ```{code-cell} ipython3
+# Run the RNA analysis through the mounted store.
 mounted_run = mounted.pipeline.run(label="mounted_analysis")
+# Confirm that the saved pipeline run completed.
+mounted_run.status
 ```
 
 ```{code-cell} ipython3
+# Show the clusters produced by the mounted analysis.
 mounted.plots.embedding(run=mounted_run, color_by="clusters")
 ```
 
@@ -114,11 +132,11 @@ Opening the target later resolves the source automatically.
 The source must remain accessible at the recorded path or URI:
 
 ```{code-cell} ipython3
-reopened = scarf.DataStore(
-    str(target_path),
-    nthreads=4,
-)
+# Reopen the mounted target from its saved path.
+reopened = scarf.DataStore(str(target_path), nthreads=4)
+# Open the exact run saved in the mounted target.
 reopened_run = reopened.pipeline.open(run_id=mounted_run.run_id)
+# Confirm that the saved pipeline run completed.
 reopened_run.status
 ```
 
@@ -145,6 +163,7 @@ artifacts to a local target. This is the remote form of the source/target separa
 locally in Section 1:
 
 ```python
+# Mount the count source into a separate writable target.
 mounted = scarf.mount_datastore(
     's3://shared-bucket/atlas.zarr',
     at='my-analysis.zarr',
@@ -161,8 +180,10 @@ Pass an object-store URI as `zarr_loc` and provider options as `storage_options`
 S3 shape is a template, not a tested public dataset:
 
 ```python
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Open the count store for this analysis.
 ds = scarf.DataStore(
     "s3://bucket/path/to/data.zarr",
     zarr_mode="r",
@@ -175,9 +196,12 @@ retain the layout chosen when they were created. Read credentials from the envir
 than embedding secrets in notebooks:
 
 ```python
+# Read object-store credentials from the environment.
 import os
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Open a writable remote store with credentials from the environment.
 remote_writable = scarf.DataStore(
     "s3://my-bucket/project/data.zarr",
     zarr_mode="r+",
@@ -221,14 +245,18 @@ policy stages normalized blocks and keeps the cache for inspection or reuse. The
 also a non-executed template:
 
 ```python
+# Freeze the current active cells before selecting genes.
 cell_selection = remote_writable.snapshot_cell_selection(cell_key="I")
+# Select variable genes for the remote reduction.
 features = remote_writable.select_hvgs(
     cell_selection,
     min_cells=20,
     top_n=2000,
     show_plot=False,
 )
+# Normalize counts over the selected features.
 normalized = remote_writable.run_normalization(cell_selection, features)
+# Fit PCA with persistent local scratch for remote normalized data.
 reduction = remote_writable.run_pca(
     normalized,
     dims=15,

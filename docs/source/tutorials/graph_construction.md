@@ -51,37 +51,70 @@ run's frozen cell and feature selections, then calls every graph stage explicitl
 reuse the completed baseline artifacts; later sections create only the branches they discuss.
 
 ```{code-cell} ipython3
+# Arrange and save Matplotlib figures.
 import matplotlib.pyplot as plt
+# Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize cells and results in tables.
 import pandas as pd
 
+# Open count stores and run Scarf analyses.
 import scarf
+# Use Scarf plotting options and diagnostics.
 import scarf.plotting as splt
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved analysis that supplies the starting selections.
 baseline = ds.pipeline.open(label="docs_default")
+# Inspect the opened store's cells and features.
+ds
+```
+
+Retrieve the cell and gene selections used by the saved analysis:
+
+```{code-cell} ipython3
+# Keep the cells used by the saved analysis.
 cell_selection = baseline["analysis_cell_selection"]
+# Keep the variable genes used by the saved analysis.
 hvg_ref = baseline["highly_variable_features"]
+# Use the cell metadata frozen with this analysis.
 run_cells = baseline.cells
+# Inspect the saved cell and gene selections.
+{"cells": cell_selection, "genes": hvg_ref}
 ```
 
 Each method returns a reference to its saved result. Pass it to the next method to keep the
 steps connected. We use 15 PCs to match the prepared example; `run_pca` defaults to 21.
 
 ```{code-cell} ipython3
+# Normalize counts over the selected features.
 normalized = ds.run_normalization(cell_selection, hvg_ref)
+# Reduce the normalized expression to principal components.
 pca = ds.run_pca(normalized, dims=15)
-initialization = ds.build_embedding_initialization(pca)
+# Inspect the PCA result that will supply neighbor coordinates.
+pca
+```
+
+Build the neighbor index from PCA, then turn neighbor distances into connectivity:
+
+```{code-cell} ipython3
+# Build the nearest-neighbor search index from the reduction.
 ann_index = ds.build_ann_index(pca)
+# Find neighbors of each cell in the reduced space.
 neighbors = ds.query_neighbors(ann_index)
+# Convert neighbor distances into weighted connectivity.
 graph = ds.build_connectivity_map(neighbors)
+# Inspect the saved connectivity graph.
 graph
 ```
 
@@ -92,18 +125,23 @@ neighbour edges. For the diagnostics below, use `symmetric=True` to include a co
 either cell selects the other. This lets us count each cell's neighbours in either direction.
 
 ```{code-cell} ipython3
+# Load a symmetric sparse graph for diagnostics.
 loaded_graph = ds.load_graph(graph, symmetric=True)
+# Check the number of cells and nonzero graph edges.
 loaded_graph.shape, loaded_graph.nnz
 ```
 
 ```{code-cell} ipython3
+# Inspect graph degree and edge-weight distributions.
 splt.graph_qc(loaded_graph)
 ```
 
 Check isolation and whether degree tracks QC metrics before treating the graph as ready for clustering:
 
 ```{code-cell} ipython3
+# Count the neighbors connected to each cell.
 degrees = np.asarray((loaded_graph != 0).sum(axis=0)).ravel()
+# Summarize graph coverage and isolated cells.
 pd.Series(
     {
         "active cells": int(loaded_graph.shape[0]),
@@ -117,6 +155,7 @@ pd.Series(
 ```
 
 ```{code-cell} ipython3
+# Align graph degrees with the same cells' quality measurements.
 degree_vs_qc = pd.DataFrame(
     {
         "degree": degrees,
@@ -124,6 +163,7 @@ degree_vs_qc = pd.DataFrame(
         "RNA_nFeatures": run_cells.fetch("RNA_nFeatures"),
     }
 )
+# Check whether graph degree tracks the quality measurements.
 degree_vs_qc.corr(numeric_only=True)
 ```
 
@@ -139,9 +179,15 @@ Each returns an immutable artifact without adding cell-metadata columns. Use
 Resolution 0.5 matches the prepared PBMC analysis; Leiden's default is 1.0.
 
 ```{code-cell} ipython3
+# Build starting coordinates for the embedding.
+initialization = ds.build_embedding_initialization(pca)
+# Calculate the UMAP coordinates from the graph.
 umap = ds.run_umap(graph, initialization)
+# Find groups of cells in the graph.
 clusters = ds.run_leiden_clustering(graph, resolution=0.5)
+# Read cluster labels in the selected cells' order.
 cluster_values = np.asarray(ds.load_artifact(clusters)["values"][:])
+# Color the graph-derived UMAP by its Leiden clusters.
 ds.plots.embedding(layout=umap, color_by=clusters)
 ```
 
@@ -151,8 +197,11 @@ Suppose the PCA and ANN index are expensive but two neighbour counts need to be 
 Reuse the same index and retain both returned graph references.
 
 ```{code-cell} ipython3
+# Query the same index with 21 neighbors per cell.
 neighbors_k21 = ds.query_neighbors(ann_index, k=21)
+# Build connectivity for the 21-neighbor comparison.
 graph_k21 = ds.build_connectivity_map(neighbors_k21)
+# Check that the changed parameters produced a distinct result.
 graph_k21 != graph
 ```
 
@@ -162,7 +211,9 @@ Downstream calls must receive one of them explicitly, so a parameter experiment 
 Degree and edge weight both shift when every cell sees more neighbours:
 
 ```{code-cell} ipython3
+# Load the comparison graph with symmetric edges.
 loaded_graph_k21 = ds.load_graph(graph_k21, symmetric=True)
+# Compare the number of stored edges in the two graphs.
 pd.Series(
     {
         "k=11 nnz": int(loaded_graph.nnz),
@@ -173,6 +224,7 @@ pd.Series(
 ```
 
 ```{code-cell} ipython3
+# Inspect graph degree and edge-weight distributions.
 splt.graph_qc(loaded_graph_k21)
 ```
 
@@ -180,21 +232,28 @@ To analyse the side branch, pass its exact graph reference.
 Retain both returned refs so neither branch replaces the other.
 
 ```{code-cell} ipython3
+# Cluster the 21-neighbor graph at the same resolution.
 clusters_k21 = ds.run_leiden_clustering(graph_k21, resolution=0.5)
+# Read the comparison cluster labels.
+cluster_values_k21 = np.asarray(ds.load_artifact(clusters_k21)["values"][:])
+# Count cells in each reported category.
+pd.Series(cluster_values_k21, name="cluster").value_counts().sort_index()
 ```
 
 Place both partitions on the shared `k=11` UMAP so changes in group boundaries are visible,
 then compare their assignments with a crosstab:
 
 ```{code-cell} ipython3
-cluster_values_k21 = np.asarray(ds.load_artifact(clusters_k21)["values"][:])
+# Create axes for the comparison panels.
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+# Draw each result on its comparison axes.
 for axis, cluster_ref, title in zip(
     axes,
     (clusters, clusters_k21),
     ("k=11 Leiden", "k=21 Leiden"),
     strict=True,
 ):
+    # Compare the two clusterings on the same k=11 UMAP.
     ds.plots.embedding(
         layout=umap,
         color_by=cluster_ref,
@@ -202,12 +261,16 @@ for axis, cluster_ref, title in zip(
         show_titles=False,
         show=False,
     )
+    # Label the panel with the result it shows.
     axis.set_title(title)
+# Adjust spacing between the comparison panels.
 figure.tight_layout()
+# Display the completed comparison figure.
 figure
 ```
 
 ```{code-cell} ipython3
+# Count cells shared by each pair of cluster assignments.
 pd.crosstab(
     pd.Series(cluster_values, name="k=11"),
     pd.Series(cluster_values_k21, name="k=21"),
@@ -229,9 +292,13 @@ the earlier analysis remain available.
 Harmony fits between PCA and the ANN index:
 
 ```python
+# Correct PCA coordinates using a technical batch column.
 corrected = ds.run_harmony(pca, ["technical_batch"])
+# Build the neighbor index from corrected coordinates.
 corrected_index = ds.build_ann_index(corrected)
+# Find neighbors in the corrected space.
 corrected_neighbors = ds.query_neighbors(corrected_index, k=21)
+# Build connectivity from the corrected neighbors.
 corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
 

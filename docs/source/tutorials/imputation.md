@@ -26,25 +26,35 @@ monocytes. Use other markers to interpret its location, as described in {doc}`an
 ## Open the prepared graph
 
 ```{code-cell}
+# Open count stores and run Scarf analyses.
 import scarf
+# Select explicit fields and display options for plots.
 from scarf.plotting import CellField, ColorScale, FeatureRef
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved analysis and its exact results.
 run = ds.pipeline.open(label="docs_default")
+# Keep the graph from the saved analysis.
 graph = run["connectivity_map"]
+# Inspect the opened store's cells and features.
+ds
 ```
 
 The graph and UMAP come from the same saved analysis. First view its clusters so we
 have population boundaries to compare with the expression maps.
 
 ```{code-cell}
+# Locate the PBMC clusters before comparing CD4 expression.
 ds.plots.embedding(run=run, layout="umap", color_by="clusters", legend_loc="on_data")
 ```
 
@@ -54,9 +64,14 @@ ds.plots.embedding(run=run, layout="umap", color_by="clusters", legend_loc="on_d
 signal across graph neighbors. `get_imputed` applies that operator to one feature.
 
 ```{code-cell}
+# Build the diffusion operator with the default two steps.
 diffusion = ds.run_diffusion_operator(graph)
+# Apply diffusion to normalized CD4 expression.
 smoothed = ds.get_imputed(feature_name="CD4", diffusion=diffusion)
+# Save the calculated values in the cell table.
 ds.cells.insert("CD4_imputed_t2", smoothed, key="I", overwrite=True)
+# Check the number of smoothed cells and their expression range.
+{"cells": len(smoothed), "minimum": smoothed.min(), "maximum": smoothed.max()}
 ```
 
 The inserted column lets us plot the smoothed values beside observed, normalized CD4
@@ -64,6 +79,7 @@ expression. Both panels share a color scale. In this prepared store, the active 
 (`I`) match the saved graph's cell selection.
 
 ```{code-cell}
+# Compare observed CD4 with two-step smoothing on a shared color scale.
 ds.plots.embedding(
     layout=run["umap"],
     color_by=[
@@ -86,18 +102,31 @@ A larger `t` lets signal travel through more graph steps. To judge whether the d
 smooths too little or too much, compare it with one and three steps:
 
 ```{code-cell}
+# Compute the two additional diffusion depths.
 for t in (1, 3):
+    # Build the operator for this diffusion depth.
     operator = ds.run_diffusion_operator(graph, t=t)
+    # Smooth CD4 expression with this operator.
     values = ds.get_imputed(feature_name="CD4", diffusion=operator)
+    # Save the calculated values in the cell table.
     ds.cells.insert(f"CD4_imputed_t{t}", values, key="I", overwrite=True)
 
+# Confirm which smoothing depths are ready to compare.
+{"diffusion steps": [1, 2, 3], "cells per column": len(values)}
+```
+
+Place the observed values beside all three smoothing depths:
+
+```{code-cell} ipython3
+# Name the three smoothed columns for the comparison plot.
+diffusion_fields = [
+    CellField(f"CD4_imputed_t{t}", kind="continuous", label=f"Diffusion t={t}")
+    for t in (1, 2, 3)
+]
+# Compare observed CD4 with all three diffusion depths.
 ds.plots.embedding(
     layout=run["umap"],
-    color_by=[FeatureRef("CD4", label="Observed CD4")]
-    + [
-        CellField(f"CD4_imputed_t{t}", kind="continuous", label=f"Diffusion t={t}")
-        for t in (1, 2, 3)
-    ],
+    color_by=[FeatureRef("CD4", label="Observed CD4"), *diffusion_fields],
     n_columns=4,
     color_scale=ColorScale(scope="shared"),
     sort_values=True,

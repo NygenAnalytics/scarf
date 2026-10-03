@@ -24,7 +24,9 @@ assumptions; changing it can change the scores.
 ## Count the cells that were scored
 
 ```python
+# Load pseudotime scores and their validity mask.
 pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
+# Report the fraction of cells with valid pseudotime scores.
 float(pseudotime.valid.mean())
 ```
 
@@ -37,8 +39,20 @@ when searching for pseudotime markers or aggregating expression.
 ## Inspect changing genes and modules
 
 ```python
+# Load the marker table and adjusted p-values.
 markers = ds.load_pseudotime_markers(marker_ref)
+# Inspect the first few rows of the result.
+markers.table.head()
+```
+
+Inspect the expression profiles with the module plots in {doc}`expression_dynamics`.
+Load the aggregation result when you need its values for further checks:
+
+```python
+# Load the saved aggregation of changing genes.
 modules = ds.load_pseudotime_aggregation(modules_ref)
+# Inspect the loaded aggregation result.
+modules
 ```
 
 Correlations can miss transient or branch-specific changes. Inspect the profiles and
@@ -52,9 +66,13 @@ checks. Neither result establishes that a gene causes the process.
 ## Separate probability checks from biological evidence
 
 ```python
+# Load the saved fate probabilities and validity mask.
 fate = ds.load_fate_mapping(fate_ref)
+# Restrict probability checks to scored cells.
 valid_probabilities = fate.values[fate.valid]
+# Measure the largest deviation from a row sum of one.
 row_sum_error = abs(valid_probabilities.sum(axis=1) - 1.0).max()
+# Show the largest probability row-sum error.
 row_sum_error
 ```
 
@@ -72,7 +90,14 @@ Record which graph, cells, features, and endpoints produced the result. Saved re
 let you check this directly:
 
 ```python
+# Inspect the saved result's parameters and inputs.
 ds.inspect_artifact(fate_ref)
+```
+
+Then inspect how those inputs connect:
+
+```python
+# Display the saved result and its upstream inputs.
 ds.lineage(fate_ref)
 ```
 

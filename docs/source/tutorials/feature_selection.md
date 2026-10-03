@@ -34,21 +34,36 @@ import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_5K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the prepared baseline for the comparisons below.
 baseline = ds.pipeline.open(label="docs_default")
+# Reuse the run's frozen analysis cells.
 cell_selection = baseline["analysis_cell_selection"]
-hvg_500 = ds.select_hvgs(
-    cell_selection,
-    top_n=500,
-)
+# Inspect the opened assays and their dimensions.
+ds
+```
+
+Fit and inspect the 500-gene selection used by the saved example.
+
+```{code-cell} ipython3
+# Select the same 500 genes used by the prepared baseline.
+hvg_500 = ds.select_hvgs(cell_selection, top_n=500)
+# Load the selected-gene mask on the full feature axis.
 hvg_500_values = np.asarray(ds.load_artifact(hvg_500)["values"][:])
+# Check agreement with the saved selection and its gene count.
 {
     "matches docs_default": hvg_500 == baseline["highly_variable_features"],
     "selected genes": int(hvg_500_values.sum()),
@@ -75,17 +90,14 @@ Count how many genes in this dataset fall into each family:
 from scarf.features.gene_families import GENE_FAMILY_PATTERNS
 from scarf.features.variability import DEFAULT_HVG_BLACKLIST
 
+# Count genes matching each default exclusion family.
 family_counts = pd.Series(
-    {
-        name: len(ds.RNA.feats.grep(pattern))
-        for name, pattern in GENE_FAMILY_PATTERNS.items()
-    },
+    {name: len(ds.RNA.feats.grep(pattern)) for name, pattern in GENE_FAMILY_PATTERNS.items()},
     name="genes matching pattern",
 )
-print(
-    "Default blacklist matches:",
-    len(ds.RNA.feats.grep(DEFAULT_HVG_BLACKLIST)),
-)
+# Count all genes matched by the combined default blacklist.
+print("Default blacklist matches:", len(ds.RNA.feats.grep(DEFAULT_HVG_BLACKLIST)))
+# Inspect which excluded gene families are represented in the assay.
 family_counts
 ```
 
@@ -99,33 +111,31 @@ Clearing the blacklist keeps every gene name while retaining other HVG filters.
 Compare the same `top_n` with and without the default pattern:
 
 ```{code-cell} ipython3
-hvg_no_blacklist = ds.select_hvgs(
-    cell_selection,
-    top_n=500,
-    blacklist="",
-    show_plot=False,
-)
+# Repeat selection with the same count and no name blacklist.
+hvg_no_blacklist = ds.select_hvgs(cell_selection, top_n=500, blacklist="", show_plot=False)
+# Keep both feature masks for a direct comparison.
 selection_values = {
     "hvgs_default": hvg_500_values,
-    "hvgs_no_blacklist": np.asarray(
-        ds.load_artifact(hvg_no_blacklist)["values"][:]
-    ),
+    "hvgs_no_blacklist": np.asarray(ds.load_artifact(hvg_no_blacklist)["values"][:]),
 }
+# Compare selected-gene counts with and without name exclusions.
 pd.Series(
-    {
-        key: int(values.sum())
-        for key, values in selection_values.items()
-    },
-    name="selected genes",
+    {key: int(values.sum()) for key, values in selection_values.items()}, name="selected genes"
 )
 ```
 
 ```{code-cell} ipython3
+# Read gene names on the full feature axis.
 feature_names = ds.RNA.feats.fetch_all("names")
+# Keep the default selection mask.
 default_values = selection_values["hvgs_default"]
+# Keep the selection made without name exclusions.
 unblocked_values = selection_values["hvgs_no_blacklist"]
+# Find genes added only when the blacklist is cleared.
 only_without_blacklist = feature_names[unblocked_values & ~default_values]
+# Count genes added only when the blacklist is cleared.
 print("Genes selected only when blacklist is cleared:", len(only_without_blacklist))
+# Inspect the newly included gene names.
 pd.Series(only_without_blacklist).head(15)
 ```
 
@@ -149,17 +159,35 @@ This comparison keeps all other graph choices fixed. The 500-gene branch comes d
 `docs_default`; only the 1,000-gene branch is new.
 
 ```{code-cell} ipython3
-feature_1000 = ds.select_hvgs(
-    cell_selection,
-    top_n=1000,
-    show_plot=False,
-)
+# Select 1,000 genes on the same frozen cell population.
+feature_1000 = ds.select_hvgs(cell_selection, top_n=1000, show_plot=False)
+# Check the number of genes retained for the new branch.
+int(np.asarray(ds.load_artifact(feature_1000)["values"][:]).sum())
+```
+
+Normalize the selected genes and construct the new graph.
+
+```{code-cell} ipython3
+# Normalize the new feature selection.
 normalized_1000 = ds.run_normalization(cell_selection, feature_1000)
+# Keep 15 PCA dimensions for this feature-count comparison.
 pca_1000 = ds.run_pca(normalized_1000, dims=15)
+# Prepare the embedding initialization from the new PCA.
 initialization_1000 = ds.build_embedding_initialization(pca_1000)
+# Build a neighbor-search index for the new PCA.
 ann_1000 = ds.build_ann_index(pca_1000)
+# Keep the baseline neighbor count of 11.
 neighbors_1000 = ds.query_neighbors(ann_1000, k=11)
+# Build connectivity from the new neighbors.
 graph_1000 = ds.build_connectivity_map(neighbors_1000)
+# Inspect the PCA dimensions supplied to this graph.
+ds.load_artifact(pca_1000)["data"].shape
+```
+
+Build the layout and clustering for the new graph.
+
+```{code-cell} ipython3
+# Pair the layout and clustering for each feature count.
 feature_branches = {
     500: (baseline["umap"], baseline["leiden_0.5"]),
     1000: (
@@ -167,24 +195,37 @@ feature_branches = {
         ds.run_leiden_clustering(graph_1000, resolution=0.5),
     ),
 }
+# Read the dimensions of the saved layout for each feature count.
+layout_shapes = {
+    top_n: ds.load_artifact(layout_ref)["values"].shape
+    for top_n, (layout_ref, _) in feature_branches.items()
+}
+# Check that both layouts contain the same cells and two embedding coordinates.
+pd.DataFrame(layout_shapes, index=["cells", "embedding dimensions"]).T
 ```
 
 ```{code-cell} ipython3
+# Create one plotting axis for each comparison panel.
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+# Retain the cluster labels from each plotted feature branch.
 cluster_values = {}
+# Draw each comparison on its own labeled axis.
 for axis, top_n in zip(axes, feature_branches, strict=True):
+    # Select this branch's layout and cluster labels.
     umap_ref, cluster_ref = feature_branches[top_n]
+    # Read the cluster labels for this branch.
     labels = np.asarray(ds.load_artifact(cluster_ref)["values"][:])
+    # Retain those labels for the cross-tabulation below.
     cluster_values[top_n] = labels
+    # Plot this feature branch with its corresponding clustering.
     ds.plots.embedding(
-        layout=umap_ref,
-        color_by=cluster_ref,
-        target=axis,
-        show_titles=False,
-        show=False,
+        layout=umap_ref, color_by=cluster_ref, target=axis, show_titles=False, show=False
     )
+    # Label the panel with the quantity being compared.
     axis.set_title(f"{top_n:,} selected genes")
+# Adjust spacing so panel labels remain readable.
 figure.tight_layout()
+# Display the completed figure.
 figure
 ```
 
@@ -193,8 +234,11 @@ change without changing the groups. A row spread across several columns suggests
 column collecting several rows suggests a merge. The margins report cluster sizes.
 
 ```{code-cell} ipython3
+# Read the baseline 500-gene cluster labels.
 cluster_500 = cluster_values[500]
+# Read the 1,000-gene cluster labels.
 cluster_1000 = cluster_values[1000]
+# Compare the cell counts or fractions across the selected groups.
 pd.crosstab(
     pd.Series(cluster_500, name="500 genes"),
     pd.Series(cluster_1000, name="1,000 genes"),
@@ -203,11 +247,12 @@ pd.crosstab(
 ```
 
 ```{code-cell} ipython3
+# Quantify partition agreement between 500 and 1,000 genes.
 pd.Series(
     {
         "adjusted Rand index": ds.metric_label_concordance(
             feature_branches[500][1], feature_branches[1000][1]
-        ),
+        )
     },
     name="500 vs 1,000 selected genes",
 )
@@ -227,13 +272,15 @@ Exactly one input form is required; duplicate or out-of-range indexes, misaligne
 Verify the mask length and selected count before building a graph:
 
 ```{code-cell} ipython3
+# Choose a small marker panel for the comparison.
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
-manual_mask = np.isin(
-    feature_names.astype(str),
-    panel_genes,
-)
+# Match the chosen genes to the complete feature axis.
+manual_mask = np.isin(feature_names.astype(str), panel_genes)
+# Check that the manual mask matches the assay axis and is nonempty.
 print("mask length:", len(manual_mask), "selected:", int(manual_mask.sum()))
+# Save the externally chosen feature selection.
 custom_features = ds.set_feature_selection(mask=manual_mask)
+# Inspect the reference for the saved manual gene selection.
 custom_features
 ```
 
@@ -243,6 +290,7 @@ Both producer calls return an {term}`ArtifactRef`.
 Pass that reference directly when continuing a branch:
 
 ```python
+# Keep the normalization fixed while comparing reductions.
 normalized = ds.run_normalization(cell_selection, custom_features)
 ```
 
@@ -250,6 +298,7 @@ Retain or persist exact refs in the analysis record. To request the complete fea
 use the canonical all-features producer:
 
 ```python
+# Use the complete feature universe for this assay.
 all_features = ds.select_all_features(from_assay="RNA")
 ```
 
@@ -259,6 +308,7 @@ In your own workflow, the standard pipeline uses 1,000 HVGs by default. Change t
 there is a reason to include more or fewer genes:
 
 ```python
+# Run the pipeline with the explicitly changed feature setting.
 ds.pipeline.run(hvg_count=2000)
 ```
 
@@ -266,6 +316,7 @@ Other HVG settings are available through the pipeline's `params` mapping. For ex
 study needs genes that the default blacklist removes:
 
 ```python
+# Run the pipeline with the explicitly changed feature setting.
 ds.pipeline.run(params={"hvg": {"blacklist": ""}})
 ```
 

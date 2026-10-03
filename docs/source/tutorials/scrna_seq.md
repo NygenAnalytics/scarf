@@ -27,15 +27,21 @@ own counts. This page uses saved results so we can concentrate on interpreting t
 ## Open the analysis and look at the clusters
 
 ```{code-cell} ipython3
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the count store for this analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr")
+# Open the saved analysis and its exact results.
 run = ds.pipeline.open(label="docs_default")
+# Inspect the opened store's cells and features.
+ds
 ```
 
 The prepared run contains the selected cells, clusters, UMAP coordinates, and marker results.
@@ -44,6 +50,7 @@ Its name is `docs_default`, but it used dataset-specific filtering, 500 variable
 defaults.
 
 ```{code-cell} ipython3
+# Locate the numbered clusters in the prepared PBMC UMAP.
 ds.plots.embedding(run=run, color_by="clusters")
 ```
 
@@ -57,6 +64,7 @@ The panel below includes several genes for each broad lineage. In a dot plot, a 
 more cells express the gene; its colour shows the mean expression in the cluster.
 
 ```{code-cell} ipython3
+# Choose several markers for each broad lineage.
 marker_panel = {
     "Monocyte": ["LST1", "S100A8", "FCGR3A"],
     "B cell": ["MS4A1", "CD79A"],
@@ -64,6 +72,7 @@ marker_panel = {
     "NK cell": ["NKG7", "GNLY"],
     "pDC-like": ["GZMB", "JCHAIN"],
 }
+# Compare marker expression and detection across the selected groups.
 ds.plots.dotplot(features=marker_panel, groups=run["clusters"])
 ```
 
@@ -79,11 +88,8 @@ The next plot changes only the colour scale: values are now relative within each
 cannot be used to compare absolute expression between different genes.
 
 ```{code-cell} ipython3
-ds.plots.dotplot(
-    features=marker_panel,
-    groups=run["clusters"],
-    standardize="feature",
-)
+# Compare marker expression and detection across the selected groups.
+ds.plots.dotplot(features=marker_panel, groups=run['clusters'], standardize='feature')
 ```
 
 ## Give the clusters broad names
@@ -93,6 +99,7 @@ clusters share a label because they belong to the same lineage. These cluster nu
 specific to this analysis and must not be copied to another dataset.
 
 ```{code-cell} ipython3
+# Assign broad names supported by the marker evidence.
 cell_type_by_cluster = {
     "1": "CD14 monocytes",
     "2": "monocytes",
@@ -105,25 +112,38 @@ cell_type_by_cluster = {
     "9": "B cells",
     "10": "pDC-like cells",
 }
+# Review the names assigned to the prepared clusters.
+cell_type_by_cluster
 ```
 
 Save the names in the cell table. The run contains only the analyzed cells, while the cell table
 contains every cell, so fill the other rows with an explicit label before inserting the column.
 
 ```{code-cell} ipython3
+# Work with numeric arrays and cell masks.
 import numpy as np
 
+# Locate the analyzed cells within the full cell table.
 analysis_cells = run.cells.fetch_all("I").astype(bool)
+# Read cluster labels in the selected cells' order.
 cluster_values = run.cells.fetch("clusters").astype(str)
+# Give cells outside the analysis an explicit label.
 cell_types = np.full(ds.cells.N, "Not analyzed", dtype=object)
+# Fill analyzed rows with their cluster's chosen cell-type label.
 cell_types[analysis_cells] = [cell_type_by_cluster[value] for value in cluster_values]
+# Save the calculated values in the cell table.
 ds.cells.insert("pbmc_cell_type", cell_types, overwrite=True)
+# Count analyzed cells assigned to each cell type.
+labels, counts = np.unique(cell_types[analysis_cells], return_counts=True)
+# Show the number of analyzed cells assigned to each cell type.
+dict(zip(labels, counts, strict=True))
 ```
 
 This writes our labels to `pbmc_cell_type`; rerunning the cell replaces that column. The saved
 clusters remain available. Use their UMAP to display the new names:
 
 ```{code-cell} ipython3
+# Show the assigned broad cell types on the saved UMAP.
 ds.plots.embedding(layout=run["umap"], color_by="pbmc_cell_type")
 ```
 

@@ -31,16 +31,27 @@ import pandas as pd
 
 import scarf
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_5K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr")
+# Open the saved analysis and retain its exact results.
 run = ds.pipeline.open(label="docs_default")
+# Keep the exact clustering result.
 clusters = run["clusters"]
+# Keep the marker result for the selected clustering.
 markers = run["markers"]
+# Read the cluster labels in the run's cell order.
 cluster_values = run.cells.fetch("clusters").astype(str)
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 This is the same prepared result as the RNA tutorial. Cluster numbers and labels below belong
@@ -51,10 +62,12 @@ to this result; a new analysis may produce different clusters.
 Start with the default marker filters and inspect one cluster:
 
 ```{code-cell} ipython3
+# Load the marker evidence for cluster 1.
 group_markers = ds.get_markers(marker=markers, group_id="1")
-group_markers[
-    ["feature_name", "score", "frac_exp", "fold_change", "auc", "p_value_adjusted"]
-].head(10)
+# Inspect the ten leading markers and their supporting statistics.
+marker_columns = ["feature_name", "score", "frac_exp", "fold_change", "auc", "p_value_adjusted"]
+# Preview the ten leading rows using those evidence columns.
+group_markers[marker_columns].head(10)
 ```
 
 Each row compares expression in this cluster with the rest of the analyzed cells.
@@ -76,12 +89,11 @@ Plot a few familiar markers alongside the clusters. Drawing high values last mak
 expression easier to see in these panels.
 
 ```{code-cell} ipython3
+# Choose a small marker panel for the comparison.
 panel_genes = ["CD14", "CD19", "CD8A", "CD4", "NCAM1", "IL3RA"]
+# Compare the initial marker panel with the saved clusters.
 ds.plots.embedding(
-    layout=run["umap"],
-    color_by=[*panel_genes, clusters],
-    n_columns=3,
-    sort_values=True,
+    layout=run["umap"], color_by=[*panel_genes, clusters], n_columns=3, sort_values=True
 )
 ```
 
@@ -94,8 +106,11 @@ The default marker filters hide weak and negative evidence. For the remaining co
 load all marker rows once by relaxing both filters. Keep this table for the later panels.
 
 ```{code-cell} ipython3
+# Include weak and negative marker evidence for the remaining checks.
 all_markers = ds.get_markers(marker=markers, min_score=-1, min_frac_exp=-1)
+# Keep the marker statistics for the chosen genes.
 panel_stats = all_markers[all_markers["feature_name"].isin(panel_genes)]
+# Find the highest-scoring cluster for each marker.
 panel_best = (
     panel_stats.sort_values("score", ascending=False)
     .groupby("feature_name", sort=False)
@@ -103,12 +118,14 @@ panel_best = (
     .set_index("feature_name")
     .reindex(panel_genes)
 )
+# Inspect the strongest cluster association for each panel gene.
 panel_best[["group_id", "score", "frac_exp", "auc"]].round(2)
 ```
 
 These are starting hypotheses. Several clusters receive the same broad name:
 
 ```{code-cell} ipython3
+# Record the broad identities suggested by the initial marker panel.
 proposed_labels = {
     "1": "CD14 monocytes",
     "2": "monocytes",
@@ -121,6 +138,7 @@ proposed_labels = {
     "9": "B cells",
     "10": "pDC-like cells",
 }
+# Display the initial cluster-to-cell-type proposals.
 pd.Series(proposed_labels, name="proposed_cell_type")
 ```
 
@@ -130,6 +148,7 @@ A heatmap helps us check whether several genes support each proposed identity. S
 leading markers per cluster, with enough width to read the cluster labels:
 
 ```{code-cell} ipython3
+# Compare the leading markers across the saved clusters.
 ds.plots.marker_heatmap(marker=markers, topn=3, figsize=(6, 6))
 ```
 
@@ -148,11 +167,13 @@ Read the patterns together:
 For finer T-cell labels, inspect a small panel rather than a long list of every possible marker:
 
 ```{code-cell} ipython3
+# Choose markers for T-cell identity and state.
 t_cell_genes = ["CD3D", "CD8A", "CD8B", "CCR7", "IL7R", "CD27", "GZMK"]
+# Select the marker rows for the two T-cell groups.
 t_cell_evidence = all_markers[
-    all_markers["group_id"].isin(["7", "8"])
-    & all_markers["feature_name"].isin(t_cell_genes)
+    all_markers["group_id"].isin(["7", "8"]) & all_markers["feature_name"].isin(t_cell_genes)
 ]
+# Inspect T-cell marker detection and specificity in clusters 7 and 8.
 t_cell_evidence[["group_id", "feature_name", "frac_exp", "score"]].round(2)
 ```
 
@@ -166,14 +187,14 @@ Supporting markers are only part of the evidence. For an NK-cell call, inspect T
 such as CD3D and CD3E. For a CD8 T-cell call, compare CD4 with CD8A and CD8B.
 
 ```{code-cell} ipython3
+# Choose markers that distinguish the competing cell identities.
 comparison_genes = ["CD3D", "CD3E", "CD4", "NKG7", "GNLY", "CD8A", "CD8B"]
+# Keep evidence for the two populations under review.
 comparison = all_markers[
-    all_markers["group_id"].isin(["6", "8"])
-    & all_markers["feature_name"].isin(comparison_genes)
+    all_markers["group_id"].isin(["6", "8"]) & all_markers["feature_name"].isin(comparison_genes)
 ]
-comparison[
-    ["group_id", "feature_name", "frac_exp", "frac_exp_rest", "auc"]
-].round(2)
+# Compare marker detection inside and outside the competing populations.
+comparison[["group_id", "feature_name", "frac_exp", "frac_exp_rest", "auc"]].round(2)
 ```
 
 In cluster 6, CD3D and CD3E are depleted compared with the other cells, while NKG7 and GNLY are
@@ -190,6 +211,7 @@ Keep the broad labels where we have not established a finer identity. Update the
 additional supporting evidence:
 
 ```{code-cell} ipython3
+# Refine only the identities supported by the additional evidence.
 final_labels = proposed_labels | {
     "3": "memory B cells",
     "5": "CD4+ T cells",
@@ -197,6 +219,10 @@ final_labels = proposed_labels | {
     "8": "naive CD8 T cells",
     "9": "naive B cells",
 }
+# Put the initial and reviewed labels beside each other.
+label_review = pd.DataFrame({"initial": proposed_labels, "reviewed": final_labels})
+# Display only the labels changed during review.
+label_review.loc[label_review["initial"] != label_review["reviewed"]]
 ```
 
 The cell table includes cells outside this run. Align the labels to the run's selection before
@@ -204,20 +230,27 @@ saving them. Rerunning this cell replaces the two annotation columns, leaving th
 clusters unchanged.
 
 ```{code-cell} ipython3
+# Locate the run's selected cells on the full metadata axis.
 analysis_cells = run.cells.fetch_all("I").astype(bool)
+# Reserve a label for every cell, including cells outside the run.
 initial_cell_type = np.full(ds.cells.N, "Not analyzed", dtype=object)
+# Reserve the same full cell axis for the reviewed labels.
 reviewed_cell_type = np.full(ds.cells.N, "Not analyzed", dtype=object)
+# Place the initial labels into the selected physical rows.
 initial_cell_type[analysis_cells] = [proposed_labels[value] for value in cluster_values]
+# Place the reviewed labels into those same rows.
 reviewed_cell_type[analysis_cells] = [final_labels[value] for value in cluster_values]
+# Save the values in cell metadata using the stated selection.
 ds.cells.insert("proposed_cell_type", initial_cell_type, overwrite=True)
+# Save the values in cell metadata using the stated selection.
 ds.cells.insert("reviewed_cell_type", reviewed_cell_type, overwrite=True)
+# Count cells assigned to each reviewed identity.
+pd.Series(reviewed_cell_type[analysis_cells]).value_counts().rename("cells")
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=run["umap"],
-    color_by=["proposed_cell_type", "reviewed_cell_type"],
-)
+# Compare the original and reviewed annotations on the same UMAP.
+ds.plots.embedding(layout=run["umap"], color_by=["proposed_cell_type", "reviewed_cell_type"])
 ```
 
 The saved `naive CD8 T cells` and `memory B cells` labels summarize the interpretations above.

@@ -40,50 +40,58 @@ the query store must be writable so Scarf can save the mapping and transferred l
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
+# Work with numeric arrays and cell masks.
 import numpy as np
 
+# Open count stores and run Scarf analyses.
 import scarf
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Connect to the public example-data repository.
 repository = scarf.cytebase.connect("scarf_docs")
 
+# Download the unstimulated reference cells.
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the reference count store.
 ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
+# Inspect the opened store's cells and features.
+ds_ctrl
 ```
 
 ```{code-cell} ipython3
+# Download the interferon-stimulated query cells.
 stim_path = repository.download_dataset(
     name="kang_14K_ifnb-pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the query store where mapping results will be saved.
 ds_stim = scarf.DataStore(
     f"{stim_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
+# Inspect the opened store's cells and features.
+ds_stim
 ```
 
 First, look at the author labels in both datasets.
 
 ```{code-cell} ipython3
-ds_ctrl.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="cluster_labels",
-)
-ds_stim.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="cluster_labels",
-)
+# Inspect the published labels in the control reference.
+ds_ctrl.plots.embedding(layout_key='RNA_UMAP', color_by='cluster_labels')
+# Inspect the published labels in the stimulated query.
+ds_stim.plots.embedding(layout_key='RNA_UMAP', color_by='cluster_labels')
 ```
 
 These UMAP layouts were fitted independently, so their coordinates are not comparable.
@@ -96,10 +104,16 @@ The control store already contains an analysis named `docs_default`. Use its nei
 prepare a reference that later queries can share.
 
 ```{code-cell} ipython3
+# Open the saved analysis and its exact results.
 run = ds_ctrl.pipeline.open(label="docs_default")
+# Keep the reference UMAP fixed for mapping-score plots.
 reference_layout = run["umap"]
+# Prepare a reusable reference from the saved neighbors.
 reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
+# Load the saved reference model.
 reference = ds_ctrl.get_mapping_reference(reference_ref)
+# Inspect the reference saved for future query datasets.
+reference_ref
 ```
 
 The completed `MappingReference` is immutable.
@@ -120,18 +134,22 @@ We map the cells of the query's own pipeline run, so that the results can be dra
 UMAP later. The default mapping keeps the three nearest reference neighbours for each query cell.
 
 ```{code-cell} ipython3
+# Open the saved analysis of the query cells.
 query_run = ds_stim.pipeline.open(label="docs_default")
+# Keep the query UMAP for displaying transferred labels.
 query_layout = query_run["umap"]
-mapping_ref = ds_stim.run_mapping(
-    reference,
-    query_run["analysis_cell_selection"],
-)
+# Map the selected query cells onto the fixed reference.
+mapping_ref = ds_stim.run_mapping(reference, query_run['analysis_cell_selection'])
+# Inspect the saved query-mapping reference.
+mapping_ref
 ```
 
 Reload the saved mapping to inspect its diagnostics:
 
 ```{code-cell} ipython3
+# Load the saved mapping and its diagnostics.
 mapping = ds_stim.get_mapping_result(mapping_ref, reference=reference)
+# Inspect feature coverage and query mapping diagnostics.
 mapping.diagnostics
 ```
 
@@ -149,14 +167,27 @@ we can split by a few known query populations to see whether each population lan
 The author labels of the mapped cells are read in the order of the run's cells.
 
 ```{code-cell} ipython3
+# Find the query cell rows included in the saved analysis.
 mapped_rows = np.flatnonzero(query_run.cells.fetch_all("I"))
+# Read the published labels in mapped-cell order.
 query_labels = np.asarray(ds_stim.cells.fetch_all("cluster_labels"))[mapped_rows]
+# Use text labels consistently when forming plot groups.
 query_labels = query_labels.astype(str)
+# Choose a few known populations for separate mapping-score panels.
 focus = {"CD 14 Mono", "CD4 Memory T", "CD4 naive T", "NK"}
+# Keep the selected populations and group the remaining labels as other.
 score_groups = np.array(
     [label if label in focus else "other" for label in query_labels],
     dtype=object,
 )
+# Count cells in each mapping-score group.
+np.unique(score_groups, return_counts=True)
+```
+
+Show where each query population contributes weight on the reference map:
+
+```{code-cell} ipython3
+# Show where each query group contributes weight on the reference.
 ds_stim.plots.mapping_score(
     mapping_ref,
     reference=reference,
@@ -185,12 +216,15 @@ datastore and returns its reference. It first freezes the reference labels it re
 datastore, so later edits to the reference annotations cannot change this result.
 
 ```{code-cell} ipython3
+# Transfer reference labels with the default abstention threshold.
 transfer_ref = ds_stim.run_label_transfer(
     mapping_ref,
     reference=reference,
     reference_labels="cluster_labels",
 )
+# Load the transferred labels and their supporting evidence.
 transfer = ds_stim.get_label_transfer(transfer_ref)
+# Count cells in each reported category.
 transfer.labels.notna().value_counts().rename(
     index={True: "labelled", False: "abstained"}
 ).rename("query cells")
@@ -208,6 +242,7 @@ says why:
 Uninformative cells also add nothing to mapping scores.
 
 ```{code-cell} ipython3
+# Count cells in each reported category.
 transfer.evidence["abstentionReason"].value_counts()
 ```
 
@@ -216,6 +251,7 @@ A label artifact colours an embedding directly, so nothing is written into the q
 Abstained cells are drawn as missing, which shows the geography of abstention.
 
 ```{code-cell} ipython3
+# Compare published and transferred labels on the query UMAP.
 ds_stim.plots.embedding(
     layout=query_layout,
     color_by=["cluster_labels", transfer_ref],
@@ -234,6 +270,7 @@ To also abstain by distance, pass `max_distance` to `run_label_transfer`. That s
 transfer and leaves this one unchanged.
 
 ```{code-cell} ipython3
+# Inspect the evidence supporting transferred labels.
 ds_stim.plots.mapping_evidence(
     transfer_ref,
     target_groups=query_labels,
@@ -247,6 +284,7 @@ Because this query dataset also carries original author labels, we can compare t
 with the transferred labels.
 
 ```{code-cell} ipython3
+# Compare transferred labels with the known query labels.
 ds_stim.plots.mapping_confusion(
     transfer_ref,
     known_labels=query_labels,
@@ -267,10 +305,8 @@ Higher thresholds keep fewer cells. Use this curve to check whether the retained
 also more accurate in this dataset.
 
 ```{code-cell} ipython3
-ds_stim.plots.mapping_calibration(
-    transfer_ref,
-    known_labels=query_labels,
-)
+# Compare label accuracy and retained coverage across thresholds.
+ds_stim.plots.mapping_calibration(transfer_ref, known_labels=query_labels)
 ```
 
 ## 6. Choose stricter settings when needed
@@ -315,12 +351,13 @@ reopen both stores, and reload the exact results. A saved transfer loads from th
 alone:
 
 ```{code-cell} ipython3
+# Load the saved reference model.
 reference = ds_ctrl.get_mapping_reference(reference_ref)
-reloaded_mapping = ds_stim.get_mapping_result(
-    mapping_ref,
-    reference=reference,
-)
+# Reload the exact mapping without recomputing it.
+reloaded_mapping = ds_stim.get_mapping_result(mapping_ref, reference=reference)
+# Reload the saved labels from the query store.
 reloaded_transfer = ds_stim.get_label_transfer(transfer_ref)
+# Check the reloaded cell count, correction, label source, and threshold.
 (
     reloaded_mapping.n_cells,
     reloaded_mapping.correction_method,
@@ -347,6 +384,7 @@ through the threshold, the frozen reference labels, and the projection, to the r
 the cells it was built from.
 
 ```{code-cell} ipython3
+# Display the saved result and its upstream inputs.
 ds_stim.lineage(transfer_ref, references=reference)
 ```
 

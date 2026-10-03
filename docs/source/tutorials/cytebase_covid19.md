@@ -73,17 +73,16 @@ from scipy.stats import mannwhitneyu, spearmanr
 
 import scarf
 from scarf import cytebase
-from scarf.plotting import (
-    CategoricalScale,
-    CellField,
-    NormalizationSpec,
-)
+from scarf.plotting import CategoricalScale, CellField, NormalizationSpec
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 # HF retry messages include request URLs; keep them out of shared outputs.
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+# Keep printed tables wide enough for the selected metadata.
 pd.set_option("display.width", 160)
 
+# Connect to the public Cytebase catalog.
 catalog = cytebase.Catalog()  # Public Cytebase unless CYTEBASE_BUCKET is set.
 ```
 
@@ -94,13 +93,19 @@ machine; searching it does not touch any count data. Search by author and topic
 rather than typing an ID by hand.
 
 ```{code-cell} ipython3
+# Search the catalog for the dataset used in this example.
 matches = catalog.search("wilk sars cov 2", ready_only=True, max_cell_chars=None)
+# Inspect the matching COVID-19 datasets before choosing the cohort.
 display(matches)
 
+# Stop if the published COVID-19 cohort is unavailable.
 if not matches:
     raise RuntimeError("The Wilk COVID-19 dataset is not ready in this catalog")
+# Keep the dataset identifier returned by the catalog.
 dataset_id = matches[0]["cytebase_id"]
+# Read the dataset's scientific metadata and citation.
 entry = catalog.dataset(dataset_id)
+# Inspect the dataset record and source citation.
 entry
 ```
 
@@ -114,9 +119,13 @@ until a gene is requested. The CELLxGENE UMAP was imported with the data, so it
 can be plotted directly instead of recomputing an embedding.
 
 ```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = catalog.open_datastore(entry.id)
+# Inspect the remote datastore dimensions and assays.
 print(ds)
+# List the imported embeddings before selecting the UMAP.
 print("\nImported embeddings:", sorted(cytebase.embeddings(ds)))
+# Select the imported UMAP without recomputing its coordinates.
 umap_ref = cytebase.embedding(ds, "X_umap")
 ```
 
@@ -132,30 +141,44 @@ Read only the columns needed into pandas. This reads cell metadata, not the
 expression matrix. Then summarize one row per donor.
 
 ```{code-cell} ipython3
+# Choose the study-design and annotation fields needed below.
 columns = [
-    "cell_type", "cell.type.coarse", "disease", "donor_id", "Ventilated",
-    "Admission", "DPS", "sex", "development_stage", "IFN1",
+    "cell_type",
+    "cell.type.coarse",
+    "disease",
+    "donor_id",
+    "Ventilated",
+    "Admission",
+    "DPS",
+    "sex",
+    "development_stage",
+    "IFN1",
 ]
+# Read cell metadata and index it by cell ID.
 meta = ds.cells.to_pandas_dataframe(["ids", *columns], key="I").set_index("ids")
+# Check how many cells and metadata columns were loaded.
 print(f"{len(meta):,} cells, {meta.shape[1]} metadata columns read")
+```
 
+Summarize clinical metadata once per donor.
 
+```{code-cell} ipython3
+# Combine distinct donor metadata values without hiding repeated samples.
 def distinct(values):
     return " / ".join(map(str, sorted(values.unique())))
 
 
-donors = (
-    meta.groupby("donor_id")
-    .agg(
-        disease=("disease", "first"),
-        ventilated=("Ventilated", distinct),
-        admission=("Admission", distinct),
-        days_post_symptoms=("DPS", distinct),
-        sex=("sex", "first"),
-        age=("development_stage", "first"),
-        cells=("disease", "size"),
-    )
+# Summarize the study metadata and cell count per donor.
+donors = meta.groupby("donor_id").agg(
+    disease=("disease", "first"),
+    ventilated=("Ventilated", distinct),
+    admission=("Admission", distinct),
+    days_post_symptoms=("DPS", distinct),
+    sex=("sex", "first"),
+    age=("development_stage", "first"),
+    cells=("disease", "size"),
 )
+# Inspect one clinical and cell-count summary per donor.
 donors
 ```
 
@@ -171,8 +194,11 @@ into 13 shorter labels, which the compact figures use. Each ontology label maps 
 exactly one coarse label:
 
 ```{code-cell} ipython3
+# Count cells of each published type in each condition.
 by_type = pd.crosstab(meta["cell_type"], meta["disease"])
+# Save the values in cell metadata using the stated selection.
 by_type.insert(0, "coarse label", meta.groupby("cell_type")["cell.type.coarse"].first())
+# Compare condition counts with the authors' shorter cell-type labels.
 by_type.sort_values(["coarse label", "COVID-19"], ascending=[True, False])
 ```
 
@@ -186,21 +212,18 @@ contributed. Section 4 returns to this with per-donor proportions.
 coordinates. First, the full Cell Ontology annotation:
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=umap_ref, color_by="cell_type", legend_loc="right", figsize=(12, 7)
-);
+# Show the published Cell Ontology labels on the imported UMAP.
+ds.plots.embedding(layout=umap_ref, color_by="cell_type", legend_loc="right", figsize=(12, 7))
 ```
 
 Splitting the same layout by condition with `facet_by` shows where each group's
 cells fall. Labels are the authors' coarse types.
 
 ```{code-cell} ipython3
+# Compare the two conditions on matching UMAP panels.
 ds.plots.embedding(
-    layout=umap_ref,
-    color_by="cell.type.coarse",
-    facet_by="disease",
-    figsize=(12, 6),
-);
+    layout=umap_ref, color_by="cell.type.coarse", facet_by="disease", figsize=(12, 6)
+)
 ```
 
 Two differences stand out. The plasmablast (PB) island at the top is well
@@ -222,22 +245,37 @@ circles for COVID-19 and squares for healthy donors, with the group mean and 95%
 confidence interval as a diamond.
 
 ```{code-cell} ipython3
+# Use the same cell-type order across composition figures.
 coarse_order = [
-    "CD4 T", "CD8 T", "gd T", "NK", "B", "PB", "CD14 Monocyte",
-    "CD16 Monocyte", "DC", "pDC", "Granulocyte", "Platelet", "RBC",
+    "CD4 T",
+    "CD8 T",
+    "gd T",
+    "NK",
+    "B",
+    "PB",
+    "CD14 Monocyte",
+    "CD16 Monocyte",
+    "DC",
+    "pDC",
+    "Granulocyte",
+    "Platelet",
+    "RBC",
 ]
+# Keep category colors consistent across those figures.
 coarse_scale = CategoricalScale(order=tuple(coarse_order))
 
+# Compare cell-type composition with one summary per donor.
 ds.plots.composition(
     category_by="cell.type.coarse",
     sample_by="donor_id",
     kind="stacked",
     categorical_scale=coarse_scale,
     figsize=(10, 4.5),
-);
+)
 ```
 
 ```{code-cell} ipython3
+# Compare cell-type composition with one summary per donor.
 ds.plots.composition(
     category_by="cell.type.coarse",
     sample_by="donor_id",
@@ -246,13 +284,17 @@ ds.plots.composition(
     categorical_scale=coarse_scale,
     figsize=(13, 4.5),
     max_figure_width=None,
-);
+)
 ```
 
 ```{code-cell} ipython3
+# Calculate cell-type proportions separately within each donor.
 fractions = pd.crosstab(meta["donor_id"], meta["cell.type.coarse"], normalize="index")
+# Choose the cell types highlighted in the comparison.
 shown = ["PB", "CD16 Monocyte", "gd T", "pDC", "NK", "RBC"]
+# Attach each donor's condition to the composition summary.
 fraction_table = fractions[shown].join(donors["disease"])
+# Summarize the donor-level fractions within each disease group.
 fraction_table.groupby("disease")[shown].agg(["min", "median", "max"]).T.round(3)
 ```
 
@@ -284,6 +326,7 @@ markers are equally visible. Dot size is the fraction of cells with nonzero
 expression.
 
 ```{code-cell} ipython3
+# Group canonical PBMC markers by the identities they support.
 marker_sets = {
     "T": ["CD3E", "IL7R", "CD8A"],
     "gd T": ["TRDC"],
@@ -297,11 +340,12 @@ marker_sets = {
     "Plt": ["PPBP"],
     "RBC": ["HBB"],
 }
+# Choose four interferon-response genes for the next comparison.
 isg_genes = ["IFI27", "ISG15", "IFI44L", "IFI6"]
-
 ```
 
 ```{code-cell} ipython3
+# Compare marker expression and detection across cell types.
 ds.plots.dotplot(
     features=marker_sets,
     group_by="cell.type.coarse",
@@ -310,7 +354,7 @@ ds.plots.dotplot(
     standardize="feature",
     figsize=(11, 5),
     max_figure_width=None,
-);
+)
 ```
 
 Each population is brightest for its expected markers: TRDC in gamma-delta T
@@ -328,6 +372,7 @@ signalling. This section looks at four: IFI27, ISG15, IFI44L, and IFI6.
 `sort_values=True` draws high-expressing cells on top.
 
 ```{code-cell} ipython3
+# Plot the four interferon-response genes on the imported UMAP.
 ds.plots.embedding(
     layout=umap_ref,
     color_by=isg_genes,
@@ -335,7 +380,7 @@ ds.plots.embedding(
     sort_values=True,
     n_columns=2,
     figsize=(11, 10),
-);
+)
 ```
 
 ISG15, IFI44L, and IFI6 are expressed across many cell types, with the highest
@@ -345,6 +390,7 @@ the erythrocyte cluster. Faceting IFI27 by condition, on a shared color scale,
 shows where the signal comes from:
 
 ```{code-cell} ipython3
+# Compare IFI27 expression between conditions on a shared scale.
 ds.plots.embedding(
     layout=umap_ref,
     color_by=isg_genes[0],
@@ -352,7 +398,7 @@ ds.plots.embedding(
     normalization=NormalizationSpec(transform="log1p"),
     sort_values=True,
     figsize=(12, 6),
-);
+)
 ```
 
 IFI27 is essentially absent from healthy cells. In COVID-19 samples it is
@@ -369,7 +415,9 @@ each point below is one donor's mean within a cell type; `split_by="disease"`
 puts the two conditions side by side.
 
 ```{code-cell} ipython3
+# Focus the donor comparison on the major immune populations.
 main_types = ["CD14 Monocyte", "CD16 Monocyte", "CD4 T", "CD8 T", "NK", "B"]
+# Compare distributions within the stated groups.
 ds.plots.distribution(
     isg_genes,
     grouping=CellField("cell.type.coarse"),
@@ -382,7 +430,7 @@ ds.plots.distribution(
     point_alpha=0.85,
     figsize=(12, 6.5),
     max_figure_width=None,
-);
+)
 ```
 
 Healthy donors (orange) sit near zero for all four genes in every cell type.
@@ -397,6 +445,7 @@ the authors' per-cell `IFN1` score averaged per donor; the original study define
 it.
 
 ```{code-cell} ipython3
+# Read and log-transform only the four selected genes.
 expression = pd.DataFrame(
     {
         gene: np.log1p(ds.get_cell_vals(from_assay="RNA", cell_key="I", k=gene))
@@ -404,9 +453,19 @@ expression = pd.DataFrame(
     },
     index=meta.index,
 )
+# Average the four log-transformed values within each cell.
 expression["ISG mean"] = expression[isg_genes].mean(axis=1)
 
+# Preview the four-gene expression table and per-cell mean.
+expression.head()
+```
+
+Restrict the summary to CD14 monocytes and compare donors.
+
+```{code-cell} ipython3
+# Keep CD14 monocytes and their aligned expression values.
 monocytes = meta.join(expression).query("`cell.type.coarse` == 'CD14 Monocyte'")
+# Average gene scores within each donor's monocytes.
 mono_table = monocytes.groupby("donor_id").agg(
     disease=("disease", "first"),
     admission=("Admission", distinct),
@@ -414,6 +473,7 @@ mono_table = monocytes.groupby("donor_id").agg(
     monocytes=("disease", "size"),
     **{column: (column, "mean") for column in [*isg_genes, "ISG mean", "IFN1"]},
 )
+# Inspect the expression and clinical summary for each donor's monocytes.
 mono_table.round(3)
 ```
 
@@ -422,17 +482,25 @@ seven patient means with the six healthy means and compare the four-gene summary
 `IFN1` score. These are exploratory checks, not a model of disease severity.
 
 ```{code-cell} ipython3
+# Select the patient donor means.
 covid = mono_table.loc[mono_table["disease"] == "COVID-19", "ISG mean"]
+# Select the healthy donor means.
 healthy = mono_table.loc[mono_table["disease"] == "normal", "ISG mean"]
+# Compare the independent donor means with a two-sided rank test.
 test = mannwhitneyu(covid, healthy, alternative="two-sided")
+# Compare the four-gene summary with the authors' interferon score.
 rho = spearmanr(mono_table["ISG mean"], mono_table["IFN1"]).statistic
 
+# Count patients above the highest healthy donor mean.
 n_above = (covid > healthy.max()).sum()
+# Show how many patient means exceed the highest healthy donor.
 print(f"Patients above the highest healthy donor: {n_above} of {len(covid)}")
+# Report the donor-level rank statistic and two-sided p-value.
 print(
     f"Mann-Whitney U on donor means ({len(covid)} vs {len(healthy)} donors): "
     f"U = {test.statistic:.0f}, two-sided p = {test.pvalue:.4f}"
 )
+# Report concordance with the authors' interferon-response score.
 print(f"Spearman correlation of donor ISG mean with the authors' IFN1 score: {rho:.2f}")
 ```
 
@@ -474,6 +542,7 @@ Working only from the remote store, with cell metadata and 21 genes:
   dataset so new results are written locally while the counts stay in the bucket:
 
 ```python
+# Mount a writable analysis store while keeping counts remote.
 analysis_ds = catalog.mount_datastore(entry.id, at="./analysis.zarr")
 ```
 

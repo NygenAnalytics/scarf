@@ -50,15 +50,24 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+# Keep routine progress messages out of the teaching output.
+scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_5K_pbmc_rnaseq',
-    destination='scarf_datasets',
-    zarr=True,
+    "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-ds = scarf.DataStore(f'{dataset}/data.zarr', nthreads=4)
-run = ds.pipeline.open(label='docs_default')
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved analysis and retain its exact results.
+run = ds.pipeline.open(label="docs_default")
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 ## 1. Read and inspect gene sets
@@ -68,15 +77,25 @@ The first field is the source name, the second is a description, and the remaini
 `read_gmt` returns one source-target row per gene.
 
 ```{code-cell} ipython3
+# Keep the example GMT file in a temporary folder.
 input_directory = TemporaryDirectory()
-gmt_path = Path(input_directory.name) / 'pbmc_signatures.gmt'
-gmt_path.write_text(
-    'T_cell\tna\tCD3D\tCD3E\tTRAC\tLTB\tIL7R\n'
-    'B_cell\tna\tMS4A1\tCD79A\tCD37\tCD74\tHLA-DRA\n'
-    'Myeloid\tna\tLST1\tS100A8\tS100A9\tCTSS\tFCER1G\n',
-    encoding='utf-8',
+# Choose a path for the teaching signatures.
+gmt_path = Path(input_directory.name) / "pbmc_signatures.gmt"
+# Write the three short teaching signatures in GMT format.
+_ = gmt_path.write_text(
+    "T_cell\tna\tCD3D\tCD3E\tTRAC\tLTB\tIL7R\n"
+    "B_cell\tna\tMS4A1\tCD79A\tCD37\tCD74\tHLA-DRA\n"
+    "Myeloid\tna\tLST1\tS100A8\tS100A9\tCTSS\tFCER1G\n",
+    encoding="utf-8",
 )
+```
+
+Read the GMT into a source-target table.
+
+```{code-cell} ipython3
+# Parse GMT rows into source-target pairs.
 gene_sets = scarf.read_gmt(gmt_path)
+# Inspect the signature membership table.
 gene_sets
 ```
 
@@ -87,13 +106,13 @@ A target that matches several active features, such as a gene symbol shared by t
 By default its edges are dropped with a warning and recorded in the result's `dropped_ambiguous_targets` attribute; pass `ambiguous_targets='error'` to reject such a network instead.
 
 ```{code-cell} ipython3
-available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}
+# Normalize gene-name case before checking signature overlap.
+available = {str(name).upper() for name in ds.RNA.feats.fetch_all("names")}
+# Count how many genes from each signature match the assay.
 (
-    gene_sets.assign(
-        matched=gene_sets['target'].str.upper().isin(available),
-    )
-    .groupby('source')['matched']
-    .agg(['sum', 'count'])
+    gene_sets.assign(matched=gene_sets["target"].str.upper().isin(available))
+    .groupby("source")["matched"]
+    .agg(["sum", "count"])
 )
 ```
 
@@ -107,24 +126,26 @@ one or two of its five genes are missing. The default requires five matched targ
 This comparison uses the complete assay feature universe for both methods:
 
 ```{code-cell} ipython3
-cell_selection = run['analysis_cell_selection']
-all_features = ds.select_all_features(from_assay='RNA')
+# Reuse the run's frozen analysis cells.
+cell_selection = run["analysis_cell_selection"]
+# Use the complete feature universe for this assay.
+all_features = ds.select_all_features(from_assay="RNA")
+# Show the cells and ranking universe used by both methods.
+{"cells": int(run.cells.fetch_all("I").sum()), "genes": ds.RNA.feats.N}
 ```
 
 ```{code-cell} ipython3
-waggr = ds.run_waggr(
-    gene_sets,
-    cell_selection,
-    features=all_features,
-    tmin=3,
-)
-score_sources = ['T_cell', 'B_cell', 'Myeloid']
+# Score the signatures with equal-weight expression aggregation.
+waggr = ds.run_waggr(gene_sets, cell_selection, features=all_features, tmin=3)
+
+# Load only the three signatures used in the figures.
+score_sources = ["T_cell", "B_cell", "Myeloid"]
+# Open the selected WAGGR score columns.
 waggr_result = ds.get_enrichment(waggr, sources=score_sources)
-waggr_scores = pd.DataFrame(
-    waggr_result.data.compute(),
-    columns=list(waggr_result.source_names),
-)
-waggr_scores.describe().loc[['min', '50%', 'max']]
+# Materialize the small cells-by-signatures table.
+waggr_scores = pd.DataFrame(waggr_result.data.compute(), columns=list(waggr_result.source_names))
+# Inspect WAGGR score ranges across the selected cells.
+waggr_scores.describe().loc[["min", "50%", "max"]]
 ```
 
 Each column is one source.
@@ -141,18 +162,15 @@ Here the `all_features` artifact ranks the complete RNA feature order.
 By default, AUCell evaluates the top 5% of that ranking universe.
 
 ```{code-cell} ipython3
-aucell = ds.run_aucell(
-    gene_sets,
-    cell_selection,
-    features=all_features,
-    tmin=3,
-)
+# Score recovery of each signature near the top of each cell's ranks.
+aucell = ds.run_aucell(gene_sets, cell_selection, features=all_features, tmin=3)
+
+# Open the same three AUCell score columns.
 aucell_result = ds.get_enrichment(aucell, sources=score_sources)
-aucell_scores = pd.DataFrame(
-    aucell_result.data.compute(),
-    columns=list(aucell_result.source_names),
-)
-aucell_scores.describe().loc[['min', '50%', 'max']]
+# Materialize those selected score columns for inspection.
+aucell_scores = pd.DataFrame(aucell_result.data.compute(), columns=list(aucell_result.source_names))
+# Inspect AUCell score ranges for the same signatures.
+aucell_scores.describe().loc[["min", "50%", "max"]]
 ```
 
 AUCell values stay between zero and one. The default seed keeps the ordering of tied expression
@@ -165,20 +183,23 @@ The tables above contain only the three requested signatures. Reuse them for plo
 loading the scores again. These values describe gene-set activity; they are not p-values.
 
 ```{code-cell} ipython3
-umap = run.cells.to_pandas_dataframe(['umap_1', 'umap_2'])
+# Read the run's UMAP coordinates in the score arrays' cell order.
+umap = run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
+# Create one plotting axis for each comparison panel.
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+# Draw each comparison on its own labeled axis.
 for axis, source in zip(axes, score_sources, strict=True):
+    # Color each cell by the values for this panel.
     points = axis.scatter(
-        umap['umap_1'],
-        umap['umap_2'],
-        c=aucell_scores[source],
-        s=3,
-        vmin=0,
-        vmax=1,
+        umap["umap_1"], umap["umap_2"], c=aucell_scores[source], s=3, vmin=0, vmax=1
     )
-    axis.set_title(f'{source} AUCell')
-    figure.colorbar(points, ax=axis, label='AUCell score')
+    # Label the panel with the quantity being compared.
+    axis.set_title(f"{source} AUCell")
+    # Show the value scale used to color the cells.
+    figure.colorbar(points, ax=axis, label="AUCell score")
+# Adjust spacing so panel labels remain readable.
 figure.tight_layout()
+# Display the completed figure.
 plt.show()
 ```
 
@@ -188,25 +209,24 @@ Compare the two methods for the Myeloid signature. WAGGR follows expression magn
 AUCell measures recovery among the highest-ranked genes, so their numerical scales differ.
 
 ```{code-cell} ipython3
+# Place the two methods' myeloid scores beside each other.
 myeloid_compare = pd.DataFrame(
-    {
-        'Myeloid_WAGGR': waggr_scores['Myeloid'],
-        'Myeloid_AUCell': aucell_scores['Myeloid'],
-    }
+    {"Myeloid_WAGGR": waggr_scores["Myeloid"], "Myeloid_AUCell": aucell_scores["Myeloid"]}
 )
+# Compare the distributions of the two myeloid activity scores.
 myeloid_compare.describe()
 ```
 
 ```{code-cell} ipython3
+# Create the figure and plotting axis.
 figure, axis = plt.subplots(figsize=(4, 4))
-axis.scatter(
-    myeloid_compare['Myeloid_WAGGR'],
-    myeloid_compare['Myeloid_AUCell'],
-    s=4,
-    alpha=0.35,
-)
-axis.set_xlabel('Myeloid WAGGR')
-axis.set_ylabel('Myeloid AUCell')
+# Plot these cells using the selected coordinates and values.
+axis.scatter(myeloid_compare["Myeloid_WAGGR"], myeloid_compare["Myeloid_AUCell"], s=4, alpha=0.35)
+# Label the horizontal score axis.
+axis.set_xlabel("Myeloid WAGGR")
+# Label the vertical score axis.
+axis.set_ylabel("Myeloid AUCell")
+# Display the completed figure.
 plt.show()
 ```
 

@@ -32,20 +32,29 @@ ability to predict its local neighborhood.
 import scarf
 from scarf.plotting import FeatureRef
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_8K_pbmc_citeseq",
-    destination="scarf_datasets",
-    zarr=True,
+    "tenx_8K_pbmc_citeseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the RNA and protein assays in the downloaded store.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="RNA", nthreads=4)
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 The store already contains a WNN graph, UMAP, and Leiden clusters. We select the UMAP
 and clusters made from that same graph. Each returned reference identifies one saved result.
 
 ```{code-cell}
+# Find the single saved WNN graph.
 [wnn_graph] = ds.list_artifacts(
     scope="datastore",
     kind="integrated_graph",
@@ -53,6 +62,7 @@ and clusters made from that same graph. Each returned reference identifies one s
     parameters={"method": "wnn"},
     complete_only=True,
 )
+# Find the UMAP computed from that exact WNN graph.
 [wnn_umap] = ds.list_artifacts(
     scope="datastore",
     kind="embedding",
@@ -60,6 +70,7 @@ and clusters made from that same graph. Each returned reference identifies one s
     inputs={"graph": wnn_graph},
     complete_only=True,
 )
+# Find the clustering computed from the same graph.
 [wnn_clusters] = ds.list_artifacts(
     scope="datastore",
     kind="cluster_labels",
@@ -67,16 +78,18 @@ and clusters made from that same graph. Each returned reference identifies one s
     inputs={"graph": wnn_graph},
     complete_only=True,
 )
+# Check that the saved labels and UMAP cover the same number of cells.
+{
+    "clustered cells": ds.load_artifact(wnn_clusters)["values"].shape[0],
+    "UMAP shape": ds.load_artifact(wnn_umap)["values"].shape,
+}
 ```
 
 ## Find populations to investigate
 
 ```{code-cell}
-ds.plots.embedding(
-    layout=wnn_umap,
-    color_by=wnn_clusters,
-    legend_loc="on_data",
-)
+# Locate clusters on the joint RNA and protein embedding.
+ds.plots.embedding(layout=wnn_umap, color_by=wnn_clusters, legend_loc="on_data")
 ```
 
 Each point is a cell. Nearby points tend to have similar RNA and protein profiles.
@@ -90,23 +103,24 @@ short antibody names as feature IDs, so `by="id"` selects the protein explicitly
 `FeatureRef` also supplies the assay and a readable panel title.
 
 ```{code-cell}
+# Select protein markers by their stored antibody IDs.
 protein_panel = [
     FeatureRef(marker, assay="ADT", by="id", label=f"{marker} protein")
     for marker in ("CD3", "CD4", "CD8a", "CD14", "CD19", "CD56")
 ]
+# Select the corresponding RNA markers.
 rna_panel = [
     FeatureRef(gene, assay="RNA", label=f"{gene} RNA")
     for gene in ("CD3D", "CD4", "CD8A", "CD14", "CD19", "NCAM1")
 ]
-paired_panel = [
-    marker for pair in zip(protein_panel, rna_panel, strict=True) for marker in pair
-]
-ds.plots.embedding(
-    layout=wnn_umap,
-    color_by=paired_panel,
-    n_columns=2,
-    sort_values=True,
-)
+# Interleave each protein marker with its RNA counterpart.
+paired_panel = []
+# Put each protein immediately before its RNA counterpart.
+for protein, gene in zip(protein_panel, rna_panel, strict=True):
+    # Add the two matched markers in plotting order.
+    paired_panel.extend([protein, gene])
+# Compare each protein with its RNA counterpart on the same map.
+ds.plots.embedding(layout=wnn_umap, color_by=paired_panel, n_columns=2, sort_values=True)
 ```
 
 Start with CD3 protein and CD3D RNA: their shared region supports a T-cell population.
@@ -128,8 +142,11 @@ and the RNA embedding initialization, `rna_initialization`. WNN is the default, 
 joint analysis then needs only these calls:
 
 ```python
+# Combine the RNA and protein neighbor results.
 wnn_graph = ds.integrate_assays([rna_neighbors, adt_neighbors])
+# Embed the joint graph using the RNA initialization.
 wnn_umap = ds.run_umap(wnn_graph, rna_initialization)
+# Cluster the joint RNA and protein graph.
 wnn_clusters = ds.run_leiden_clustering(wnn_graph)
 ```
 

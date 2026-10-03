@@ -57,6 +57,7 @@ import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 ```
 
@@ -66,22 +67,28 @@ The rebuilt store uses the current layout and contains a completed pipeline run 
 markers.
 
 ```{code-cell} ipython3
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq", destination="scarf_datasets", zarr=True
 )
-ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
-    nthreads=4,
-)
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Reuse the saved run and its frozen cell selection.
 analysis_run = ds.pipeline.open(label="docs_default")
 
+# Inspect the store's assays and dimensions.
 ds
 ```
 
 ```{code-cell} ipython3
+# Read the cluster labels in the run's cell order.
 cluster_values = analysis_run.cells.fetch("clusters")
+# Count cells in each cluster saved by the run.
 pd.Series(cluster_values).value_counts().sort_index()
 ```
 
@@ -95,17 +102,20 @@ Cell and feature tables are `MetaData` objects (`ds.cells`, `ds.RNA.feats`), not
 Use `head` for a quick look, `to_pandas_dataframe` to export selected columns, and `fetch` / `fetch_all` for single columns.
 
 ```{code-cell} ipython3
+# Preview the live cell metadata.
 ds.cells.head()
 ```
 
 ```{code-cell} ipython3
+# Preview the RNA feature metadata.
 ds.RNA.feats.head()
 ```
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    columns=["ids", "RNA_nCounts", "RNA_nFeatures", "clusters"]
-).set_index("ids")
+# Inspect selected QC columns alongside the published annotations.
+ds.cells.to_pandas_dataframe(columns=["ids", "RNA_nCounts", "RNA_nFeatures", "clusters"]).set_index(
+    "ids"
+)
 ```
 
 `insert` writes a new column and aligns values to the active subset unless you override `key`.
@@ -115,26 +125,24 @@ cluster labels align with the values we insert. For another analysis, check the 
 before copying results into live metadata.
 
 ```{code-cell} ipython3
+# Choose the cluster containing the first selected cell.
 first_run_cluster = cluster_values[0]
+# Mark cells belonging to that cluster.
 is_first_cluster = cluster_values == first_run_cluster
-ds.cells.insert(
-    column_name="is_first_cluster",
-    values=is_first_cluster,
-    overwrite=True,
-)
+# Save the values in cell metadata using the stated selection.
+ds.cells.insert(column_name="is_first_cluster", values=is_first_cluster, overwrite=True)
+# Check the sizes of the selected cluster and its complement.
+pd.Series(is_first_cluster).value_counts().rename("cells")
 ```
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    columns=["ids", "clusters", "is_first_cluster"]
-).head()
+# Preview the newly saved cluster-selection column.
+ds.cells.to_pandas_dataframe(columns=["ids", "clusters", "is_first_cluster"]).head()
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by="is_first_cluster",
-)
+# Locate the selected cluster on the saved UMAP.
+ds.plots.embedding(layout=analysis_run["umap"], color_by="is_first_cluster")
 ```
 
 The new column marks one cluster on the same active cells used for the insert.
@@ -145,9 +153,12 @@ With every cell active the lengths match. Pass the new Boolean column as `key` t
 cluster without changing `I`:
 
 ```{code-cell} ipython3
+# Compare a selected fetch with the complete metadata axis.
 print(
-    "fetch:", ds.cells.fetch("clusters", key="is_first_cluster").shape,
-    "fetch_all:", ds.cells.fetch_all("clusters").shape,
+    "fetch:",
+    ds.cells.fetch("clusters", key="is_first_cluster").shape,
+    "fetch_all:",
+    ds.cells.fetch_all("clusters").shape,
 )
 ```
 
@@ -157,34 +168,44 @@ print(
 `multi_sift` combines several ranges, and `get_index_by` locates exact categorical values:
 
 ```{code-cell} ipython3
+# Record the active-cell count before creating new masks.
 active_before = int(ds.cells.fetch_all("I").sum())
-count_range = ds.cells.sift(
-    "RNA_nCounts",
-    min_v=1000,
-    max_v=15000,
-)
+# Select cells within the stated count range.
+count_range = ds.cells.sift("RNA_nCounts", min_v=1000, max_v=15000)
+# Count cells inside the count range.
+int(count_range.sum())
+```
+
+Combine count and detected-gene limits.
+
+```{code-cell} ipython3
+# Apply count and detected-feature ranges together.
 joint_range = ds.cells.multi_sift(
-    columns=["RNA_nCounts", "RNA_nFeatures"],
-    lows=[1000, 500],
-    highs=[15000, 4000],
+    columns=["RNA_nCounts", "RNA_nFeatures"], lows=[1000, 500], highs=[15000, 4000]
 )
+# Count cells satisfying both QC ranges.
+int(joint_range.sum())
+```
+
+Find rows by their published annotation.
+
+```{code-cell} ipython3
+# Find the physical rows annotated as ductal cells.
 ductal_rows = ds.cells.get_index_by(["Ductal"], "clusters")
 
-print(
-    "count_range:", int(count_range.sum()),
-    "joint_range:", int(joint_range.sum()),
-    "ductal_rows:", int(ductal_rows.size),
-)
+# Count the rows matching the published ductal annotation.
+print("Ductal cells:", int(ductal_rows.size))
+# Show the active-cell count recorded before creating masks.
 print("Active cells (I) before:", active_before)
+# Check that creating masks left the active selection unchanged.
 print("Active cells (I) after:", int(ds.cells.fetch_all("I").sum()))
 ```
 
 ```{code-cell} ipython3
+# Save the values in cell metadata using the stated selection.
 ds.cells.insert(column_name="in_count_range", values=count_range, overwrite=True)
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by="in_count_range",
-)
+# Locate cells inside the count range on the saved UMAP.
+ds.plots.embedding(layout=analysis_run["umap"], color_by="in_count_range")
 ```
 
 These helpers return masks or indexes aligned with the metadata table.
@@ -205,7 +226,9 @@ store the physical feature `I` column is all true. Inspect the shapes without lo
 complete matrix:
 
 ```{code-cell} ipython3
+# Inspect raw matrix dimensions without reading its values.
 print("Raw shape:", ds.RNA.rawData.shape)
+# Inspect normalized-view dimensions without materializing the matrix.
 print("Normed shape:", ds.RNA.normed().shape)
 ```
 
@@ -219,23 +242,31 @@ The completed `docs_default` run retained the HVG and normalization references i
 Asking for the same normalization again reuses that result rather than recomputing:
 
 ```{code-cell} ipython3
+# Request the saved normalization using the same exact inputs.
 reused_normalized = ds.run_normalization(
-    analysis_run["analysis_cell_selection"],
-    analysis_run["highly_variable_features"],
+    analysis_run["analysis_cell_selection"], analysis_run["highly_variable_features"]
 )
+# Check whether this request reused the saved normalization.
 print("Reused:", reused_normalized == analysis_run["normalized"])
+# Inspect the reference identifying the reused normalization.
 reused_normalized
 ```
 
 Inspect its status and open the underlying group only when a custom method needs direct access:
 
 ```{code-cell} ipython3
+# Inspect the saved result's completeness and provenance.
 status = ds.inspect_artifact(reused_normalized)
+# Check that the saved normalization is complete.
 print("Complete:", status.complete)
+# Show the operation that created this artifact.
 print("Operation:", status.operation)
+# Inspect the parameters recorded for that operation.
 print("Parameters:", status.parameters)
 
+# Open the artifact arrays for a low-level inspection.
 group = ds.load_artifact(reused_normalized)
+# List a few arrays available in the saved artifact.
 print("Arrays:", list(group.array_keys())[:5])
 ```
 
@@ -253,12 +284,14 @@ Relative to a single HDF5 file, the layout supports parallel reads and writes, f
 With `depth=1` you see the top-level assays and `cellData`.
 
 ```{code-cell} ipython3
+# Inspect this part of the store hierarchy without reading counts.
 ds.show_zarr_tree(depth=1)
 ```
 
 Cell statistics computed from an assay are stored under `cellData` with the assay name as a prefix (`RNA_…`, `ADT_…`).
 
 ```{code-cell} ipython3
+# Inspect this part of the store hierarchy without reading counts.
 ds.show_zarr_tree(start="cellData")
 ```
 
@@ -268,6 +301,7 @@ Use `snapshot_cell_selection("I")` to capture this live column before passing it
 producer. Some metadata, mapping, and export utilities still accept `cell_key` directly.
 
 ```{code-cell} ipython3
+# Count active and inactive rows on the complete cell axis.
 ds.cells.to_pandas_dataframe(["I"])["I"].value_counts()
 ```
 
@@ -279,12 +313,11 @@ Each assay group holds `featureData` and its persisted artifacts.
 Count matrices are Zarr arrays, often sharded. This store keeps RNA counts at `RNA/counts`.
 
 ```{code-cell} ipython3
+# Inspect this part of the store hierarchy without reading counts.
 ds.show_zarr_tree(start="RNA", depth=1)
 ```
 
-```{code-cell} ipython3
-ds.show_zarr_tree(start="RNA/featureData", depth=1)
-```
+For feature arrays, pass `start="RNA/featureData"` to the same method.
 
 Each persisted result is an {term}`artifact`. Assay-scoped results live under
 `{assay}/artifacts/{kind}/{artifact_id}`; datastore-scoped selections and integrated results live
@@ -292,9 +325,7 @@ under `artifacts/{kind}/{artifact_id}`.
 The kind names the operation family and the identifier is derived from the inputs and parameters, which is what lets Scarf recognise an equivalent result instead of recomputing it.
 Nothing here encodes parameters in the path, so a second PCA at different dimensionality becomes a sibling entry rather than a new branch of the tree.
 
-```{code-cell} ipython3
-ds.show_zarr_tree(start="RNA/artifacts", depth=1)
-```
+To inspect saved result groups, use `ds.show_zarr_tree(start="RNA/artifacts", depth=1)`.
 
 {doc}`../developers/zarr_internals` covers the complete on-disk layout.
 

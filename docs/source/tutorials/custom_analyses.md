@@ -38,16 +38,26 @@ import numpy as np
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_5K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+```
+
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Open the saved analysis and retain its exact results.
 run = ds.pipeline.open(label="docs_default")
+# Keep the reference to the saved connectivity graph.
 graph_ref = run["connectivity_map"]
+# Inspect the opened assays and their dimensions.
+ds
 ```
 
 ## 2. Calculate from the graph
@@ -57,18 +67,13 @@ Here the row sum measures each cell's total edge weight in the symmetric graph.
 It is a graph statistic, not a biological confidence score.
 
 ```{code-cell} ipython3
-graph = ds.load_graph(
-    graph=graph_ref,
-    symmetric=True,
-    upper_only=False,
-)
+# Load the symmetric connectivity graph as a sparse matrix.
+graph = ds.load_graph(graph=graph_ref, symmetric=True, upper_only=False)
+# Sum the edge weights connected to each cell.
 graph_strength = np.asarray(graph.sum(axis=1)).ravel()
-ds.cells.insert(
-    column_name="customGraphStrength",
-    values=graph_strength,
-    key="I",
-    overwrite=True,
-)
+# Save the values in cell metadata using the stated selection.
+ds.cells.insert(column_name="customGraphStrength", values=graph_strength, key="I", overwrite=True)
+# Summarize the graph size and the new per-cell connectivity statistic.
 {
     "cells": int(graph.shape[0]),
     "edges": int(graph.nnz),
@@ -80,10 +85,8 @@ The insert writes one value per active cell in graph row order.
 The summary shows the graph size and the mean of the new column.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout=run["umap"],
-    color_by="customGraphStrength",
-)
+# Locate high and low graph connectivity on the saved embedding.
+ds.plots.embedding(layout=run["umap"], color_by="customGraphStrength")
 ```
 
 The plot asks where cells have stronger or weaker weighted connectivity in this specific graph.
@@ -97,28 +100,42 @@ blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
+# Locate the run's cells on the stored count-matrix axis.
 cell_index = np.flatnonzero(run.cells.fetch_all("I"))
-hvg_values = np.asarray(
-    run.features.fetch_all("highly_variable_features"),
-    dtype=bool,
-)
+# Read the run's highly variable gene selection.
+hvg_values = np.asarray(run.features.fetch_all("highly_variable_features"), dtype=bool)
+# Locate those genes on the stored feature axis.
 feature_index = np.flatnonzero(hvg_values)
+# Create a lazy view of the selected cells and genes.
 selected_counts = ds.RNA.rawData[:, feature_index][cell_index, :]
 
-detected_blocks = []
-for count_block in selected_counts.stream_blocks(
-    nthreads=4,
-    msg="Calculating custom detection statistic",
-):
-    detected_blocks.append(np.count_nonzero(count_block, axis=1))
+# Check the selected matrix dimensions before streaming counts.
+{"selected cells": len(cell_index), "selected genes": len(feature_index)}
+```
 
+Count detected genes one block at a time.
+
+```{code-cell} ipython3
+# Collect one small vector of detection counts per block.
+detected_blocks = []
+# Process a bounded count block without loading the full matrix.
+for count_block in selected_counts.stream_blocks(
+    nthreads=4, msg="Calculating custom detection statistic"
+):
+    # Keep this result in its original processing order.
+    detected_blocks.append(np.count_nonzero(count_block, axis=1))
+# Check how many cell results were collected across the blocks.
+sum(len(block) for block in detected_blocks)
+```
+
+Collect the per-cell results and save them in metadata.
+
+```{code-cell} ipython3
+# Join the block results in their original cell order.
 detected_hvgs = np.concatenate(detected_blocks)
-ds.cells.insert(
-    column_name="customDetectedHVGs",
-    values=detected_hvgs,
-    key="I",
-    overwrite=True,
-)
+# Save the values in cell metadata using the stated selection.
+ds.cells.insert(column_name="customDetectedHVGs", values=detected_hvgs, key="I", overwrite=True)
+# Summarize the per-cell detected-gene counts.
 {
     "cells": int(detected_hvgs.size),
     "customDetectedHVGs mean": float(detected_hvgs.mean()),
@@ -138,21 +155,20 @@ Here we keep cells above the lowest quarter of graph strength as an example of m
 This is an illustration of the API, not a recommended quality-control filter:
 
 ```{code-cell} ipython3
+# Keep cells above the lowest quarter of graph strength.
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
+# Save the values in cell metadata using the stated selection.
 ds.cells.insert(
-    column_name="wellConnected",
-    values=well_connected,
-    fill_value=False,
-    key="I",
-    overwrite=True,
+    column_name="wellConnected", values=well_connected, fill_value=False, key="I", overwrite=True
 )
+# Check how many active cells pass the custom selection.
+{"selected cells": int(well_connected.sum()), "active cells": len(well_connected)}
 ```
 
 ```{code-cell} ipython3
+# Compare detected-gene counts and the custom cell selection.
 ds.plots.embedding(
-    layout=run["umap"],
-    color_by=["customDetectedHVGs", "wellConnected"],
-    n_columns=2,
+    layout=run["umap"], color_by=["customDetectedHVGs", "wellConnected"], n_columns=2
 )
 ```
 
@@ -165,11 +181,11 @@ The second shows the lower-quartile graph-strength exclusion created from the sa
 materializing it. Here we pass the custom cell selection and the six-gene panel:
 
 ```{code-cell} ipython3
+# Choose a small marker panel for the comparison.
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
-adata = ds.to_anndata(
-    cell_key="wellConnected",
-    feature_names=panel_genes,
-)
+# Materialize only the selected cells and marker panel.
+adata = ds.to_anndata(cell_key="wellConnected", feature_names=panel_genes)
+# Check the exported dimensions and feature identifiers.
 adata.shape, adata.var_names.tolist()
 ```
 
