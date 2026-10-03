@@ -207,6 +207,17 @@ def test_stacked_violins_share_one_category_axis():
         horizontal.close()
 
 
+def _body_colors(axis):
+    return np.asarray([body.get_facecolor()[0][:3] for body in axis.collections])
+
+
+def _desaturated(palette, values):
+    from matplotlib.colors import to_rgb
+    from seaborn.utils import desaturate
+
+    return np.asarray([to_rgb(desaturate(palette[value], 0.9)) for value in values])
+
+
 def test_distribution_returns_the_scales_it_draws():
     rng = np.random.default_rng(0)
     store = _synthetic_plot_store(
@@ -224,11 +235,28 @@ def test_distribution_returns_the_scales_it_draws():
         ticks = grouped.axes["metric"].get_xticklabels()
         assert group_scale.order == ("g1", "g2", "g3", "g10")
         assert [text.get_text() for text in ticks] == list(group_scale.order)
-        assert list(group_scale.palette) == list(group_scale.order)
-        assert len(set(group_scale.palette.values())) == 4
+        assert group_scale.palette == {
+            "g1": "#1f77b4",
+            "g2": "#ff7f0e",
+            "g3": "#279e68",
+            "g10": "#d62728",
+        }
+        # Seaborn draws each violin in its palette color, desaturated by 0.9.
+        np.testing.assert_allclose(
+            _body_colors(grouped.axes["metric"]),
+            _desaturated(group_scale.palette, group_scale.order),
+            atol=0.005,
+        )
         (split_scale,) = split.scales
         assert split_scale.order == ("x", "y")
         assert list(split_scale.palette) == ["x", "y"]
+        np.testing.assert_allclose(
+            _body_colors(split.axes["metric"]),
+            _desaturated(split_scale.palette, ["x", "y"] * 4),
+            atol=0.005,
+        )
+        legend = split.axes["metric"].get_legend()
+        assert [text.get_text() for text in legend.get_texts()] == ["x", "y"]
     finally:
         grouped.close()
         split.close()
@@ -290,28 +318,33 @@ def test_embedding_draws_label_artifacts_as_categories(monkeypatch):
 
 def test_mean_contours_skip_panels_without_signal():
     rng = np.random.default_rng(0)
-    x = rng.normal(size=20_000)
-    y = rng.normal(size=20_000)
-    xlim = (float(x.min()), float(x.max()))
-    ylim = (float(y.min()), float(y.max()))
-    figure, ax = plt.subplots()
+    x = rng.normal(size=3_000)
+    y = rng.normal(size=3_000)
+    limits = {
+        "xlim": (float(x.min()), float(x.max())),
+        "ylim": (float(y.min()), float(y.max())),
+        "theme": "notebook",
+    }
+    overlay = splt.DensityOverlay(statistic="mean")
+    figure, (flat, signal) = plt.subplots(1, 2)
     try:
+        # A panel of zeros has no positive mean to contour.
         embedding_module._draw_density_overlay(
-            ax,
-            x,
-            y,
-            overlay=splt.DensityOverlay(statistic="mean"),
-            values=np.zeros(20_000),
-            xlim=xlim,
-            ylim=ylim,
-            theme="notebook",
+            flat, x, y, overlay=overlay, values=np.zeros(3_000), **limits
         )
-        assert not ax.collections
+        assert len(flat.collections) == 0
+        # The same cells with values rising along x do draw contours.
+        embedding_module._draw_density_overlay(
+            signal, x, y, overlay=overlay, values=np.clip(x, 0, None), **limits
+        )
+        assert len(signal.collections) == 1
     finally:
         plt.close(figure)
 
 
 def test_multi_layout_names_layouts_and_shares_category_colors():
+    from matplotlib.colors import to_hex
+
     rng = np.random.default_rng(0)
     clusters = np.repeat([f"c{index}" for index in range(11)], 10)
     tsne1 = rng.normal(size=110)
@@ -339,7 +372,16 @@ def test_multi_layout_names_layouts_and_shares_category_colors():
             if isinstance(scale, splt.CategoricalScale)
         ]
         assert len(palettes) == 1
-        assert list(palettes[0]) == [f"c{index}" for index in range(11)]
+        palette = palettes[0]
+        assert list(palette) == [f"c{index}" for index in range(11)]
+        # Eleven categories use the 20-color table.
+        assert palette["c1"] == "#aec7e8"
+        # Both layouts color each drawn cell from the one shared palette; TSNE
+        # leaves out the cells whose coordinates are missing.
+        drawn = {"UMAP": clusters, "TSNE": clusters[clusters != "c10"]}
+        for (layout, _), axis in titled.axes.items():
+            colors = [to_hex(color) for color in axis.collections[0].get_facecolors()]
+            assert colors == [palette[cluster] for cluster in drawn[layout]]
     finally:
         titled.close()
         untitled.close()
@@ -347,13 +389,21 @@ def test_multi_layout_names_layouts_and_shares_category_colors():
 
 def test_composed_colorbars_keep_panel_limits_scales_and_raster_limits():
     rng = np.random.default_rng(0)
+    score = rng.uniform(1.0, 1000.0, size=80)
     store = _synthetic_plot_store(
         I=np.ones(80, dtype=bool),
         UMAP1=rng.normal(size=80),
         UMAP2=rng.normal(size=80),
         facet=np.repeat(["x", "y"], 40),
-        score=rng.uniform(1.0, 1000.0, size=80),
+        score=score,
     )
+
+    def colorbar_norms(figure):
+        return [
+            axis._colorbar.norm
+            for axis in figure.axes
+            if axis.get_label() == "<colorbar>"
+        ]
 
     figure, axes = plt.subplots(1, 2, layout="constrained")
     child = splt.embedding(
@@ -366,8 +416,11 @@ def test_composed_colorbars_keep_panel_limits_scales_and_raster_limits():
         show=False,
     )
     splt.compose_results(figure, [child], panel_labels=False)
-    colorbars = [ax for ax in figure.axes if ax.get_label() == "<colorbar>"]
-    assert len(colorbars) == 2
+    # One colorbar per facet, each spanning that facet's own scores.
+    assert [(norm.vmin, norm.vmax) for norm in colorbar_norms(figure)] == [
+        pytest.approx((score[:40].min(), score[:40].max())),
+        pytest.approx((score[40:].min(), score[40:].max())),
+    ]
     plt.close(figure)
 
     figure, axis = plt.subplots(layout="constrained")
@@ -380,17 +433,19 @@ def test_composed_colorbars_keep_panel_limits_scales_and_raster_limits():
         show=False,
     )
     splt.compose_results(figure, [child], panel_labels=False)
-    (colorbar_axis,) = [ax for ax in figure.axes if ax.get_label() == "<colorbar>"]
-    assert isinstance(colorbar_axis._colorbar.norm, matplotlib.colors.LogNorm)
+    (norm,) = colorbar_norms(figure)
+    assert isinstance(norm, matplotlib.colors.LogNorm)
+    assert (norm.vmin, norm.vmax) == pytest.approx((score.min(), score.max()))
     plt.close(figure)
 
+    raster_score = rng.normal(size=80)
     raster_store = SimpleNamespace(
         cells=_GuardedMeta(
             {
                 "I": np.ones(80, dtype=bool),
                 "UMAP1": rng.normal(size=80),
                 "UMAP2": rng.normal(size=80),
-                "score": rng.normal(size=80),
+                "score": raster_score,
             }
         ),
         _stored_display_metadata=lambda _column: None,
@@ -405,7 +460,11 @@ def test_composed_colorbars_keep_panel_limits_scales_and_raster_limits():
         show=False,
     )
     splt.compose_results(figure, [child], panel_labels=False)
-    assert sum(ax.get_label() == "<colorbar>" for ax in figure.axes) == 1
+    (norm,) = colorbar_norms(figure)
+    # The raster's colorbar keeps its default 1% and 99% quantile limits.
+    expected = tuple(np.quantile(raster_score, (0.01, 0.99)))
+    assert (norm.vmin, norm.vmax) == pytest.approx(expected)
+    assert axis.get_images()[0].get_clim() == pytest.approx(expected)
     plt.close(figure)
 
 
@@ -422,13 +481,26 @@ def test_composition_refreshes_embedding_point_sizes():
         store,
         layout_key="UMAP",
         color_by="score",
+        point_size_range=(1.0, 100.0),
         target=axis,
         show=False,
     )
-    splt.compose_results(figure, [child], panel_labels=False)
     points = axis.collections[0]
-    assert points.get_sizes()[0] == pytest.approx(
-        default_point_size(200, panel_area=panel_area_inches(axis))
+    before = points.get_sizes()[0]
+    splt.compose_results(figure, [child], panel_labels=False)
+
+    # Composition changes the panel area, and sizes follow the new area.
+    after = points.get_sizes()[0]
+    figure_width, figure_height = figure.get_size_inches()
+    box = axis.get_position()
+    area = box.width * figure_width * box.height * figure_height
+    expected = min(100.0, 16 * (area / 3.2**2) ** 0.72 * (1000 / 200) ** 0.5)
+    assert after == pytest.approx(expected)
+    assert after != pytest.approx(before)
+    assert after == pytest.approx(
+        default_point_size(
+            200, panel_area=panel_area_inches(axis), size_min=1.0, size_max=100.0
+        )
     )
     plt.close(figure)
 

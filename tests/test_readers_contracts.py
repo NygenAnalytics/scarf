@@ -92,16 +92,6 @@ _MODULE_SIGNATURE_DIGEST = (
 )
 
 
-def _write_minimal_cellranger_directory(path) -> None:
-    (path / "features.tsv").write_text(
-        "f1\tg1\tGene Expression\nf2\tg2\tGene Expression\n"
-    )
-    (path / "barcodes.tsv").write_text("c1\n")
-    (path / "matrix.mtx").write_text(
-        "%%MatrixMarket matrix coordinate integer general\n2 1 1\n1 1 1\n"
-    )
-
-
 def _write_mixed_cellranger_directory(path) -> None:
     (path / "features.tsv").write_text(
         "f1\tg1\tGene Expression\n"

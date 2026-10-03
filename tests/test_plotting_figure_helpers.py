@@ -1,5 +1,6 @@
 """Figure ownership and composition helper tests."""
 
+import builtins
 import json
 import warnings
 from pathlib import Path
@@ -139,6 +140,39 @@ def test_plot_result_show_is_warning_free_noop_for_headless_agg(monkeypatch):
     plt.close(result.figure)
 
 
+def test_plot_result_show_without_ipython_falls_back_to_the_canvas(monkeypatch):
+    original_import = builtins.__import__
+
+    def import_without_ipython(name, *args, **kwargs):
+        if name.split(".", 1)[0] == "IPython":
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    show_calls = []
+    monkeypatch.setattr(builtins, "__import__", import_without_ipython)
+    monkeypatch.setattr(plt, "show", lambda: show_calls.append(True))
+
+    headless = _plot_result()
+    headless.show()
+
+    assert show_calls == []
+    assert not plt.fignum_exists(headless.figure.number)
+    assert "rendered=False" in repr(headless)
+
+    interactive = _plot_result()
+    monkeypatch.setattr(
+        interactive.figure.canvas,
+        "required_interactive_framework",
+        "qt",
+        raising=False,
+    )
+    interactive.show()
+
+    assert show_calls == [True]
+    assert not plt.fignum_exists(interactive.figure.number)
+    assert "rendered=True" in repr(interactive)
+
+
 def test_plot_result_show_closes_owned_figure_and_retains_metadata(monkeypatch):
     result = _plot_result()
     figure = result.figure
@@ -174,8 +208,10 @@ def test_plot_result_can_save_after_show(monkeypatch, tmp_path):
     result.show()
     output = result.save(tmp_path / "after-show.png", dpi=80)
 
-    assert output.exists()
-    assert output.stat().st_size > 0
+    # Showing closes the owned figure, yet the full figure still exports.
+    assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    width, height = result.figure.get_size_inches()
+    assert plt.imread(output).shape[:2] == (round(height * 80), round(width * 80))
 
 
 def test_plot_result_save_restores_chrome_when_backend_raises(monkeypatch, tmp_path):
@@ -377,7 +413,10 @@ def test_dark_plot_exports_with_readable_opaque_background(tmp_path):
     output = result.save(tmp_path / "dark.png", dpi=60)
     pixels = plt.imread(output)
 
-    assert float(pixels[0, 0, :3].mean()) < 0.2
+    # Dark exports paint an opaque near-black page behind the plot.
+    np.testing.assert_allclose(
+        pixels[0, 0], (*matplotlib.colors.to_rgb("#111111"), 1.0), atol=1 / 255
+    )
     assert result.figure.patch.get_facecolor()[:3] == pytest.approx((1, 1, 1))
     result.close()
 
@@ -416,16 +455,21 @@ def test_rendered_plot_result_publishes_no_extra_notebook_output(monkeypatch):
     from IPython.core.formatters import DisplayFormatter
 
     result = _plot_result()
+    published = []
     monkeypatch.setattr("IPython.get_ipython", lambda: object())
-    monkeypatch.setattr("IPython.display.display", lambda _: None)
+    monkeypatch.setattr(
+        "IPython.display.display", lambda *args, **kwargs: published.append(args)
+    )
     result.show()
+    assert published == [(result.figure,)]
 
     data, metadata = DisplayFormatter().format(result)
 
-    # An empty format bundle makes the IPython display hook publish nothing, so
-    # the already-displayed figure stays the only output of the cell.
+    # The figure shown above stays the only output: formatting the rendered
+    # result publishes nothing more, not even its text summary.
     assert data == {}
     assert metadata == {}
+    assert published == [(result.figure,)]
 
 
 def test_unrendered_plot_result_still_displays_its_summary(monkeypatch):
@@ -498,6 +542,16 @@ def test_normalize_axes_target_creates_owned_single_and_sparse_grid():
     assert len(grid_figure.axes) == len(keys)
     assert all(axis.figure is grid_figure for axis in grid_axes.values())
     assert grid_figure.get_size_inches() == pytest.approx((5.0, 4.0))
+    # Panels fill a 3 x 2 grid row by row and the unused cell is removed.
+    specs = [axis.get_subplotspec() for axis in grid_axes.values()]
+    assert specs[0].get_gridspec().get_geometry() == (3, 2)
+    assert [(spec.rowspan.start, spec.colspan.start) for spec in specs] == [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (2, 0),
+    ]
     plt.close(single_figure)
     plt.close(grid_figure)
 
@@ -675,12 +729,10 @@ def test_composition_renders_deduplicated_size_legend():
         "67%",
         "100%",
     ]
-    values = np.linspace(0.0, 1.0, 4)
-    areas = size_scale.areas(values)
-    area_factor = min(1.0, 180.0 / float(areas.max()))
-    expected_sizes = np.sqrt(areas * area_factor)
+    # Areas 16, 144, 272 and 400 for the four ticks, scaled so the largest
+    # handle has area 180, then drawn with marker size sqrt(area).
     observed_sizes = [handle.get_markersize() for handle in legend.legend_handles]
-    assert observed_sizes == pytest.approx(expected_sizes)
+    assert observed_sizes == pytest.approx(np.sqrt([7.2, 64.8, 122.4, 180.0]))
     assert result.legends == (legend_spec,)
     plt.close(figure)
 
@@ -717,6 +769,38 @@ def test_composition_renders_marker_legend_and_skips_malformed_specs():
     ]
     assert [handle.get_marker() for handle in legend.legend_handles] == ["s", "^"]
     assert result.legends == (marker_spec, malformed)
+    plt.close(figure)
+
+
+def test_composition_skips_categorical_legends_without_order_or_palette():
+    figure, axes = plt.subplots(1, 3, figsize=(7, 3), layout="constrained")
+    unordered = _child_result(
+        figure,
+        axes[0],
+        legends=(splt.LegendSpec(kind="categorical", label="Unordered"),),
+        scales=(splt.CategoricalScale(palette={"a": "#ff0000"}),),
+    )
+    unpainted = _child_result(
+        figure,
+        axes[1],
+        legends=(splt.LegendSpec(kind="categorical", label="Unpainted"),),
+        scales=(splt.CategoricalScale(order=("a",)),),
+    )
+    complete = _categorical_child(figure, axes[2], "Group", ("a", "b"))
+
+    result = compose_results(
+        figure,
+        [unordered, unpainted, complete],
+        panel_labels=False,
+    )
+
+    assert [legend.get_title().get_text() for legend in figure.legends] == ["Group"]
+    assert [text.get_text() for text in figure.legends[0].get_texts()] == ["a", "b"]
+    assert [spec.label for spec in result.legends] == [
+        "Unordered",
+        "Unpainted",
+        "Group",
+    ]
     plt.close(figure)
 
 
@@ -929,16 +1013,20 @@ def test_child_legend_removal_clears_all_axis_and_figure_legends():
     plt.close(figure)
 
 
-def test_panel_labels_follow_result_axes(umap, leiden_clustering, datastore):
-    first = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by=leiden_clustering,
-        show=False,
-    )
-    axes = list(first.axes.values())
-    splt.label_panels(first.axes)
-    assert axes[0].texts[-1].get_text() == "A"
-    with pytest.raises(ValueError, match="labels length"):
-        splt.label_panels(first.axes, labels=["A", "B"])
-    first.close()
+def test_panel_labels_follow_result_axes():
+    figure, axes = plt.subplots(1, 2)
+    panels = {"left": axes[0], "right": axes[1]}
+
+    with splt.theme_context("paper"):
+        splt.label_panels(panels)
+
+    for axis, label in zip(axes, ("A", "B"), strict=True):
+        text = axis.texts[-1]
+        assert text.get_text() == label
+        assert text.get_fontsize() == splt.THEMES["paper"]["axes.titlesize"]
+        assert text.get_fontweight() == "bold"
+        assert text.get_position() == pytest.approx((-0.06, 1.04))
+        assert text.get_transform() == axis.transAxes
+    with pytest.raises(ValueError, match="labels length must match number of axes"):
+        splt.label_panels(panels, labels=["A"])
+    plt.close(figure)

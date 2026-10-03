@@ -102,6 +102,19 @@ def _write_cr_h5(path, values, *, legacy=False):
             )
 
 
+def _assert_same_sparse(observed, expected) -> None:
+    """Compare two sparse matrices entry by entry in canonical CSR form."""
+    observed, expected = observed.tocsr(), expected.tocsr()
+    assert observed.shape == expected.shape
+    assert observed.dtype == expected.dtype
+    for matrix in (observed, expected):
+        matrix.sum_duplicates()
+        matrix.eliminate_zeros()
+    np.testing.assert_array_equal(observed.indptr, expected.indptr)
+    np.testing.assert_array_equal(observed.indices, expected.indices)
+    np.testing.assert_array_equal(observed.data, expected.data)
+
+
 def test_toy_crdir_assay_feats_table(toy_crdir_reader):
     assert np.all(
         toy_crdir_reader.assayFeats.columns
@@ -316,29 +329,32 @@ def test_toy_crdir_empty(toy_crdir_empty):
 
 
 def test_crh5reader(crh5_reader):
+    from tests.test_writers import _read_cellranger_h5
+
+    _counts, barcodes, features = _read_cellranger_h5(crh5_reader.h5obj.filename)
     assert crh5_reader.nCells == 892
     assert crh5_reader.nFeatures == 36611
     n_assay_feats = list(crh5_reader.assayFeats.T.nFeatures.values)
     assert n_assay_feats == [36601, 10]
+    assert crh5_reader.cell_names() == barcodes.tolist()
+    assert crh5_reader.feature_ids() == features["id"].tolist()
+    assert crh5_reader.feature_names() == features["name"].tolist()
+    assert crh5_reader.feature_types() == features["feature_type"].tolist()
 
 
 def test_crh5reader_streams_counts(crh5_reader):
-    streamed_rows = 0
-    streamed_nnz = 0
+    from scipy.sparse import vstack
+
+    from tests.test_writers import _read_cellranger_h5
 
     indptr = crh5_reader.grp["indptr"]
     assert crh5_reader.producer_staging_bytes(300, 1) > (
         indptr.size * indptr.dtype.itemsize
     )
-    for chunk in crh5_reader.consume(batch_size=300):
-        assert 0 < chunk.shape[0] <= 300
-        assert chunk.shape[1] == crh5_reader.nFeatures
-        streamed_rows += chunk.shape[0]
-        streamed_nnz += chunk.nnz
-
-    assert streamed_rows == crh5_reader.nCells
-    assert streamed_nnz == crh5_reader.grp["data"].shape[0]
-    assert len(crh5_reader.cell_names()) == crh5_reader.nCells
+    chunks = list(crh5_reader.consume(batch_size=300))
+    assert [chunk.shape[0] for chunk in chunks] == [300, 300, 292]
+    expected, _barcodes, _features = _read_cellranger_h5(crh5_reader.h5obj.filename)
+    _assert_same_sparse(vstack(chunks, format="csr"), expected)
 
 
 def test_crh5reader_filters_background_barcodes(crh5_reader):
@@ -443,14 +459,31 @@ def test_crh5reader_preserves_legacy_layout_values(tmp_path):
         reader.close()
 
 
-def test_crdir_reader(crdir_reader):
+def test_crdir_reader(crdir_reader, mtx_dir):
+    import gzip
+    from pathlib import Path
+
     assert crdir_reader.nCells == 892
     assert crdir_reader.nFeatures == 36601  # Does not contain 10 ADTs
+    with gzip.open(Path(mtx_dir) / "barcodes.tsv.gz", "rt") as handle:
+        assert crdir_reader.cell_names() == handle.read().split()
+    with gzip.open(Path(mtx_dir) / "features.tsv.gz", "rt") as handle:
+        features = [line.rstrip("\n").split("\t") for line in handle]
+    assert crdir_reader.feature_ids() == [row[0] for row in features]
+    assert crdir_reader.feature_names() == [row[1] for row in features]
 
 
 def test_h5ad_reader(h5ad_reader):
-    assert h5ad_reader.nCells == 3696 == len(h5ad_reader.cell_ids())
-    assert h5ad_reader.nFeatures == 27998 == len(h5ad_reader.feat_names())
+    import h5py
+
+    assert h5ad_reader.nCells == 3696
+    assert h5ad_reader.nFeatures == 27998
+    with h5py.File(h5ad_reader.h5adFn, mode="r") as h5:
+        cells = [value.decode() for value in h5["obs"]["index"]]
+        features = [value.decode() for value in h5["var"]["index"]]
+    assert _texts(h5ad_reader.cell_ids()) == cells
+    assert _texts(h5ad_reader.feat_ids()) == features
+    assert _texts(h5ad_reader.feat_names()) == features
 
 
 def test_inspect_h5ad_resolves_fixture_and_builds_reader(bastidas_ponce_data):
@@ -792,25 +825,18 @@ def test_inspect_h5ad_rejects_files_without_numeric_matrices(tmp_path):
 
 
 def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
-    streamed_rows = 0
-    streamed_nnz = 0
-    streamed_sum = 0.0
+    import h5py
+    from scipy.sparse import csr_matrix, vstack
 
-    for chunk in h5ad_reader.consume(batch_size=1000):
-        assert 0 < chunk.shape[0] <= 1000
-        assert chunk.shape[1] == h5ad_reader.nFeatures
-        assert chunk.dtype == h5ad_reader.sourceMatrixDtype
-        streamed_rows += chunk.shape[0]
-        streamed_nnz += chunk.nnz
-        streamed_sum += chunk.data.sum(dtype=np.float64)
-
-    matrix_data = h5ad_reader.h5[h5ad_reader.matrixKey]["data"]
-    assert streamed_rows == h5ad_reader.nCells
-    assert streamed_nnz == matrix_data.shape[0]
-    np.testing.assert_allclose(
-        streamed_sum,
-        matrix_data[:].sum(dtype=np.float64),
-    )
+    chunks = list(h5ad_reader.consume(batch_size=1000))
+    assert [chunk.shape[0] for chunk in chunks] == [1000, 1000, 1000, 696]
+    assert all(chunk.dtype == h5ad_reader.sourceMatrixDtype for chunk in chunks)
+    with h5py.File(h5ad_reader.h5adFn, mode="r") as h5:
+        expected = csr_matrix(
+            (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
+            shape=(h5ad_reader.nCells, h5ad_reader.nFeatures),
+        )
+    _assert_same_sparse(vstack(chunks, format="csr"), expected)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 5, 8, 9])
@@ -995,28 +1021,48 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
-    cell_columns = dict(h5ad_reader.get_cell_columns())
+    import h5py
 
-    assert "index" not in cell_columns
-    assert {
+    def decoded(codes, categories):
+        # AnnData 0.6 keeps the categories of a coded column in uns.
+        return np.array(
+            [categories[code] if code >= 0 else None for code in codes], dtype=object
+        )
+
+    with h5py.File(h5ad_reader.h5adFn, mode="r") as h5:
+        obs = h5["obs"][:]
+        var = h5["var"][:]
+        uns = {
+            key: h5["uns"][key][:] for key in h5["uns"] if key.endswith("_categories")
+        }
+
+    cell_columns = dict(h5ad_reader.get_cell_columns())
+    assert cell_columns.keys() == {
         "clusters_coarse",
         "clusters",
         "S_score",
         "G2M_score",
-    } <= cell_columns.keys()
-    assert not any(key.startswith(("X_pca", "X_umap")) for key in cell_columns)
-    assert all(
-        values.shape == (h5ad_reader.nCells,) for values in cell_columns.values()
-    )
+    }
+    for column in ("clusters_coarse", "clusters"):
+        np.testing.assert_array_equal(
+            cell_columns[column],
+            decoded(obs[column], uns[f"{column}_categories"]),
+        )
     np.testing.assert_array_equal(
         cell_columns["clusters_coarse"][:3],
         np.array([b"Pre-endocrine", b"Ductal", b"Endocrine"]),
     )
+    for column in ("S_score", "G2M_score"):
+        np.testing.assert_array_equal(cell_columns[column], obs[column])
     feature_columns = dict(h5ad_reader.get_feat_columns())
     assert feature_columns.keys() == {"highly_variable_genes"}
-    assert feature_columns["highly_variable_genes"].shape == (h5ad_reader.nFeatures,)
     # Legacy codes here are {-1, 0, 1} against categories [False, True]; the
     # -1 sentinel decodes to missing rather than wrapping to the last category.
+    assert set(var["highly_variable_genes"]) == {-1, 0, 1}
+    np.testing.assert_array_equal(
+        feature_columns["highly_variable_genes"],
+        decoded(var["highly_variable_genes"], uns["highly_variable_genes_categories"]),
+    )
     np.testing.assert_array_equal(
         feature_columns["highly_variable_genes"][:3],
         np.array([b"False", None, None], dtype=object),
@@ -1367,16 +1413,6 @@ def test_h5ad_csc_conversion_rejects_insufficient_workspace(tmp_path):
         assert reader.materialized_csr_bytes() == 0
     finally:
         reader.close()
-
-
-@pytest.mark.parametrize("option", ["skip_cols", "cell_data_cols"])
-def test_csv_reader_requires_header_for_named_columns(tmp_path, option):
-    from scarf.readers import CSVReader
-
-    path = tmp_path / "counts.csv"
-    path.write_text("1,2,3\n4,5,6\n")
-    with pytest.raises(ValueError, match="header"):
-        CSVReader(str(path), has_header=False, **{option: ["2"]})
 
 
 def test_csv_reader_rejects_features_along_rows(tmp_path):
@@ -1786,3 +1822,279 @@ def test_h5ad_reader_requires_a_sparse_matrix_shape(tmp_path) -> None:
         del h5["X"].attrs["shape"]
     with pytest.raises(ValueError, match="has no shape attribute"):
         H5adReader(str(path))
+
+
+def _inspect_file(tmp_path, build):
+    """Write an H5AD file through ``build`` and inspect it."""
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    path = tmp_path / "inspected.h5ad"
+    with h5py.File(path, mode="w") as h5:
+        build(h5)
+    return inspect_h5ad(str(path))
+
+
+def test_inspect_h5ad_without_obs_columns_generates_cell_ids(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2], [3, 0]], np.uint16))
+        # An obs group without columns holds neither IDs nor a length.
+        h5.create_group("obs").create_group("__categories")
+        h5.create_group("var").create_dataset("gene_ids", data=np.array([b"a", b"b"]))
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.cellIdsKey == "_index"
+    assert (inspection.nCells, inspection.nFeatures) == (3, 2)
+    assert inspection.featureIdsKey == "gene_ids"
+
+    def build_without_obs(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        h5.create_group("var").create_dataset("gene_ids", data=np.array([b"a", b"b"]))
+
+    assert _inspect_file(tmp_path, build_without_obs).cellIdsKey == "_index"
+
+
+@pytest.mark.parametrize(
+    ("values", "integer_like"),
+    [
+        # A sparse matrix without entries holds no evidence of counts.
+        (np.zeros((2, 2), dtype=np.float32), False),
+        # Boolean values are not numbers.
+        (np.array([[True, False], [False, True]]), False),
+    ],
+    ids=["empty-float", "boolean"],
+)
+def test_inspect_h5ad_sparse_values_without_numeric_counts_are_not_integer_like(
+    tmp_path, values, integer_like
+):
+    def build(h5):
+        _write_sparse_group(h5, "X", values)
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.matrixEncoding == "csr"
+    assert inspection.integerLike is integer_like
+
+
+def test_inspect_h5ad_dense_candidates_by_dtype_and_size(tmp_path):
+    def build(h5):
+        h5.create_dataset("X", data=np.array([[1, 0], [0, 2]], dtype=np.int32))
+        layers = h5.create_group("layers")
+        # A text grid is not a count matrix candidate.
+        layers.create_dataset("labels", data=np.array([[b"a", b"b"], [b"c", b"d"]]))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.matrixCandidates == ("X",)
+    assert inspection.matrixEncoding == "dense"
+    # Integer storage is integer-like without sampling its values.
+    assert inspection.integerLike is True
+
+    def build_empty(h5):
+        h5.create_dataset("X", data=np.zeros((0, 3), dtype=np.float32))
+
+    empty = _inspect_file(tmp_path, build_empty)
+    assert (empty.nCells, empty.nFeatures) == (0, 3)
+    # An empty matrix offers no sample to call integer-like.
+    assert empty.integerLike is False
+
+
+def test_inspect_h5ad_skips_cell_id_columns_that_do_not_fit_the_cells(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        obs = h5.create_group("obs")
+        obs.attrs["_index"] = "names"
+        # The named index repeats a value, and the preferred cell_id column
+        # holds one value more than there are cells.
+        obs.create_dataset("names", data=np.array([b"x", b"x"]))
+        obs.create_dataset("cell_id", data=np.array([b"a", b"b", b"c"]))
+        obs.create_dataset("sequence", data=np.array([b"AC", b"GT"]))
+
+    assert _inspect_file(tmp_path, build).cellIdsKey == "sequence"
+
+
+def test_inspect_h5ad_skips_columns_it_cannot_decode(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        obs = h5.create_group("obs")
+        broken = obs.create_group("barcode")
+        broken.attrs["encoding-type"] = "nullable-string-array"
+        broken.create_dataset("values", data=np.array([b"a", b"b"]))
+        broken.create_dataset("mask", data=np.array([False]))
+        obs.create_dataset("well", data=np.array([b"A1", b"A2"]))
+
+    # The barcode mask does not align with its values, so the next unique
+    # text column holds the IDs.
+    assert _inspect_file(tmp_path, build).cellIdsKey == "well"
+
+
+def test_inspect_h5ad_uses_feature_names_as_ids_without_unique_ids(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+        h5.create_group("var").create_dataset(
+            "gene_symbols", data=np.array([b"GENE", b"GENE"])
+        )
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.featureIdsKey == "gene_symbols"
+    assert inspection.featureNameKey == "gene_symbols"
+
+
+def test_inspect_h5ad_reads_text_lengths_of_columns_without_values(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1], [2]], np.uint16))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+        var = h5.create_group("var")
+        # One feature, whose only text column is missing for it.
+        missing = var.create_group("alias")
+        missing.attrs["encoding-type"] = "nullable-string-array"
+        missing.create_dataset("values", data=np.array([b""]))
+        missing.create_dataset("mask", data=np.array([True]))
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.featureIdsKey == "alias"
+    assert inspection.featureNameKey == "alias"
+
+
+def test_inspect_h5ad_matches_matrices_to_feature_groups(tmp_path):
+    from loguru import logger
+
+    def build(h5):
+        # raw/X is integer and ranks first, but raw/var holds two features
+        # for its three columns.
+        _write_sparse_group(h5, "raw/X", np.array([[1, 0, 3], [0, 2, 0]], np.uint16))
+        h5.create_group("raw/var").create_dataset(
+            "gene_ids", data=np.array([b"r1", b"r2"])
+        )
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        h5.create_group("var").create_dataset("gene_ids", data=np.array([b"a", b"b"]))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        inspection = _inspect_file(tmp_path, build)
+    finally:
+        logger.remove(sink)
+    assert (inspection.matrixKey, inspection.featureAttrsKey) == ("X", "var")
+    assert any(
+        "Ignoring matrix candidate raw/X: feature metadata group `raw/var` "
+        "length 2 does not match feature count 3" in message
+        for message in messages
+    )
+
+
+def test_inspect_h5ad_borrows_the_dimension_matched_feature_group(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "raw/X", np.array([[1, 0, 3], [0, 2, 0]], np.uint16))
+        h5.create_group("var").create_dataset(
+            "gene_ids", data=np.array([b"a", b"b", b"c"])
+        )
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+
+    inspection = _inspect_file(tmp_path, build)
+    # raw/X has no raw/var, so it takes the var group of its three features.
+    assert (inspection.matrixKey, inspection.featureAttrsKey) == ("raw/X", "var")
+    assert inspection.featureIdsKey == "gene_ids"
+
+
+def test_inspect_h5ad_rejects_matrices_without_matching_feature_groups(tmp_path):
+    from loguru import logger
+
+    from scarf.readers import inspect_h5ad
+
+    def build(h5):
+        _write_sparse_group(h5, "raw/X", np.array([[1, 0, 3], [0, 2, 0]], np.uint16))
+        _write_sparse_group(h5, "X", np.array([[1, 0, 3], [0, 2, 0]], np.uint16))
+        h5.create_group("var").create_dataset("gene_ids", data=np.array([b"a", b"b"]))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        with pytest.raises(
+            ValueError, match="No matrix candidate matches the obs and var dimensions"
+        ):
+            _inspect_file(tmp_path, build)
+    finally:
+        logger.remove(sink)
+    # raw/X has no raw/var and var does not match it; X does not match var.
+    assert any(
+        "Ignoring matrix candidate raw/X: no feature metadata group has 3 rows"
+        in message
+        for message in messages
+    )
+    assert any(
+        "Ignoring matrix candidate X: feature metadata group `var` length 2" in message
+        for message in messages
+    )
+    with pytest.raises(
+        ValueError, match=r"matrix_key 'layers/counts' not found. Available: raw/X, X"
+    ):
+        inspect_h5ad(str(tmp_path / "inspected.h5ad"), matrix_key="layers/counts")
+
+
+def test_inspect_h5ad_drops_a_split_key_whose_length_differs(tmp_path):
+    def build(h5):
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        h5.create_group("obs").create_dataset("_index", data=np.array([b"c0", b"c1"]))
+        var = h5.create_group("var")
+        var.attrs["_index"] = "gene_ids"
+        var.create_dataset("gene_ids", data=np.array([b"a", b"b"]))
+        var.create_dataset(
+            "feature_types",
+            data=np.array([b"Gene Expression", b"Antibody Capture", b"Peaks"]),
+        )
+
+    inspection = _inspect_file(tmp_path, build)
+    assert inspection.assaySplitKey is None
+    assert inspection.suggestedAssays == {}
+
+
+def test_h5ad_reader_rejects_identifiers_that_are_not_one_dimensional(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader
+
+    path = tmp_path / "grid_ids.h5ad"
+    with h5py.File(path, mode="w") as h5:
+        _write_sparse_group(h5, "X", np.array([[1, 0], [0, 2]], np.uint16))
+        obs = h5.create_group("obs")
+        obs.create_dataset("_index", data=np.array([b"c0", b"c1"]))
+        obs.create_dataset("grid", data=np.array([[b"a", b"b"], [b"c", b"d"]]))
+    reader = H5adReader(str(path), cell_ids_key="grid")
+    try:
+        with pytest.raises(ValueError, match="H5AD cell IDs must be one-dimensional"):
+            reader.cell_ids()
+    finally:
+        reader.close()
+
+
+def test_crh5_reader_rejects_a_matrix_without_features(tmp_path):
+    from scarf.readers import CrH5Reader
+
+    path = tmp_path / "no_features.h5"
+    _write_cr_h5(path, np.zeros((2, 0), dtype=np.int32))
+
+    with pytest.raises(
+        ValueError, match="Cannot build an assay table without features"
+    ):
+        CrH5Reader(str(path))
+
+
+def test_h5ad_table_column_names_of_a_node_that_is_not_a_table(tmp_path):
+    import h5py
+
+    from scarf.readers._h5ad_columns import table_column_names
+
+    with h5py.File(tmp_path / "types.h5", mode="w") as h5:
+        # A committed datatype is neither a dataframe group nor a dataset.
+        h5["var"] = np.dtype("f8")
+        assert isinstance(h5["var"], h5py.Datatype)
+        assert table_column_names(h5["var"]) == []

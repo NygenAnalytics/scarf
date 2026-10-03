@@ -1,5 +1,6 @@
 import inspect
 import re
+import shutil
 
 import numpy as np
 import pytest
@@ -9,6 +10,23 @@ from scarf.datastore.datastore import DataStore
 from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import snapshot_run_metadata
+
+
+@pytest.fixture(scope="module")
+def hvg_store_template(datastore_zarr_root, tmp_path_factory):
+    """A PBMC store with the default HVG selection and its feature summary."""
+    location = tmp_path_factory.mktemp("hvg_selection") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, location)
+    store = DataStore(str(location), default_assay="RNA")
+    store.select_hvgs(store.snapshot_cell_selection(), show_plot=False)
+    return location
+
+
+@pytest.fixture
+def hvg_store(hvg_store_template, tmp_path) -> DataStore:
+    """A private copy of the template, so a test may edit its records."""
+    shutil.copytree(hvg_store_template, tmp_path / "data.zarr")
+    return DataStore(str(tmp_path / "data.zarr"), default_assay="RNA")
 
 
 def test_hvg_public_contract_removed_assay_persistence_methods() -> None:
@@ -30,12 +48,12 @@ def test_hvg_public_contract_removed_assay_persistence_methods() -> None:
 
 
 def test_hvg_regex_correction_recomputes_without_rewriting_saved_selection(
-    datastore_ephemeral, monkeypatch
+    hvg_store, monkeypatch
 ) -> None:
     import scarf.datastore._operations.features as operations
     import scarf.features.variability as variability
 
-    store = datastore_ephemeral
+    store = hvg_store
     indices = np.flatnonzero(store.RNA.feats.fetch_all("nCells") > 2)[:2]
     names = np.array([f"GENE_{index}" for index in range(store.RNA.feats.N)])
     names[indices] = ["RPS3", "RPSX"]
@@ -89,9 +107,9 @@ def test_hvg_regex_correction_recomputes_without_rewriting_saved_selection(
 
 
 def test_select_hvgs_returns_ref_without_creating_alias(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     cell_selection = store.snapshot_cell_selection()
     columns_before = set(store.RNA.feats.columns)
     ref = store.select_hvgs(
@@ -164,9 +182,9 @@ def test_select_hvgs_returns_ref_without_creating_alias(
 
 @pytest.mark.parametrize("bin_strategy", ["adaptive", "fixed"])
 def test_select_hvgs_reuse_accounts_for_variance_estimator(
-    datastore_ephemeral, bin_strategy
+    hvg_store, bin_strategy
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     cell_selection = store.snapshot_cell_selection()
     options = {
         "min_cells": 0,
@@ -210,9 +228,9 @@ def test_select_hvgs_reuse_accounts_for_variance_estimator(
 
 @pytest.mark.parametrize("stored_quantile", [None, 0.1])
 def test_select_hvgs_recomputes_when_background_quantile_changes(
-    datastore_ephemeral, stored_quantile
+    hvg_store, stored_quantile
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     cells = store.snapshot_cell_selection()
     existing = store.select_hvgs(cells, show_plot=False)
     group = store.zw[artifact_path(existing)]
@@ -241,10 +259,8 @@ def test_select_hvgs_recomputes_when_background_quantile_changes(
 
 
 @pytest.mark.parametrize("quantile", [True, 0, 1, -0.1, "0.25"])
-def test_hvg_artifact_rejects_invalid_background_quantile(
-    datastore_ephemeral, quantile
-) -> None:
-    store = datastore_ephemeral
+def test_hvg_artifact_rejects_invalid_background_quantile(hvg_store, quantile) -> None:
+    store = hvg_store
     ref = store.select_hvgs(store.snapshot_cell_selection(), show_plot=False)
     group = store.zw[artifact_path(ref)]
     provenance = dict(group.attrs["provenance"])
@@ -255,8 +271,8 @@ def test_hvg_artifact_rejects_invalid_background_quantile(
         store.resolve_features("RNA", ref)
 
 
-def test_select_hvgs_default_calibrates_pbmc_malat1(datastore_ephemeral) -> None:
-    store = datastore_ephemeral
+def test_select_hvgs_default_calibrates_pbmc_malat1(hvg_store) -> None:
+    store = hvg_store
     ref = store.select_hvgs(store.snapshot_cell_selection(), show_plot=False)
     names = np.asarray(store.RNA.feats.fetch_all("names"))
     index = int(np.flatnonzero(names == "MALAT1")[0])
@@ -270,9 +286,9 @@ def test_select_hvgs_default_calibrates_pbmc_malat1(datastore_ephemeral) -> None
     [("unknown", "adaptive"), ("regularized_local_quantile", "fixed")],
 )
 def test_hvg_artifact_rejects_incompatible_variance_estimator(
-    datastore_ephemeral, estimator, bin_strategy
+    hvg_store, estimator, bin_strategy
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     ref = store.select_hvgs(
         store.snapshot_cell_selection(),
         min_cells=0,
@@ -293,9 +309,9 @@ def test_hvg_artifact_rejects_incompatible_variance_estimator(
 
 
 def test_select_hvgs_persists_effective_default_max_cells(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     n_selected = int(np.asarray(store.cells.fetch_all("I"), dtype=bool).sum())
     expected: int | float = n_selected - 20
     if expected <= 0:
@@ -327,9 +343,9 @@ def test_select_hvgs_persists_effective_default_max_cells(
 
 
 def test_select_hvgs_recomputes_when_feature_names_change(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     names = np.asarray(
         [f"GENE_{index}" for index in range(store.RNA.feats.N)],
     )
@@ -368,9 +384,9 @@ def test_select_hvgs_recomputes_when_feature_names_change(
 
 
 def test_select_hvgs_rejects_empty_result_without_metadata_mutation(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     store.select_all_features(from_assay="RNA")
     cell_selection = store.snapshot_cell_selection()
     before = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
@@ -395,9 +411,9 @@ def test_select_hvgs_rejects_empty_result_without_metadata_mutation(
 
 
 def test_select_hvgs_rejects_unknown_keywords_before_saving(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     cell_selection = store.snapshot_cell_selection()
     before = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
     summaries = set(store.list_artifacts(kind="feature_summary", from_assay="RNA"))
@@ -430,10 +446,10 @@ def test_select_hvgs_rejects_unknown_keywords_before_saving(
     }
 
 
-def test_select_hvgs_rejects_non_rna_assay(datastore_ephemeral) -> None:
-    cell_selection = datastore_ephemeral.snapshot_cell_selection()
+def test_select_hvgs_rejects_non_rna_assay(hvg_store) -> None:
+    cell_selection = hvg_store.snapshot_cell_selection()
     with pytest.raises(TypeError, match="RNAassay"):
-        datastore_ephemeral.select_hvgs(
+        hvg_store.select_hvgs(
             cell_selection,
             from_assay="assay2",
             show_plot=False,
@@ -441,9 +457,9 @@ def test_select_hvgs_rejects_non_rna_assay(datastore_ephemeral) -> None:
 
 
 def test_select_hvgs_read_only_guard_precedes_snapshot_planning(
-    datastore_ephemeral,
+    hvg_store,
 ) -> None:
-    store = datastore_ephemeral
+    store = hvg_store
     cell_selection = store.snapshot_cell_selection()
     store.zarr_mode = "r"
 
@@ -451,8 +467,8 @@ def test_select_hvgs_read_only_guard_precedes_snapshot_planning(
         store.select_hvgs(cell_selection, show_plot=False)
 
 
-def test_select_hvgs_requires_a_feature_name_snapshot(datastore_ephemeral) -> None:
-    store = datastore_ephemeral
+def test_select_hvgs_requires_a_feature_name_snapshot(hvg_store) -> None:
+    store = hvg_store
     cell_selection = store.snapshot_cell_selection()
     ref = store.select_hvgs(
         cell_selection,

@@ -65,17 +65,23 @@ class _MergeAssay:
             I=np.ones(len(cell_ids), dtype=bool),
         )
         self.feats = _MergeMeta(ids=feature_ids, names=feature_names)
+        self._matrixGroup = None
+        self._matrixGroupCounts = None
 
     @property
     def matrixGroup(self):
-        # A prepared assay's saved count summaries match its current counts.
-        from tests.storage_helpers import finalize_test_counts
+        # A prepared assay's saved count summaries match its current counts,
+        # so they are rebuilt only when a test replaces the counts.
+        if self._matrixGroupCounts is not self.rawData:
+            from tests.storage_helpers import finalize_test_counts
 
-        group = zarr.open_group(store=MemoryStore(), mode="w")
-        finalize_test_counts(
-            group.create_array("counts", data=np.asarray(self.rawData.compute()))
-        )
-        return group
+            group = zarr.open_group(store=MemoryStore(), mode="w")
+            finalize_test_counts(
+                group.create_array("counts", data=np.asarray(self.rawData.compute()))
+            )
+            self._matrixGroup = group
+            self._matrixGroupCounts = self.rawData
+        return self._matrixGroup
 
     def _percent_features(self):
         return {}
@@ -99,6 +105,24 @@ class _MergeDataStore:
 class _NoFullReadMeta(_MergeMeta):
     def fetch_all(self, key):
         raise AssertionError(f"full metadata read attempted for {key}")
+
+
+# Merged rows of _merge_two_rna, by merged cell ID.
+_TWO_RNA_ROWS = {
+    "left__c0": [1, 10],
+    "left__c1": [2, 20],
+    "right__c0": [3, 30],
+    "right__c1": [4, 40],
+}
+
+
+def _rows_by_id(
+    root, path: str = "RNA/counts", ids: str = "cellData/ids"
+) -> dict[str, list]:
+    """Return the stored rows of ``path`` keyed by merged cell ID."""
+    cell_ids = np.asarray(root[ids][:]).astype(str)
+    rows = np.asarray(root[path][:])
+    return {cell: row.tolist() for cell, row in zip(cell_ids, rows, strict=True)}
 
 
 def _merge_two_rna(**kwargs):
@@ -137,6 +161,45 @@ def _merge_two_rna(**kwargs):
     }
     defaults.update(kwargs)
     return DataStoreMerge(**defaults)
+
+
+def _with_partial_quality(merger):
+    """Give the left source a quality column that the right source lacks."""
+    merger.datasets[0].cells._columns["quality"] = np.array([1, 2])
+    merger.datasets[0].cells.columns.append("quality")
+    return merger
+
+
+_SHARDED_POLICY = CountMatrixPolicy(unitBytes=32, chunkBytes=16)
+
+
+@pytest.fixture(scope="module")
+def merged_two_rna(tmp_path_factory):
+    """Completed merges of _merge_two_rna that tests copy before changing them.
+
+    ``default`` uses the default options, ``sharded`` a policy of several
+    shards, and ``quality`` a left source with a partial quality column.
+    """
+    root = tmp_path_factory.mktemp("merged_two_rna")
+    templates = {}
+    for variant, options in (("default", {}), ("sharded", {"policy": _SHARDED_POLICY})):
+        templates[variant] = root / f"{variant}.zarr"
+        _merge_two_rna(
+            zarr_path=str(templates[variant]), overwrite=False, **options
+        ).dump()
+    templates["quality"] = root / "quality.zarr"
+    _with_partial_quality(
+        _merge_two_rna(zarr_path=str(templates["quality"]), overwrite=False)
+    ).dump()
+    return templates
+
+
+def _copy_merge(templates, variant: str, destination) -> str:
+    """Copy a completed merge to ``destination`` and return its location."""
+    import shutil
+
+    shutil.copytree(templates[variant], destination)
+    return str(destination)
 
 
 def test_merged_case_distinct_ids_resolve_and_fetch_exactly():
@@ -281,41 +344,116 @@ def test_dataset_merge_rejects_summary_before_truncating_destination():
     assert set(preserved.group_keys()) == {"sentinel"}
 
 
-def test_dataset_merge(datastore, rna_raw_total, tmp_path):
-    fn = str(tmp_path / "merged.zarr")
-    writer = DataStoreMerge(
-        datasets=[datastore, datastore],
-        zarr_path=fn,
-        names=["self1", "self2"],
-        assays=["RNA"],
-        prepend_text="",
-        overwrite=True,
-    )
-    writer.dump()
-    rna_count = zarr.open(fn + "/RNA/counts")
-    assert rna_count.shape[0] == 2 * datastore.cells.N
-    assert int(rna_count[...].sum()) == rna_raw_total * 2
-    assert zarr.open_group(fn, mode="r").attrs["assayTypes"]["RNA"] == "RNA"
+@pytest.fixture(scope="module")
+def merged_pbmc(datastore_zarr_root, tmp_path_factory):
+    """Merge a copy of the bundled 1K PBMC store with itself.
 
+    The source holds a pipeline run, and the merged store has been opened once
+    as a DataStore, which adds its cell QC columns.
+    """
+    import shutil
 
-def test_dataset_merge_does_not_copy_source_pipeline_runs(
-    datastore_ephemeral,
-    tmp_path,
-):
-    datastore_ephemeral.zw.create_group(f"pipeline/runs/{'d' * 64}/stages")
-    destination = str(tmp_path / "merged_without_runs.zarr")
+    from scarf.datastore.datastore import DataStore
 
+    root = tmp_path_factory.mktemp("merged_pbmc")
+    source_path = root / "source.zarr"
+    shutil.copytree(datastore_zarr_root, source_path)
+    source = DataStore(str(source_path), default_assay="RNA")
+    source.zw.create_group(f"pipeline/runs/{'d' * 64}/stages")
+    destination = str(root / "merged.zarr")
     DataStoreMerge(
-        datasets=[datastore_ephemeral, datastore_ephemeral],
+        datasets=[source, source],
         zarr_path=destination,
-        names=["left", "right"],
-        assays=["RNA"],
-        prepend_text="",
+        names=["self1", "self2"],
+        prepend_text="orig",
+        source_column="sample_id",
         overwrite=True,
     ).dump()
+    merged = DataStore(destination, default_assay="RNA")
+    return source, merged
 
-    assert "pipeline" in datastore_ephemeral.zw
-    assert "pipeline" not in zarr.open_group(destination, mode="r")
+
+def _pbmc_counts():
+    """Return the RNA and ADT counts of the 1K PBMC file the store was built from."""
+    from tests import full_path
+    from tests.test_writers import _read_cellranger_h5
+
+    counts, barcodes, features = _read_cellranger_h5(full_path("1K_pbmc_citeseq.h5"))
+    types = features["feature_type"]
+    return (
+        {
+            "RNA": counts[:, types == "Gene Expression"],
+            "assay2": counts[:, types == "Antibody Capture"],
+        },
+        barcodes,
+    )
+
+
+def _merged_sources(merged_ids, barcodes):
+    """Return the source name and source row of every merged cell ID."""
+    position = {barcode: index for index, barcode in enumerate(barcodes)}
+    names, rows = zip(
+        *(
+            (name, position[barcode])
+            for name, _separator, barcode in (
+                str(value).partition("__") for value in merged_ids
+            )
+        ),
+        strict=True,
+    )
+    return np.asarray(names), np.asarray(rows)
+
+
+def _assert_merged_counts(array, expected, rows) -> None:
+    """Compare merged counts, one stored chunk at a time, with source ``rows``."""
+    assert tuple(array.shape) == (rows.size, expected.shape[1])
+    step_rows, step_columns = (int(value) for value in array.chunks)
+    for start in range(0, array.shape[0], step_rows):
+        band = expected[rows[start : start + step_rows]]
+        for column in range(0, array.shape[1], step_columns):
+            stored = array[start : start + step_rows, column : column + step_columns]
+            wanted = band[:, column : column + step_columns].toarray()
+            if not np.array_equal(stored, wanted):
+                np.testing.assert_array_equal(stored, wanted)
+
+
+def test_dataset_merge(merged_pbmc):
+    source, merged = merged_pbmc
+    expected, barcodes = _pbmc_counts()
+    root = merged.zw
+    names, rows = _merged_sources(root["cellData/ids"][:], barcodes)
+    # Each source contributes every one of its cells exactly once.
+    for name in ("self1", "self2"):
+        np.testing.assert_array_equal(
+            np.sort(rows[names == name]), np.arange(barcodes.size)
+        )
+    assert root.attrs["assayTypes"] == {"RNA": "RNA", "assay2": "Assay"}
+    for assay_name, counts in expected.items():
+        # Merged counts take the common type of the source count dtypes, and
+        # both sources are this one store.
+        assert (
+            root[f"{assay_name}/counts"].dtype
+            == source.zw[f"{assay_name}/counts"].dtype
+        )
+        _assert_merged_counts(root[f"{assay_name}/counts"], counts, rows)
+    # Only the RNA assay holds the feature-major copy, in merged cell order.
+    assert "countsT" not in root["assay2"]
+    counts_t = root["RNA/countsT"]
+    assert counts_t.attrs["complete"] is True
+    step_rows, step_columns = (int(value) for value in counts_t.chunks)
+    rna_t = expected["RNA"][rows].T.tocsr()
+    for start in range(0, counts_t.shape[0], step_rows):
+        for column in range(0, counts_t.shape[1], step_columns):
+            stored = counts_t[start : start + step_rows, column : column + step_columns]
+            wanted = rna_t[start : start + step_rows, column : column + step_columns]
+            assert np.array_equal(stored, wanted.toarray())
+
+
+def test_dataset_merge_does_not_copy_source_pipeline_runs(merged_pbmc):
+    source, merged = merged_pbmc
+
+    assert "pipeline" in source.zw
+    assert "pipeline" not in merged.zw
 
 
 def test_dataset_merge_maps_features_and_preserves_row_order(tmp_path):
@@ -832,61 +970,83 @@ def test_dataset_merge_missing_assay_policy_error(tmp_path):
         ).plan()
 
 
-@pytest.mark.parametrize(
-    ("n_sources", "names"),
-    [
-        (2, ["self1", "self2"]),
-        (3, ["self1", "self2", "self3"]),
-    ],
-)
-def test_dataset_merge_multi_source_totals(
-    datastore,
-    rna_raw_total,
-    assay2_raw_total,
-    tmp_path,
-    n_sources,
-    names,
-):
-    fn = str(tmp_path / f"merged_{n_sources}.zarr")
-    writer = DataStoreMerge(
-        zarr_path=fn,
-        datasets=[datastore] * n_sources,
-        names=names,
+def test_dataset_merge_three_sources_keep_each_source_row(tmp_path):
+    sources = []
+    for label, block_size in (("a", 2), ("b", 3), ("c", 1)):
+        offset = {"a": 0, "b": 100, "c": 200}[label]
+        sources.append(
+            _MergeDataStore(
+                [
+                    _MergeAssay(
+                        "RNA",
+                        [
+                            [offset + 1, offset + 10],
+                            [offset + 2, offset + 20],
+                            [offset + 3, offset + 30],
+                        ],
+                        ["c0", "c1", "c2"],
+                        ["id_a", "id_b"],
+                        ["A", "B"],
+                        block_size=block_size,
+                    )
+                ],
+                zarr_loc=f"memory://{label}",
+            )
+        )
+    path = str(tmp_path / "three.zarr")
+    result = DataStoreMerge(
+        datasets=sources,
+        zarr_path=path,
+        names=["a", "b", "c"],
         prepend_text="",
-        overwrite=True,
-    )
-    writer.dump()
-    rna_count = zarr.open(fn + "/RNA/counts")
-    assay2_count = zarr.open(fn + "/assay2/counts")
-    assert rna_count.shape[0] == n_sources * datastore.cells.N
-    assert assay2_count.shape[0] == n_sources * datastore.cells.N
-    assert int(rna_count[...].sum()) == rna_raw_total * n_sources
-    assert int(assay2_count[...].sum()) == assay2_raw_total * n_sources
-
-
-def test_dataset_merge_cells(datastore, tmp_path):
-    from scarf.datastore.datastore import DataStore
-
-    fn = str(tmp_path / "merged.zarr")
-    writer = DataStoreMerge(
-        zarr_path=fn,
-        datasets=[datastore, datastore],
-        names=["self1", "self2"],
-        prepend_text="orig",
         source_column="sample_id",
-        overwrite=True,
+        seed=5,
+    ).dump()
+
+    assert result.nCells == 9
+    root = zarr.open_group(path, mode="r")
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    assert sorted(ids) == sorted(
+        f"{label}__c{cell}" for label in "abc" for cell in range(3)
     )
-    writer.dump()
-    ds = DataStore(fn, default_assay="RNA")
-    df = ds.cells.to_pandas_dataframe(ds.cells.columns)
-    assert "orig_RNA_nCounts" not in df
-    np.testing.assert_array_equal(
-        df["RNA_nCounts"], ds.RNA.rawData.sum(axis=1).compute()
-    )
-    assert df["sample_id"].value_counts().to_dict() == {
-        "self1": datastore.cells.N,
-        "self2": datastore.cells.N,
+    expected = {
+        f"{label}__c{cell}": [offset + cell + 1, offset + 10 * (cell + 1)]
+        for label, offset in (("a", 0), ("b", 100), ("c", 200))
+        for cell in range(3)
     }
+    counts = np.asarray(root["RNA/counts"][:])
+    samples = np.asarray(root["cellData/sample_id"][:]).astype(str)
+    for cell_id, row, sample in zip(ids, counts, samples, strict=True):
+        np.testing.assert_array_equal(row, expected[cell_id])
+        assert sample == cell_id.split("__")[0]
+    np.testing.assert_array_equal(root["RNA/countsT"][:], counts.T)
+
+
+def test_dataset_merge_cells(merged_pbmc):
+    _source, merged = merged_pbmc
+    expected, barcodes = _pbmc_counts()
+    columns = set(merged.cells.columns)
+    ids = merged.cells.fetch_all("ids")
+    names, rows = _merged_sources(ids, barcodes)
+    # Cell QC columns are recomputed for the merged counts rather than copied
+    # with the prefix of the source columns.
+    assert not any(column.startswith("orig_") for column in columns)
+    np.testing.assert_array_equal(merged.cells.fetch_all("sample_id"), names)
+    for assay_name, counts in expected.items():
+        totals = np.asarray(counts.sum(axis=1)).ravel()[rows]
+        np.testing.assert_array_equal(
+            merged.cells.fetch_all(f"{assay_name}_nCounts"), totals
+        )
+        np.testing.assert_array_equal(
+            merged.cells.fetch_all(f"{assay_name}_nFeatures"),
+            np.diff(counts.indptr)[rows],
+        )
+        np.testing.assert_array_equal(
+            merged.cells.fetch_all(f"{assay_name}_I"), np.ones(rows.size, dtype=bool)
+        )
+    assert merged.cells.to_pandas_dataframe(["sample_id"])[
+        "sample_id"
+    ].value_counts().to_dict() == {"self1": barcodes.size, "self2": barcodes.size}
 
 
 def test_dataset_merge_rejects_duplicate_sample_names(datastore, tmp_path):
@@ -972,25 +1132,32 @@ def test_dataset_merge_row_order_ignores_unselected_assay_chunks(tmp_path):
     np.testing.assert_array_equal(ids_with_adt, ids_without_adt)
 
 
-def test_dataset_merge_workspace_and_counts_t(datastore, rna_raw_total, tmp_path):
-    fn = str(tmp_path / "workspace_merged.zarr")
-    writer = DataStoreMerge(
-        zarr_path=fn,
-        datasets=[datastore, datastore],
-        names=["self1", "self2"],
-        assays=["RNA"],
-        out_workspace="merged",
-        prepend_text="",
-        overwrite=True,
-    )
-    writer.dump()
-    root = zarr.open_group(fn, mode="r")
-    counts = root["matrices/RNA/counts"]
-    assert counts.shape[0] == 2 * datastore.cells.N
-    assert int(counts[...].sum()) == 2 * rna_raw_total
-    assert "countsT" in root["matrices/RNA"]
+def test_dataset_merge_workspace_and_counts_t(tmp_path):
+    path = str(tmp_path / "workspace_merged.zarr")
+    result = _merge_two_rna(
+        zarr_path=path, overwrite=False, out_workspace="merged"
+    ).dump()
+
+    assert result.assayNames == ("RNA",)
+    root = zarr.open_group(path, mode="r")
+    # Workspace metadata lives in the workspace and the counts under matrices.
+    assert set(root.group_keys()) == {"matrices", "merged"}
+    workspace = root["merged"]
+    assert workspace.attrs["assayTypes"] == {"RNA": "RNA"}
+    assert workspace.attrs["complete"] is True
+    ids = np.asarray(workspace["cellData/ids"][:]).astype(str)
+    counts = np.asarray(root["matrices/RNA/counts"][:])
+    expected = {
+        "left__c0": [1, 10],
+        "left__c1": [2, 20],
+        "right__c0": [3, 30],
+        "right__c1": [4, 40],
+    }
+    assert {
+        cell_id: row.tolist() for cell_id, row in zip(ids, counts, strict=True)
+    } == expected
     assert root["matrices/RNA/countsT"].attrs["complete"] is True
-    assert root["merged"].attrs["assayTypes"]["RNA"] == "RNA"
+    np.testing.assert_array_equal(root["matrices/RNA/countsT"][:], counts.T)
 
 
 def test_dataset_merge_plan_is_side_effect_free():
@@ -1050,6 +1217,7 @@ def test_dataset_merge_idempotent_resume(tmp_path):
     )
     result = second.dump()
     assert all(component.action == "skip" for component in result.components)
+    assert _rows_by_id(zarr.open_group(fn, mode="r")) == _TWO_RNA_ROWS
 
 
 def test_dataset_merge_metadata_layout_is_budget_independent_and_resumable(
@@ -1256,8 +1424,21 @@ def test_dataset_merge_partial_metadata_uses_missing_mask(tmp_path):
         overwrite=True,
     ).dump()
     root = zarr.open_group(fn, mode="r")
-    assert "batch" in root["cellData"]
-    assert "__scarf_missing__batch" in root["cellData"]
+    cell_data = root["cellData"]
+    assert cell_data["batch"].attrs["missing_mask"] == "__scarf_missing__batch"
+    # The right source has no batch column, so its cells are missing values.
+    assert _rows_by_id(root, "cellData/batch") == {
+        "left__c0": "x",
+        "left__c1": "y",
+        "right__c0": "",
+        "right__c1": "",
+    }
+    assert _rows_by_id(root, "cellData/__scarf_missing__batch") == {
+        "left__c0": False,
+        "left__c1": False,
+        "right__c0": True,
+        "right__c1": True,
+    }
 
 
 def test_dataset_merge_reads_cell_metadata_without_fetch_all(tmp_path):
@@ -1285,7 +1466,12 @@ def test_dataset_merge_reads_cell_metadata_without_fetch_all(tmp_path):
     ).dump()
 
     root = zarr.open_group(path, mode="r")
-    assert root["cellData/label"].shape == (4,)
+    assert _rows_by_id(root, "cellData/label") == {
+        "left__c0": "left",
+        "left__c1": "left",
+        "right__c0": "right",
+        "right__c1": "right",
+    }
 
 
 def test_dataset_merge_preserves_existing_missing_masks(tmp_path):
@@ -1338,9 +1524,10 @@ def test_dataset_merge_preserves_existing_missing_masks(tmp_path):
     } == expected
 
 
-def test_dataset_merge_finalizes_complete_components_after_interruption(tmp_path):
-    path = str(tmp_path / "finalize_only.zarr")
-    _merge_two_rna(zarr_path=path, overwrite=False).dump()
+def test_dataset_merge_finalizes_complete_components_after_interruption(
+    tmp_path, merged_two_rna
+):
+    path = _copy_merge(merged_two_rna, "default", tmp_path / "finalize_only.zarr")
     root = zarr.open_group(path, mode="r+")
     root.attrs["scarf:import_complete"] = False
     root.attrs["complete"] = False
@@ -1356,12 +1543,12 @@ def test_dataset_merge_finalizes_complete_components_after_interruption(tmp_path
     completed = zarr.open_group(path, mode="r")
     assert completed.attrs["scarf:import_complete"] is True
     assert completed.attrs["complete"] is True
+    assert _rows_by_id(completed) == _TWO_RNA_ROWS
 
 
-def test_dataset_merge_overwrite_forces_scoped_rebuild(tmp_path):
-    path = str(tmp_path / "forced_rebuild.zarr")
+def test_dataset_merge_overwrite_forces_scoped_rebuild(tmp_path, merged_two_rna):
+    path = _copy_merge(merged_two_rna, "default", tmp_path / "forced_rebuild.zarr")
     first = _merge_two_rna(zarr_path=path, overwrite=False)
-    first.dump()
     root = zarr.open_group(path, mode="r+")
     root.create_group("unrelated")
 
@@ -1385,7 +1572,12 @@ def test_dataset_merge_overwrite_forces_scoped_rebuild(tmp_path):
         ("counts:RNA", "write"),
         ("countsT:RNA", "write"),
     ]
-    assert int(np.asarray(rebuilt["RNA/counts"][:]).sum()) == 477
+    # The left counts were replaced, so the rebuild holds the new values.
+    assert _rows_by_id(rebuilt) == {
+        **_TWO_RNA_ROWS,
+        "left__c0": [100, 100],
+        "left__c1": [100, 100],
+    }
     assert "unrelated" in rebuilt
 
 
@@ -1397,11 +1589,12 @@ def test_dataset_merge_instance_can_be_reused(tmp_path):
     result = merger.dump()
 
     assert all(component.action == "skip" for component in result.components)
+    assert _rows_by_id(zarr.open_group(path, mode="r")) == _TWO_RNA_ROWS
 
 
-def test_dataset_merge_plan_reports_destination_conflict(tmp_path):
-    path = str(tmp_path / "blocked_plan.zarr")
-    _merge_two_rna(zarr_path=path, overwrite=False, seed=0).dump()
+def test_dataset_merge_plan_reports_destination_conflict(tmp_path, merged_two_rna):
+    # The completed merge used seed 0.
+    path = _copy_merge(merged_two_rna, "default", tmp_path / "blocked_plan.zarr")
     blocked = _merge_two_rna(zarr_path=path, overwrite=False, seed=1)
 
     plan = blocked.plan()
@@ -1440,28 +1633,20 @@ def test_dataset_merge_plan_reports_destination_conflict(tmp_path):
 )
 def test_dataset_merge_plan_blocks_tampered_components(
     tmp_path,
+    merged_two_rna,
     case,
     reason,
 ):
-    path = str(tmp_path / f"tampered_{case}.zarr")
-    merge_kwargs = (
-        {"policy": CountMatrixPolicy(unitBytes=32, chunkBytes=16)}
-        if case
-        in {
-            "counts_shards",
-            "counts_t_shards",
-        }
-        else {}
+    sharded = case in {"counts_shards", "counts_t_shards"}
+    merge_kwargs = {"policy": _SHARDED_POLICY} if sharded else {}
+    variant = (
+        "sharded"
+        if sharded
+        else "quality"
+        if case == "metadata_missing_chunks"
+        else "default"
     )
-    initial = _merge_two_rna(
-        zarr_path=path,
-        overwrite=False,
-        **merge_kwargs,
-    )
-    if case == "metadata_missing_chunks":
-        initial.datasets[0].cells._columns["quality"] = np.array([1, 2])
-        initial.datasets[0].cells.columns.append("quality")
-    initial.dump()
+    path = _copy_merge(merged_two_rna, variant, tmp_path / f"tampered_{case}.zarr")
     root = zarr.open_group(path, mode="r+")
     if case == "cell_identity":
         ids = np.asarray(root["cellData/ids"][:]).astype(str)
@@ -1559,8 +1744,7 @@ def test_dataset_merge_plan_blocks_tampered_components(
         **merge_kwargs,
     )
     if case == "metadata_missing_chunks":
-        blocked_merger.datasets[0].cells._columns["quality"] = np.array([1, 2])
-        blocked_merger.datasets[0].cells.columns.append("quality")
+        _with_partial_quality(blocked_merger)
     blocked = blocked_merger.plan()
     assert blocked.canDump is False
     assert blocked.blockedReason is not None
@@ -1691,6 +1875,14 @@ def test_dataset_merge_resumes_after_component_interruption(
         for name, action in expected.items():
             assert actions[name] == action
         assert result.resumed is True
+        completed = zarr.open_group(path, mode="r")
+        assert _rows_by_id(completed) == _TWO_RNA_ROWS
+        assert _rows_by_id(completed, "ADT/counts") == {
+            "left__c0": [101, 110],
+            "left__c1": [102, 120],
+            "right__c0": [103, 130],
+            "right__c1": [104, 140],
+        }
         return
 
     if case == "cell_metadata":
@@ -1742,14 +1934,17 @@ def test_dataset_merge_resumes_after_component_interruption(
     actions = {component.name: component.action for component in result.components}
     assert actions == expected
     assert result.resumed is True
+    completed = zarr.open_group(path, mode="r")
+    assert _rows_by_id(completed) == _TWO_RNA_ROWS
+    np.testing.assert_array_equal(
+        completed["RNA/countsT"][:], np.asarray(completed["RNA/counts"][:]).T
+    )
 
 
-def test_dataset_merge_rewrites_counts_t_when_counts_resume(tmp_path):
-    path = str(tmp_path / "resume_counts_dependency.zarr")
-    _merge_two_rna(
-        zarr_path=path,
-        overwrite=False,
-    ).dump()
+def test_dataset_merge_rewrites_counts_t_when_counts_resume(tmp_path, merged_two_rna):
+    path = _copy_merge(
+        merged_two_rna, "default", tmp_path / "resume_counts_dependency.zarr"
+    )
     root = zarr.open_group(path, mode="r+")
     root.attrs["scarf:import_complete"] = False
     root.attrs["complete"] = False
@@ -1765,15 +1960,18 @@ def test_dataset_merge_rewrites_counts_t_when_counts_resume(tmp_path):
     assert actions["counts:RNA"] == "resume"
     assert actions["countsT:RNA"] == "resume"
     completed = zarr.open_group(path, mode="r")
+    # The zeroed counts are rewritten from the sources, and countsT with them.
+    assert _rows_by_id(completed) == _TWO_RNA_ROWS
     np.testing.assert_array_equal(
         completed["RNA/countsT"][:],
         np.asarray(completed["RNA/counts"][:]).T,
     )
 
 
-def test_dataset_merge_blocks_inconsistent_complete_marker(tmp_path):
-    path = str(tmp_path / "inconsistent_complete.zarr")
-    _merge_two_rna(zarr_path=path, overwrite=False).dump()
+def test_dataset_merge_blocks_inconsistent_complete_marker(tmp_path, merged_two_rna):
+    path = _copy_merge(
+        merged_two_rna, "default", tmp_path / "inconsistent_complete.zarr"
+    )
     root = zarr.open_group(path, mode="r+")
     root["RNA"].attrs["complete"] = False
 
@@ -1841,11 +2039,21 @@ def test_dataset_merge_overwrite_removes_old_assay_components(tmp_path):
     assert "ADT" not in completed
 
 
-def test_dataset_merge_rejects_invalid_workspace_names(tmp_path):
-    path = str(tmp_path / "invalid_workspace.zarr")
-    for workspace in ("", "matrices", "cellData", "a/b", "artifacts"):
-        with pytest.raises(ValueError):
-            _merge_two_rna(zarr_path=path, out_workspace=workspace)
+@pytest.mark.parametrize(
+    ("workspace", "reason"),
+    [
+        ("", "Workspace names must be non-empty"),
+        ("matrices", "'matrices' is reserved for workspace matrix storage"),
+        ("cellData", "'cellData' is reserved for datastore cell metadata"),
+        ("a/b", "'a/b' must not contain path separators"),
+        ("artifacts", "'artifacts' is reserved for datastore artifact storage"),
+    ],
+)
+def test_dataset_merge_rejects_invalid_workspace_names(tmp_path, workspace, reason):
+    path = tmp_path / "invalid_workspace.zarr"
+    with pytest.raises(ValueError, match=reason):
+        _merge_two_rna(zarr_path=str(path), out_workspace=workspace)
+    assert not path.exists()
 
 
 def test_dataset_merge_rejects_duplicate_assay_filter(tmp_path):
@@ -2272,7 +2480,7 @@ def test_dataset_merge_resumes_after_partial_counts_band(tmp_path, monkeypatch):
         np.asarray(completed["RNA/counts"][:]).T,
     )
     assert "sentinel" in completed
-    assert int(np.asarray(completed["RNA/counts"][:]).sum()) == 110
+    assert _rows_by_id(completed) == _TWO_RNA_ROWS
 
 
 def test_dataset_merge_metadata_admission_bounds_selection(tmp_path, monkeypatch):
@@ -2452,8 +2660,8 @@ def test_dataset_merge_metadata_admission_shrinks_under_budget(monkeypatch):
         resources,
         resident_bytes=2_000,
     )
-    assert admitted < 10
-    assert admitted >= 1
+    # The 2,500 bytes left beside the resident data hold two 1,000-byte rows.
+    assert admitted == 2
 
     updated = merge_metadata.admit_cell_metadata_plan(
         metadata_plan,
@@ -2472,7 +2680,6 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
     import scarf.merge.writer as merge_writer
 
     path = str(tmp_path / "sparse_geometry.zarr")
-    reference_path = str(tmp_path / "sparse_geometry_ref.zarr")
     n_left = 12
     n_right = 12
     n_feats = 8
@@ -2506,18 +2713,6 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         ],
         zarr_loc="memory://right",
     )
-
-    DataStoreMerge(
-        datasets=[left, right],
-        zarr_path=reference_path,
-        names=["left", "right"],
-        prepend_text="",
-        seed=0,
-        overwrite=True,
-        mem_budget=256 * 1024,
-        nthreads=1,
-        policy=CountMatrixPolicy(unitBytes=64, chunkBytes=32),
-    ).dump()
 
     dense_rows: list[int] = []
     coo_rows: list[int] = []
@@ -2564,16 +2759,11 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
     assert all(rows <= admitted for rows in dense_rows)
     assert all(rows <= admitted for rows in coo_rows)
     assert sum(coo_rows) == n_left + n_right
-    reference = zarr.open_group(reference_path, mode="r")
     completed = zarr.open_group(path, mode="r")
-    np.testing.assert_array_equal(
-        completed["RNA/counts"][:],
-        reference["RNA/counts"][:],
-    )
-    np.testing.assert_array_equal(
-        completed["cellData/ids"][:],
-        reference["cellData/ids"][:],
-    )
+    assert _rows_by_id(completed) == {
+        **{f"left__c{i}": row.tolist() for i, row in enumerate(left_counts)},
+        **{f"right__c{i}": row.tolist() for i, row in enumerate(right_counts)},
+    }
 
 
 def _sparse_rna_sources(n_cells=12, n_feats=8):
@@ -2689,9 +2879,6 @@ def test_dataset_merge_writes_cell_metadata_in_whole_chunk_bands(tmp_path, monke
             nthreads=1,
         )
 
-    reference_path = tmp_path / "single_chunk.zarr"
-    merger(reference_path).dump()
-
     writes: list[tuple[int, int]] = []
     original_create = merge_metadata.create_streamed_metadata_column
 
@@ -2713,12 +2900,32 @@ def test_dataset_merge_writes_cell_metadata_in_whole_chunk_bands(tmp_path, monke
 
     assert writes
     assert all(start % 5 == 0 and size == min(5, 24 - start) for start, size in writes)
-    reference = zarr.open_group(reference_path, mode="r")["cellData"]
-    banded = zarr.open_group(banded_path, mode="r")["cellData"]
-    assert set(banded.array_keys()) == set(reference.array_keys())
-    for name in reference.array_keys():
+    root = zarr.open_group(banded_path, mode="r")
+    banded = root["cellData"]
+    assert set(banded.array_keys()) == {
+        "ids",
+        "names",
+        "I",
+        "RNA_I",
+        "quality",
+        "__scarf_missing__quality",
+    }
+    for name in banded.array_keys():
         assert banded[name].chunks == (5,)
-        np.testing.assert_array_equal(banded[name][:], reference[name][:])
+    # Bands that straddle the source blocks keep every value with its cell.
+    cells = [f"{side}__c{i}" for side in ("left", "right") for i in range(12)]
+    assert _rows_by_id(root, "cellData/names") == {
+        cell: cell.split("__")[1] for cell in cells
+    }
+    assert _rows_by_id(root, "cellData/I") == dict.fromkeys(cells, True)
+    assert _rows_by_id(root, "cellData/RNA_I") == dict.fromkeys(cells, True)
+    assert _rows_by_id(root, "cellData/quality") == {
+        cell: int(cell.split("__c")[1]) if cell.startswith("left") else 0
+        for cell in cells
+    }
+    assert _rows_by_id(root, "cellData/__scarf_missing__quality") == {
+        cell: cell.startswith("right") for cell in cells
+    }
     resumed = merger(banded_path).plan()
     assert resumed.cellDataAction == "skip"
 
@@ -2876,7 +3083,15 @@ def test_dataset_merge_rejects_insufficient_metadata_budget(tmp_path):
     assert not (tmp_path / "meta_budget.zarr").exists()
 
 
-def test_dataset_merge_rejects_insufficient_counts_budget(tmp_path):
+@pytest.mark.parametrize(
+    ("budget", "reason"),
+    [
+        (8_000, "Resident data needs about"),
+        (16_000, "One task needs about"),
+        (32_000, "countsT write needs at least"),
+    ],
+)
+def test_dataset_merge_rejects_insufficient_counts_budget(tmp_path, budget, reason):
     path = str(tmp_path / "counts_budget.zarr")
     left = _MergeDataStore(
         [
@@ -2909,11 +3124,14 @@ def test_dataset_merge_rejects_insufficient_counts_budget(tmp_path):
         zarr_path=path,
         names=["left", "right"],
         prepend_text="",
-        mem_budget=2_000,
+        mem_budget=budget,
         nthreads=1,
         overwrite=True,
     )
-    with pytest.raises(MemoryError):
+    # These budgets hold the cell metadata, but not the counts of one row.
+    with pytest.raises(
+        MemoryError, match=f"count shards of one row. Increase mem_budget. {reason}"
+    ):
         merger.plan()
     assert not (tmp_path / "counts_budget.zarr").exists()
 
@@ -3109,9 +3327,8 @@ def test_dataset_merge_uses_the_common_type_of_the_source_count_dtypes(
     merger.dump()
 
     root = zarr.open_group(destination, mode="r")
-    counts = np.asarray(root["RNA/counts"][:])
-    assert counts.dtype == np.dtype(expected)
-    assert int(counts.sum()) == 110
+    assert root["RNA/counts"].dtype == np.dtype(expected)
+    assert _rows_by_id(root) == _TWO_RNA_ROWS
 
 
 def test_dataset_merge_rejects_integer_sources_without_a_common_integer_dtype():
@@ -3370,12 +3587,11 @@ def test_dataset_merge_rejects_unknown_feature_key():
         )
 
 
-def test_dataset_merge_namespaces_duplicate_cell_ids_across_sources():
-    destination = MemoryStore()
-    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
-
+def test_dataset_merge_namespaces_duplicate_cell_ids_across_sources(merged_two_rna):
     ids = (
-        np.asarray(zarr.open_group(destination, mode="r")["cellData/ids"][:])
+        np.asarray(
+            zarr.open_group(str(merged_two_rna["default"]), mode="r")["cellData/ids"][:]
+        )
         .astype(str)
         .tolist()
     )
@@ -3438,9 +3654,10 @@ def test_dataset_merge_rejects_feature_metadata_width_mismatch():
         ("feature_name", "featureData/names"),
     ],
 )
-def test_dataset_merge_resume_validates_current_source_identity(case, reason):
-    destination = MemoryStore()
-    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+def test_dataset_merge_resume_validates_current_source_identity(
+    tmp_path, merged_two_rna, case, reason
+):
+    destination = _copy_merge(merged_two_rna, "default", tmp_path / "resume.zarr")
     candidate = _merge_two_rna(zarr_path=destination, overwrite=False)
 
     if case == "cell_id":
@@ -3470,9 +3687,10 @@ def test_dataset_merge_resume_validates_current_source_identity(case, reason):
         ("wrong_assay", "column 'RNA_I' has the wrong assay"),
     ],
 )
-def test_dataset_merge_blocks_tampered_completed_cell_metadata(case, reason):
-    destination = MemoryStore()
-    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+def test_dataset_merge_blocks_tampered_completed_cell_metadata(
+    tmp_path, merged_two_rna, case, reason
+):
+    destination = _copy_merge(merged_two_rna, "default", tmp_path / "tampered.zarr")
     root = zarr.open_group(destination, mode="r+")
     cell_data = root["cellData"]
 
@@ -3511,14 +3729,10 @@ def test_dataset_merge_blocks_tampered_completed_cell_metadata(case, reason):
         ("mask_dtype", "has the wrong dtype"),
     ],
 )
-def test_dataset_merge_blocks_tampered_completed_missing_masks(case, reason):
-    def with_partial_quality(merger):
-        merger.datasets[0].cells._columns["quality"] = np.array([1, 2])
-        merger.datasets[0].cells.columns.append("quality")
-        return merger
-
-    destination = MemoryStore()
-    with_partial_quality(_merge_two_rna(zarr_path=destination, overwrite=False)).dump()
+def test_dataset_merge_blocks_tampered_completed_missing_masks(
+    tmp_path, merged_two_rna, case, reason
+):
+    destination = _copy_merge(merged_two_rna, "quality", tmp_path / "tampered.zarr")
     root = zarr.open_group(destination, mode="r+")
     cell_data = root["cellData"]
     missing_name = "__scarf_missing__quality"
@@ -3536,7 +3750,7 @@ def test_dataset_merge_blocks_tampered_completed_missing_masks(case, reason):
         del cell_data[missing_name]
         cell_data.create_array(missing_name, data=values, chunks=(2,))
 
-    plan = with_partial_quality(
+    plan = _with_partial_quality(
         _merge_two_rna(zarr_path=destination, overwrite=False)
     ).plan()
     assert plan.canDump is False
@@ -3554,9 +3768,10 @@ def test_dataset_merge_blocks_tampered_completed_missing_masks(case, reason):
         ("selection_dtype", "featureData/I has the wrong dtype"),
     ],
 )
-def test_dataset_merge_blocks_tampered_completed_assay_components(case, reason):
-    destination = MemoryStore()
-    _merge_two_rna(zarr_path=destination, overwrite=False).dump()
+def test_dataset_merge_blocks_tampered_completed_assay_components(
+    tmp_path, merged_two_rna, case, reason
+):
+    destination = _copy_merge(merged_two_rna, "default", tmp_path / "tampered.zarr")
     root = zarr.open_group(destination, mode="r+")
 
     if case == "counts_missing":
@@ -3881,18 +4096,38 @@ _FITTED_BUDGET = 16 * 1024**2
 _METADATA_SHORTFALL = 128 * 1024
 
 
+def _large_counts() -> dict[str, np.ndarray]:
+    counts = {}
+    for index, label in enumerate(("left", "right")):
+        values = np.random.default_rng(index).poisson(0.3, size=(1_000, 400))
+        # One count past uint16 keeps uint32 storage and wide count rows.
+        values[0, 0] = 70_000
+        counts[label] = values.astype(np.uint32)
+    return counts
+
+
+def _large_merged_counts(root) -> np.ndarray:
+    """Return the source rows of _large_sources in the merged cell order."""
+    sources = _large_counts()
+    return np.vstack(
+        [
+            sources[label][int(cell[1:])]
+            for label, _separator, cell in (
+                str(value).partition("__") for value in root["cellData/ids"][:]
+            )
+        ]
+    )
+
+
 def _large_sources() -> list[_MergeDataStore]:
     sources = []
-    for index, label in enumerate(("left", "right")):
-        counts = np.random.default_rng(index).poisson(0.3, size=(1_000, 400))
-        # One count past uint16 keeps uint32 storage and wide count rows.
-        counts[0, 0] = 70_000
+    for label, counts in _large_counts().items():
         sources.append(
             _MergeDataStore(
                 [
                     _MergeAssay(
                         "RNA",
-                        counts.astype(np.uint32),
+                        counts,
                         [f"c{i}" for i in range(1_000)],
                         [f"g{i}" for i in range(400)],
                         [f"G{i}" for i in range(400)],
@@ -3923,6 +4158,8 @@ def _merged_policy(path) -> CountMatrixPolicy:
 
 
 def test_dataset_merge_fits_the_count_layout_to_its_budget(tmp_path):
+    from tests.storage_helpers import finalize_test_counts
+
     # The default layout does not fit, and it is refused while planning.
     with pytest.raises(MemoryError, match="default count-matrix policy"):
         _large_merge(
@@ -3932,25 +4169,24 @@ def test_dataset_merge_fits_the_count_layout_to_its_budget(tmp_path):
         ).dump()
     assert not (tmp_path / "default.zarr").exists()
 
-    _large_merge(tmp_path / "roomy.zarr", mem_budget="1G").dump()
     plan = _large_merge(tmp_path / "fitted.zarr", mem_budget=_FITTED_BUDGET).plan()
     _large_merge(tmp_path / "fitted.zarr", mem_budget=_FITTED_BUDGET).dump()
 
-    assert _merged_policy(tmp_path / "roomy.zarr") == DEFAULT_COUNT_MATRIX_POLICY
     policy = _merged_policy(tmp_path / "fitted.zarr")
     assert policy.unitBytes < DEFAULT_COUNT_MATRIX_POLICY.unitBytes
     assert policy.chunksPerShard == DEFAULT_COUNT_MATRIX_POLICY.chunksPerShard
-    roomy = zarr.open_group(str(tmp_path / "roomy.zarr"), mode="r")
     fitted = zarr.open_group(str(tmp_path / "fitted.zarr"), mode="r")
     # The plan reports the geometry that the fitted layout writes.
     assert plan.assays[0].chunks == tuple(fitted["RNA/counts"].chunks)
     assert fitted["RNA/counts"].dtype == np.uint32
     assert fitted["RNA/countsT"].attrs["complete"] is True
-    np.testing.assert_array_equal(fitted["RNA/counts"][:], roomy["RNA/counts"][:])
-    np.testing.assert_array_equal(fitted["RNA/countsT"][:], roomy["RNA/countsT"][:])
-    assert (
-        fitted["RNA/counts"].attrs["content_fingerprint"]
-        == roomy["RNA/counts"].attrs["content_fingerprint"]
+    expected = _large_merged_counts(fitted)
+    np.testing.assert_array_equal(fitted["RNA/counts"][:], expected)
+    np.testing.assert_array_equal(fitted["RNA/countsT"][:], expected.T)
+    # Identity does not depend on the layout that holds the counts.
+    reference = zarr.open_group(store=MemoryStore(), mode="w")
+    assert fitted["RNA/counts"].attrs["content_fingerprint"] == finalize_test_counts(
+        reference.create_array("counts", data=expected)
     )
 
 
@@ -3985,7 +4221,9 @@ def test_dataset_merge_resume_keeps_the_layout_of_completed_counts(
     assert _merged_policy(path) == fitted
     root = zarr.open_group(str(path), mode="r")
     assert root["RNA/countsT"].attrs["complete"] is True
-    np.testing.assert_array_equal(root["RNA/countsT"][:], root["RNA/counts"][:].T)
+    expected = _large_merged_counts(root)
+    np.testing.assert_array_equal(root["RNA/counts"][:], expected)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], expected.T)
 
 
 def test_dataset_merge_refits_the_layout_of_counts_it_rewrites(tmp_path, monkeypatch):
@@ -4092,3 +4330,440 @@ def test_dataset_merge_stores_an_assay_without_features_as_uint8():
     merger.dump()
     counts = zarr.open_group(store=destination, mode="r")["ADT/counts"]
     assert (counts.shape, counts.dtype) == ((4, 0), np.uint8)
+
+
+@pytest.mark.parametrize(
+    ("cells", "chunks", "names", "message"),
+    [
+        ([2, 2], [2], ["a", "b"], "Row chunk sizes must match the number of sources"),
+        ([2, 2], [2, 2], ["a"], "Source names must match the number of sources"),
+        ([2, 2], [2, 0], ["a", "b"], "Row chunk sizes must be positive"),
+        ([2, 2], [2, 2], ["a", "a"], "A unique name must be provided for each source"),
+    ],
+)
+def test_build_row_plan_rejects_inconsistent_sources(cells, chunks, names, message):
+    from scarf.merge.row_plan import build_row_plan
+
+    with pytest.raises(ValueError, match=message):
+        build_row_plan(cells, chunks, names)
+
+
+def test_row_plan_segments_and_identity_checks_cover_every_cell_once():
+    from scarf.merge.row_plan import (
+        RowPlan,
+        build_row_plan,
+        iter_merged_cell_ids,
+        iter_row_plan_segments,
+        verify_merged_cell_ids,
+    )
+
+    plan = build_row_plan([5, 3], [2, 3], ["a", "b"], seed=0)
+    segments = list(iter_row_plan_segments(plan, segment_rows=1))
+    # One-row segments fill the destination contiguously with every source
+    # row exactly once.
+    assert [segment.destStart for segment in segments] == list(range(8))
+    assert sorted(
+        (segment.sourceIdx, int(segment.localRows[0])) for segment in segments
+    ) == [(0, row) for row in range(5)] + [(1, row) for row in range(3)]
+    with pytest.raises(ValueError, match="segment_rows must be positive"):
+        list(iter_row_plan_segments(plan, segment_rows=0))
+    # A plan that promises more cells than its blocks hold is refused.
+    overstated = RowPlan(
+        permutationsRows=plan.permutationsRows,
+        coordinatesPermutations=plan.coordinatesPermutations,
+        nCells=plan.nCells + 1,
+        sourceNames=plan.sourceNames,
+    )
+    with pytest.raises(AssertionError, match="does not cover every planned cell"):
+        list(iter_row_plan_segments(overstated))
+
+    tables = [
+        _MergeMeta(ids=[f"x{row}" for row in range(5)]),
+        _MergeMeta(ids=[f"y{row}" for row in range(3)]),
+    ]
+    with pytest.raises(ValueError, match="Source cell tables must match the row plan"):
+        list(iter_merged_cell_ids(plan, tables[:1], dtype="U8"))
+    stored = zarr.open_group(store=MemoryStore(), mode="w").create_array(
+        "ids", shape=(8,), chunks=(3,), dtype="U8"
+    )
+    for start, ids in iter_merged_cell_ids(plan, tables, dtype="U8"):
+        stored[start : start + ids.size] = ids
+    assert sorted(stored[:]) == sorted(
+        [f"a__x{row}" for row in range(5)] + [f"b__y{row}" for row in range(3)]
+    )
+    verify_merged_cell_ids(stored, plan, tables, block_rows=2)
+    shorter = zarr.open_group(store=MemoryStore(), mode="w").create_array(
+        "ids", data=stored[:7]
+    )
+    with pytest.raises(ValueError, match="order of cells does not match"):
+        verify_merged_cell_ids(shorter, plan, tables)
+
+
+def test_validate_cell_metadata_reports_a_missing_or_incomplete_group():
+    import scarf.merge.metadata as merge_metadata
+    from scarf.merge.row_plan import build_row_plan
+
+    tables = [
+        _MergeMeta(ids=["c0", "c1"], names=["c0", "c1"], I=np.ones(2, dtype=bool))
+        for _ in range(2)
+    ]
+    row_plan = build_row_plan([2, 2], [2, 2], ["left", "right"], seed=0)
+    metadata_plan = merge_metadata.plan_cell_metadata(
+        tables,
+        ["left", "right"],
+        prepend_text="",
+        reset_cell_filter=True,
+        source_column=None,
+    )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+
+    def reason(workspace):
+        return merge_metadata.validate_cell_metadata(
+            root,
+            workspace,
+            row_plan,
+            tables,
+            metadata_plan,
+            resources=ResourceBudget(1024**2, 1),
+            resident_bytes=0,
+        )
+
+    assert reason("ws") == "cell metadata group 'ws/cellData' is missing"
+    root.create_group("ws/cellData")
+    assert reason("ws") == "cell metadata group 'ws/cellData' is not complete"
+
+
+def test_dataset_merge_without_prepend_text_keeps_source_column_names(tmp_path):
+    path = str(tmp_path / "unprefixed.zarr")
+    merger = _merge_two_rna(zarr_path=path, overwrite=False, prepend_text=None)
+    for source, batch in zip(merger.datasets, ("x", "y"), strict=True):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"],
+            names=["c0", "c1"],
+            I=np.ones(2, dtype=bool),
+            batch=np.array([batch, batch]),
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+    root = zarr.open_group(path, mode="r")
+    assert {name for name in root["cellData"].array_keys() if "batch" in name} == {
+        "batch"
+    }
+    assert _rows_by_id(root, "cellData/batch") == {
+        "left__c0": "x",
+        "left__c1": "x",
+        "right__c0": "y",
+        "right__c1": "y",
+    }
+
+
+def test_dataset_merge_sizes_object_text_columns_by_their_longest_value():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    for source, labels in zip(
+        merger.datasets,
+        (np.array(["a", "bcd"], dtype=object), np.array(["ef", "g"], dtype=object)),
+        strict=True,
+    ):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"], names=["c0", "c1"], I=np.ones(2, dtype=bool), label=labels
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+    root = zarr.open_group(destination, mode="r")
+    # Python strings of any length hold the labels; the longest has 3 letters.
+    assert root["cellData/label"].dtype == np.dtype("U3")
+    assert _rows_by_id(root, "cellData/label") == {
+        "left__c0": "a",
+        "left__c1": "bcd",
+        "right__c0": "ef",
+        "right__c1": "g",
+    }
+
+
+@pytest.mark.parametrize(
+    ("dtype", "values", "exact"),
+    [
+        (np.dtype("S3"), [b"abc"], True),
+        (np.dtype(bool), [True, False], True),
+        (np.dtype(np.int16), [-(2**15), 2**15 - 1], True),
+        (np.dtype(np.uint32), [0, 2**32 - 1], True),
+        (
+            np.dtype(np.float64),
+            [-np.finfo(np.float64).max, np.finfo(np.float64).tiny],
+            False,
+        ),
+        (np.dtype(np.complex128), [complex(-1e308, -1e-308)], False),
+        (np.dtype("datetime64[ns]"), ["2262-04-11T23:47:16.854775807"], False),
+        (np.dtype("timedelta64[ns]"), [-(2**63) + 1], False),
+    ],
+)
+def test_schema_scan_text_bound_holds_the_text_of_every_value(dtype, values, exact):
+    from scarf.merge.metadata import _string_itemsize_bound
+
+    # The schema scan converts values to text; the bound must hold the UTF-32
+    # text NumPy makes of the extreme values of each kind.
+    text_itemsize = np.asarray(values, dtype=dtype).astype(str).dtype.itemsize
+    bound = _string_itemsize_bound(dtype)
+    if exact:
+        assert bound == text_itemsize
+    else:
+        assert bound >= text_itemsize
+    # Object columns are sized by their values, not by their pointers.
+    assert _string_itemsize_bound(np.dtype(object)) == np.dtype(object).itemsize
+
+
+def test_dataset_merge_resume_needs_one_identity_row_within_its_budget(tmp_path):
+    def merger(**options):
+        sources = []
+        for offset, label in enumerate(("left", "right")):
+            sources.append(
+                _MergeDataStore(
+                    [
+                        _MergeAssay(
+                            "RNA",
+                            (np.arange(20, dtype=np.uint16) + offset).reshape(20, 1),
+                            [f"c{index}" for index in range(20)],
+                            ["g"],
+                            ["G"],
+                            block_size=20,
+                        )
+                    ],
+                    zarr_loc=f"memory://{label}",
+                )
+            )
+        return DataStoreMerge(
+            datasets=sources,
+            zarr_path=str(tmp_path / "identity.zarr"),
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+            nthreads=1,
+            **options,
+        )
+
+    merger().dump()
+    assert merger().plan().cellDataAction == "skip"
+    # Validating the completed cell IDs holds one stored chunk of all 40 IDs,
+    # which this budget cannot, though it holds the schema scan of the sources.
+    with pytest.raises(
+        MemoryError,
+        match="Merged cell identity validation cannot fit one row within the "
+        "operation memory budget",
+    ):
+        merger(mem_budget=4_000).plan()
+
+
+def test_dataset_merge_keeps_complex_cell_metadata_values():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    for source, values in zip(
+        merger.datasets,
+        (
+            np.array([1.5, 2.5], dtype=np.float32),
+            np.array([1 + 2j, 3 - 1j], dtype=np.complex64),
+        ),
+        strict=True,
+    ):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"], names=["c0", "c1"], I=np.ones(2, dtype=bool), score=values
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+    root = zarr.open_group(destination, mode="r")
+    # Real and complex values widen to complex128, as real mixes widen to
+    # float64, so every source value is kept exactly.
+    assert root["cellData/score"].dtype == np.complex128
+    assert _rows_by_id(root, "cellData/score") == {
+        "left__c0": 1.5,
+        "left__c1": 2.5,
+        "right__c0": 1 + 2j,
+        "right__c1": 3 - 1j,
+    }
+
+
+def test_dataset_merge_marks_cells_missing_from_a_complex_column():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    for source, columns in zip(
+        merger.datasets,
+        ({}, {"phase": np.array([1j, 2 + 0j], dtype=np.complex64)}),
+        strict=True,
+    ):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"], names=["c0", "c1"], I=np.ones(2, dtype=bool), **columns
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+    root = zarr.open_group(destination, mode="r")
+    phase = root["cellData/phase"]
+    # Cells of the source without the column are filled and marked missing.
+    assert phase.dtype == np.complex64
+    values = _rows_by_id(root, "cellData/phase")
+    assert (values["right__c0"], values["right__c1"]) == (1j, 2 + 0j)
+    assert np.isnan(values["left__c0"]) and np.isnan(values["left__c1"])
+    assert _rows_by_id(root, f"cellData/{phase.attrs['missing_mask']}") == {
+        "left__c0": True,
+        "left__c1": True,
+        "right__c0": False,
+        "right__c1": False,
+    }
+
+
+def _feature_annotated_sources(left_columns, right_columns, attrs=None):
+    """Return two sources whose features carry extra annotation columns."""
+    datasets = []
+    for label, columns, feature_ids in (
+        ("left", left_columns, ["a", "b"]),
+        ("right", right_columns, ["b", "c"]),
+    ):
+        assay = _MergeAssay(
+            "RNA",
+            [[1, 2], [3, 4]],
+            ["c0", "c1"],
+            feature_ids,
+            [name.upper() for name in feature_ids],
+            block_size=2,
+        )
+        assay.feats = _AttributedMeta(
+            {} if attrs is None else attrs[label],
+            ids=feature_ids,
+            names=[name.upper() for name in feature_ids],
+            **columns,
+        )
+        datasets.append(_MergeDataStore([assay], zarr_loc=f"memory://{label}"))
+    return datasets
+
+
+def test_dataset_merge_keeps_float_feature_annotations_where_present(tmp_path):
+    path = str(tmp_path / "float_features.zarr")
+    DataStoreMerge(
+        datasets=_feature_annotated_sources(
+            {"gc": np.array([0.5, np.nan])}, {"gc": np.array([0.25, np.nan])}
+        ),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+    ).dump()
+
+    features = zarr.open_group(path, mode="r")["RNA/featureData"]
+    np.testing.assert_array_equal(features["ids"][:], ["a", "b", "c"])
+    # NaN marks a missing value: b takes the right value, and c has none.
+    np.testing.assert_array_equal(features["gc"][:], [0.5, 0.25, np.nan])
+    np.testing.assert_array_equal(
+        features[features["gc"].attrs["missing_mask"]][:], [False, False, True]
+    )
+
+
+def test_dataset_merge_keeps_complex_feature_annotations_where_present(tmp_path):
+    path = str(tmp_path / "complex_features.zarr")
+    DataStoreMerge(
+        datasets=_feature_annotated_sources(
+            {"phase": np.array([0.5, np.nan])},
+            {"phase": np.array([np.nan, 1 + 1j], dtype=np.complex128)},
+        ),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+    ).dump()
+
+    features = zarr.open_group(path, mode="r")["RNA/featureData"]
+    # Real and complex values widen to complex128, and NaN marks a missing
+    # value in either kind: b has no value, and c keeps its imaginary part.
+    assert features["phase"].dtype == np.complex128
+    phase = features["phase"][:]
+    assert (phase[0], phase[2]) == (0.5 + 0j, 1 + 1j)
+    assert np.isnan(phase[1])
+    np.testing.assert_array_equal(
+        features[features["phase"].attrs["missing_mask"]][:], [False, True, False]
+    )
+
+
+def test_dataset_merge_skips_feature_values_that_differ_only_in_imaginary_part(
+    tmp_path,
+):
+    path = str(tmp_path / "complex_conflict.zarr")
+    DataStoreMerge(
+        datasets=_feature_annotated_sources(
+            {"phase": np.array([0.5, 1.0])},
+            {"phase": np.array([1 + 1j, 2 + 0j], dtype=np.complex128)},
+        ),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+    ).dump()
+
+    # Feature b is 1 in one source and 1+1j in the other, a conflict that
+    # casting to float64 used to hide.
+    assert "phase" not in zarr.open_group(path, mode="r")["RNA/featureData"]
+
+
+def test_dataset_merge_drops_feature_annotations_whose_attributes_differ(tmp_path):
+    from scarf.utils.logging import logger
+
+    path = str(tmp_path / "feature_attributes.zarr")
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        DataStoreMerge(
+            datasets=_feature_annotated_sources(
+                {"biotype": ["coding", "coding"], "chrom": ["1", "2"]},
+                {"biotype": ["coding", "coding"], "chrom": ["2", "3"]},
+                attrs={
+                    "left": {"biotype": {"unit": "class"}, "chrom": {"unit": "name"}},
+                    "right": {"biotype": {"unit": "label"}, "chrom": {"unit": "name"}},
+                },
+            ),
+            zarr_path=path,
+            names=["left", "right"],
+            prepend_text="",
+            seed=0,
+        ).dump()
+    finally:
+        logger.remove(sink)
+
+    features = zarr.open_group(path, mode="r")["RNA/featureData"]
+    # The values agree for both columns, but biotype metadata differs.
+    assert "biotype" not in features
+    np.testing.assert_array_equal(features["chrom"][:], ["1", "2", "3"])
+    assert features["chrom"].attrs["unit"] == "name"
+    assert any("were not merged: biotype" in message for message in messages)
+
+
+def test_dataset_merge_below_one_feature_metadata_row_fails_before_the_destination_exists(
+    tmp_path,
+):
+    path = tmp_path / "wide_features.zarr"
+    long_text = {"description": np.array(["x" * 5_000, "y" * 5_000])}
+    merger = DataStoreMerge(
+        datasets=_feature_annotated_sources(long_text, long_text),
+        zarr_path=str(path),
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+        nthreads=1,
+        mem_budget=150_000,
+    )
+    # One 5,000-character value needs about 240 KB to merge, more than the
+    # budget that admits the rest of the merge. Planning refuses it, so the
+    # destination is never created.
+    message = "^Merged feature column 'description' cannot fit the memory budget$"
+    with pytest.raises(MemoryError, match=message):
+        merger.plan()
+    assert not path.exists()
+    with pytest.raises(MemoryError, match=message):
+        merger.dump()
+    assert not path.exists()

@@ -92,8 +92,19 @@ def test_duplicate_worker_cannot_execute_or_replace_owner_result(
     assert calls == ["testsubmission"]
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("worker failed"), TimeoutError()])
-def test_recovery_never_accepts_a_previous_submission(object_store, failure):
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        pytest.param(RuntimeError("worker failed"), "^worker failed$", id="error"),
+        # Modal reports a failed input as an empty TimeoutError.
+        pytest.param(
+            TimeoutError(),
+            "^Spawned call failed-call ended with status=FAILURE$",
+            id="failed-input",
+        ),
+    ],
+)
+def test_recovery_never_accepts_a_previous_submission(object_store, failure, message):
     config = _config()
     r2.put_json(
         config.resultUri(10_000, "initializeStore"),
@@ -115,7 +126,7 @@ def test_recovery_never_accepts_a_previous_submission(object_store, failure):
                 )
             ]
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=message):
         await_stage_result(
             config,
             10_000,

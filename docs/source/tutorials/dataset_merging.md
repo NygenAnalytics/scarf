@@ -24,29 +24,40 @@ This guide builds that uncorrected baseline first.
 ## 1. Load compatible source stores
 
 The control and interferon beta stimulated Kang PBMC stores use the same RNA feature space.
-Their publication recipe physically removes cells without an imported cell-type label before running source-level quality control.
-The remaining `I` cell key records that quality-control selection.
+These prepared stores contain cells with author-provided cell-type labels.
+Their `I` columns mark the cells that passed quality control.
 
 ```{code-cell} ipython3
 import pandas as pd
 
 import scarf
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="ERROR", progress=False)
 
+# Connect to the repository of prepared documentation datasets.
 repository = scarf.cytebase.connect("scarf_docs")
+# Download the control PBMC store.
 ctrl_path = repository.download_dataset(
-    name="kang_15K_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="kang_15K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-stim_path = repository.download_dataset(
-    name="kang_14K_ifnb-pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
-)
+```
 
+Download the stimulated sample from the same repository.
+
+```{code-cell} ipython3
+# Download the interferon-stimulated PBMC store.
+stim_path = repository.download_dataset(
+    name="kang_14K_ifnb-pbmc_rnaseq", destination="scarf_datasets", zarr=True
+)
+```
+
+Open both source stores before checking their axes.
+
+```{code-cell} ipython3
+# Open the control sample.
 ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
+# Open the stimulated sample.
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
@@ -55,6 +66,7 @@ feature axes; matching gene symbols alone do not establish compatible genome bui
 quantification conventions.
 
 ```{code-cell} ipython3
+# Compare assay types and cell and feature counts before merging.
 pd.DataFrame(
     [
         {
@@ -76,7 +88,9 @@ keeps imported metadata names distinct from columns authored in the merged store
 `reset_cell_filter=False` preserves the source quality-control selections.
 
 ```{code-cell} ipython3
+# Choose a separate path for the merged counts.
 merged_path = "scarf_datasets/kang_dataset_merging.zarr"
+# Write the prepared counts and metadata to the new store.
 scarf.DataStoreMerge(
     datasets=[ds_ctrl, ds_stim],
     zarr_path=merged_path,
@@ -88,7 +102,10 @@ scarf.DataStoreMerge(
     overwrite=True,
 ).dump()
 
+# Open the completed merge to inspect its cells and features.
 merged = scarf.DataStore(merged_path, nthreads=4)
+# Check the merged cell and feature dimensions.
+merged
 ```
 
 `sample_id` records the source label.
@@ -97,30 +114,33 @@ Columns imported from the sources keep the `orig_` prefix so their origin remain
 The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-merged.cells.to_pandas_dataframe(
-    ["sample_id", "orig_cluster_labels"],
-    key="I",
-).groupby("sample_id")["orig_cluster_labels"].agg(
-    cells="count",
-    cell_types="nunique",
+# Read source labels and imported cell types for active cells.
+merged_labels = merged.cells.to_pandas_dataframe(
+    ["sample_id", "orig_cluster_labels"], key="I"
+)
+# Count active cells and distinct imported cell types from each source.
+merged_labels.groupby("sample_id")["orig_cluster_labels"].agg(
+    cells="count", cell_types="nunique"
 )
 ```
 
-## 3. Open the rebuilt uncorrected baseline
+## 3. Inspect a prepared joint analysis
 
-The catalog's merged store is rebuilt with the merge recipe above and a labelled standard RNA
-run. Open that frozen run instead of repeating PCA, graph construction, clustering, and UMAP in
-this merge tutorial. Its graph uses 21 neighbours so the correction methods on the next page can
-branch from the same baseline.
+The merge is complete. To see what these datasets look like together, open the catalog's prepared
+merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP.
+This is a separate store from `merged`, so the following plots do not run an analysis on the store
+you just created. The saved example run is named `docs_default`.
 
 ```{code-cell} ipython3
+# Download the separate, pre-analyzed joint example.
 prepared_path = repository.download_dataset(
-    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
+    name="kang_29K_ctrl-ifnb_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
+# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{prepared_path}/data.zarr", nthreads=4)
+# Open the prepared baseline for the comparisons below.
 baseline = ds.pipeline.open(label="docs_default")
+# List the results available in the separate prepared analysis.
 sorted(baseline)
 ```
 
@@ -131,6 +151,7 @@ One plotting call compares source identity, imported cell types, and the exact c
 on the same layout.
 
 ```{code-cell} ipython3
+# Compare source labels, imported cell types, and computed clusters.
 ds.plots.embedding(
     layout=baseline["umap"],
     color_by=["sample_id", "orig_cluster_labels", baseline["clusters"]],
@@ -138,35 +159,22 @@ ds.plots.embedding(
 )
 ```
 
-A proportional composition plot makes source dominance within the uncorrected Leiden clusters explicit.
+A table of proportions shows whether each Leiden cluster contains cells from both sources.
 
 ```{code-cell} ipython3
+# Compare source proportions within each computed cluster.
 pd.crosstab(
     baseline.cells.fetch("clusters"),
     baseline.cells.fetch("sample_id"),
+    rownames=["cluster"],
+    colnames=["source"],
     normalize="index",
-)
-```
-
-iLISI summarizes local source mixing on a zero-to-one scale.
-Zero means the median neighbourhood effectively contains cells from only one source.
-One is the maximum mixing score across the observed sources.
-
-```{code-cell} ipython3
-uncorrected_ilisi = ds.metric_ilisi(
-    batch_colname="sample_id",
-    neighbors=baseline["neighbors"],
-    perplexity=7,
-)
-{"uncorrected iLISI": round(uncorrected_ilisi, 3)}
+).round(3)
 ```
 
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
 Source-associated structure can therefore include biological response as well as technical variation.
-An interferon-response gene such as `ISG15` makes that stim-enriched program visible on the same uncorrected layout.
 
-Inspect treatment-linked expression separately before interpreting the source mixing as purely
-technical.
-
-This page establishes the uncorrected observation; {doc}`batch_correction` compares how partial PCA and Harmony change it.
+The next page, {doc}`batch_correction`, uses a different dataset with measured sequencing batches
+to compare an uncorrected analysis with Harmony. It also introduces metrics for batch mixing.
 Keep uncorrected counts for condition-level differential expression.

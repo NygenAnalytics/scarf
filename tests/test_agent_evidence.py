@@ -21,13 +21,18 @@ from scarf.agent.models import AnalysisConfig, ContextDecision, RuntimeConfig, S
 from scarf.writers import SparseToZarr
 
 
-def make_source(path: Path, *, high_count_outlier: bool = False) -> Any:
+def _counts(*, high_count_outlier: bool = False) -> np.ndarray:
     rng = np.random.default_rng(87)
     matrix = rng.poisson(1.5, (48, 40)).astype(np.uint32)
     matrix[:24, :8] += 8
     matrix[24:, 8:16] += 8
     if high_count_outlier:
         matrix[-1] *= 1000
+    return matrix
+
+
+def make_source(path: Path, *, high_count_outlier: bool = False) -> Any:
+    matrix = _counts(high_count_outlier=high_count_outlier)
     genes = ["MT-CO1", "HLA-DRA", "RPL3", "G.3", *[f"G{i}" for i in range(36)]]
     writer = SparseToZarr(
         csr_matrix(matrix),
@@ -52,10 +57,18 @@ def make_source(path: Path, *, high_count_outlier: bool = False) -> Any:
     return store
 
 
-@pytest.fixture
-def source(tmp_path: Path) -> Path:
-    path = tmp_path / "source.zarr"
+@pytest.fixture(scope="module")
+def source_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("evidence") / "source.zarr"
     make_source(path)
+    return path
+
+
+@pytest.fixture
+def source(source_template: Path, tmp_path: Path) -> Path:
+    """A private copy of the prepared store; several checks edit it."""
+    path = tmp_path / "source.zarr"
+    shutil.copytree(source_template, path)
     return path
 
 
@@ -88,8 +101,25 @@ def test_inspection_and_open_do_not_mutate_source_or_expose_labels(
     assert prepared["filtering"] is False
     assert "cell.type.fine" in prepared["excludedColumns"]
     assert "SECRET" not in repr(prepared["contextEvidence"])
-    assert prepared["qcFlags"]["RNA_nCounts"]["highFlags"] >= 0
     assert not prepared["correctionEligible"]
+    # Advisory flags use five scaled MADs of log1p total counts.
+    totals = _counts().sum(axis=1).astype(float)
+    work = np.log1p(totals)
+    median = np.median(work)
+    deviation = 1.4826 * np.median(np.abs(work - median))
+    low = max(0.0, float(np.expm1(median - 5 * deviation)))
+    high = float(np.expm1(median + 5 * deviation))
+    flags = prepared["qcFlags"]["RNA_nCounts"]
+    assert flags["low"] == pytest.approx(low)
+    assert flags["high"] == pytest.approx(high)
+    assert flags["lowFlags"] == int((totals < low).sum()) == 0
+    assert flags["highFlags"] == int((totals > high).sum()) == 0
+    assert (flags["missing"], flags["zeroMad"]) == (0, False)
+    assert prepared["qcOutliers"]["RNA_nCounts"] == {
+        "missing": [],
+        "low": [],
+        "high": [],
+    }
 
 
 def test_fingerprint_survives_relocation_and_rejects_metadata_edits(
@@ -208,8 +238,22 @@ def test_inferred_sample_identity_is_frozen_for_diagnostics_without_authority(
         row for row in prepared["resolvedRoles"] if row["column"] == "condition"
     )
     assert confirmed["evidenceIds"] == ["study:protected"]
-    assert prepared["qcProjections"][0]["byGroup"]["sample"]["levels"]
-    assert prepared["designDiagnostics"]["crossTabs"]
+    # The inferred unit is summarized for diagnostics on the retained cohort.
+    retain = prepared["qcProjections"][0]
+    assert retain["policy"] == "retain"
+    assert {row["value"]: row for row in retain["byGroup"]["sample"]["levels"]} == {
+        f"s{index}": {
+            "value": f"s{index}",
+            "inputCells": 12,
+            "retainedCells": 12,
+            "removedCells": 0,
+        }
+        for index in range(1, 5)
+    }
+    (table,) = prepared["designDiagnostics"]["crossTabs"]
+    assert {table["leftColumn"], table["rightColumn"]} == {"condition", "sample"}
+    assert (table["rowsUsed"], table["fullyCrossed"]) == (48, True)
+    assert sorted(row["count"] for row in table["counts"]) == [6] * 8
     assert not prepared["correctionEligible"]
 
 

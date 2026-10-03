@@ -92,16 +92,6 @@ def test_two_hundred_thousand_read_group_spans_two_shards() -> None:
     assert plan.sourceDecodeAmplification == 1.0
 
 
-def test_cellxgene_width_at_500k_and_1m() -> None:
-    for n_cells in (500_000, 1_000_000):
-        plan = plan_count_matrix_pair(n_cells, 45_525, "uint16")
-        assert plan.counts.shape == (n_cells, 45_525)
-        assert plan.countsT.shards[0] % plan.countsT.chunks[0] == 0
-        assert plan.countsT.shards[1] % plan.countsT.chunks[1] == 0
-        assert plan.readGroup.featureWidth >= 1
-        assert plan.readGroup.readGroupBytes > 0
-
-
 def test_gene_width_and_dtype_change_the_cell_band() -> None:
     uint16 = plan_count_matrix_pair(1_000_000, 25_000, "uint16")
     uint32 = plan_count_matrix_pair(1_000_000, 25_000, "uint32")
@@ -144,6 +134,9 @@ def test_two_gib_layout_back_calculates_one_shared_geometry() -> None:
         (1_000_000, 25_000, "uint32", 1_000_000_000, 100_000_000),
         (5_000_000, 50_000, "uint16", 1_000_000_000, 100_000_000),
         (900_000, 45_525, "uint16", 2_000_000_000, 100_000_000),
+        # The CELLxGENE feature width under the default policy.
+        (500_000, 45_525, "uint16", 1_000_000_000, 100_000_000),
+        (1_000_000, 45_525, "uint16", 1_000_000_000, 100_000_000),
     ],
 )
 def test_joint_geometry_honors_alignment_and_byte_limits(
@@ -272,12 +265,42 @@ def test_policy_metadata_round_trip() -> None:
     plan = plan_count_matrix_pair(10_000, 50_000, "uint16")
     root = zarr.open_group(store=MemoryStore(), mode="w")
     persist_count_matrix_plan(root, plan)
-    stored = root.attrs["scarf:countMatrixLayout"]
-    assert stored["fingerprint"] == plan.fingerprint
-    assert stored["policy"]["unitBytes"] == 1_000_000_000
-    assert stored["policy"]["chunkBytes"] == 100_000_000
-    replay = plan_count_matrix_pair(10_000, 50_000, "uint16")
-    assert replay.fingerprint == plan.fingerprint
+    # The record holds the agreed 10,000-cell geometry of
+    # test_uint16_50k_gene_examples_match_the_agreed_geometry.
+    assert root.attrs["scarf:countMatrixLayout"] == {
+        "policy": {"unitBytes": 1_000_000_000, "chunkBytes": 100_000_000},
+        "nCells": 10_000,
+        "nFeats": 50_000,
+        "dtype": "uint16",
+        "itemsize": 2,
+        "chunksPerShard": 10,
+        "counts": {
+            "shape": [10_000, 50_000],
+            "chunks": [10_000, 5_000],
+            "shards": [10_000, 50_000],
+        },
+        "countsT": {
+            "shape": [50_000, 10_000],
+            "chunks": [50_000, 1_000],
+            "shards": [50_000, 10_000],
+        },
+        "readGroup": {
+            "featureWidth": 50_000,
+            "cellExtent": 10_000,
+            "chunkFeatures": 50_000,
+            "chunkCells": 1_000,
+            "shardFeatures": 50_000,
+            "shardCells": 10_000,
+            "shardsTouched": 1,
+            "chunksTouched": 10,
+            "readGroupBytes": 1_000_000_000,
+            "physicalShardBytes": 1_000_000_000,
+        },
+        "sourceDecodeAmplification": 1.0,
+        "fingerprint": plan.fingerprint,
+    }
+    assert load_count_matrix_plan(root) == root.attrs["scarf:countMatrixLayout"]
+    assert policy_from_payload(load_count_matrix_plan(root)) == plan.policy
 
 
 def test_require_count_matrix_layout_rejects_read_group_mismatch() -> None:
@@ -354,6 +377,9 @@ def test_count_matrix_source_and_live_geometry_mismatches() -> None:
         plan_count_matrix_pair(1, 1, np.dtype("V0"))
     with pytest.raises(ValueError, match="incomplete"):
         policy_from_payload({"policy": {}})
+    for payload in ({}, {"policy": None}, {"policy": [1_000, 100]}):
+        with pytest.raises(ValueError, match="metadata is missing a policy"):
+            policy_from_payload(payload)
     with pytest.raises(ValueError, match="invalid persisted read group"):
         read_group_from_payload(
             {"readGroup": {"featureWidth": -1, "readGroupBytes": 4}}

@@ -51,9 +51,13 @@ def test_max_cell_chars_must_be_positive_integers(value):
         CatalogResults(ROWS, max_cell_chars=value)
 
 
-@pytest.mark.parametrize("value", [None, 1, 80])
-def test_max_cell_chars_accepts_none_and_positive_integers(value):
+@pytest.mark.parametrize(
+    ("value", "cell"), [(None, "Smith"), (1, "…"), (2, "S…"), (80, "Smith")]
+)
+def test_max_cell_chars_accepts_none_and_positive_integers(value, cell):
     _validate_max_cell_chars(value)
+    results = CatalogResults(ROWS[:1], columns=("first_author",), max_cell_chars=value)
+    assert repr(results).splitlines()[2] == f"| {cell} |"
 
 
 def test_results_behave_like_lists_of_complete_rows():

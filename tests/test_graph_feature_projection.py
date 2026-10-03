@@ -11,7 +11,9 @@ from scarf.embeddings.imported import write_imported_coordinates
 from scarf.graph.feature_projection import (
     graph_cell_selection,
     graph_source_assays,
+    resolve_coordinate_inputs,
     resolve_graph_assay_inputs,
+    resolve_graph_source_assay,
     resolve_native_graph_inputs,
 )
 from scarf.storage.artifacts import (
@@ -274,29 +276,6 @@ def test_native_projection_ignores_live_cell_alias_drift(root: zarr.Group) -> No
     root["cellData/I"][0] = False
 
     assert resolve_native_graph_inputs(root, connectivity).cell_selection == cells
-
-
-def test_native_projection_rejects_extra_coordinate_ref_fields(
-    root: zarr.Group,
-) -> None:
-    cells = _cell_selection(root)
-    connectivity, neighbors, _coordinates = _native_chain(
-        root,
-        "RNA",
-        cell_selection=cells,
-    )
-    group = root[artifact_path(neighbors)]
-    provenance = dict(group.attrs["provenance"])
-    inputs = dict(provenance["inputs"])
-    coordinates = dict(inputs["coordinates"])
-    coordinates["unexpected"] = True
-    inputs["coordinates"] = coordinates
-    provenance["inputs"] = inputs
-    group.attrs["provenance"] = provenance
-
-    with pytest.raises(ArtifactResolutionError) as caught:
-        resolve_native_graph_inputs(root, connectivity)
-    assert caught.value.code == "corrupt_payload"
 
 
 def test_native_graph_classifies_missing_incomplete_and_malformed_records(
@@ -780,9 +759,16 @@ def test_ini_embed_requires_initialization_from_the_graph_reduction(
     assert other_coordinates != coordinates
 
 
-@pytest.mark.parametrize("damage", ["incomplete", "row_ids", "selection"])
+@pytest.mark.parametrize(
+    ("damage", "code"),
+    [
+        ("incomplete", "incomplete_artifact"),
+        ("row_ids", "row_identity_mismatch"),
+        ("selection", "selection_values_changed"),
+    ],
+)
 def test_native_resolution_reuses_records_only_within_one_call(
-    root, monkeypatch, damage
+    root, monkeypatch, damage, code
 ):
     from collections import Counter
 
@@ -805,5 +791,358 @@ def test_native_resolution_reuses_records_only_within_one_call(
         root["cellData/ids"][:] = np.array(["c2", "c1", "c0"])
     else:
         root[artifact_path(cells)]["values"][0] = False
-    with pytest.raises(ArtifactResolutionError):
+    # The second call reads the damaged records again instead of reusing them.
+    with pytest.raises(ArtifactResolutionError) as caught:
         resolve_native_graph_inputs(root, graph)
+    assert caught.value.code == code
+    damaged = neighbors if damage == "incomplete" else cells
+    assert caught.value.context["artifact_id"] == damaged.artifact_id
+
+
+def _replace_input(root: zarr.Group, ref: ArtifactRef, name: str, value) -> None:
+    """Rewrite one named provenance input of a stored artifact."""
+    group = root[artifact_path(ref)]
+    provenance = dict(group.attrs["provenance"])
+    inputs = dict(provenance["inputs"])
+    inputs[name] = value.to_dict() if isinstance(value, ArtifactRef) else value
+    provenance["inputs"] = inputs
+    group.attrs["provenance"] = provenance
+
+
+def _input(root: zarr.Group, ref: ArtifactRef, name: str) -> ArtifactRef:
+    raw = root[artifact_path(ref)].attrs["provenance"]["inputs"][name]
+    return ArtifactRef.from_dict(raw)
+
+
+def _two_assay_snn(root: zarr.Group, **graph_options) -> dict[str, ArtifactRef]:
+    cells = _cell_selection(root)
+    rna, rna_neighbors, rna_coordinates = _native_chain(
+        root, "RNA", cell_selection=cells
+    )
+    adt, adt_neighbors, _adt_coordinates = _native_chain(
+        root, "ADT", cell_selection=cells
+    )
+    options = {
+        "inputs": {"source_0": rna, "source_1": adt, "cell_selection": cells},
+        "parameters": {"method": "snn", "assays": ["RNA", "ADT"]},
+        "operation": "integrate_assays",
+    } | graph_options
+    return {
+        "cells": cells,
+        "rna": rna,
+        "rna_neighbors": rna_neighbors,
+        "rna_coordinates": rna_coordinates,
+        "adt": adt,
+        "adt_neighbors": adt_neighbors,
+        "integrated": _artifact(root, "integrated_graph", assay=None, **options),
+    }
+
+
+@pytest.mark.parametrize(
+    ("replacement", "code", "context"),
+    [
+        ("rna_coordinates", "wrong_kind", {"expected_kind": "neighbors"}),
+        ("adt_neighbors", "wrong_assay", {"expected_assay": "RNA"}),
+    ],
+)
+def test_native_projection_rejects_an_input_of_another_kind_or_assay(
+    root: zarr.Group, replacement: str, code: str, context: dict[str, str]
+) -> None:
+    refs = _two_assay_snn(root)
+    _replace_input(root, refs["rna"], "neighbors", refs[replacement])
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        resolve_native_graph_inputs(root, refs["rna"])
+
+    assert caught.value.code == code
+    assert caught.value.context["artifact_id"] == refs[replacement].artifact_id
+    assert context.items() <= caught.value.context.items()
+
+
+def test_native_projection_rejects_unsupported_neighbor_coordinates(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    connectivity, neighbors, coordinates = _native_chain(
+        root, "RNA", cell_selection=cells
+    )
+    normalized = _input(root, coordinates, "normalized")
+    _replace_input(root, neighbors, "coordinates", normalized)
+
+    with pytest.raises(
+        ArtifactResolutionError, match="unsupported artifact kind"
+    ) as caught:
+        resolve_native_graph_inputs(root, connectivity)
+
+    assert caught.value.code == "unsupported_graph_kind"
+    assert caught.value.context["actual_kind"] == "normalized"
+
+
+def test_coordinate_resolution_requires_assay_scoped_supported_coordinates(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    _connectivity, _neighbors, coordinates = _native_chain(
+        root, "RNA", cell_selection=cells
+    )
+    unscoped = ArtifactRef(
+        scope="datastore", kind="reduction", artifact_id=new_artifact_id()
+    )
+
+    with pytest.raises(ArtifactResolutionError, match="has no assay") as caught:
+        resolve_coordinate_inputs(root, unscoped)
+    assert caught.value.code == "wrong_scope"
+
+    normalized = _input(root, coordinates, "normalized")
+    with pytest.raises(ArtifactResolutionError, match="Coordinates must be") as caught:
+        resolve_coordinate_inputs(root, normalized)
+    assert caught.value.code == "unsupported_graph_kind"
+
+
+@pytest.mark.parametrize(
+    ("array", "values", "code"),
+    [
+        ("loadings", None, "payload_missing"),
+        ("loadings", np.zeros((3, 2)), "column_mismatch"),
+        ("loadings", np.zeros(4), "column_mismatch"),
+        ("data", np.zeros((2, 2)), "row_mismatch"),
+        ("data", np.zeros((3, 3)), "row_mismatch"),
+        ("data", np.zeros((3, 2), dtype=np.int32), "row_mismatch"),
+    ],
+    ids=[
+        "missing_loadings",
+        "loadings_rows",
+        "one_dimensional_loadings",
+        "data_rows",
+        "data_columns",
+        "integer_data",
+    ],
+)
+def test_coordinate_resolution_rejects_reduction_payload_damage(
+    root: zarr.Group, array: str, values: np.ndarray | None, code: str
+) -> None:
+    cells = _cell_selection(root)
+    _connectivity, _neighbors, coordinates = _native_chain(
+        root, "RNA", cell_selection=cells
+    )
+    group = root[artifact_path(coordinates)]
+    assert resolve_coordinate_inputs(root, coordinates).cell_selection == cells
+    if values is None:
+        del group[array]
+    else:
+        group.create_array(array, data=values, overwrite=True)
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        resolve_coordinate_inputs(root, coordinates)
+
+    assert caught.value.code == code
+    assert caught.value.context["artifact_id"] == coordinates.artifact_id
+
+
+@pytest.mark.parametrize(
+    "graph_options",
+    [
+        {"operation": "merge_graphs"},
+        {"parameters": {"method": "knn", "assays": ["RNA", "ADT"]}},
+        {"parameters": {"method": "snn", "assays": "RNA,ADT"}},
+        {"parameters": {"method": "snn", "assays": ["RNA", "ADT"], "k": 3}},
+        {"parameters": {"method": "wnn", "assays": ["RNA", "ADT"]}},
+        {
+            "parameters": {
+                "method": "wnn",
+                "assays": ["RNA", "ADT"],
+                "l2_normalize": "yes",
+            }
+        },
+    ],
+    ids=[
+        "other_operation",
+        "unknown_method",
+        "assays_not_a_list",
+        "extra_parameter",
+        "wnn_without_l2_normalize",
+        "wnn_non_boolean_l2_normalize",
+    ],
+)
+def test_integrated_graph_rejects_invalid_source_parameters(
+    root: zarr.Group, graph_options: dict
+) -> None:
+    integrated = _two_assay_snn(root, **graph_options)["integrated"]
+
+    with pytest.raises(
+        ArtifactResolutionError, match="invalid source parameters"
+    ) as caught:
+        graph_source_assays(root, integrated)
+
+    assert caught.value.code == "corrupt_payload"
+
+
+def test_integrated_wnn_requires_a_neighbor_coordinate_bundle(
+    root: zarr.Group,
+) -> None:
+    refs = _two_assay_snn(
+        root,
+        parameters={"method": "wnn", "assays": ["RNA", "ADT"], "l2_normalize": True},
+    )
+
+    # An SNN-style connectivity reference is not a WNN source bundle.
+    with pytest.raises(ArtifactResolutionError, match="no source bundle") as caught:
+        graph_source_assays(root, refs["integrated"])
+
+    assert caught.value.code == "corrupt_payload"
+    assert caught.value.context["input_name"] == "source_0"
+
+
+def test_integrated_graph_sources_must_share_its_cell_selection(
+    root: zarr.Group,
+) -> None:
+    refs = _two_assay_snn(root)
+    # The same cells under another selection record are a different input.
+    cells = refs["cells"]
+    other_cells = _artifact(
+        root,
+        "cell_selection",
+        assay=None,
+        inputs=root[artifact_path(cells)].attrs["provenance"]["inputs"],
+    )
+    other_group = root[artifact_path(other_cells)]
+    other_group.create_array("values", data=np.ones(3, dtype=bool))
+    other_group.attrs["execution_options"] = {"source_column": "I"}
+    _replace_input(root, refs["integrated"], "cell_selection", other_cells)
+
+    with pytest.raises(
+        ArtifactResolutionError, match="shared cell selection"
+    ) as caught:
+        graph_cell_selection(root, refs["integrated"])
+
+    assert caught.value.code == "corrupt_payload"
+    assert caught.value.context["input_name"] == "cell_selection"
+
+
+def test_graph_resolvers_reject_non_graph_artifacts(root: zarr.Group) -> None:
+    cells = _cell_selection(root)
+    _connectivity, _neighbors, coordinates = _native_chain(
+        root, "RNA", cell_selection=cells
+    )
+
+    for resolve in (
+        lambda: graph_cell_selection(root, coordinates),
+        lambda: graph_source_assays(root, coordinates),
+        lambda: resolve_graph_assay_inputs(root, coordinates, "RNA"),
+    ):
+        with pytest.raises(
+            ArtifactResolutionError, match="connectivity_map, neighbors, or integrated"
+        ) as caught:
+            resolve()
+        assert caught.value.code == "unsupported_graph_kind"
+
+
+def test_graph_source_assay_resolution_checks_the_requested_assay(
+    root: zarr.Group,
+) -> None:
+    refs = _two_assay_snn(root)
+
+    assert resolve_graph_source_assay(root, refs["rna"], None, parameter_name="x") == (
+        "RNA"
+    )
+    assert resolve_graph_source_assay(root, refs["rna"], "RNA", parameter_name="x") == (
+        "RNA"
+    )
+    with pytest.raises(ArtifactResolutionError, match="x does not match") as native:
+        resolve_graph_source_assay(root, refs["rna"], "ADT", parameter_name="x")
+    assert native.value.code == "wrong_assay"
+    assert native.value.context["expected_assay"] == "RNA"
+
+    integrated = refs["integrated"]
+    assert (
+        resolve_graph_source_assay(root, integrated, "ADT", parameter_name="x") == "ADT"
+    )
+    with pytest.raises(ValueError, match="x is required for an integrated graph"):
+        resolve_graph_source_assay(root, integrated, None, parameter_name="x")
+    with pytest.raises(
+        ArtifactResolutionError, match="no source assay 'ATAC'"
+    ) as other:
+        resolve_graph_source_assay(root, integrated, "ATAC", parameter_name="x")
+    assert other.value.code == "wrong_assay"
+    assert other.value.context["expected_assay"] == "RNA,ADT"
+
+
+def _second_cell_selection(root: zarr.Group, values: np.ndarray) -> ArtifactRef:
+    """Store another cell selection over the rows ``_cell_selection`` created."""
+    selection = _artifact(
+        root,
+        "cell_selection",
+        assay=None,
+        inputs={
+            "ordered_row_ids_fingerprint": fingerprint_stored_strings(
+                root["cellData/ids"]
+            ),
+            "values_fingerprint": fingerprint_array(values),
+        },
+    )
+    group = root[artifact_path(selection)]
+    group.create_array("values", data=values)
+    group.attrs["execution_options"] = {"source_column": "I"}
+    return selection
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "wrong_kind",
+        "datastore_scope",
+        "incomplete",
+        "operation",
+        "no_coordinates",
+        "other_assay",
+        "other_cells",
+    ],
+)
+def test_ini_embed_rejects_an_initialization_from_other_inputs(
+    root: zarr.Group, damage: str
+) -> None:
+    cells = _cell_selection(root)
+    graph, _neighbors, coordinates = _native_chain(root, "RNA", cell_selection=cells)
+    inputs: dict[str, object] = {"coordinates": coordinates}
+    assay: str | None = "RNA"
+    operation = "build_embedding_initialization"
+    if damage == "datastore_scope":
+        assay = None
+    elif damage == "operation":
+        operation = "run_kmeans"
+    elif damage == "no_coordinates":
+        inputs = {}
+    elif damage == "other_assay":
+        _adt_graph, _adt_neighbors, adt_coordinates = _native_chain(
+            root, "ADT", cell_selection=cells
+        )
+        inputs = {"coordinates": adt_coordinates}
+    elif damage == "other_cells":
+        subset = _second_cell_selection(root, np.array([True, True, False]))
+        _subset_graph, _subset_neighbors, subset_coordinates = _native_chain(
+            root, "RNA", cell_selection=subset
+        )
+        inputs = {"coordinates": subset_coordinates}
+    initialization = _artifact(
+        root,
+        "embedding_initialization",
+        assay=assay,
+        inputs=inputs,
+        operation=operation,
+    )
+    if damage == "incomplete":
+        root[artifact_path(initialization)].attrs["complete"] = False
+    if damage == "wrong_kind":
+        initialization = coordinates
+    message = {
+        "wrong_kind": "must be an embedding_initialization ref",
+        "datastore_scope": "must be an assay-scoped artifact",
+        "incomplete": "unavailable or incomplete",
+        "operation": "has an invalid operation",
+        "no_coordinates": "has no coordinate source",
+        "other_assay": "source belongs to another assay",
+        "other_cells": "does not match the graph cell selection",
+    }[damage]
+
+    with pytest.raises(ValueError, match=message):
+        _bare_embedding_store(root)._get_ini_embed(initialization, graph, 2)

@@ -470,10 +470,9 @@ def test_row_and_column_names_share_the_metadata_budget() -> None:
     # Each axis needs 18 bytes, one UTF-8 byte and an 8-byte reference per name.
     limits = SourceLimits(maxMetadataBytes=20)
     values = np.ones((2, 2))
-    assert DenseMatrixSource(values, row_names=["a", "b"], limits=limits).shape == (
-        2,
-        2,
-    )
+    named = DenseMatrixSource(values, row_names=["a", "b"], limits=limits)
+    assert named.row_names == ("a", "b")
+    assert named.resident_bytes == 2 * 2 * 8 + 18
     with pytest.raises(ResourceLimitError, match="names exceed maxMetadataBytes=20"):
         DenseMatrixSource(
             values, row_names=["a", "b"], column_names=["c", "d"], limits=limits

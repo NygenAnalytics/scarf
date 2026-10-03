@@ -509,6 +509,40 @@ def test_statistical_testing_requires_keys(store: DataStore) -> None:
         _statistical_tests(store, keys=[], skip_save=True)
 
 
+@pytest.mark.parametrize("index", [N_GENES, -1])
+def test_statistical_feature_keys_by_index_must_index_the_assay(
+    store: DataStore, index: int
+) -> None:
+    from scarf.metadata.selection import FeatureRef
+
+    with pytest.raises(
+        KeyError, match=rf"Feature index {index} out of range for assay 'RNA' \(N=12\)"
+    ):
+        _statistical_tests(
+            store, keys=FeatureRef(value=index, by="index"), skip_save=True
+        )
+
+
+def test_feature_values_accept_a_normalizer_that_returns_one_feature_as_a_vector(
+    store: DataStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scarf.features.values import fetch_normalized_feature_matrix, resolve_feature
+
+    def squeezed(_assay: Any, counts: Any) -> np.ndarray:
+        # A user normalizer that drops the feature axis of one feature.
+        return 2.0 * np.asarray(counts.compute())[:, 0]
+
+    monkeypatch.setattr(store.ADT, "normMethod", squeezed)
+
+    values = fetch_normalized_feature_matrix(
+        store,
+        [resolve_feature(store, "ADT1", from_assay="ADT")],
+        np.arange(N_CELLS),
+    )
+
+    np.testing.assert_array_equal(values, 2.0 * _counts()["ADT"][:, [1]])
+
+
 def test_automatic_test_for_three_groups_is_kruskal_wallis(store: DataStore) -> None:
     result = _statistical_tests(store, grouping="grp3", skip_save=True)
 

@@ -379,4 +379,8 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
         "from_counts",
         1,
     )
-    assert "from_counts" in root
+    # Without countsT the subset totals come from the raw counts.
+    np.testing.assert_array_equal(
+        root["from_counts"][:],
+        (1000.0 * raw.astype(np.float64) / raw.sum(axis=1)[:, None]).astype(np.float32),
+    )

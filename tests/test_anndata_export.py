@@ -11,11 +11,10 @@ import scarf.datastore._operations.presentation as presentation_operations
 from scarf.assay.base import raw_csr
 from scarf.datastore.datastore import DataStore
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
+from tests.test_writers import _TOY_RNA_COUNTS
 
 
-@pytest.fixture
-def export_store(toy_crdir_writer, tmp_path):
-    destination = tmp_path / "toy.zarr"
+def _open_toy_copy(toy_crdir_writer, destination) -> DataStore:
     shutil.copytree(toy_crdir_writer, destination)
     return DataStore(
         str(destination),
@@ -25,8 +24,22 @@ def export_store(toy_crdir_writer, tmp_path):
     )
 
 
+@pytest.fixture
+def export_store(toy_crdir_writer, tmp_path):
+    """A copy of the toy store that a test may change."""
+    return _open_toy_copy(toy_crdir_writer, tmp_path / "toy.zarr")
+
+
+@pytest.fixture(scope="module")
+def shared_export_store(toy_crdir_writer, tmp_path_factory):
+    """A copy of the toy store for tests that only read it."""
+    return _open_toy_copy(
+        toy_crdir_writer, tmp_path_factory.mktemp("shared_export") / "toy.zarr"
+    )
+
+
 def test_to_anndata_handles_missing_optional_dependency(
-    export_store,
+    shared_export_store,
     monkeypatch,
 ) -> None:
     messages: list[str] = []
@@ -42,7 +55,7 @@ def test_to_anndata_handles_missing_optional_dependency(
         RecordingLogger(),
     )
 
-    assert export_store.to_anndata() is None
+    assert shared_export_store.to_anndata() is None
     assert len(messages) == 1
     assert "anndata is not installed" in messages[0]
     assert "optional dependency" in messages[0]
@@ -180,7 +193,7 @@ def test_to_anndata_exports_empty_raw_cell_selection(export_store) -> None:
 def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -> None:
     anndata = pytest.importorskip("anndata")
     from scarf.writers import to_h5ad
-    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.storage_helpers import insert_nullable_cell_column
 
     n_cells = export_store.cells.N
     missing = np.arange(n_cells) % 3 == 1
@@ -190,7 +203,7 @@ def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -
         "flag": np.where(missing, False, np.arange(n_cells) % 2 == 0),
     }
     for name, values in columns.items():
-        _insert_nullable_cell_column(export_store, name, values, missing)
+        insert_nullable_cell_column(export_store, name, values, missing)
     active = export_store.cells.active_index("I")
     path = tmp_path / "live.h5ad"
     to_h5ad(export_store.RNA, str(path))
@@ -208,73 +221,66 @@ def test_live_exports_write_masked_metadata_as_missing(export_store, tmp_path) -
     assert anndata.read_h5ad(path).obs["flag"].dtype == "boolean"
 
 
-def test_raw_feature_subset_matches_full_raw_columns(export_store) -> None:
-    cell_indexes = export_store.cells.active_index("I")
-    full = raw_csr(export_store.RNA, cell_indexes)
-
-    adata = export_store.to_anndata(feature_indexes=[3, 1])
+def test_raw_feature_subset_matches_full_raw_columns(shared_export_store) -> None:
+    adata = shared_export_store.to_anndata(feature_indexes=[3, 1])
 
     assert sparse.isspmatrix_csr(adata.X)
-    assert adata.shape == (cell_indexes.size, 2)
-    np.testing.assert_array_equal(adata.X.toarray(), full[:, [3, 1]].toarray())
+    assert list(adata.var_names) == ["g4", "g2"]
+    np.testing.assert_array_equal(adata.X.toarray(), _TOY_RNA_COUNTS[:, [3, 1]])
 
 
 def test_to_anndata_exports_normed_csr_with_ordered_feature_indexes(export_store):
     feature_indexes = np.array([3, 0])
-    cell_indexes = export_store.cells.active_index("I")
+    export_store.cells.insert("picked", np.array([True, False, True]), overwrite=True)
 
     adata = export_store.to_anndata(
         from_assay="RNA",
-        cell_key="I",
+        cell_key="picked",
         matrix="normed",
         feature_indexes=feature_indexes,
     )
 
-    expected = export_store.RNA.normed(
-        cell_idx=cell_indexes,
-        feat_idx=feature_indexes,
-    ).compute()
+    # Library-size normalization scales each cell to 1,000 counts over all of
+    # its RNA features, not only the exported ones.
+    totals = _TOY_RNA_COUNTS.sum(axis=1, keepdims=True)
+    expected = (_TOY_RNA_COUNTS * 1000 / totals)[[0, 2]][:, feature_indexes]
     assert sparse.isspmatrix_csr(adata.X)
-    np.testing.assert_allclose(adata.X.toarray(), expected)
+    np.testing.assert_allclose(adata.X.toarray(), expected, rtol=1e-12)
     assert list(adata.var_names) == ["g4", "g1"]
-    assert list(adata.obs_names) == list(export_store.cells.fetch("ids", key="I"))
+    assert list(adata.obs_names) == ["b1", "b3"]
 
 
-def test_to_anndata_selects_names_and_aligns_raw_layers(export_store):
-    all_names = export_store.RNA.feats.fetch_all("names").astype(str)
+def test_to_anndata_selects_names_and_aligns_raw_layers(shared_export_store):
+    all_names = shared_export_store.RNA.feats.fetch_all("names").astype(str)
     requested = [all_names[2], all_names[0]]
 
-    adata = export_store.to_anndata(
+    adata = shared_export_store.to_anndata(
         from_assay="RNA",
         feature_names=requested,
         layers={"raw": "RNA"},
     )
 
-    expected = raw_csr(export_store.RNA, export_store.cells.active_index("I"))[
-        :, [2, 0]
-    ]
+    expected = _TOY_RNA_COUNTS[:, [2, 0]]
     assert sparse.isspmatrix_csr(adata.X)
-    np.testing.assert_array_equal(adata.X.toarray(), expected.toarray())
-    np.testing.assert_array_equal(adata.layers["raw"].toarray(), expected.toarray())
-    assert list(adata.var["names"].astype(str)) == requested
+    np.testing.assert_array_equal(adata.X.toarray(), expected)
+    np.testing.assert_array_equal(adata.layers["raw"].toarray(), expected)
+    assert list(adata.var["names"].astype(str)) == requested == ["g3", "g1"]
 
 
-def test_to_anndata_preserves_legacy_layer_behavior_without_subset(export_store):
-    adata = export_store.to_anndata(layers={"raw": "RNA"})
+def test_to_anndata_preserves_legacy_layer_behavior_without_subset(shared_export_store):
+    adata = shared_export_store.to_anndata(layers={"raw": "RNA"})
 
     assert sparse.isspmatrix_csr(adata.X)
-    np.testing.assert_array_equal(
-        adata.layers["raw"].toarray(),
-        adata.X.toarray(),
-    )
-    assert adata.n_vars == export_store.RNA.feats.N
+    np.testing.assert_array_equal(adata.X.toarray(), _TOY_RNA_COUNTS)
+    np.testing.assert_array_equal(adata.layers["raw"].toarray(), _TOY_RNA_COUNTS)
+    assert list(adata.var_names) == ["g1", "g2", "g3", "g4"]
 
 
 def test_to_anndata_aligns_reordered_layer_ids_without_subset(
-    export_store,
+    shared_export_store,
     monkeypatch,
 ):
-    primary = export_store.RNA
+    primary = shared_export_store.RNA
     primary_ids = primary.feats.fetch_all("ids").astype(str)
     order = np.array([2, 0, 3, 1])
     reordered_assay = SimpleNamespace(
@@ -285,20 +291,18 @@ def test_to_anndata_aligns_reordered_layer_ids_without_subset(
         nthreads=1,
         name="reordered",
     )
-    original_get_assay = export_store._get_assay
+    original_get_assay = shared_export_store._get_assay
 
     def get_assay(name):
         if name == "reordered":
             return reordered_assay
         return original_get_assay(name)
 
-    monkeypatch.setattr(export_store, "_get_assay", get_assay)
-    adata = export_store.to_anndata(layers={"reordered": "reordered"})
+    monkeypatch.setattr(shared_export_store, "_get_assay", get_assay)
+    adata = shared_export_store.to_anndata(layers={"reordered": "reordered"})
 
-    np.testing.assert_array_equal(
-        adata.layers["reordered"].toarray(),
-        raw_csr(primary, export_store.cells.active_index("I")).toarray(),
-    )
+    # The layer's columns are put back in the order of the primary features.
+    np.testing.assert_array_equal(adata.layers["reordered"].toarray(), _TOY_RNA_COUNTS)
 
 
 @pytest.mark.parametrize(
@@ -337,13 +341,13 @@ def test_to_anndata_aligns_reordered_layer_ids_without_subset(
     ],
 )
 def test_to_anndata_rejects_malformed_selector_types(
-    export_store,
+    shared_export_store,
     kwargs: dict[str, object],
     error_type: type[Exception],
     message: str,
 ) -> None:
     with pytest.raises(error_type, match=message):
-        export_store.to_anndata(**kwargs)
+        shared_export_store.to_anndata(**kwargs)
 
 
 def test_to_anndata_rejects_invalid_or_ambiguous_selectors(export_store):
@@ -384,10 +388,10 @@ def test_to_anndata_rejects_duplicate_primary_ids_when_exporting_layers(
 
 
 def test_to_anndata_rejects_ambiguous_layer_feature_ids(
-    export_store,
+    shared_export_store,
     monkeypatch,
 ) -> None:
-    primary = export_store.RNA
+    primary = shared_export_store.RNA
     primary_ids = primary.feats.fetch_all("ids").astype(str)
     ambiguous_ids = primary_ids.copy()
     ambiguous_ids[1] = ambiguous_ids[0]
@@ -399,34 +403,34 @@ def test_to_anndata_rejects_ambiguous_layer_feature_ids(
         nthreads=1,
         name="ambiguous",
     )
-    original_get_assay = export_store._get_assay
+    original_get_assay = shared_export_store._get_assay
 
     def get_assay(name):
         if name == "ambiguous":
             return ambiguous_assay
         return original_get_assay(name)
 
-    monkeypatch.setattr(export_store, "_get_assay", get_assay)
+    monkeypatch.setattr(shared_export_store, "_get_assay", get_assay)
 
     with pytest.raises(ValueError, match="ambiguous"):
-        export_store.to_anndata(
+        shared_export_store.to_anndata(
             feature_indexes=[0],
             layers={"ambiguous": "ambiguous"},
         )
 
 
-def test_to_anndata_rejects_unaligned_subset_layer(export_store):
-    columns_before = set(export_store.cells.columns)
-    artifacts_before = set(export_store.list_artifacts())
+def test_to_anndata_rejects_unaligned_subset_layer(shared_export_store):
+    columns_before = set(shared_export_store.cells.columns)
+    artifacts_before = set(shared_export_store.list_artifacts())
 
     with pytest.raises(ValueError, match="cannot align selected feature IDs"):
-        export_store.to_anndata(
+        shared_export_store.to_anndata(
             feature_indexes=[0],
             layers={"adt": "ADT"},
         )
 
-    assert set(export_store.cells.columns) == columns_before
-    assert set(export_store.list_artifacts()) == artifacts_before
+    assert set(shared_export_store.cells.columns) == columns_before
+    assert set(shared_export_store.list_artifacts()) == artifacts_before
 
 
 def _run_export_store(monkeypatch, cell_frame: pd.DataFrame):

@@ -223,7 +223,10 @@ def test_artifact_ids_are_random_storage_addresses() -> None:
     first = new_artifact_id()
     second = new_artifact_id()
     assert first != second
-    assert len(first) == len(second) == 64
+    # 256 random bits as lowercase hexadecimal.
+    for artifact_id in (first, second):
+        assert len(artifact_id) == 64
+        assert set(artifact_id) <= set("0123456789abcdef")
 
     assay_ref = _ref(artifact_id=first)
     datastore_ref = ArtifactRef(
@@ -768,7 +771,10 @@ def test_value_fingerprint_builder_enforces_lifecycle_order() -> None:
 
     builder.update_array_block("values", (0,), np.array([1.0, 2.0]))
     builder.end_array("values")
-    assert len(builder.hexdigest()) == 64
+    # The refused calls left no trace in the digest.
+    whole = ValueFingerprintBuilder()
+    whole.update_array("values", np.array([1.0, 2.0]))
+    assert builder.hexdigest() == whole.hexdigest()
 
 
 def test_value_fingerprint_builder_validates_block_layout_and_dtype() -> None:
@@ -1183,12 +1189,30 @@ def test_artifact_listing_matches_exact_serialized_provenance_predicates() -> No
         parameters={"options": {"log": True}},
         inputs={"source": source.to_dict()},
     ) == sorted(expected, key=lambda ref: ref.artifact_id)
+    other_source = _ref(kind="neighbors", artifact_id="9" * 64)
+    assert (
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            kind="normalized",
+            inputs={"source": other_source},
+        )
+        == []
+    )
     with pytest.raises(TypeError, match="parameters must be a mapping"):
         list_artifacts(
             root,
             scope="assay",
             assay="RNA",
             parameters=[],  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="inputs must be a mapping"):
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            inputs=["source"],  # type: ignore[arg-type]
         )
 
 
@@ -1575,6 +1599,13 @@ def test_completed_artifact_requires_full_provenance_record() -> None:
         }
     )
     assert inspect_artifact(root, ref).complete
+
+    for version in ("", 3):
+        group.attrs["scarf_version"] = version
+        with pytest.raises(TypeError, match="scarf_version at .* non-empty string"):
+            inspect_artifact(root, ref)
+    group.attrs["scarf_version"] = "1.0.0"
+    assert inspect_artifact(root, ref).scarf_version == "1.0.0"
 
     group.attrs["complete"] = "false"
     with pytest.raises(TypeError, match="must be boolean"):

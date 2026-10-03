@@ -303,7 +303,9 @@ def embedding_raster(
             store,
             layout,
         )
-        available_columns = set(raster_cells.columns)
+        # The view lists its coordinate columns for the raster pass; they are
+        # not cell metadata that color_by or subset_by may name.
+        available_columns = set(raster_cells.columns) - {_ARTIFACT_X, _ARTIFACT_Y}
         x_key = _ARTIFACT_X
         y_key = _ARTIFACT_Y
         layout_name = "Embedding"

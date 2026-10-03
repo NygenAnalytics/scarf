@@ -1,6 +1,8 @@
 import copy
 import io
 import shutil
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ try:
     from jupyter_cache import get_cache
     from jupyter_cache.base import CacheBundleIn
     from jupyter_cache.cache.main import NbArtifacts
+    from nbclient import NotebookClient
 
     import docs.execute_vignette as cache_tools
     from docs.execute_all_vignettes import (
@@ -257,6 +260,81 @@ def test_discovery_uses_myst_notebook_parser(tmp_path: Path) -> None:
     sources = discover_sources(docs_root / "source", docs_root)
 
     assert [source.uri for source in sources] == ["source/executable.md"]
+
+
+def test_notebook_download_preserves_cached_outputs_and_current_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docs_root = tmp_path / "docs"
+    marker = tmp_path / "executed"
+    page = _write_source(
+        docs_root,
+        "index",
+        code=(
+            "from pathlib import Path\n"
+            f"marker = Path({str(marker)!r})\n"
+            "assert not marker.exists()\n"
+            'marker.write_text("executed")\n'
+            "value = 7"
+        ),
+    )
+    page.write_text(
+        page.read_text()
+        + "\n```{code-cell} ipython3\nvalue * 6\n```\n"
+        + "\n{nb-download}`Download notebook <index.ipynb>`\n",
+        encoding="utf-8",
+    )
+    source = _source(docs_root, "index")
+    notebook = copy.deepcopy(source.notebook)
+    monkeypatch.setenv("IPYTHONDIR", str(tmp_path / "ipython"))
+    NotebookClient(
+        notebook, kernel_name="python3", timeout=30, record_timing=False
+    ).execute()
+    cache_path = docs_root / ".jupyter_cache"
+    _cache_output(cache_path, source, notebook=notebook)
+    page.write_text(page.read_text() + "\nCurrent tutorial explanation.\n")
+    (page.parent / "conf.py").write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+        "from docs.source.conf import setup\n"
+        'extensions = ["myst_nb"]\n'
+        'master_doc = "index"\n'
+        'nb_execution_mode = "cache"\n'
+        f"nb_execution_cache_path = {str(cache_path)!r}\n"
+        "nb_execution_raise_on_error = True\n",
+        encoding="utf-8",
+    )
+    build_root = tmp_path / "build"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sphinx",
+            "-b",
+            "html",
+            "-W",
+            "-q",
+            str(page.parent),
+            str(build_root / "html"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    [download] = (build_root / "html" / "_downloads").glob("*/index.ipynb")
+    for path in (build_root / "jupyter_execute" / "index.ipynb", download):
+        exported = nbformat.read(path, as_version=4)
+        cells = [cell for cell in exported.cells if cell.cell_type == "code"]
+        assert [cell.execution_count for cell in cells] == [1, 2]
+        assert cells[0].outputs == []
+        assert cells[1].outputs[0].data["text/plain"] == "42"
+        assert any(
+            "Current tutorial explanation." in cell.source
+            for cell in exported.cells
+            if cell.cell_type == "markdown"
+        )
 
 
 def test_empty_cache_does_not_match_current_source(tmp_path: Path) -> None:
@@ -566,6 +644,16 @@ def test_frozen_progress_survives_modal_cache_transport(tmp_path: Path) -> None:
         source_dir=docs_root / "source",
         docs_root=docs_root,
     )
+    cache = get_cache(restored)
+    try:
+        record = cache.match_cache_notebook(source.notebook)
+        restored_notebook = cache.get_cache_bundle(record.pk).nb
+    finally:
+        close_cache(cache)
+    assert "widgets" not in restored_notebook.metadata
+    frozen = _first_code_cell(notebook).outputs
+    assert _first_code_cell(restored_notebook).outputs == frozen
+    assert frozen[0].data["text/plain"] == "Writing data: 1 / 1 complete"
 
 
 def test_modal_page_cache_archive_round_trip(tmp_path: Path) -> None:
@@ -696,10 +784,18 @@ def test_modal_wait_honors_polling_deadline(
     assert observed_timeouts == [0.25]
 
 
-@pytest.mark.parametrize("corruption", ["stale", "orphan", "journal"])
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("stale", "Cache contains stale record hashes: [0-9a-f]{32}$"),
+        ("orphan", f"Cache contains orphan executed directories: {'f' * 32}$"),
+        ("journal", "Cache contains SQLite journal files: global.db-journal$"),
+    ],
+)
 def test_validation_detects_stale_and_orphan_state(
     tmp_path: Path,
     corruption: str,
+    message: str,
 ) -> None:
     docs_root = tmp_path / "docs"
     _write_source(docs_root, "page")
@@ -717,7 +813,7 @@ def test_validation_detects_stale_and_orphan_state(
     else:
         (cache_path / "global.db-journal").write_bytes(b"journal")
 
-    with pytest.raises(CacheValidationError):
+    with pytest.raises(CacheValidationError, match=f"^{message}"):
         validate_cache(
             cache_path,
             source_dir=docs_root / "source",
@@ -778,7 +874,10 @@ def test_execution_failure_preserves_target(tmp_path: Path) -> None:
     def fail_runner(source, cache_path):
         raise RuntimeError("execution failed")
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="^Page execution failed:\n  source/page.md: execution failed$",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -800,7 +899,10 @@ def test_import_failure_preserves_target(tmp_path: Path) -> None:
         _initialize_cache(cache_path)
         return cache_path
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="source/page.md: No cache output matches source/page.md$",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -822,7 +924,10 @@ def test_candidate_validation_failure_preserves_target(tmp_path: Path) -> None:
         _cache_output(cache_path, source, error=True)
         return cache_path
 
-    with pytest.raises(CacheValidationError):
+    with pytest.raises(
+        CacheValidationError,
+        match="^Unexpected error output in source/page.md code cell",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -1003,7 +1108,10 @@ def test_explicit_resume_reuses_matching_successes(tmp_path: Path) -> None:
         _cache_output(cache_path, source, text="new first\n")
         return cache_path
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="^Page execution failed:\n  source/second.md: second failed$",
+    ):
         execute_and_publish(
             ["first", "second"],
             docs_root=docs_root,
@@ -1086,7 +1194,9 @@ def test_modal_fanout_spawns_before_wait_and_resumes_failures(
 
     first_launcher = SpawnedPageRunner(first_run_spawn)
     try:
-        with pytest.raises(ExecutionBatchError):
+        with pytest.raises(
+            ExecutionBatchError, match="source/second.md: second failed$"
+        ):
             execute_and_publish(
                 ["first", "second"],
                 jobs=2,

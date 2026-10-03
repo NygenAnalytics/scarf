@@ -1,13 +1,16 @@
+import shutil
 from typing import Any
 
 import numpy as np
 import pytest
 
+from scarf import DataStore
 from scarf.datastore._pipeline_recipe import (
     _parameter_value,
     _resolve_params,
     resolve_pipeline_recipe,
 )
+from scarf.storage.artifacts import ArtifactRef
 from scarf.storage.feature_selection import read_feature_selection_indices
 
 
@@ -32,8 +35,33 @@ def _run_ids(store) -> list[str]:
     return [run.run_id for run in store.pipeline.list_runs()]
 
 
-def test_params_forward_stage_settings_and_record_them(datastore_ephemeral):
-    store = datastore_ephemeral
+@pytest.fixture(scope="module")
+def params_base(datastore_zarr_root: str, tmp_path_factory) -> str:
+    """A PBMC store holding the artifacts of one run with the default params."""
+    location = tmp_path_factory.mktemp("params_base") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, location)
+    DataStore(str(location), default_assay="RNA").pipeline.run(params=_params())
+    return str(location)
+
+
+@pytest.fixture
+def params_store(params_base: str, tmp_path) -> DataStore:
+    """A writable copy of the base; runs reuse the stages they share with it."""
+    location = tmp_path / "data.zarr"
+    shutil.copytree(params_base, location)
+    return DataStore(str(location), default_assay="RNA")
+
+
+@pytest.fixture(scope="module")
+def rejection_store(datastore_zarr_root: str, tmp_path_factory) -> DataStore:
+    """One writable store for calls that must be refused before any write."""
+    location = tmp_path_factory.mktemp("params_rejections") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, location)
+    return DataStore(str(location), default_assay="RNA")
+
+
+def test_params_forward_stage_settings_and_record_them(params_store):
+    store = params_store
 
     run = store.pipeline.run(
         params=_params(
@@ -53,6 +81,8 @@ def test_params_forward_stage_settings_and_record_them(datastore_ephemeral):
         "pca": {"feat_scaling": False},
         "connectivity": {"bandwidth": 1.2},
     }
+    hvg_parameters = store.inspect_artifact(run["highly_variable_features"]).parameters
+    assert (hvg_parameters["top_n"], hvg_parameters["lowess_frac"]) == (50, 0.2)
     # The stage functions called with the same settings reuse the run's artifacts.
     assert store.run_pca(run["normalized"], dims=3, feat_scaling=False) == run["pca"]
     assert (
@@ -63,9 +93,9 @@ def test_params_forward_stage_settings_and_record_them(datastore_ephemeral):
 
 
 def test_params_pca_dims_zero_builds_the_graph_on_normalized_values(
-    datastore_ephemeral,
+    params_store,
 ):
-    store = datastore_ephemeral
+    store = params_store
 
     run = store.pipeline.run(params=_params(pca={"dims": 0}))
 
@@ -75,13 +105,18 @@ def test_params_pca_dims_zero_builds_the_graph_on_normalized_values(
     n_features = len(
         read_feature_selection_indices(store.zw, "RNA", run["highly_variable_features"])
     )
+    assert n_features == 50
     assert store.inspect_artifact(run["reduction"]).parameters["dims"] == n_features
+    # The identity loadings keep each selected feature as one graph coordinate.
+    np.testing.assert_array_equal(
+        store.load_artifact(run["reduction"])["loadings"][:], np.eye(n_features)
+    )
     with pytest.raises(ValueError, match="dims above 0"):
         store.pipeline.run(params=_params(pca={"dims": 0, "feat_scaling": False}))
 
 
-def test_params_selected_resolution_is_the_saved_clustering(datastore_ephemeral):
-    store = datastore_ephemeral
+def test_params_selected_resolution_is_the_saved_clustering(params_store):
+    store = params_store
 
     run = store.pipeline.run(
         params=_params(
@@ -95,14 +130,21 @@ def test_params_selected_resolution_is_the_saved_clustering(datastore_ephemeral)
     assert "cluster_selection" not in outputs
     assert "membership_strength" in outputs
     assert {"clusters", "membership_strength"} <= set(run.cells.columns)
+    # Membership strength is computed on the saved clustering and run graph.
+    inputs = store.inspect_artifact(run["membership_strength"]).inputs
+    assert ArtifactRef.from_dict(inputs["clusters"]) == run["leiden_1.0"]
+    assert ArtifactRef.from_dict(inputs["connectivity_map"]) == run["connectivity_map"]
+    strength = run.cells.fetch("membership_strength")
+    assert strength.shape == run.cells.fetch("clusters").shape
+    assert np.all((strength >= 0) & (strength <= 1))
     assert run.report()["run"]["config"]["leiden"] == {
         "partitions": [0.5, 1.0],
         "selected": 1.0,
     }
 
 
-def test_params_tsne_stage_forwards_its_settings(datastore_ephemeral, monkeypatch):
-    store = datastore_ephemeral
+def test_params_tsne_stage_forwards_its_settings(params_store, monkeypatch):
+    store = params_store
     calls: list[dict[str, Any]] = []
 
     def run_sgtsne(_graph, initial, **kwargs):
@@ -133,9 +175,9 @@ def test_params_tsne_stage_forwards_its_settings(datastore_ephemeral, monkeypatc
     ],
 )
 def test_params_reject_invalid_sections_before_writing(
-    datastore_ephemeral, params, error, match
+    rejection_store, params, error, match
 ):
-    store = datastore_ephemeral
+    store = rejection_store
     before = _run_ids(store)
 
     with pytest.raises(error, match=match):
@@ -144,8 +186,8 @@ def test_params_reject_invalid_sections_before_writing(
     assert _run_ids(store) == before
 
 
-def test_params_and_shortcuts_cannot_set_the_same_setting(datastore_ephemeral):
-    store = datastore_ephemeral
+def test_params_and_shortcuts_cannot_set_the_same_setting(rejection_store):
+    store = rejection_store
     before = _run_ids(store)
 
     with pytest.raises(ValueError, match="not both"):

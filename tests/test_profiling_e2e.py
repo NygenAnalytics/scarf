@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -535,7 +536,7 @@ def test_run_e2e_cli_spawns_deployed_function_and_returns(
     assert captured["functionName"] == "run_funnel_job"
     assert captured["options"] == {"timeout": 86_400, "retries": 0}
     payload, n_rows, submission_id, backend, funnel_stages = captured["spawnArgs"]
-    assert submission_id
+    assert re.fullmatch(r"[0-9a-f]{32}", submission_id)
     assert payload["runTag"] == "e2e-test"
     assert n_rows == 10_000
     assert (backend, funnel_stages) == ("r2", list(CORE_STAGE_ORDER))
@@ -606,7 +607,7 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     payload, n_rows, stage, submission_id, force, stages, allow_reuse = captured[
         "spawnArgs"
     ]
-    assert submission_id
+    assert re.fullmatch(r"[0-9a-f]{32}", submission_id)
     assert payload["runTag"] == "e2e-test"
     assert n_rows == 10_000
     assert stage == "findMarkers"

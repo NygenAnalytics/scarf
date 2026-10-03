@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy.sparse import csr_matrix, triu
-from sklearn.metrics import adjusted_rand_score
 
 from scarf.clustering._paris_core import ParisHierarchy
 from scarf.clustering._paris_modularity import modularity_split_gains
@@ -1108,6 +1107,34 @@ def _rare_cluster_f1(labels: np.ndarray, truth: np.ndarray) -> float:
     return best
 
 
+def adjusted_rand_index(truth: np.ndarray, labels: np.ndarray) -> float:
+    """Adjusted Rand index in scikit-learn's exact pair-confusion form.
+
+    One contingency table from ``np.bincount`` replaces scikit-learn's input
+    validation and sparse contingency matrix, which dominated the oracle
+    scans. Pair counts are Python integers, so the result is identical to
+    ``sklearn.metrics.adjusted_rand_score``.
+    """
+    _truth, truth_codes = np.unique(np.asarray(truth), return_inverse=True)
+    _labels, label_codes = np.unique(np.asarray(labels), return_inverse=True)
+    n_labels = int(label_codes.max()) + 1
+    table = np.bincount(
+        truth_codes * n_labels + label_codes,
+        minlength=(int(truth_codes.max()) + 1) * n_labels,
+    ).reshape(-1, n_labels)
+    n_samples = int(truth_codes.size)
+    sum_squares = int(np.sum(table.astype(np.int64) ** 2))
+    true_pairs = int(np.sum(table.sum(axis=1).astype(np.int64) ** 2))
+    label_pairs = int(np.sum(table.sum(axis=0).astype(np.int64) ** 2))
+    tp = sum_squares - n_samples
+    fp = label_pairs - sum_squares
+    fn = true_pairs - sum_squares
+    tn = n_samples * n_samples - fp - fn - sum_squares
+    if fn == 0 and fp == 0:
+        return 1.0
+    return 2.0 * (tp * tn - fn * fp) / ((tp + fn) * (fn + tn) + (tp + fp) * (fp + tn))
+
+
 def _best_global_cut(
     dendrogram: np.ndarray,
     truth: np.ndarray,
@@ -1116,7 +1143,7 @@ def _best_global_cut(
     best_clusters = 0
     for n_clusters in range(2, len(truth) + 1):
         labels = straight_cut(dendrogram, n_clusters)
-        ari = float(adjusted_rand_score(truth, labels))
+        ari = adjusted_rand_index(truth, labels)
         if ari > best_ari:
             best_ari = ari
             best_clusters = n_clusters
@@ -1147,7 +1174,7 @@ def _best_cpm_partition(
             resolution_parameter=float(resolution),
             seed=seed,
         )
-        ari = float(adjusted_rand_score(truth, partition.membership))
+        ari = adjusted_rand_index(truth, np.asarray(partition.membership))
         if ari > best_ari:
             best_ari = ari
             best_resolution = float(resolution)
@@ -1179,9 +1206,9 @@ def evaluate_quality_gate(
             plateau_forest=forest,
         )
         dendrogram = hierarchy_to_dendrogram(hierarchy)
-        adaptive_ari = float(adjusted_rand_score(truth, adaptive.labels))
+        adaptive_ari = adjusted_rand_index(truth, adaptive.labels)
         adaptive_rare_f1 = _rare_cluster_f1(adaptive.labels, truth)
-        unguarded_ari = float(adjusted_rand_score(truth, unguarded.labels))
+        unguarded_ari = adjusted_rand_index(truth, unguarded.labels)
         global_ari, global_clusters = _best_global_cut(dendrogram, truth)
         cpm_ari, cpm_resolution = _best_cpm_partition(graph, truth, seed)
         accepted = (

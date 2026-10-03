@@ -264,7 +264,18 @@ def test_oracle_gap_recovery(
     assert oracle_gap_recovery(scorer, baseline, maximum) == pytest.approx(expected)
 
 
-def test_unequal_depth_quality_gate_preserves_the_rare_branch() -> None:
+def test_unequal_depth_quality_gate_preserves_the_rare_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tests.paris_quality_gate as quality_gate
+
+    # The command-line gate also reports the best CPM partition, which is not
+    # among the acceptance criteria checked here.
+    monkeypatch.setattr(
+        quality_gate,
+        "_best_cpm_partition",
+        lambda *_args: (float("nan"), float("nan")),
+    )
     report = evaluate_quality_gate(seed_count=5, nthreads=2)
 
     assert report.passed
@@ -280,3 +291,25 @@ def test_unequal_depth_quality_gate_preserves_the_rare_branch() -> None:
         # sacrifice recovered structure while doing so.
         assert result.adaptive_clusters <= result.unguarded_clusters
         assert result.adaptive_ari >= result.unguarded_ari - ORACLE_ARI_TOLERANCE
+
+
+def test_adjusted_rand_index_matches_scikit_learn_exactly() -> None:
+    from sklearn.metrics import adjusted_rand_score
+
+    from tests.paris_quality_gate import adjusted_rand_index
+
+    rng = np.random.default_rng(7)
+    for size, n_true, n_pred in ((7, 2, 3), (180, 5, 40), (500, 9, 2)):
+        truth = rng.integers(0, n_true, size=size)
+        labels = rng.integers(1, n_pred + 1, size=size) * 3
+        assert adjusted_rand_index(truth, labels) == adjusted_rand_score(truth, labels)
+    # Agreement up to renaming scores one; so do two all-singleton partitions,
+    # which scikit-learn special-cases, while one cluster against singletons
+    # carries no pair agreement beyond chance.
+    truth = np.array([0, 0, 1, 1, 2])
+    assert adjusted_rand_index(truth, np.array([5, 5, 9, 9, 4])) == 1.0
+    assert adjusted_rand_index(np.arange(6), np.arange(6)[::-1]) == 1.0
+    assert adjusted_rand_index(np.zeros(6), np.arange(6)) == 0.0
+    assert adjusted_rand_index(np.zeros(6), np.arange(6)) == adjusted_rand_score(
+        np.zeros(6), np.arange(6)
+    )

@@ -1,6 +1,8 @@
 """Parity between write-time RNA classification and DataStore presets."""
 
 from scarf.assay import (
+    ADTassay,
+    ATACassay,
     Assay,
     RNAassay,
     is_rna_assay_type,
@@ -9,12 +11,32 @@ from scarf.assay import (
 )
 
 
-def test_rna_classifier_matches_preset_map():
-    presets = preset_assay_types()
-    for name, assay_cls in presets.items():
-        expected = issubclass(assay_cls, RNAassay)
-        assert is_rna_assay_type(name) is expected
-        assert is_rna_assay_type(assay_cls) is expected
+def test_preset_map_names_every_assay_class():
+    assert preset_assay_types() == {
+        "RNA": RNAassay,
+        "ATAC": ATACassay,
+        "ADT": ADTassay,
+        "HTO": ADTassay,
+        "CRISPR": Assay,
+        "ANTIGEN": Assay,
+        "CUSTOM": Assay,
+        "GeneActivity": RNAassay,
+        "GeneScores": RNAassay,
+        "URNA": RNAassay,
+        "Assay": Assay,
+    }
+
+
+def test_rna_classifier_accepts_classes_and_instances():
+    class GeneModules(RNAassay):
+        pass
+
+    assert is_rna_assay_type(RNAassay)
+    assert is_rna_assay_type(GeneModules)
+    assert not is_rna_assay_type(ATACassay)
+    assert is_rna_assay_type(RNAassay.__new__(GeneModules))
+    assert not is_rna_assay_type(ADTassay.__new__(ADTassay))
+    assert not is_rna_assay_type(3)
 
 
 def test_rna_classifier_aliases():

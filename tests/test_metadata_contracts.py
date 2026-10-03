@@ -1,7 +1,9 @@
+import json
 import pickle
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import zarr
 from zarr.core.buffer import default_buffer_prototype
@@ -17,10 +19,18 @@ from scarf.metadata.selection import (
     NormalizationSpec,
     grouping_value_name,
     resolve_cell_aligned_artifact,
+    resolve_complete_labels,
     resolve_grouping,
     valid_category_mask,
 )
-from scarf.metadata.queries import missing_frame_values
+from scarf.metadata.queries import (
+    column_constant_within,
+    column_partition_digest,
+    columns_same_partition,
+    level_key,
+    missing_frame_values,
+    reduce_observation_units,
+)
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.rows import (
     apply_missing_mask,
@@ -165,7 +175,9 @@ def test_metadata_row_helpers_read_permutations_and_missing_masks():
         read_metadata_rows(table, "score", np.array([3, 2])),
         [5.0, 3.5],
     )
-    assert metadata_missing_mask(table, "score") is not None
+    np.testing.assert_array_equal(
+        metadata_missing_mask(table, "score")[:], [False, True, False, True]
+    )
     np.testing.assert_array_equal(
         read_metadata_missing_rows(table, "score", np.array([3, 2])),
         [True, False],
@@ -393,7 +405,10 @@ def test_metadata_row_blocks_remain_pickle_resolvable():
     restored = pickle.loads(pickle.dumps(block))
 
     assert type(restored) is metadata.MetaDataRowBlock
+    assert (restored.start, restored.stop) == (0, 2)
     np.testing.assert_array_equal(restored.active_global_indices, [0])
+    assert list(restored.values) == ["score"]
+    np.testing.assert_array_equal(restored.values["score"], [0.5])
 
 
 def _artifact(kind: str, token: str) -> ArtifactRef:
@@ -546,7 +561,7 @@ def test_metadata_table_fill_and_error_contracts():
             "value/zarr.json", default_buffer_prototype().buffer.from_bytes(b"{")
         )
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(json.JSONDecodeError):
         table._get_size(corrupt)
     with pytest.raises(ValueError, match="empty zarr group"):
         table._get_size(empty)
@@ -643,18 +658,15 @@ def test_sift_never_passes_rows_with_a_linked_missing_mask():
 
 
 def test_partition_helpers_treat_masked_rows_as_missing():
-    from scarf.metadata.queries import (
-        column_constant_within,
-        column_partition_digest,
-        columns_same_partition,
-        reduce_observation_units,
-    )
-
     table = _masked_metadata()
     digest = column_partition_digest(table, "label")
 
     assert (digest.nMissing, digest.nLevels, digest.nRows) == (1, 3, 4)
-    assert columns_same_partition(table, "label", "donor")[0]
+    # Masked rows hold "" placeholders but pair up as one missing level.
+    assert columns_same_partition(table, "label", "donor") == (
+        True,
+        "a = x; missing = missing; b = y",
+    )
     assert column_constant_within(table, "donor", "label")
     units = reduce_observation_units(table, "donor", ["label"])
     assert units["donor"].isna().tolist() == [False, True, False]
@@ -763,3 +775,245 @@ def test_nested_group_from_an_older_import_asks_for_a_new_import():
         table.fetch_all("Baseline (ml")
     with pytest.raises(TypeError, match="import the source again"):
         table.head()
+
+
+class _SelectionArray:
+    """A vector whose vectorized selections may be absent or unsupported.
+
+    ``orthogonal`` and ``coordinate`` are None to omit that selection, True to
+    support it, or the exception type that the selection raises.
+    """
+
+    def __init__(self, values, *, orthogonal=None, coordinate=None):
+        self._values = np.asarray(values)
+        self.shape = self._values.shape
+        self.requests: list[str] = []
+        for kind, behavior in (("orthogonal", orthogonal), ("coordinate", coordinate)):
+            if behavior is not None:
+                setattr(self, f"get_{kind}_selection", self._selection(kind, behavior))
+
+    def _selection(self, kind, behavior):
+        def select(selection):
+            self.requests.append(kind)
+            if behavior is not True:
+                raise behavior(f"{kind} selection is unsupported")
+            (indices,) = selection
+            return self._values[np.asarray(indices)]
+
+        return select
+
+    def __getitem__(self, key):
+        self.requests.append("getitem")
+        return self._values[key]
+
+
+@pytest.mark.parametrize(
+    ("options", "requests"),
+    [
+        (
+            {"orthogonal": NotImplementedError, "coordinate": True},
+            ["orthogonal", "coordinate"],
+        ),
+        (
+            {"orthogonal": AttributeError, "coordinate": TypeError},
+            ["orthogonal", "coordinate", "getitem"],
+        ),
+        ({"coordinate": NotImplementedError}, ["coordinate", "getitem"]),
+        ({}, ["getitem"]),
+    ],
+    ids=["orthogonal_unsupported", "both_unsupported", "coordinate_only", "neither"],
+)
+def test_row_reader_falls_back_through_the_selections_a_backend_supports(
+    options, requests
+):
+    array = _SelectionArray([10, 20, 30, 40, 50, 60], **options)
+    table = SimpleNamespace(_get_array=lambda _column: array)
+
+    np.testing.assert_array_equal(
+        read_metadata_rows(table, "score", np.array([5, 1, 4])), [60, 20, 50]
+    )
+    assert array.requests == requests
+
+    # Only errors that mean "unsupported" fall back; others propagate.
+    failing = _SelectionArray([10, 20, 30], orthogonal=RuntimeError, coordinate=True)
+    table = SimpleNamespace(_get_array=lambda _column: failing)
+    with pytest.raises(RuntimeError, match="orthogonal selection is unsupported"):
+        read_metadata_rows(table, "score", np.array([2, 0]))
+    assert failing.requests == ["orthogonal"]
+
+
+def test_row_readers_reject_malformed_and_out_of_range_rows():
+    table = _metadata_fixture()
+
+    for read in (read_metadata_rows, read_metadata_rows_chunkwise):
+        with pytest.raises(ValueError, match="row indices must be one-dimensional"):
+            read(table, "score", np.array([[0, 2]]))
+        empty = read(table, "score", np.array([], dtype=np.int64))
+        assert empty.shape == (0,)
+        assert empty.dtype == np.float64
+    for rows in ([1, 4], [-1, 2]):
+        with pytest.raises(IndexError, match="Metadata row indices are out of bounds"):
+            read_metadata_rows(table, "score", np.array(rows))
+    # The chunkwise reader reads each requested row exactly once.
+    with pytest.raises(IndexError, match="out-of-range index"):
+        read_metadata_rows_chunkwise(table, "score", np.array([1, 4]))
+    with pytest.raises(ValueError, match="cannot contain duplicate indexes"):
+        read_metadata_rows_chunkwise(table, "score", np.array([2, 2]))
+
+
+def test_chunkwise_row_reader_rejects_a_selection_of_the_wrong_shape():
+    class ArrayMetadata:
+        shards = None
+
+    class ShortArray:
+        """A chunked array whose selections drop their last value."""
+
+        def __init__(self):
+            self._values = np.arange(4.0)
+            self.shape = self._values.shape
+            self.dtype = self._values.dtype
+            self.chunks = (4,)
+            self.metadata = ArrayMetadata()
+
+        def get_orthogonal_selection(self, selection):
+            (indices,) = selection
+            return self._values[np.asarray(indices)][:-1]
+
+    table = SimpleNamespace(_get_array=lambda _column: ShortArray())
+
+    with pytest.raises(ValueError, match="selection returned an invalid shape"):
+        read_metadata_rows_chunkwise(table, "score", np.array([0, 2]))
+
+
+def test_block_iterators_reject_nonpositive_block_sizes():
+    table = _metadata_fixture()
+
+    for block_rows in (0, -3):
+        with pytest.raises(ValueError, match="block_rows must be >= 1"):
+            list(iter_metadata_column_blocks(table, "score", block_rows=block_rows))
+        with pytest.raises(ValueError, match="block_rows must be >= 1"):
+            list(table.iter_row_blocks(columns=["score"], block_rows=block_rows))
+
+
+def test_single_row_blocks_cover_every_row_in_order():
+    table = _metadata_fixture()
+
+    blocks = list(table.iter_row_blocks(columns=["ids", "score"], block_rows=1))
+
+    assert [(block.start, block.stop) for block in blocks] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+    ]
+    assert [block.active_global_indices.tolist() for block in blocks] == [
+        [0],
+        [],
+        [2],
+        [3],
+    ]
+    assert [block.values["ids"].tolist() for block in blocks] == [
+        ["a"],
+        [],
+        ["c"],
+        ["d"],
+    ]
+    assert [block.values["score"].tolist() for block in blocks] == [
+        [0.5],
+        [],
+        [3.5],
+        [5.0],
+    ]
+
+
+def test_missing_mask_lookup_of_an_unknown_column_raises_a_key_error():
+    table = _masked_metadata()
+
+    with pytest.raises(KeyError, match="unknown does not exist in the metadata"):
+        metadata_missing_mask(table, "unknown")
+    with pytest.raises(KeyError, match="unknown does not exist in the metadata"):
+        read_metadata_missing_rows(table, "unknown", np.array([0]))
+    # Reserved and unmasked columns exist but have no mask.
+    assert metadata_missing_mask(table, "ids") is None
+    np.testing.assert_array_equal(
+        metadata_missing_mask(table, "count")[:], [False, True, False, False]
+    )
+
+
+def test_level_keys_merge_every_missing_value_and_decode_bytes():
+    missing = level_key(None)
+
+    # Missing scalars of every kind share one level.
+    for value in (np.nan, np.float32("nan"), pd.NA, pd.NaT, np.datetime64("NaT", "D")):
+        assert level_key(value) is missing
+    # Bytes compare with their UTF-8 text; NumPy scalars with Python values.
+    assert level_key(b"donor") == level_key(np.bytes_(b"donor")) == "donor"
+    assert level_key(b"\xff") == "�"
+    assert level_key(np.int64(3)) == 3
+    assert type(level_key(np.int64(3))) is int
+    assert level_key(np.str_("x")) == "x"
+    # Unhashable labels compare by representation, even those whose
+    # missing-value test is ambiguous.
+    for value in ([1, 2], [1], (1, 2), {1}, {"a": 1}, np.array([1, 2])):
+        assert level_key(value) == ("__scarf_repr__", repr(value))
+    assert level_key([1, 2]) != level_key((1, 2))
+    assert level_key("missing") is not missing
+
+
+def _partition_metadata() -> metadata.MetaData:
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.create_array("I", data=np.ones(6, dtype=bool), chunks=(4,))
+    group.create_array("none", data=np.zeros(6, dtype=bool), chunks=(4,))
+    group.create_array("ids", data=np.array([f"c{i}" for i in range(6)]), chunks=(4,))
+    for name, values in (
+        ("sample", ["s1", "s1", "s2", "s2", "s3", "s3"]),
+        ("donor", ["d1", "d1", "d2", "d2", "d2", "d2"]),
+        ("site", ["x", "x", "y", "y", "y", "y"]),
+    ):
+        group.create_array(name, data=np.array(values), chunks=(4,))
+    return metadata.MetaData(group)
+
+
+def test_partition_helpers_detect_coarser_and_varying_columns():
+    table = _partition_metadata()
+
+    # Donor merges samples s2 and s3: the partitions differ in both orders.
+    assert columns_same_partition(table, "sample", "donor") == (False, "")
+    assert columns_same_partition(table, "donor", "sample") == (False, "")
+    # Renamed labels form the same partition and list each correspondence.
+    assert columns_same_partition(table, "donor", "site") == (True, "d1 = x; d2 = y")
+    assert column_partition_digest(table, "donor") == column_partition_digest(
+        table, "site"
+    )
+    assert column_constant_within(table, "donor", "sample")
+    assert not column_constant_within(table, "sample", "donor")
+    units = reduce_observation_units(table, "sample", ["donor"])
+    assert units.to_dict(orient="list") == {
+        "sample": ["s1", "s2", "s3"],
+        "donor": ["d1", "d2", "d2"],
+    }
+
+
+def test_observation_units_of_an_empty_selection_keep_their_columns():
+    table = _partition_metadata()
+
+    units = reduce_observation_units(
+        table, "sample", ["donor", "sample"], cell_key="none"
+    )
+
+    assert units.empty
+    assert list(units.columns) == ["sample", "donor"]
+
+
+def test_category_mask_accepts_labels_whose_missing_test_is_ambiguous():
+    values = np.empty(4, dtype=object)
+    values[:] = [["a", "b"], "c", None, " "]
+
+    np.testing.assert_array_equal(
+        valid_category_mask(values), [True, True, False, False]
+    )
+
+
+def test_complete_labels_require_an_artifact_ref():
+    with pytest.raises(TypeError, match="^clusters must be an ArtifactRef$"):
+        resolve_complete_labels(None, "clusters", name="clusters")

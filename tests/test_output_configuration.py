@@ -92,3 +92,25 @@ def test_reconfiguration_tolerates_a_stale_scarf_handler(capsys):
 def test_configure_output_requires_boolean_settings(setting):
     with pytest.raises(TypeError, match=setting):
         configure_output(**{setting: 1})
+
+
+def test_loading_tolerates_an_already_removed_default_handler():
+    import importlib.util
+
+    import scarf.utils.logging as scarf_logging
+
+    # An application, like this test session, may remove Loguru's default
+    # handler 0 before Scarf's logging module loads.
+    with pytest.raises(ValueError):
+        logger.remove(0)
+    spec = importlib.util.spec_from_file_location(
+        "scarf_logging_copy", scarf_logging.__file__
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module._config == module._OutputConfig()
+    assert module._handler_id is not None
+    # Removing the copy's handler succeeds only because loading installed it.
+    logger.remove(module._handler_id)

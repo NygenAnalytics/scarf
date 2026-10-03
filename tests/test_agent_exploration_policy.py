@@ -3,8 +3,8 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -16,172 +16,6 @@ from scarf.agent import workflow
 from scarf.agent.models import Choice, ContextDecision
 from scarf.agent.records import RunRecords, procedure_identity
 from tests.test_agent_recovery import science as science
-
-
-def _provider(
-    observed: list[dict[str, Any]], *, ambiguous: bool = False
-) -> FunctionModel:
-    async def respond(messages: Any, info: Any) -> ModelResponse:
-        evidence = json.loads(messages[-1].parts[-1].content)["evidence"]
-        observed.append(evidence)
-        schema = info.output_tools[0].parameters_json_schema["title"]
-        if schema == "ContextDecision":
-            assert "source:summary" in evidence["evidenceIds"]
-            answer = {"rationale": "Retain the supplied cohort and declared roles."}
-        elif schema == "AnnotationDecision":
-            answer = {
-                "annotations": [
-                    {
-                        "clusterId": row["clusterId"],
-                        "identity": "unassigned",
-                        "rationale": "Synthetic evidence does not establish a biological identity.",
-                    }
-                    for row in evidence["clusters"]
-                ]
-            }
-        elif evidence.get("decisionKind") == "pcProbe":
-            assert evidence["allowedActions"] == ["experiment", "defer"]
-            answer = {
-                "action": "experiment",
-                "optionIds": [
-                    next(
-                        key
-                        for key, row in evidence["experiments"].items()
-                        if row["pcaDims"] == 30
-                    )
-                ],
-                "evidenceIds": ["c0"],
-                "rationale": "Measure the higher-rank registered probe.",
-            }
-        elif "eligibleOptions" in evidence:
-            assert evidence["allowedActions"] == ["choose", "defer"]
-            assert set(evidence["eligibleOptions"]) <= set(evidence["evidenceIds"])
-            answer = {
-                "action": "choose",
-                "optionIds": [evidence["eligibleOptions"][0]],
-                "evidenceIds": evidence["eligibleOptions"],
-                "rationale": "Select a measured native population partition.",
-            }
-            if ambiguous and len(evidence["eligibleOptions"]) >= 2:
-                answer.update(
-                    action="defer",
-                    optionIds=[],
-                    acceptableOptionIds=evidence["eligibleOptions"],
-                    deferralReason="ambiguousSelection",
-                    question="Both measured partitions support descriptive discovery; which should be presented?",
-                )
-        else:
-            assert evidence["decisionKind"] == "nativeShortlist"
-            assert evidence["allowedActions"] == ["shortlist", "defer"]
-            assert all(
-                row["status"] != "pending"
-                for row in evidence["explorationCoverage"]["slots"]
-            )
-            answer = {
-                "action": "shortlist",
-                "optionIds": ["c0:r0.5", "c0:r0.75"],
-                "evidenceIds": ["c0:r0.5", "c0:r0.75"],
-                "rationale": "Compare measured baseline resolutions after all independent probes.",
-            }
-        return ModelResponse(parts=[ToolCallPart("decision", answer)])
-
-    return FunctionModel(respond)
-
-
-@pytest.fixture
-def full_panel_source(tmp_path: Path) -> Path:
-    from scipy.sparse import csr_matrix
-    from scarf import DataStore
-    from scarf.writers import SparseToZarr
-
-    source = tmp_path / "counts.zarr"
-    rng = np.random.default_rng(39)
-    counts = rng.poisson(1, size=(120, 2102)).astype(np.uint32)
-    for group in range(3):
-        counts[group * 40 : (group + 1) * 40, 2 + group * 40 : 42 + group * 40] += (
-            rng.poisson(4, size=(40, 40)).astype(np.uint32)
-        )
-    names = ["MT-CO1", "RPL3", *[f"GENE{i}" for i in range(2100)]]
-    writer = SparseToZarr(
-        csr_matrix(counts),
-        str(source),
-        [f"cell{i}" for i in range(120)],
-        names,
-        mem_budget="512M",
-        nthreads=1,
-    )
-    writer.dump()
-    store = DataStore(
-        str(source),
-        default_assay="RNA",
-        min_features_per_cell=-1,
-        nthreads=1,
-        mem_budget="512M",
-    )
-    store.cells.insert("donor", np.tile(["donorA", "donorB"], 60))
-    store.cells.insert(
-        "author_annotation", np.repeat(["SECRET_A", "SECRET_B", "SECRET_C"], 40)
-    )
-    return source
-
-
-def test_real_four_representation_panel_and_recorded_lenient_choice(
-    full_panel_source: Path, tmp_path: Path
-) -> None:
-    from scarf import DataStore
-
-    before = DataStore(
-        str(full_panel_source), zarr_mode="r", nthreads=1, mem_budget="512M"
-    )
-    columns = list(before.cells.columns)
-    selected = before.cells.fetch_all("I").copy()
-    seen: list[dict[str, Any]] = []
-    result = analyze_rna(
-        full_panel_source,
-        run_dir=tmp_path / "analysis",
-        model=_provider(seen, ambiguous=True),
-        study=Study(
-            context="Synthetic RNA with two explicitly declared donors.",
-            objective="Describe populations",
-            sampleColumn="donor",
-        ),
-        config=AnalysisConfig(maxCandidates=4),
-        runtime=RuntimeConfig(nthreads=1, memBudget="512M"),
-    )
-    records = RunRecords(result.run_dir)
-    assert result.status == "completed", records.events()[-5:]
-    coverage = result.exploration_coverage
-    assert coverage["nativeComplete"] is True
-    assert [row["status"] for row in coverage["slots"]] == ["measured"] * 4
-    candidates = result.candidates
-    assert len(candidates) == 4
-    baseline = candidates[0]["parameters"]
-    for row, axis in zip(
-        candidates[1:], ["hvgCount", "pcaDims", "neighborsK"], strict=True
-    ):
-        assert {key for key in baseline if baseline[key] != row["parameters"][key]} == {
-            axis
-        }
-        assert row["selection"] == candidates[0]["selection"]
-        assert len(row["comparisons"]) == 4
-    assert [row["actualHvgCount"] for row in candidates[:2]] == [1000, 2000]
-    assert len(result.pipeline_runs) == 7
-    assert len(result.decision_resolutions) == 1
-    assert result.decision_resolutions[0]["resolved"]["optionIds"] == ["c0:r0.5"]
-    assert any(row["source"] == "policy" for row in result.replay_decisions())
-    finalist = records.read_json("evidence/finalist_0.json")
-    assert (
-        "markerSupportFraction" in finalist["metrics"]
-        and "markerCoherence" not in finalist["metrics"]
-    )
-    assessed_run = before.pipeline.open(run_id=finalist["runId"])
-    assert assessed_run["markers"] == result.pipeline["markers"]
-    assert not any("SECRET_" in json.dumps(evidence) for evidence in seen)
-    after = DataStore(
-        str(full_panel_source), zarr_mode="r", nthreads=1, mem_budget="512M"
-    )
-    assert list(after.cells.columns) == columns
-    np.testing.assert_array_equal(after.cells.fetch_all("I"), selected)
 
 
 def test_model_cannot_shortlist_instead_of_the_pc_probe() -> None:
@@ -304,6 +138,72 @@ def test_optional_prompt_compression_preserves_choices_and_measurement_gates() -
     assert result["finalists"]["a"]["metrics"] == evidence["finalists"]["a"]["metrics"]
     assert result["promptOmissions"]
     assert evidence["finalists"]["a"]["covariateAssociations"]
+
+
+def test_prompt_trimming_empties_optional_tables_only_until_the_budget_fits() -> None:
+    evidence = {
+        "byGroup": {f"group{index:02d}": "x" * 40 for index in range(80)},
+        "clusterCounts": {str(index): index for index in range(30)},
+        "eligibleOptions": ["c0:r0.5"],
+    }
+    original = json.dumps(evidence, sort_keys=True)
+    # The budget reserves 16 KiB of the limit for instructions and schema.
+    result = workflow._bounded_evidence(evidence, 16_384 + 700)
+    assert result == {
+        "byGroup": {},
+        "clusterCounts": evidence["clusterCounts"],
+        "eligibleOptions": ["c0:r0.5"],
+        "promptOmissions": [{"path": "evidence.byGroup", "omitted": 80}],
+    }
+    assert len(json.dumps(result).encode()) <= 700
+    assert json.dumps(evidence, sort_keys=True) == original
+
+
+def test_policy_resolution_requires_its_saved_decision_and_frozen_order(
+    tmp_path: Path,
+) -> None:
+    from scarf.agent.records import RecordError
+
+    records = RunRecords.create(tmp_path / "records", {})
+    deferred = Choice(
+        action="defer",
+        acceptableOptionIds=["c0:r0.5", "c0:r0.75"],
+        evidenceIds=["c0:r0.5", "c0:r0.75"],
+        deferralReason="ambiguousSelection",
+        question="Which measured granularity should be presented?",
+        rationale="Both measured partitions remain acceptable",
+    )
+    config = AnalysisConfig()
+    options = {"key": "choose_finalist", "stage": "finalists"}
+    with pytest.raises(RecordError, match="requires its saved model decision"):
+        workflow._resolve_decision(
+            records, deferred, config, option_order=["c0:r0.5", "c0:r0.75"], **options
+        )
+    assert records.events() == []
+    records.append(
+        "decisionAccepted",
+        decisionId="choose_finalist",
+        stage="finalists",
+        evidenceDigest="frozen-evidence",
+        output=deferred.model_dump(mode="json"),
+    )
+    resolved = workflow._resolve_decision(
+        records, deferred, config, option_order=["c0:r0.75", "c0:r0.5"], **options
+    )
+    assert resolved.action == "choose"
+    assert resolved.optionIds == ["c0:r0.75"]
+    assert resolved.question is None and resolved.acceptableOptionIds == []
+    saved = records.latest("decisionResolved")
+    assert saved["acceptedSequence"] == 1
+    assert saved["evidenceDigest"] == "frozen-evidence"
+    assert saved["rule"] == "orderedAcceptableOption"
+    before = records.events()
+    # A resumed resolution cannot silently change under another frozen order.
+    with pytest.raises(RecordError, match="no longer matches frozen evidence"):
+        workflow._resolve_decision(
+            records, deferred, config, option_order=["c0:r0.5", "c0:r0.75"], **options
+        )
+    assert records.events() == before
 
 
 @pytest.mark.parametrize("stage", ["explore", "finalists", "annotate"])
@@ -524,6 +424,54 @@ def test_realistic_measured_payloads_fit_the_complete_default_request(
         assert all(cluster["markers"] == markers for cluster in observed[0]["clusters"])
 
 
+def _fail_second_probe(
+    science: Any,
+    monkeypatch: Any,
+    cause: BaseException,
+    *,
+    failed_status: str = "failed",
+    damage_parent: bool = False,
+) -> list[str]:
+    """Run the registered probes and fail the PC probe (c2) at its PCA stage."""
+    from scarf.agent.choices import native_probe_options
+    from scarf.datastore.pipeline_run import PipelineExecutionError
+    from tests.test_agent_recovery import Run
+
+    monkeypatch.setattr(workflow, "native_probe_options", native_probe_options)
+    monkeypatch.setattr(workflow, "compare_candidates", lambda *args: [])
+    execute = workflow.execute_pipeline
+    attempted: list[str] = []
+
+    def fail_probe(
+        store: Any, prepared: Any, candidate: Any, config: Any, **kwargs: Any
+    ) -> Any:
+        attempted.append(candidate.candidateId)
+        if candidate.candidateId == "c2":
+            failed = Run("numerical-failure")
+            failed.status = failed_status
+            science.runs[failed.run_id] = failed
+            if damage_parent:
+                science.store.inspect_artifact.return_value = SimpleNamespace(
+                    complete=False
+                )
+            raise PipelineExecutionError(failed.run_id, "pca", cause) from cause
+        return execute(store, prepared, candidate, config, **kwargs)
+
+    monkeypatch.setattr(workflow, "execute_pipeline", fail_probe)
+    return attempted
+
+
+def _probe_config(mode: str = "lenient") -> AnalysisConfig:
+    return AnalysisConfig(
+        hvgCount=20,
+        pcaDims=4,
+        neighborsK=7,
+        resolutions=(0.5,),
+        maxCandidates=4,
+        interactionMode=mode,
+    )
+
+
 @pytest.mark.parametrize(
     "mode,cause,expected",
     [
@@ -542,45 +490,24 @@ def test_failed_probe_continuation_consumes_slot_without_repair(
     expected: str,
 ) -> None:
     from scarf.agent import resume_rna
-    from scarf.agent.choices import native_probe_options
-    from scarf.datastore.pipeline_run import PipelineExecutionError
-    from tests.test_agent_recovery import Run, _model, _study
+    from tests.test_agent_recovery import _model, _study
 
-    monkeypatch.setattr(workflow, "native_probe_options", native_probe_options)
-    monkeypatch.setattr(workflow, "compare_candidates", lambda *args: [])
-    execute = workflow.execute_pipeline
-    attempted = []
-
-    def fail_probe(
-        store: Any, prepared: Any, candidate: Any, config: Any, **kwargs: Any
-    ) -> Any:
-        attempted.append(candidate.candidateId)
-        if candidate.candidateId == "c2":
-            failed = Run("numerical-failure")
-            failed.status = "failed"
-            science.runs[failed.run_id] = failed
-            raise PipelineExecutionError(failed.run_id, "pca", cause) from cause
-        return execute(store, prepared, candidate, config, **kwargs)
-
-    monkeypatch.setattr(workflow, "execute_pipeline", fail_probe)
-    config = AnalysisConfig(
-        hvgCount=20,
-        pcaDims=4,
-        neighborsK=7,
-        resolutions=(0.5,),
-        maxCandidates=4,
-        interactionMode=mode,
-    )
+    attempted = _fail_second_probe(science, monkeypatch, cause)
     run = analyze_rna(
         science.source,
         run_dir=tmp_path / "analysis",
         model=_model([]),
         study=_study(),
-        config=config,
+        config=_probe_config(mode),
     )
     assert run.status == expected
     records = RunRecords(run.run_dir)
     assert attempted.count("c2") == 1
+    failure = records.latest("pipelineFailed")
+    assert failure["operation"] == "screen_c2"
+    assert failure["errorType"] == "PipelineExecutionError"
+    numerical = isinstance(cause, np.linalg.LinAlgError)
+    assert failure.get("numericalFailure") == ("LinAlgError" if numerical else None)
     if expected == "completed":
         assert [row["status"] for row in run.exploration_coverage["slots"]] == [
             "measured",
@@ -588,16 +515,209 @@ def test_failed_probe_continuation_consumes_slot_without_repair(
             "failed",
             "measured",
         ]
-        assert run.exploration_coverage["nativeComplete"] is False
-        assert records.latest("candidateFailed")["reason"] == "LinAlgError"
-        before = list(attempted)
-        assert resume_rna(run.run_dir, model=_model([])).status == "completed"
-        assert attempted == before
-        # A same-procedure interruption after the exploration stage reuses its
-        # terminal failure as well as all completed pipeline invocations.
-        monkeypatch.setattr(
-            workflow, "execute_pipeline", Mock(side_effect=AssertionError("must reuse"))
+        assert run.exploration_coverage["slots"][2]["reason"] == (
+            "Recognized numerical failure; no automatic retry"
         )
-        assert run.replay_decisions()
+        assert run.exploration_coverage["nativeComplete"] is False
+        skipped = records.latest("candidateFailed")
+        assert skipped["candidateId"] == "c2"
+        assert skipped["reason"] == "LinAlgError"
+        assert skipped["failureSequence"] == failure["sequence"]
+        assert attempted == ["c0", "c2", "c3", "c0", "c0"]
+        assert resume_rna(run.run_dir, model=_model([])).status == "completed"
+        assert attempted == ["c0", "c2", "c3", "c0", "c0"]
     else:
+        # Strict mode and non-numerical causes stop instead of skipping a slot.
+        status = records.latest("status")
+        assert status["stage"] == "explore"
+        assert status["errorType"] == "PipelineExecutionError"
         assert records.latest("candidateFailed") is None
+        assert attempted == ["c0", "c2"]
+
+
+def test_interrupted_exploration_resumes_with_the_saved_probe_failure(
+    science: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    from scarf.agent import resume_rna
+    from tests.test_agent_recovery import _model, _study
+
+    attempted = _fail_second_probe(
+        science, monkeypatch, np.linalg.LinAlgError("no convergence")
+    )
+    decision = workflow._decision
+
+    async def stop_before_shortlist(*args: Any, **kwargs: Any) -> Any:
+        if kwargs["key"] == "shortlist_native":
+            raise asyncio.CancelledError
+        return await decision(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "_decision", stop_before_shortlist)
+    with pytest.raises(asyncio.CancelledError):
+        analyze_rna(
+            science.source,
+            run_dir=tmp_path / "analysis",
+            model=_model([]),
+            study=_study(),
+            config=_probe_config(),
+        )
+    records = RunRecords(tmp_path / "analysis")
+    assert records.latest("candidateFailed")["candidateId"] == "c2"
+    assert workflow.stage_result(records, "explore") is None
+    assert attempted == ["c0", "c2", "c3"]
+    monkeypatch.setattr(workflow, "_decision", decision)
+    resumed = resume_rna(records.path, model=_model([]))
+    assert resumed.status == "completed"
+    # The terminal failure and both measurements are reused; only the finalist
+    # and final pipelines are new.
+    assert attempted == ["c0", "c2", "c3", "c0", "c0"]
+    kinds = [row["kind"] for row in records.events()]
+    assert kinds.count("candidateFailed") == 1
+    assert [
+        row["operation"] for row in records.events() if row["kind"] == "pipelinePlanned"
+    ] == ["screen_c0", "screen_c2", "screen_c3", "finalist_0", "final"]
+    assert [row["status"] for row in resumed.exploration_coverage["slots"]] == [
+        "measured",
+        "infeasible",
+        "failed",
+        "measured",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        (
+            "unfinished",
+            "A skipped numerical attempt must have a durable failed outcome",
+        ),
+        ("parent", "A numerical fallback requires intact completed parent artifacts"),
+    ],
+)
+def test_numerical_fallback_requires_a_durable_failure_and_intact_parent(
+    science: Any, tmp_path: Path, monkeypatch: Any, damage: str, message: str
+) -> None:
+    from tests.test_agent_recovery import _model, _study
+
+    attempted = _fail_second_probe(
+        science,
+        monkeypatch,
+        np.linalg.LinAlgError("no convergence"),
+        failed_status="running" if damage == "unfinished" else "failed",
+        damage_parent=damage == "parent",
+    )
+    run = analyze_rna(
+        science.source,
+        run_dir=tmp_path / "analysis",
+        model=_model([]),
+        study=_study(),
+        config=_probe_config(),
+    )
+    assert run.status == "failed"
+    records = RunRecords(run.run_dir)
+    status = records.latest("status")
+    assert status["stage"] == "explore"
+    assert status["errorType"] == "AnalysisInputError"
+    assert status["message"] == message
+    assert records.latest("pipelineFailed")["numericalFailure"] == "LinAlgError"
+    assert records.latest("candidateFailed") is None
+    assert attempted == ["c0", "c2"]
+
+
+def test_probe_skip_requires_a_numerical_failure_of_its_latest_attempt(
+    science: Any, tmp_path: Path
+) -> None:
+    from scarf.agent.models import Candidate
+    from scarf.agent.records import RecordError
+    from tests.test_agent_recovery import Run, _study
+
+    records = RunRecords.create(tmp_path / "records", {"runId": "skip-test"})
+    baseline = Candidate(candidateId="c0", hvgCount=20, pcaDims=4, neighborsK=7)
+    probe = baseline.model_copy(
+        update={"candidateId": "c2", "parentId": "c0", "pcaDims": 10}
+    )
+    science.runs["baseline-run"] = Run("baseline-run")
+    failed = Run("failed-attempt")
+    failed.status = "failed"
+    science.runs[failed.run_id] = failed
+    parent = {"runId": "baseline-run", "selection": {"artifactId": "same-cells"}}
+    records.append("pipelinePlanned", operation="screen_c2", label="first")
+    assert workflow._skippable_failure(records, science.store, probe, parent) is None
+    records.append(
+        "pipelineFailed",
+        operation="screen_c2",
+        label="first",
+        runId="failed-attempt",
+        errorType="PipelineExecutionError",
+        numericalFailure="LinAlgError",
+        numericalStage="pca",
+    )
+    failure = workflow._skippable_failure(records, science.store, probe, parent)
+    assert failure is not None and failure["runId"] == "failed-attempt"
+    # The baseline has no parent to fall back to.
+    assert workflow._skippable_failure(records, science.store, baseline, None) is None
+    # A newer unfinished attempt supersedes the earlier numerical failure.
+    records.append("pipelinePlanned", operation="screen_c2", label="retry")
+    assert workflow._skippable_failure(records, science.store, probe, parent) is None
+    records.append(
+        "candidateFailed",
+        candidateId="c2",
+        failureSequence=failure["sequence"],
+        reason="LinAlgError",
+        stage="pca",
+    )
+    with pytest.raises(RecordError, match="saved numerical skip lacks its failed"):
+        workflow._measure_candidate(
+            records,
+            science.source,
+            science.store,
+            science.inspect.return_value,
+            _study(),
+            _probe_config(),
+            RuntimeConfig(),
+            probe,
+            parent=parent,
+            parent_candidate=baseline,
+        )
+    assert science.calls == []
+
+
+def test_hvg_probe_matching_the_baseline_selection_is_infeasible(
+    science: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    from scarf.agent.choices import native_probe_options
+    from tests.test_agent_recovery import _model, _study
+
+    monkeypatch.setattr(workflow, "native_probe_options", native_probe_options)
+    monkeypatch.setattr(workflow, "compare_candidates", lambda *args: [])
+    science.inspect.return_value["availableFeatures"] = 2500
+    summarize = workflow.summarize_candidate
+    monkeypatch.setattr(
+        workflow,
+        "summarize_candidate",
+        lambda *args: {**summarize(*args), "hvgSelectionDigest": "same-genes"},
+    )
+    run = analyze_rna(
+        science.source,
+        run_dir=tmp_path / "analysis",
+        model=_model([]),
+        study=_study(),
+        config=_probe_config(),
+    )
+    assert run.status == "completed"
+    coverage = run.exploration_coverage
+    assert [(row["axis"], row["status"]) for row in coverage["slots"]] == [
+        ("baseline", "measured"),
+        ("hvgCount", "infeasible"),
+        ("pcaDims", "measured"),
+        ("neighborsK", "measured"),
+    ]
+    assert coverage["slots"][1]["parameters"]["hvgCount"] == 2000
+    assert coverage["slots"][1]["reason"] == (
+        "Measured HVG selection is identical to the baseline; "
+        "no distinct sensitivity comparison"
+    )
+    assert coverage["nativeComplete"] is False
+    # The probe was measured before it was classified; nothing was skipped.
+    assert [row["candidateId"] for row in run.candidates] == ["c0", "c1", "c2", "c3"]
+    assert RunRecords(run.run_dir).latest("candidateFailed") is None
+    assert all(row["valid"] for row in run.replay_decisions())

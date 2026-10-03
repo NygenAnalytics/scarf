@@ -578,13 +578,17 @@ def _three_way_wnn_inputs() -> list[tuple[str, np.ndarray, np.ndarray]]:
     ]
 
 
-def test_calc_snn_returns_normalized_overlap():
-    graph = _simple_knn_graph(6, k=3)
-    indices = graph.indices.reshape((6, 3))
-    snn = calc_snn(indices)
-    assert snn.shape == (6, 3)
-    assert np.all(snn >= 0)
-    assert np.all(snn <= 1)
+@pytest.mark.parametrize("kernel", [calc_snn, calc_snn.py_func], ids=["jit", "python"])
+def test_calc_snn_returns_normalized_overlap(kernel):
+    # Cell i's neighbors are i+1, i+2, and i+3 (mod 6), so a neighbor at offset
+    # d shares 3 - d of them: (2, 1, 0) shared over k - 1 = 2.
+    indices = _simple_knn_indices(6, k=3)
+
+    snn = kernel(indices)
+
+    np.testing.assert_array_equal(snn, np.tile([1.0, 0.5, 0.0], (6, 1)))
+    # The overlap does not depend on the order of a cell's neighbors.
+    np.testing.assert_array_equal(kernel(indices[:, ::-1]), snn[:, ::-1])
 
 
 def test_weight_sort_indices_keeps_top_neighbors():
@@ -592,18 +596,53 @@ def test_weight_sort_indices_keeps_top_neighbors():
     weights = np.array([0.2, 0.5, 0.4, 0.6, 0.1])
     sort_weights = weights + np.array([0.0, 0.2, 0.1, 0.2, 0.0])
     kept_idx, kept_w = weight_sort_indices(indices, weights, sort_weights, n=3)
-    assert len(kept_idx) == 3
-    assert len(kept_w) == 3
-    assert len(set(kept_idx)) == len(kept_idx)
+    # Sort weights rank the entries 1 (0.8), 1 (0.7), 2 (0.5), 4 (0.2), 3 (0.1).
+    # The duplicate of neighbor 1 keeps its higher-ranked weight.
+    np.testing.assert_array_equal(kept_idx, [1, 2, 4])
+    np.testing.assert_allclose(kept_w, [0.6, 0.4, 0.2])
 
 
-def test_merge_graphs_preserves_shape_and_edge_count():
-    g1 = _simple_knn_graph(8, k=3)
-    g2 = _simple_knn_graph(8, k=3)
-    merged = merge_graphs([g1, g2])
+def test_merging_a_graph_with_itself_returns_the_graph():
+    graph = _simple_knn_graph(8, k=3)
+
+    merged = merge_graphs([graph, graph.copy()])
+
     assert isinstance(merged, coo_matrix)
-    assert merged.shape == g1.shape
-    assert merged.nnz == g1.nnz
+    assert merged.shape == graph.shape
+    assert merged.nnz == graph.nnz
+    np.testing.assert_array_equal(merged.toarray(), graph.toarray())
+
+
+def _reference_merged_rows(
+    graphs: list[csr_matrix],
+    n_neighbors: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Merge graphs row by row with Python sets and dictionaries.
+
+    Each candidate edge is ranked by its weight plus the fraction of the source
+    cell's neighbors it shares in that graph. A candidate keeps the weight of
+    its best-ranked copy, and each row keeps its ``n_neighbors`` best ranks.
+    """
+    neighbor_sets = [
+        [set(graph[row].indices.tolist()) for row in range(graph.shape[0])]
+        for graph in graphs
+    ]
+    columns: list[int] = []
+    weights: list[float] = []
+    for row in range(graphs[0].shape[0]):
+        best: dict[int, tuple[float, float]] = {}
+        for graph, sets in zip(graphs, neighbor_sets, strict=True):
+            for neighbor, weight in zip(
+                graph[row].indices, graph[row].data, strict=True
+            ):
+                shared = len(sets[row] & sets[neighbor]) / (n_neighbors - 1)
+                rank = float(weight) + shared
+                if neighbor not in best or rank > best[neighbor][0]:
+                    best[int(neighbor)] = (rank, float(weight))
+        ordered = sorted(best.items(), key=lambda item: -item[1][0])[:n_neighbors]
+        columns.extend(neighbor for neighbor, _ in ordered)
+        weights.extend(weight for _, (_, weight) in ordered)
+    return np.asarray(columns), np.asarray(weights, dtype=np.float32)
 
 
 def test_merge_graphs_matches_row_wise_reference_and_keeps_dtypes():
@@ -631,23 +670,7 @@ def test_merge_graphs_matches_row_wise_reference_and_keeps_dtypes():
                 shape=(n_cells, n_cells),
             )
         )
-    snns = [calc_snn(graph.indices.reshape(n_cells, n_neighbors)) for graph in graphs]
-    expected_columns: list[np.ndarray] = []
-    expected_weights: list[np.ndarray] = []
-    for row in range(n_cells):
-        columns, weights = weight_sort_indices(
-            np.hstack([graph[row].indices for graph in graphs]),
-            np.hstack([graph[row].data for graph in graphs]),
-            np.hstack(
-                [
-                    graph[row].data + snn[row]
-                    for graph, snn in zip(graphs, snns, strict=True)
-                ]
-            ),
-            n_neighbors,
-        )
-        expected_columns.append(columns)
-        expected_weights.append(weights)
+    expected_columns, expected_weights = _reference_merged_rows(graphs, n_neighbors)
 
     merged = merge_graphs(graphs)
 
@@ -655,8 +678,8 @@ def test_merge_graphs_matches_row_wise_reference_and_keeps_dtypes():
         merged.row,
         np.repeat(np.arange(n_cells), n_neighbors),
     )
-    np.testing.assert_array_equal(merged.col, np.concatenate(expected_columns))
-    np.testing.assert_array_equal(merged.data, np.concatenate(expected_weights))
+    np.testing.assert_array_equal(merged.col, expected_columns)
+    np.testing.assert_array_equal(merged.data, expected_weights)
     assert merged.data.dtype == np.float32
 
 
@@ -672,6 +695,23 @@ def test_merge_graphs_rejects_one_neighbor_snn_input():
 
     with pytest.raises(ValueError, match="at least two neighbors"):
         merge_graphs([graph, graph.copy()])
+
+
+def test_merge_graphs_rejects_empty_and_irregular_inputs():
+    regular = _simple_knn_graph(6, k=3)
+    irregular = regular.tolil()
+    irregular[0, 1] = 0
+    irregular = irregular.tocsr()
+    irregular.eliminate_zeros()
+
+    with pytest.raises(ValueError, match="At least one graph is required"):
+        merge_graphs([])
+    with pytest.raises(ValueError, match="regular neighbor count"):
+        merge_graphs([regular, irregular])
+    with pytest.raises(ValueError, match="regular neighbor count"):
+        merge_graphs([csr_matrix((0, 0)), csr_matrix((0, 0))])
+    with pytest.raises(ValueError, match="same number of edges"):
+        merge_graphs([regular, _simple_knn_graph(6, k=2)])
 
 
 def test_build_connectivity_arrays_runs_in_memory():
@@ -750,6 +790,138 @@ def test_build_connectivity_arrays_runs_in_memory():
         ).astype(np.uint32),
     )
     np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
+    # The UMAP kernel: the nearest neighbor (rho) gets weight one, the others
+    # exp(-(d - rho) / sigma) with one sigma per cell chosen so that they sum
+    # to log2(k) * bandwidth.
+    rows = weights.reshape(n_cells, n_neighbors).astype(np.float64)
+    np.testing.assert_array_equal(rows[:, 0], 1.0)
+    np.testing.assert_allclose(
+        rows[:, 1:].sum(axis=1), np.log2(n_neighbors) * 1.5, rtol=1e-4
+    )
+    sigmas = -(dist[:, 1:] - dist[:, :1]) / np.log(rows[:, 1:])
+    np.testing.assert_allclose(
+        sigmas, np.broadcast_to(sigmas[:, :1], sigmas.shape), rtol=1e-4
+    )
+    # Distances may arrive in any memory layout.
+    fortran_edges, fortran_weights = build_connectivity_arrays(
+        idx,
+        np.asfortranarray(dist),
+        local_connectivity=1.0,
+        bandwidth=1.5,
+    )
+    np.testing.assert_array_equal(fortran_edges, edges)
+    np.testing.assert_array_equal(fortran_weights, weights)
+
+
+@pytest.mark.parametrize(
+    ("indices", "distances", "error", "message"),
+    [
+        (np.arange(4), np.ones(4), ValueError, "matching matrices"),
+        (
+            _simple_knn_indices(4, k=2),
+            np.ones((4, 3)),
+            ValueError,
+            "matching matrices",
+        ),
+        (
+            _simple_knn_indices(4, k=2).astype(np.float64),
+            np.ones((4, 2)),
+            TypeError,
+            "must be integers",
+        ),
+        (
+            _simple_knn_indices(4, k=2) - 1,
+            np.ones((4, 2)),
+            ValueError,
+            "outside the cell range",
+        ),
+        (
+            _simple_knn_indices(4, k=2) + 2,
+            np.ones((4, 2)),
+            ValueError,
+            "outside the cell range",
+        ),
+        (
+            _simple_knn_indices(4, k=2),
+            np.array([[1.0, np.inf]] * 4),
+            ValueError,
+            "finite and non-negative",
+        ),
+        (
+            _simple_knn_indices(4, k=2),
+            np.array([[1.0, -0.5]] * 4),
+            ValueError,
+            "finite and non-negative",
+        ),
+    ],
+    ids=[
+        "one_dimensional",
+        "shape_mismatch",
+        "float_indices",
+        "negative_index",
+        "index_past_last_cell",
+        "infinite_distance",
+        "negative_distance",
+    ],
+)
+def test_build_connectivity_arrays_rejects_invalid_neighbor_matrices(
+    indices, distances, error, message
+):
+    with pytest.raises(error, match=message):
+        build_connectivity_arrays(
+            indices,
+            distances,
+            local_connectivity=1.0,
+            bandwidth=1.5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("membership", "message"),
+    [
+        (
+            (np.zeros(7, dtype=np.int64), np.ones(8, dtype=np.int64), np.ones(8)),
+            "does not match the KNN matrix",
+        ),
+        (
+            (np.zeros(8, dtype=np.int64), np.full(8, -1, dtype=np.int64), np.ones(8)),
+            "exceed uint32 bounds",
+        ),
+        (
+            (
+                np.zeros(8, dtype=np.int64),
+                np.full(8, 2**32, dtype=np.int64),
+                np.ones(8),
+            ),
+            "exceed uint32 bounds",
+        ),
+        (
+            (
+                np.zeros(8, dtype=np.int64),
+                np.ones(8, dtype=np.int64),
+                np.full(8, np.nan),
+            ),
+            "weights must be finite",
+        ),
+    ],
+    ids=["short_output", "negative_column", "column_past_uint32", "nan_weight"],
+)
+def test_build_connectivity_arrays_rejects_inconsistent_membership_output(
+    monkeypatch, membership, message
+):
+    # Guards against a umap-learn release that changes the membership output.
+    monkeypatch.setattr(
+        "scarf.neighbors.graph.smooth_knn_chunk",
+        lambda *_args, **_kwargs: membership,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_connectivity_arrays(
+            _simple_knn_indices(4, k=2),
+            np.ones((4, 2)),
+            local_connectivity=1.0,
+            bandwidth=1.5,
+        )
 
 
 def test_connectivity_preserves_zero_weight_neighbors():
@@ -818,37 +990,6 @@ def test_take_nearest_per_row_keeps_every_cell_when_a_row_is_empty():
 
     np.testing.assert_array_equal(kept_edges[:, 0], [0, 2])
     np.testing.assert_allclose(kept_weights, [0.5, 0.75])
-
-
-def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():
-    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        merged, modality_weights = _wnn_pair(
-            "RNA",
-            indices1,
-            ld1,
-            "ADT",
-            indices2,
-            ld2,
-            nthreads=1,
-        )
-
-    assert isinstance(merged, coo_matrix)
-    assert merged.shape == (len(indices1), len(indices1))
-    assert merged.nnz == indices1.size
-    np.testing.assert_array_equal(
-        np.bincount(merged.row, minlength=len(indices1)),
-        np.repeat(indices1.shape[1], len(indices1)),
-    )
-    assert np.all(np.isfinite(merged.data))
-    assert np.all(merged.data > 0)
-    assert np.all(merged.data <= 1)
-    assert modality_weights.dtype == np.float32
-    assert np.all(np.isfinite(modality_weights))
-    assert np.all(modality_weights >= 0)
-    np.testing.assert_allclose(modality_weights.sum(axis=1), 1, rtol=1e-6)
 
 
 def test_wnn_integration_is_invariant_to_cell_order():
@@ -1029,7 +1170,19 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
 
     assert any("different neighbor counts" in message for message in messages)
     assert merged.nnz == len(indices1) * 2
-    assert np.all(np.isfinite(merged.data))
+    expected_indices, expected_affinities, expected_weights = _reference_wnn(
+        indices1, ld1, indices2, ld2, l2_normalize=True
+    )
+    np.testing.assert_array_equal(
+        merged.col.reshape(expected_indices.shape), expected_indices
+    )
+    np.testing.assert_allclose(
+        merged.data.reshape(expected_affinities.shape),
+        expected_affinities,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(modality_weights, expected_weights, rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(merged.toarray(), swapped.toarray())
     np.testing.assert_allclose(modality_weights, swapped_weights[:, ::-1])
 
@@ -1273,27 +1426,6 @@ def test_wnn_many_rejects_too_few_or_duplicate_modalities():
             [modalities[0], ("RNA", modalities[1][1], modalities[1][2])],
             nthreads=1,
         )
-
-
-def test_wnn_grouped_pairwise_weights_differ_from_max_cross_shortcut():
-    directed_scores = np.array(
-        [
-            [-np.inf, 4.0, 0.0],
-            [2.0, -np.inf, 2.0],
-            [1.0, 0.5, -np.inf],
-        ]
-    )
-    finite = np.isfinite(directed_scores)
-    pairwise = np.zeros_like(directed_scores)
-    pairwise[finite] = np.exp(directed_scores[finite] - directed_scores[finite].max())
-    grouped = pairwise.sum(axis=1)
-    grouped /= grouped.sum()
-    max_cross_scores = np.max(directed_scores, axis=1)
-    max_cross = np.exp(max_cross_scores - max_cross_scores.max())
-    max_cross /= max_cross.sum()
-
-    assert not np.allclose(grouped, max_cross)
-    assert grouped[1] > max_cross[1]
 
 
 def test_wnn_integration_follows_informative_modality_across_numeric_scales():
@@ -1571,25 +1703,126 @@ def test_wnn_integration_stays_close_to_seurat_defaults():
 def test_wnn_integration_output_contract():
     indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
 
-    graph, modality_weights = _wnn_pair(
-        "RNA",
-        indices1,
-        ld1,
-        "ADT",
-        indices2,
-        ld2,
-        nthreads=1,
-    )
+    # The clusters are far apart, so cross-modality affinities nearly vanish
+    # and the clipped scores must not overflow or divide by zero.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        graph, modality_weights = _wnn_pair(
+            "RNA",
+            indices1,
+            ld1,
+            "ADT",
+            indices2,
+            ld2,
+            nthreads=1,
+        )
 
+    assert isinstance(graph, coo_matrix)
+    assert graph.shape == (len(indices1), len(indices1))
     assert not np.any(graph.row == graph.col)
     np.testing.assert_array_equal(
-        np.bincount(graph.row, minlength=len(indices1)),
-        np.full(len(indices1), min(indices1.shape[1], indices2.shape[1])),
+        graph.row, np.repeat(np.arange(len(indices1)), indices1.shape[1])
     )
     assert graph.data.dtype == np.float32
     assert np.all(np.isfinite(graph.data))
     assert np.all((graph.data > 0) & (graph.data <= 1))
+    assert modality_weights.dtype == np.float32
     assert modality_weights.shape == (len(indices1), 2)
     assert np.all(np.isfinite(modality_weights))
     assert np.all(modality_weights >= 0)
     np.testing.assert_allclose(modality_weights.sum(axis=1), 1, rtol=1e-6)
+
+
+def test_wnn_integration_rejects_invalid_arguments():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+
+    with pytest.raises(TypeError, match="l2_normalize must be a boolean"):
+        _wnn_integration_many(
+            [("RNA", indices1, ld1), ("ADT", indices2, ld2)],
+            1,
+            l2_normalize="yes",
+        )
+    with pytest.raises(ValueError, match="at least two neighbors per cell"):
+        _wnn_pair("RNA", indices1[:, :1], ld1, "ADT", indices2, ld2, nthreads=1)
+    for embedding in (
+        ld1.astype(complex),
+        ld1.astype(str),
+        ld1 > 0,
+    ):
+        with pytest.raises(TypeError, match="must contain real numeric values"):
+            _wnn_pair("RNA", indices1, embedding, "ADT", indices2, ld2, nthreads=1)
+
+
+def test_wnn_integration_reads_integer_embeddings_as_floats():
+    indices1, _, indices2, ld2 = _multimodal_wnn_inputs()
+    counts = np.arange(16).reshape(8, 2) % 5
+
+    graph, weights = _wnn_pair(
+        "RNA", indices1, counts, "ADT", indices2, ld2, nthreads=1
+    )
+    float_graph, float_weights = _wnn_pair(
+        "RNA", indices1, counts.astype(np.float64), "ADT", indices2, ld2, nthreads=1
+    )
+
+    np.testing.assert_array_equal(graph.col, float_graph.col)
+    np.testing.assert_array_equal(graph.data, float_graph.data)
+    np.testing.assert_array_equal(weights, float_weights)
+
+
+def test_wnn_integration_rejects_distances_that_overflow():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+
+    # Finite coordinates whose squared distances overflow give infinite
+    # distances and so non-finite affinities, which must not be stored.
+    with np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(FloatingPointError, match="non-finite graph weights"):
+            _wnn_pair(
+                "RNA",
+                indices1,
+                ld1 * 1e200,
+                "ADT",
+                indices2,
+                ld2,
+                nthreads=1,
+                l2_normalize=False,
+            )
+
+
+def test_wnn_integration_reports_overflow_in_every_modality():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(
+            FloatingPointError,
+            match="^WNN integration produced non-finite modality weights$",
+        ):
+            _wnn_pair(
+                "RNA",
+                indices1,
+                ld1 * 1e200,
+                "ADT",
+                indices2,
+                ld2 * 1e200,
+                nthreads=1,
+                l2_normalize=False,
+            )
+
+
+def test_diffusion_product_bytes_count_index_widening():
+    from scarf.neighbors.diffusion import _product_bytes
+
+    narrow = csr_matrix(np.eye(2))
+    wide = csr_matrix(np.eye(2))
+    wide.indptr = wide.indptr.astype(np.int64)
+    wide.indices = wide.indices.astype(np.int64)
+
+    # Two rows and columns: int32 output (four 12-byte entries and three
+    # pointers) plus one 16-byte value and link slot per output column.
+    assert _product_bytes(narrow, narrow, 4) == 4 * 12 + 3 * 4 + 2 * 16
+    # int64 operands make every index 8 bytes.
+    assert _product_bytes(wide, wide, 4) == 4 * 16 + 3 * 8 + 2 * 24
+    # An output past the int32 range widens the int32 operands, copying their
+    # two-entry index arrays and three-entry pointers to int64 first.
+    assert _product_bytes(narrow, narrow, 2**31) == (
+        2**31 * 16 + 3 * 8 + 2 * 24 + 8 * (2 + 2 + 3 + 3)
+    )

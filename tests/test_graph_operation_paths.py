@@ -22,7 +22,7 @@ from scarf.storage.artifacts import (
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.utils.logging import logger
 from tests.storage_helpers import write_count_store
-from tests.test_pipeline import _insert_nullable_cell_column
+from tests.storage_helpers import insert_nullable_cell_column
 
 N_CELLS = 40
 
@@ -390,7 +390,7 @@ def test_harmony_reads_masked_batch_labels_as_missing(graph_store) -> None:
     labels = np.where(np.arange(N_CELLS) % 2, "a", "b")
     # Unmasked, the placeholder would be read as a third batch.
     labels[missing] = ""
-    _insert_nullable_cell_column(store, "batch", labels, missing)
+    insert_nullable_cell_column(store, "batch", labels, missing)
 
     with pytest.raises(ValueError, match="cannot contain missing values"):
         store.run_harmony(refs["rna_pca"], ["batch"], harmony_params={"nclust": 3})
@@ -573,3 +573,28 @@ def test_wnn_integration_assembles_coordinates_streamed_in_several_blocks(
             artifact_group(store.zw, split)[name][:],
             artifact_group(store.zw, refs["wnn"])[name][:],
         )
+
+
+def test_densmap_on_an_integrated_graph_runs_and_records_standard_umap(
+    graph_store,
+) -> None:
+    store, refs = graph_store
+    initial = np.random.default_rng(0).normal(size=(N_CELLS, 2)).astype(np.float32)
+    warnings: list[str] = []
+    sink = logger.add(
+        lambda message: warnings.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        requested = store.run_umap(
+            refs["wnn"], initial, n_epochs=5, use_density_map=True
+        )
+    finally:
+        logger.remove(sink)
+
+    assert "DensMap is not available for integrated graphs" in " ".join(warnings)
+    parameters = store.inspect_artifact(requested).parameters
+    assert parameters["use_density_map"] is False
+    assert "densmap_algorithm_version" not in parameters
+    # The request is the standard embedding, so a standard call reuses it.
+    assert store.run_umap(refs["wnn"], initial, n_epochs=5) == requested

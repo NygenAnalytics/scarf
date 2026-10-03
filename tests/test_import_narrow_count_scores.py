@@ -27,9 +27,16 @@ def _scores(tmp_path, dtype: str) -> np.ndarray:
     return store.CRISPR.score_features(features, "I", 3, 4, 1, log_transform=True)
 
 
+@pytest.fixture(scope="module")
+def uint32_scores(tmp_path_factory) -> np.ndarray:
+    """Scores of counts stored as uint32, whose logarithms are float64."""
+    return _scores(tmp_path_factory.mktemp("uint32"), "uint32")
+
+
 @pytest.mark.parametrize("dtype", ["uint8", "uint16", "float32"])
-def test_generic_assay_log_scores_match_every_storage_dtype(tmp_path, dtype):
-    expected = _scores(tmp_path, "uint32")
+def test_generic_assay_log_scores_match_every_storage_dtype(
+    tmp_path, uint32_scores, dtype
+):
     scores = _scores(tmp_path, dtype)
     assert scores.dtype == np.float64
-    np.testing.assert_array_equal(scores, expected)
+    np.testing.assert_array_equal(scores, uint32_scores)

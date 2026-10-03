@@ -206,12 +206,16 @@ def _draw_violin_or_box(
 
     x_key = "group" if orientation == "vertical" else "value"
     y_key = "value" if orientation == "vertical" else "group"
+    # Seaborn infers orientation from column types, and an ungrouped panel's
+    # group column is numeric, so the orientation is stated explicitly.
+    orient = "x" if orientation == "vertical" else "y"
     collections_before = len(ax.collections)
     if kind == "violin":
         sns.violinplot(
             data=df,
             x=x_key,
             y=y_key,
+            orient=orient,
             ax=ax,
             color=None if grouped else color,
             inner=violin_inner,
@@ -226,6 +230,7 @@ def _draw_violin_or_box(
             data=df,
             x=x_key,
             y=y_key,
+            orient=orient,
             ax=ax,
             color=None if grouped else color,
             showfliers=max_points <= 0,
@@ -251,6 +256,7 @@ def _draw_violin_or_box(
                 data=pts,
                 x=x_key,
                 y=y_key,
+                orient=orient,
                 ax=ax,
                 color=None if split else "0.15",
                 size=point_size,

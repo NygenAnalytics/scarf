@@ -10,7 +10,6 @@ import zarr
 
 import scarf.datastore._operations.mapping as mapping_operations
 from scarf.datastore.datastore import DataStore, mount_datastore
-from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.mapping.features import AlignedFeatureStream
 from scarf.mapping.projection import load_projection
 from scarf.storage.artifacts import (
@@ -23,6 +22,7 @@ from scarf.storage.selections import (
     read_stored_selection_indices,
     resolve_generated_selection_artifact,
 )
+from tests.test_mapping_reference import MappingStoreSource, build_mapping_store
 
 
 def _snapshot_store(path: str) -> dict[str, bytes]:
@@ -34,48 +34,26 @@ def _snapshot_store(path: str) -> dict[str, bytes]:
     }
 
 
-def _fixture_graph(datastore) -> ArtifactRef:
-    refs = datastore.list_artifacts(
-        kind="connectivity_map",
-        from_assay="RNA",
-        scope="assay",
-        complete_only=True,
+@pytest.fixture(scope="module")
+def mapping_source(tmp_path_factory) -> MappingStoreSource:
+    return build_mapping_store(
+        tmp_path_factory.mktemp("mapping_orchestration") / "reference.zarr",
+        with_references=True,
     )
-    assert len(refs) == 1
-    return refs[0]
 
 
-def _plain_reference(datastore):
-    graph = _fixture_graph(datastore)
-    raw_neighbors = datastore.inspect_artifact(graph).inputs["neighbors"]
-    neighbors = ArtifactRef.from_dict(raw_neighbors)
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    return datastore.get_mapping_reference(reference_ref)
+@pytest.fixture
+def reference_store(mapping_source, tmp_path) -> DataStore:
+    """A writable copy of the reference store with both references built."""
+    return mapping_source.open_copy(tmp_path / "reference.zarr")
 
 
-def _symphony_reference(datastore):
-    reduction = resolve_native_graph_inputs(
-        datastore.zw,
-        _fixture_graph(datastore),
-    ).coordinates
-    datastore.cells.insert(
-        "mapping_batch",
-        np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
-        overwrite=True,
-    )
-    correction = datastore.run_harmony(
-        reduction,
-        ["mapping_batch"],
-        harmony_params={"nclust": 5},
-    )
-    ann_index = datastore.build_ann_index(correction)
-    neighbors = datastore.query_neighbors(
-        ann_index,
-        coordinates=correction,
-        k=3,
-    )
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    return datastore.get_mapping_reference(reference_ref)
+def _plain_reference(datastore, source: MappingStoreSource):
+    return datastore.get_mapping_reference(source.reference)
+
+
+def _symphony_reference(datastore, source: MappingStoreSource):
+    return datastore.get_mapping_reference(source.symphony_reference)
 
 
 def _copied_query(datastore, path: Path, *, zarr_mode: str = "r+") -> DataStore:
@@ -131,8 +109,8 @@ def _panel_query(
     reference,
     path: Path,
     *,
-    n_overlap: int = 40,
-    n_informative: int = 60,
+    n_overlap: int = 20,
+    n_informative: int = 48,
 ) -> tuple[DataStore, np.ndarray]:
     """Write a targeted-panel query of real reference cells and empty cells.
 
@@ -188,12 +166,12 @@ def _changed_files(
 
 
 def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query.zarr")
     reference_before = _snapshot_store(reference_store.zarr_loc)
     query_before = _snapshot_store(query.zarr_loc)
@@ -353,14 +331,14 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
 
 @pytest.mark.parametrize("method", ["pca", "symphony"])
 def test_mapping_failure_discards_the_projection(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
     method,
 ):
-    reference_store = analyzed_datastore_ephemeral
     reference = (_plain_reference if method == "pca" else _symphony_reference)(
-        reference_store
+        reference_store, mapping_source
     )
     query = _copied_query(reference_store, tmp_path / "query.zarr")
     files = []
@@ -422,11 +400,11 @@ def test_mapping_failure_discards_the_projection(
 
 
 def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query-forged-reference.zarr")
     projection = query.run_mapping(reference, reference.cell_selection)
     forged = replace(
@@ -444,6 +422,8 @@ def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(
         query.run_mapping(forged, reference.cell_selection)
     with pytest.raises(ValueError, match="does not match its stored artifact"):
         query.get_mapping_result(projection, reference=forged)
+    with pytest.raises(TypeError, match="reference must be a MappingReference"):
+        query.get_mapping_result(projection, reference=object())
     with pytest.raises(ValueError, match="does not match its stored artifact"):
         forged.fetch_cell_column("ids")
     with pytest.raises(ValueError, match="does not match its stored artifact"):
@@ -451,12 +431,12 @@ def test_mapping_rejects_reference_handles_forged_from_a_stored_reference(
 
 
 def test_mapping_rejects_feature_axis_changes_during_stream_setup(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query-axis-change.zarr")
     before = set(
         query.list_artifacts(
@@ -497,12 +477,12 @@ def test_mapping_rejects_feature_axis_changes_during_stream_setup(
 
 
 def test_mapping_producer_returns_ref_without_loading_projection(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query-load-fail.zarr")
     before = set(
         list_artifacts(
@@ -543,11 +523,11 @@ def test_mapping_producer_returns_ref_without_loading_projection(
 
 
 def test_mapping_guards_precede_query_writes(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     reference_before = _snapshot_store(reference_store.zarr_loc)
 
     with pytest.raises(ValueError, match="same physical Zarr store"):
@@ -583,7 +563,7 @@ def test_mapping_guards_precede_query_writes(
         writable.run_mapping(
             reference,
             reference.cell_selection,
-            query_assay="assay2",
+            query_assay="ADT",
         )
     assert _snapshot_store(writable.zarr_loc) == writable_before
 
@@ -614,11 +594,11 @@ def test_mapping_guards_precede_query_writes(
 
 
 def test_separately_mounted_query_can_map_its_source_reference(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     reference_before = _snapshot_store(reference_store.zarr_loc)
     read_only_reference_store = DataStore(
         reference_store.zarr_loc,
@@ -651,10 +631,10 @@ def test_separately_mounted_query_can_map_its_source_reference(
 
 
 def test_query_projection_reproduces_stored_reference_coordinates(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     stored = np.asarray(
         artifact_group(reference_store.zw, reference.reduction)["data"][:],
         dtype=np.float64,
@@ -772,16 +752,16 @@ def test_subset_fitted_pca_center_survives_mapping_reference_reload(tmp_path, me
 
 
 def test_self_mapping_recovers_the_reference_graph_and_labels(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
     reference_store.cells.insert(
         "mapping_labels",
         np.array([f"c{index % 7}" for index in range(reference_store.cells.N)]),
         overwrite=True,
     )
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     graph = artifact_group(reference_store.zw, reference.neighbors)
     reference_indices = np.asarray(graph["indices"][:])
     reference_distances = np.asarray(graph["distances"][:], dtype=np.float64)
@@ -860,27 +840,39 @@ def test_self_mapping_recovers_the_reference_graph_and_labels(
 
 
 def test_symphony_mapping_validates_batches_and_persists_diagnostics(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _symphony_reference(reference_store)
+    reference = _symphony_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query.zarr")
     n_cells = reference.selected_cell_count
 
     invalid_frames = (
-        pd.DataFrame(index=np.arange(n_cells)),
-        pd.DataFrame({"batch": ["a"] * (n_cells - 1)}),
-        pd.DataFrame(
-            np.column_stack((np.zeros(n_cells), np.ones(n_cells))),
-            columns=["batch", "batch"],
+        (
+            pd.DataFrame(index=np.arange(n_cells)),
+            "must include at least one column",
         ),
-        pd.DataFrame({"batch": [None] + ["a"] * (n_cells - 1)}),
+        (
+            pd.DataFrame({"batch": ["a"] * (n_cells - 1)}),
+            "one row per selected query cell",
+        ),
+        (
+            pd.DataFrame(
+                np.column_stack((np.zeros(n_cells), np.ones(n_cells))),
+                columns=["batch", "batch"],
+            ),
+            "column names must be unique",
+        ),
+        (
+            pd.DataFrame({"batch": [None] + ["a"] * (n_cells - 1)}),
+            "cannot contain missing values",
+        ),
     )
-    for batches in invalid_frames:
+    for batches, message in invalid_frames:
         before = _snapshot_store(query.zarr_loc)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             query.run_mapping(
                 reference,
                 reference.cell_selection,
@@ -950,14 +942,16 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
     assert (
         query.inspect_artifact(result_ref).parameters["query_batch_model"] == "additive"
     )
+    # The query is the reference itself, so every cell is informative and its
+    # scaled values disperse exactly like the reference they were fitted on.
     assert result.diagnostics == {
         "featureCoverage": 1.0,
         "queryBatchCount": 6,
         "algorithmVariant": "symphony",
-        "uninformativeCellCount": result.diagnostics["uninformativeCellCount"],
-        "queryScaledDispersion": result.diagnostics["queryScaledDispersion"],
+        "uninformativeCellCount": 0,
+        "queryScaledDispersion": pytest.approx(1.0, abs=1e-6),
     }
-    assert accumulated_rows == n_cells - result.diagnostics["uninformativeCellCount"]
+    assert accumulated_rows == n_cells
     assert projected_rows == n_cells
     assert len(files) == 1 and files[0].closed
     loaded = load_projection(query.zw, result_ref, reference=reference)
@@ -978,11 +972,11 @@ def test_symphony_mapping_validates_batches_and_persists_diagnostics(
 
 
 def test_projection_cache_tracks_exact_references(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    first_reference = _plain_reference(reference_store)
+    first_reference = _plain_reference(reference_store, mapping_source)
     second_reference = reference_store.get_mapping_reference(
         reference_store.build_mapping_reference(
             first_reference.neighbors,
@@ -1008,16 +1002,16 @@ def test_projection_cache_tracks_exact_references(
 
 
 def test_zero_overlap_query_cells_are_uninformative(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
     reference_store.cells.insert(
         "mapping_labels",
         np.array([f"c{index % 3}" for index in range(reference_store.cells.N)]),
         overwrite=True,
     )
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query, empty = _panel_query(reference_store, reference, tmp_path / "panel.zarr")
     cells = query.snapshot_cell_selection("I")
     assert len(_selected_rows(query, cells)) == len(empty)
@@ -1059,11 +1053,26 @@ def test_zero_overlap_query_cells_are_uninformative(
         )
     )
     np.testing.assert_array_equal(scores["empty"], 0.0)
-    assert scores["measured"].sum() > 0
+    # Each measured cell adds 1 / (log(1 + d) + 1) to each of its k reference
+    # neighbors; the default multiplier of 1000 is spread over its cells and k.
+    measured = ~expected
+    k = result.indices.shape[1]
+    weights = 1.0 / (np.log1p(result.distances[measured]) + 1.0)
+    np.testing.assert_allclose(
+        scores["measured"],
+        1000.0
+        / (measured.sum() * k)
+        * np.bincount(
+            result.indices[measured].ravel().astype(np.int64),
+            weights=weights.ravel(),
+            minlength=reference.selected_cell_count,
+        ),
+        rtol=1e-12,
+    )
 
     # Symphony statistics use only informative cells, so mapping the
     # informative cells alone reproduces their corrected neighbors.
-    symphony_reference = _symphony_reference(reference_store)
+    symphony_reference = _symphony_reference(reference_store, mapping_source)
     query.cells.insert("measured_cells", ~expected, overwrite=True)
     measured_cells = query.snapshot_cell_selection("measured_cells")
     with_empty = query.get_mapping_result(
@@ -1088,11 +1097,11 @@ def test_zero_overlap_query_cells_are_uninformative(
 
 
 def test_query_scaled_dispersion_ignores_missing_feature_fill(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query, _ = _panel_query(reference_store, reference, tmp_path / "panel.zarr")
     cells = query.snapshot_cell_selection("I")
     dispersion = {
@@ -1106,12 +1115,12 @@ def test_query_scaled_dispersion_ignores_missing_feature_fill(
 
 
 def test_mapping_reuse_does_not_read_query_counts(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
     monkeypatch,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query.zarr")
     projection = query.run_mapping(reference, reference.cell_selection)
 
@@ -1149,11 +1158,11 @@ def test_mapping_reuse_does_not_read_query_counts(
 
 
 def test_projection_inputs_record_query_dataset_fingerprint(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     tmp_path,
 ):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
+    reference = _plain_reference(reference_store, mapping_source)
     query = _copied_query(reference_store, tmp_path / "query.zarr")
     projection = query.run_mapping(reference, reference.cell_selection)
 
@@ -1172,3 +1181,106 @@ def test_projection_inputs_record_query_dataset_fingerprint(
     remapped_inputs = query.inspect_artifact(remapped).inputs or {}
     assert remapped_inputs["query_dataset_fingerprint"] == "rebuilt-query-dataset"
     assert query.get_mapping_result(remapped, reference=reference).ref == remapped
+
+
+def test_run_mapping_rejects_invalid_arguments_before_writing(
+    mapping_source,
+    reference_store,
+    tmp_path,
+):
+    reference = _plain_reference(reference_store, mapping_source)
+    query = _copied_query(reference_store, tmp_path / "query.zarr")
+    before = _snapshot_store(query.zarr_loc)
+
+    for arguments, error, message in (
+        ({"reference": object()}, TypeError, "reference must be a MappingReference"),
+        (
+            {"cell_selection": "cells"},
+            TypeError,
+            "cell_selection must be an ArtifactRef",
+        ),
+        ({"query_assay": " "}, TypeError, "query_assay must be a non-empty string"),
+        ({"query_assay": 3}, TypeError, "query_assay must be a non-empty string"),
+        ({"save_k": 2.0}, TypeError, "save_k must be an integer"),
+        ({"save_k": True}, TypeError, "save_k must be an integer"),
+        ({"save_k": 0}, ValueError, "save_k must be positive"),
+        (
+            {"missing_feature_policy": None},
+            TypeError,
+            "missing_feature_policy must be a string",
+        ),
+        (
+            {"missing_feature_policy": "mean"},
+            ValueError,
+            "missing_feature_policy must be 'reference_mean', 'zero', or 'error'",
+        ),
+        (
+            {"query_batches": {"batch": ["a"]}},
+            TypeError,
+            "query_batches must be a pandas DataFrame or None",
+        ),
+        ({"invalidate_cache": 1}, TypeError, "invalidate_cache must be a boolean"),
+        ({"query_assay": "protein"}, ValueError, "Query assay 'protein' was not found"),
+    ):
+        call = {
+            "reference": reference,
+            "cell_selection": reference.cell_selection,
+            **arguments,
+        }
+        with pytest.raises(error, match=message):
+            query.run_mapping(call.pop("reference"), call.pop("cell_selection"), **call)
+    assert _snapshot_store(query.zarr_loc) == before
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("shifted", "Aligned query blocks are not contiguous"),
+        ("truncated", "Mapping did not cover all selected query cells"),
+        ("renamed", "Query feature identities changed during mapping"),
+    ],
+)
+def test_mapping_discards_the_projection_of_an_inconsistent_stream(
+    mapping_source,
+    reference_store,
+    tmp_path,
+    monkeypatch,
+    change,
+    message,
+):
+    from dataclasses import replace as replace_fields
+
+    reference = _plain_reference(reference_store, mapping_source)
+    query = _copied_query(reference_store, tmp_path / "query.zarr")
+    before = set(query.list_artifacts(kind="projection", from_assay="RNA"))
+    live_ids = query.RNA.feats._get_array("ids")
+    original_ids = np.asarray(live_ids[:]).copy()
+    original_iter_blocks = AlignedFeatureStream.iter_blocks
+
+    def inconsistent_blocks(stream):
+        blocks = list(original_iter_blocks(stream))
+        if change == "shifted":
+            blocks = [
+                replace_fields(block, row_offset=block.row_offset + 1)
+                for block in blocks
+            ]
+        elif change == "truncated":
+            last = blocks[-1]
+            blocks[-1] = replace_fields(
+                last, values=last.values[:-1], observed=last.observed[:-1]
+            )
+        yield from blocks
+        if change == "renamed":
+            # The query assay is rebuilt while its blocks are being mapped.
+            live_ids[:] = np.roll(original_ids, 1)
+
+    monkeypatch.setattr(AlignedFeatureStream, "iter_blocks", inconsistent_blocks)
+    try:
+        with pytest.raises((RuntimeError, ValueError), match=message) as caught:
+            query.run_mapping(reference, reference.cell_selection)
+    finally:
+        live_ids[:] = original_ids
+
+    expected_error = ValueError if change == "renamed" else RuntimeError
+    assert caught.type is expected_error
+    assert set(query.list_artifacts(kind="projection", from_assay="RNA")) == before

@@ -75,6 +75,13 @@ MPLBACKEND=Agg SCARF_RUN_VISUAL_REGRESSION=1 \
   uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
 ```
 
+Performance changes to a kernel or stage: run the timed micro-benchmarks on a quiet machine. They
+project each slowdown onto 1M and 10M cells and fail only on a meaningful projected delay:
+
+```bash
+SCARF_RUN_BENCHMARKS=1 uv run pytest -n 0 tests/benchmarks
+```
+
 ## Troubleshooting router
 
 - Wrong code location or import cycle: read the architecture placement rules and run
@@ -86,6 +93,8 @@ MPLBACKEND=Agg SCARF_RUN_VISUAL_REGRESSION=1 \
 - On-disk layout: read `docs/source/developers/zarr_internals.md`.
 - Documentation cache or build: follow `docs/AGENTS.md`.
 - Profiling, Modal, or benchmark interpretation: follow `profiling/AGENTS.md`.
+- Micro-benchmark regression or baseline update: read the performance benchmarks section of
+  `docs/source/developers/contributing.md`.
 
 ## Universal safety
 

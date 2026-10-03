@@ -23,7 +23,6 @@ from scarf.mapping.label_transfer import (
     write_label_transfer,
     write_reference_labels,
 )
-from scarf.mapping.models import LabelTransferResult
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
 from scarf.storage.artifacts import (
     ArtifactRef,
@@ -609,7 +608,6 @@ def test_label_transfer_result_rejects_misaligned_arrays() -> None:
             vote_class_codes=np.zeros((3, 2), dtype=np.int64),
             vote_class_fractions=np.zeros((3, 3)),
         )
-    assert isinstance(loaded, LabelTransferResult)
 
 
 def test_loader_passes_artifact_resolution_errors_through() -> None:

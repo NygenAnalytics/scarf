@@ -69,7 +69,9 @@ agent = [
 ]
 extra = [
     "anndata>=0.12",
-    "kneed>=0.8",
+    # kneed 0.8.0 opens its VERSION file relative to the working directory,
+    # so it cannot be imported from an installed environment.
+    "kneed>=0.8.1",
     "matplotlib>=3.9",
     "seaborn>=0.13",
     "ipython-autotime>=0.3",
@@ -127,6 +129,7 @@ markers = [
     "integration: live network tests",
     "slow: tests that build graphs or run iterative numerical workflows",
     "visual: deterministic image comparison tests",
+    "benchmark: scaling micro-benchmarks, timed only with SCARF_RUN_BENCHMARKS=1",
 ]
 testpaths = [
     "tests",
@@ -139,6 +142,9 @@ norecursedirs = [
 source = ["scarf"]
 omit = ["scarf/_version.py"]
 parallel = true
+# sys.monitoring measures the same lines with less overhead than the C tracer
+# on Python 3.12 and 3.13; coverage already uses it on Python 3.14.
+core = "sysmon"
 
 [tool.interrogate]
 ignore-init-method = true

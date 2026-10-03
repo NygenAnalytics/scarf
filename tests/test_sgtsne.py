@@ -371,6 +371,30 @@ def test_quiet_sgtsnepi_backend_keeps_standard_descriptors(tmp_path):
     assert "Number of vertices" not in completed.stderr
 
 
+def test_quiet_sgtsnepi_backend_suppresses_notebook_streams(monkeypatch, capsys):
+    pytest.importorskip("sgtsnepi")
+    monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
+    n_cells = 40
+    rows = np.repeat(np.arange(n_cells), 2)
+    columns = np.column_stack(
+        ((np.arange(n_cells) + 1) % n_cells, (np.arange(n_cells) - 1) % n_cells)
+    ).ravel()
+    graph = csr_matrix((np.ones(2 * n_cells) / 2, (rows, columns)))
+    initial = np.random.default_rng(0).normal(scale=1e-4, size=(n_cells, 2))
+    streams = sys.stdout, sys.stderr
+
+    embedding = sgtsne_module.run_sgtsne(
+        graph, initial, max_iter=10, early_iter=5, verbose=False
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert (sys.stdout, sys.stderr) == streams
+    assert embedding.shape == (2, n_cells)
+    assert np.isfinite(embedding).all()
+
+
 def test_run_sgtsne_requires_an_available_backend(monkeypatch):
     monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
     monkeypatch.setitem(sys.modules, "sgtsnepi", None)
@@ -379,4 +403,24 @@ def test_run_sgtsne_requires_an_available_backend(monkeypatch):
         sgtsne_module.run_sgtsne(
             csr_matrix((1, 1), dtype=np.float64),
             np.zeros((1, 2)),
+        )
+
+
+def test_export_knn_to_mtx_writes_every_row_block(tmp_path):
+    rng = np.random.default_rng(3)
+    dense = (rng.random((7, 7)) < 0.4) * rng.random((7, 7))
+    path = tmp_path / "graph.mtx"
+
+    # Blocks of three rows leave a final block of one.
+    sgtsne_module.export_knn_to_mtx(str(path), csr_matrix(dense), batch_size=3)
+
+    np.testing.assert_array_equal(mmread(path, spmatrix=False).toarray(), dense)
+
+
+def test_export_knn_to_mtx_refuses_a_batch_size_that_skips_rows(tmp_path):
+    # A negative batch size iterates no row blocks; the row count check stops
+    # the header-only file from passing as the whole graph.
+    with pytest.raises(ValueError, match="Internal loop count error"):
+        sgtsne_module.export_knn_to_mtx(
+            str(tmp_path / "graph.mtx"), _graph(), batch_size=-1
         )

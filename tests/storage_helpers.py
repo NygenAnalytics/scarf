@@ -1,6 +1,7 @@
 """Storage helpers for tests that build Scarf stores directly."""
 
 from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import zarr
@@ -64,6 +65,20 @@ def write_count_store(
         array[:] = stored
         finalize_test_counts(array)
         finalize_writer_counts_t(root, assay, None)
+
+
+def insert_nullable_cell_column(
+    datastore: Any,
+    name: str,
+    values: np.ndarray,
+    missing: np.ndarray,
+) -> None:
+    """Add a cell metadata column whose ``missing`` rows carry no value."""
+    cell_data = datastore.zw["cellData"]
+    missing_name = f"__scarf_missing__{name}"
+    cell_data.create_array(name, data=np.asarray(values))
+    cell_data.create_array(missing_name, data=np.asarray(missing, dtype=bool))
+    cell_data[name].attrs["missing_mask"] = missing_name
 
 
 def reset_zarr_runtime() -> None:

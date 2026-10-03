@@ -187,6 +187,9 @@ def test_harmony_parameters_are_validated_without_data():
         ({"epsilon_cluster": "small"}, TypeError, "epsilon_cluster"),
         ({"sigma": 0.0}, ValueError, "sigma values must be finite and positive"),
         ({"sigma": None}, TypeError, "sigma must contain real numbers"),
+        ({"sigma": "wide"}, TypeError, "sigma must contain real numbers"),
+        ({"theta": [1.0, "high"]}, TypeError, "theta must contain real numbers"),
+        ({"lamb": {"batch": 1.0}}, TypeError, "lamb must contain real numbers"),
         ({"theta": [1.0, -1.0]}, ValueError, "theta values"),
         ({"lamb": np.inf}, ValueError, "lamb values"),
         ({"cluster_fn": "unknown"}, ValueError, "cluster_fn"),
@@ -239,8 +242,12 @@ def test_fit_harmony_expands_per_column_parameters_and_records_callable(monkeypa
         cluster_fn=cluster_backend,
     )
 
-    assert captured["theta"].shape == (4,)
-    np.testing.assert_array_equal(np.diag(captured["ridge"])[1:], [1, 2, 3, 4])
+    # One theta per column expands to its two levels; with tau, each level's
+    # theta shrinks by 1 - exp(-(cells / (nclust * tau)) ** 2), here 1 - 1/e.
+    np.testing.assert_allclose(
+        captured["theta"], np.array([2.0, 2.0, 3.0, 3.0]) * (1 - np.exp(-1.0))
+    )
+    np.testing.assert_array_equal(np.diag(captured["ridge"]), [0, 1, 2, 3, 4])
     assert result.parameters["clusterBackend"].endswith(".cluster_backend")
 
 
@@ -339,3 +346,71 @@ def test_harmony_centroids_match_final_assignments_and_coordinates():
     expected = normalized @ result.assignments.T
     expected /= np.linalg.norm(expected, axis=0, keepdims=True)
     np.testing.assert_allclose(result.centroids, expected)
+
+
+def test_harmony_uses_a_callable_cluster_backend():
+    from sklearn.cluster import KMeans
+
+    values = np.random.default_rng(11).normal(size=(4, 16))
+    metadata = pd.DataFrame({"batch": ["a", "b"] * 8})
+    calls = []
+
+    def kmeans_backend(data, n_clusters):
+        calls.append((data.copy(), n_clusters))
+        return (
+            KMeans(
+                n_clusters=n_clusters,
+                init="k-means++",
+                n_init=10,
+                max_iter=25,
+                random_state=0,
+            )
+            .fit(data)
+            .cluster_centers_
+        )
+
+    options = {"nclust": 3, "max_iter_harmony": 2, "max_iter_kmeans": 2}
+    custom = harmony.fit_harmony(values, metadata, cluster_fn=kmeans_backend, **options)
+    default = harmony.fit_harmony(values, metadata, **options)
+
+    ((data, n_clusters),) = calls
+    assert n_clusters == 3
+    # The backend clusters cells by direction: unit-length rows of the input.
+    np.testing.assert_allclose(data, (values / np.linalg.norm(values, axis=0)).T)
+    # A backend that reproduces the default k-means gives the default fit.
+    np.testing.assert_allclose(custom.corrected, default.corrected)
+    assert custom.parameters["clusterBackend"].endswith(".kmeans_backend")
+
+
+def test_moe_correct_ridge_matches_a_hand_solved_ridge_regression():
+    # One cluster holding four cells in two batches, with ridge penalty 1 on
+    # each batch level and none on the intercept.
+    values = np.array([[1.0, 3.0, 10.0, 14.0]])
+    design = np.array(
+        [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0]]
+    )
+
+    unit, corrected = harmony.moe_correct_ridge(
+        values, np.ones((1, 4)), 1, design, np.diag([0.0, 1.0, 1.0])
+    )
+
+    # (X X^T + L) W = X Z^T gives intercept 7 and batch effects -10/3 and
+    # 10/3; removing the batch terms moves each batch 10/3 toward the other.
+    np.testing.assert_allclose(
+        corrected, [[1 + 10 / 3, 3 + 10 / 3, 10 - 10 / 3, 14 - 10 / 3]]
+    )
+    np.testing.assert_allclose(unit, np.ones((1, 4)))
+    np.testing.assert_array_equal(values, [[1.0, 3.0, 10.0, 14.0]])
+
+
+def test_moe_correct_ridge_rejects_a_singular_system():
+    # A batch level without cells and without a ridge penalty leaves its
+    # coefficient undetermined.
+    design = np.array(
+        [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]
+    )
+
+    with pytest.raises(ValueError, match="Harmony ridge system is singular"):
+        harmony.moe_correct_ridge(
+            np.ones((2, 4)), np.ones((1, 4)), 1, design, np.zeros((3, 3))
+        )

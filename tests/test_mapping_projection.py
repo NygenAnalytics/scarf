@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import zarr
@@ -430,72 +432,83 @@ def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
 
 
 @pytest.mark.parametrize(
-    ("indices", "distances", "uninformative", "message"),
+    ("indices", "distances", "uninformative", "error", "message"),
     [
         (
             np.ones((2, 2), dtype=np.int64),
             np.ones((2, 2), dtype=np.float64),
             np.zeros(2, dtype=bool),
-            "unsigned",
+            TypeError,
+            "indices must use an unsigned integer dtype",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.ones((2, 2), dtype=np.int64),
             np.zeros(2, dtype=bool),
-            "floating",
+            TypeError,
+            "distances must use a floating dtype",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.ones((2, 2), dtype=np.float64),
             np.zeros(2, dtype=np.uint8),
-            "boolean",
+            TypeError,
+            "uninformative values must be boolean",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.ones((2, 1), dtype=np.float64),
             np.zeros(2, dtype=bool),
+            ValueError,
             "match the index block shape",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.ones((2, 2), dtype=np.float64),
             np.zeros((2, 1), dtype=bool),
+            ValueError,
             "one value per row",
         ),
         (
             np.ones((0, 2), dtype=np.uint32),
             np.ones((0, 2), dtype=np.float64),
             np.zeros(0, dtype=bool),
+            ValueError,
             "cannot be empty",
         ),
         (
             np.zeros((5, 2), dtype=np.uint32),
             np.ones((5, 2), dtype=np.float64),
             np.zeros(5, dtype=bool),
+            ValueError,
             "exceeds the declared cell count",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.array([[0.0, np.nan], [1.0, 2.0]]),
             np.zeros(2, dtype=bool),
-            "finite",
+            ValueError,
+            "distances must be finite",
         ),
         (
             np.ones((2, 2), dtype=np.uint32),
             np.array([[0.0, -1.0], [1.0, 2.0]]),
             np.zeros(2, dtype=bool),
-            "non-negative",
+            ValueError,
+            "distances must be non-negative",
         ),
         (
             np.ones((2, 1), dtype=np.uint32),
             np.ones((2, 1), dtype=np.float64),
             np.zeros(2, dtype=bool),
-            "shape",
+            ValueError,
+            r"index blocks must have shape \(rows, 2\)",
         ),
         (
             np.array([[0, 3], [1, 2]], dtype=np.uint32),
             np.ones((2, 2), dtype=np.float64),
             np.zeros(2, dtype=bool),
+            ValueError,
             "selected reference cells",
         ),
     ],
@@ -504,6 +517,7 @@ def test_projection_writer_aborts_after_invalid_block(
     indices: np.ndarray,
     distances: np.ndarray,
     uninformative: np.ndarray,
+    error: type[Exception],
     message: str,
 ) -> None:
     root, cell_selection, feature_selection = _query_inputs()
@@ -511,12 +525,22 @@ def test_projection_writer_aborts_after_invalid_block(
     plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
     writer = ProjectionWriter(root, plan, chunk_rows=2)
 
-    with pytest.raises((TypeError, ValueError), match=message):
+    with pytest.raises(error, match=message):
         writer.write_block(0, indices, distances, uninformative)
 
     assert not inspect_artifact(root, plan.ref).exists
     with pytest.raises(RuntimeError, match="aborted"):
         writer.finish(_diagnostics())
+
+
+def test_projection_writer_requires_a_projection_plan() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+
+    with pytest.raises(TypeError, match="plan must be a ProjectionPlan"):
+        ProjectionWriter(root, plan.artifact, chunk_rows=2)  # type: ignore[arg-type]
+    assert not inspect_artifact(root, plan.ref).exists
 
 
 def test_projection_writer_constructor_and_start_failures_leave_incomplete_artifacts(
@@ -752,7 +776,7 @@ def test_projection_finish_rejects_invalid_diagnostics_and_aborts(
     diagnostics = _diagnostics()
     diagnostics[field] = value
 
-    with pytest.raises((TypeError, ValueError), match=message):
+    with pytest.raises(ValueError, match=message):
         writer.finish(diagnostics)
 
     _assert_aborted(writer)
@@ -908,6 +932,7 @@ def test_projection_loader_rejects_malformed_or_extra_payload(
     ("tamper", "message"),
     [
         ("index_dtype", "unsigned integer"),
+        ("index_rank", "indices must be a non-empty matrix"),
         ("distance_dtype", "floating matrix"),
         ("distance_shape", "floating matrix"),
         ("uninformative_dtype", "boolean row vector"),
@@ -935,6 +960,12 @@ def test_projection_loader_rejects_shape_dtype_and_value_tampering(
             group,
             "indices",
             np.asarray(group["indices"][:], dtype=np.int64),
+        )
+    elif tamper == "index_rank":
+        _replace_array(
+            group,
+            "indices",
+            np.asarray(group["indices"][:, 0], dtype=np.uint64),
         )
     elif tamper == "distance_dtype":
         _replace_array(
@@ -1128,6 +1159,9 @@ def test_projection_loader_rejects_invalid_call_and_artifact_handles() -> None:
         ("parameters", "parameters do not match"),
         ("policy", "missing_feature_policy is unsupported"),
         ("correction", "correction_method is unsupported"),
+        ("symphony_correction", "correction method does not match its mapping"),
+        ("save_k", "neighbor count does not match save_k"),
+        ("smaller_selection", "rows do not match the stored query cell selection"),
         ("inputs", "inputs do not match"),
         ("fingerprint", "query_dataset_fingerprint"),
         ("dataset", "prepared query assay"),
@@ -1156,6 +1190,20 @@ def test_projection_loader_rejects_malformed_provenance(
         parameters["missing_feature_policy"] = "guess"
     elif tamper == "correction":
         parameters["correction_method"] = "banana"
+    elif tamper == "symphony_correction":
+        # A complete Symphony record cannot be loaded with a plain reference.
+        parameters["correction_method"] = "symphony"
+        parameters["query_batch_model"] = "additive"
+    elif tamper == "save_k":
+        parameters["save_k"] = 3
+    elif tamper == "smaller_selection":
+        # A valid selection of three of the four cells shares the row axis.
+        inputs["cell_selection"] = _selection(
+            root,
+            kind="cell_selection",
+            values=np.array([True, True, True, False]),
+            assay=None,
+        ).to_dict()
     elif tamper == "inputs":
         inputs.pop("query_batch_fingerprint")
     elif tamper == "fingerprint":
@@ -1386,3 +1434,118 @@ def test_projection_rejects_fingerprint_consistent_wrong_reference_overlap() -> 
             feature_selection,
             reference.external_ref,
         )
+
+
+def _plan_arguments(
+    cell_selection: ArtifactRef,
+    feature_selection: ArtifactRef,
+    reference: MappingReference,
+) -> dict[str, object]:
+    return {
+        "query_assay": "RNA",
+        "n_cells": 4,
+        "save_k": 2,
+        "missing_feature_policy": "reference_mean",
+        "correction_method": "none",
+        "cell_selection": cell_selection,
+        "feature_selection": feature_selection,
+        "query_dataset_fingerprint": "query-dataset",
+        "query_batch_fingerprint": NO_QUERY_BATCH_FINGERPRINT,
+        "query_batch_count": 1,
+        "mapping_reference": reference.external_ref,
+        "reference": reference,
+        "reference_cell_count": reference.selected_cell_count,
+    }
+
+
+def test_plan_projection_requires_counts_and_methods_of_its_reference() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    other_reference, _ = _mapping_reference(token="b")
+    arguments = _plan_arguments(cell_selection, feature_selection, reference)
+
+    for changes, error, message in (
+        (
+            {"query_batch_count": 5},
+            ValueError,
+            "query_batch_count cannot exceed n_cells",
+        ),
+        (
+            {"reference": object()},
+            TypeError,
+            "reference must be a MappingReference",
+        ),
+        (
+            {"reference": other_reference},
+            ValueError,
+            "mapping_reference does not match reference",
+        ),
+        (
+            {"reference_cell_count": 4},
+            ValueError,
+            "reference_cell_count does not match reference",
+        ),
+        (
+            {"correction_method": "symphony"},
+            ValueError,
+            "correction_method does not match reference",
+        ),
+    ):
+        with pytest.raises(error, match=message):
+            plan_projection(root, **{**arguments, **changes})  # type: ignore[arg-type]
+
+    assert not list_artifacts(root, scope="assay", assay="RNA", kind="projection")
+    # The unchanged arguments plan a fresh projection.
+    assert not plan_projection(root, **arguments).reused  # type: ignore[arg-type]
+
+
+def test_projection_feature_selection_must_be_the_overlap_of_its_reference() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    all_features = inspect_artifact(root, feature_selection).input_ref("all_features")
+    # The overlap selection names reference "a"; a handle for "b" is consistent
+    # with its own external ref but not with the stored selection lineage.
+    other_reference, _ = _mapping_reference(token="b")
+
+    with pytest.raises(ValueError, match="not produced by select_mapping_overlap"):
+        plan_projection(
+            root,
+            **{  # type: ignore[arg-type]
+                **_plan_arguments(cell_selection, feature_selection, reference),
+                "feature_selection": all_features,
+            },
+        )
+    with pytest.raises(ValueError, match="belongs to a different mapping reference"):
+        plan_projection(
+            root,
+            **_plan_arguments(  # type: ignore[arg-type]
+                cell_selection, feature_selection, other_reference
+            ),
+        )
+    without_features = replace(reference, feature_ids=np.array([], dtype=str))
+    with pytest.raises(ValueError, match="feature identifiers are malformed"):
+        plan_projection(
+            root,
+            **_plan_arguments(  # type: ignore[arg-type]
+                cell_selection, feature_selection, without_features
+            ),
+        )
+    assert not list_artifacts(root, scope="assay", assay="RNA", kind="projection")
+
+    # A stored projection is held to the same lineage when it is loaded.
+    ref = _write(
+        root, _plan(root, cell_selection, feature_selection, reference.external_ref)
+    )
+    with pytest.raises(ValueError, match="feature identifiers are malformed"):
+        load_projection(root, ref, reference=without_features)
+
+
+@pytest.mark.parametrize("name", ["payload_fingerprint", "model_digest"])
+@pytest.mark.parametrize("value", ["", None])
+def test_mapping_reference_handle_requires_its_digests(name: str, value) -> None:
+    reference, _ = _mapping_reference()
+
+    with pytest.raises(
+        TypeError, match=f"Mapping reference {name} must be a non-empty"
+    ):
+        replace(reference, **{name: value})

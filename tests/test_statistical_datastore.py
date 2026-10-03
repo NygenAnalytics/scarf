@@ -4,6 +4,7 @@ from typing import get_type_hints
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 from scarf import ArtifactRef, DataStore
 from scarf.features.statistical import (
@@ -27,6 +28,28 @@ def _insert_group_columns(ds):
     ds.cells.insert("stat_sample", samples, overwrite=True)
     ds.cells.insert("stat_subject", subjects, overwrite=True)
     return groups2, groups3, samples, subjects
+
+
+def _library_size_values(ds: DataStore, name: str, log1p: bool = False) -> np.ndarray:
+    """Normalize one gene of the active cells from its raw counts and totals."""
+    cells = np.asarray(ds.cells.active_index("I"))
+    names = np.asarray(ds.RNA.feats.fetch_all("names"))
+    (feature,) = np.flatnonzero(names == name)
+    counts = ds.RNA.rawData[cells, :][:, [feature]].compute()[:, 0]
+    totals = np.asarray(ds.cells.fetch_all("RNA_nCounts"), dtype=np.float64)[cells]
+    totals[totals == 0] = 1
+    values = float(ds.RNA.sf) * counts.astype(np.float64) / totals
+    return np.log1p(values) if log1p else values
+
+
+def _bh(p_values: list[float]) -> np.ndarray:
+    """Benjamini-Hochberg step-up adjustment of a few p-values."""
+    p_values = np.asarray(p_values, dtype=np.float64)
+    order = np.argsort(p_values)
+    scaled = p_values[order] * len(p_values) / np.arange(1, len(p_values) + 1)
+    adjusted = np.empty_like(p_values)
+    adjusted[order] = np.minimum.accumulate(scaled[::-1])[::-1].clip(max=1.0)
+    return adjusted
 
 
 def _active_metadata_grouping(
@@ -65,7 +88,7 @@ def _test_grouping_artifact(ds: DataStore, values: np.ndarray) -> ArtifactRef:
 
 def test_run_statistical_testing_mann_whitney(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    groups2, *_ = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1", "B2M"],
@@ -98,9 +121,31 @@ def test_run_statistical_testing_mann_whitney(datastore_ephemeral):
             "p_value",
             "p_value_adjusted",
         } <= set(table.columns)
-        assert table["p_value"].between(0, 1).all()
-        assert table["p_value_adjusted"].between(0, 1).all()
         assert table["n_1"].iloc[0] + table["n_2"].iloc[0] == result.n_cells
+    # The tables test the library-size values of the active cells.
+    p_values = []
+    for key in ("MALAT1", "B2M"):
+        values = _library_size_values(ds, key)
+        first, second = values[groups2 == "g0"], values[groups2 == "g1"]
+        expected = stats.mannwhitneyu(
+            first, second, method="asymptotic", use_continuity=True
+        )
+        row = result.tables[key].iloc[0]
+        assert (row["group_1"], row["group_2"]) == ("g0", "g1")
+        assert (row["n_1"], row["n_2"]) == (len(first), len(second))
+        assert row["u_statistic"] == expected.statistic
+        assert row["p_value"] == pytest.approx(expected.pvalue, rel=1e-9)
+        assert row["mean_1"] == pytest.approx(first.mean(), rel=1e-9)
+        assert row["mean_difference"] == pytest.approx(
+            first.mean() - second.mean(), rel=1e-9
+        )
+        p_values.append(row["p_value"])
+    # One correction pools the p-values of every key.
+    np.testing.assert_allclose(
+        [result.tables[key].loc[0, "p_value_adjusted"] for key in ("MALAT1", "B2M")],
+        _bh(p_values),
+        rtol=1e-12,
+    )
 
 
 def test_get_statistical_tests_round_trip(datastore_ephemeral):
@@ -355,8 +400,10 @@ def test_statistical_design_rules_reject_unusable_requests(
 
 
 def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
+    from tests.test_statistical import _dunn_reference
+
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    _, groups3, *_ = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group3")
     result = ds.run_statistical_testing(
         ["MALAT1"],
@@ -375,7 +422,20 @@ def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
     assert list(posthoc["group_1"]) == ["g0"]
     assert list(posthoc["group_2"]) == ["g2"]
     assert {"z", "p_value", "p_value_adjusted"} <= set(posthoc.columns)
-    assert posthoc["p_value"].between(0, 1).all()
+    values = _library_size_values(ds, "MALAT1")
+    expected = stats.kruskal(
+        *(values[groups3 == group] for group in ("g0", "g1", "g2"))
+    )
+    assert omnibus.loc[0, "kruskal_statistic"] == pytest.approx(
+        expected.statistic, rel=1e-9
+    )
+    assert omnibus.loc[0, "p_value"] == pytest.approx(expected.pvalue, rel=1e-9)
+    # Dunn's z ranks every group's cells, then compares only the listed pair.
+    dunn = _dunn_reference(values, groups3).set_index(["group_1", "group_2"])
+    assert posthoc.loc[0, "z"] == pytest.approx(dunn.loc[("g0", "g2"), "z"], rel=1e-9)
+    assert posthoc.loc[0, "p_value"] == pytest.approx(
+        dunn.loc[("g0", "g2"), "p_value"], rel=1e-9
+    )
     assert result.artifact is not None
     loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["MALAT1"].to_dict("records") == omnibus.to_dict("records")
@@ -386,7 +446,7 @@ def test_run_statistical_testing_kruskal_dunn(datastore_ephemeral):
 
 def test_run_statistical_testing_wilcoxon_paired(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    groups2, _, samples, subjects = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1"],
@@ -404,7 +464,25 @@ def test_run_statistical_testing_wilcoxon_paired(datastore_ephemeral):
     assert {"group_1", "group_2", "n_pairs", "statistic", "p_value"} <= set(
         table.columns
     )
-    assert table["n_pairs"].iloc[0] >= 2
+    # Every subject holds one sample in each condition, so three pairs of
+    # sample means are tested.
+    means = (
+        pd.DataFrame(
+            {
+                "value": _library_size_values(ds, "MALAT1"),
+                "group": groups2,
+                "subject": subjects,
+                "sample": samples,
+            }
+        )
+        .groupby(["subject", "group"])["value"]
+        .mean()
+        .unstack("group")
+    )
+    expected = stats.wilcoxon(means["g0"], means["g1"])
+    assert table.loc[0, "n_pairs"] == len(means) == 3
+    assert table.loc[0, "statistic"] == pytest.approx(expected.statistic, rel=1e-12)
+    assert table.loc[0, "p_value"] == pytest.approx(expected.pvalue, rel=1e-12)
     assert result.artifact is not None
     loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.tables["MALAT1"].to_dict("records") == table.to_dict("records")
@@ -434,7 +512,7 @@ def test_run_statistical_testing_rejects_missing_pair_in_selection(
 
 def test_run_statistical_testing_cell_field_key(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    groups2, *_ = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         "RNA_nCounts",
@@ -442,7 +520,18 @@ def test_run_statistical_testing_cell_field_key(datastore_ephemeral):
     )
     assert result.method == "mann_whitney"
     assert "RNA_nCounts" in result.tables
-    assert result.tables["RNA_nCounts"]["p_value"].notna().all()
+    totals = np.asarray(ds.cells.fetch_all("RNA_nCounts"), dtype=np.float64)[
+        np.asarray(ds.cells.active_index("I"))
+    ]
+    assert result.tables["RNA_nCounts"].loc[0, "p_value"] == pytest.approx(
+        stats.mannwhitneyu(
+            totals[groups2 == "g0"],
+            totals[groups2 == "g1"],
+            method="asymptotic",
+            use_continuity=True,
+        ).pvalue,
+        rel=1e-9,
+    )
     assert result.artifact is not None
     assert result.artifact.scope == "datastore"
     assert result.grouping is None
@@ -539,14 +628,40 @@ def test_summary_scope_is_persisted(datastore_ephemeral):
 
 def test_run_statistical_testing_normalization_option(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
-    result = ds.run_statistical_testing(
+    groups2, *_ = _insert_group_columns(ds)
+    grouping = _active_metadata_grouping(ds, "stat_group2")
+    logged = ds.run_statistical_testing(
         ["MALAT1"],
         normalization=NormalizationSpec(source="assay", transform="log1p"),
-        **_active_metadata_grouping(ds, "stat_group2"),
+        **grouping,
+    ).tables["MALAT1"]
+    raw = ds.run_statistical_testing(
+        ["MALAT1"],
+        normalization=NormalizationSpec(source="raw", transform="none"),
+        **grouping,
+    ).tables["MALAT1"]
+
+    # Ranks ignore the monotone logarithm; means do not.
+    values = _library_size_values(ds, "MALAT1", log1p=True)
+    assert logged.loc[0, "mean_1"] == pytest.approx(
+        values[groups2 == "g0"].mean(), rel=1e-9
     )
-    assert result.tables["MALAT1"]["p_value"].notna().all()
-    assert result.tables["MALAT1"]["mean_1"].iloc[0] >= 0
+    assert logged.loc[0, "mean_2"] == pytest.approx(
+        values[groups2 == "g1"].mean(), rel=1e-9
+    )
+    assert logged.loc[0, "p_value"] == pytest.approx(
+        stats.mannwhitneyu(
+            values[groups2 == "g0"],
+            values[groups2 == "g1"],
+            method="asymptotic",
+            use_continuity=True,
+        ).pvalue,
+        rel=1e-9,
+    )
+    counts = ds.RNA.rawData[np.asarray(ds.cells.active_index("I")), :][
+        :, [int(np.flatnonzero(ds.RNA.feats.fetch_all("names") == "MALAT1")[0])]
+    ].compute()[:, 0]
+    assert raw.loc[0, "mean_1"] == pytest.approx(counts[groups2 == "g0"].mean())
 
 
 def test_run_statistical_testing_skip_save(datastore_ephemeral):
@@ -798,7 +913,7 @@ def test_get_statistical_tests_errors(datastore_ephemeral):
 
 def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    groups2, *_ = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group2")
     result = ds.run_statistical_testing(
         ["MALAT1"],
@@ -811,8 +926,16 @@ def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
     assert result.equal_var is False
     table = result.tables["MALAT1"]
     assert tuple(table.columns) == (*WELCH_COLUMNS, "p_value_adjusted")
-    assert table["p_value"].between(0, 1).all()
-    assert bool((table["df"] > 0).all())
+    values = _library_size_values(ds, "MALAT1")
+    expected = stats.ttest_ind(
+        values[groups2 == "g0"],
+        values[groups2 == "g1"],
+        equal_var=False,
+        alternative="less",
+    )
+    assert table.loc[0, "t_statistic"] == pytest.approx(expected.statistic, rel=1e-9)
+    assert table.loc[0, "df"] == pytest.approx(expected.df, rel=1e-9)
+    assert table.loc[0, "p_value"] == pytest.approx(expected.pvalue, rel=1e-9)
     assert result.artifact is not None
     loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.alternative == "less"
@@ -844,7 +967,7 @@ def test_welch_groups_restriction_and_contrast_direction(datastore_ephemeral):
 
 def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
     ds = datastore_ephemeral
-    _insert_group_columns(ds)
+    _, groups3, *_ = _insert_group_columns(ds)
     grouping = _active_metadata_grouping(ds, "stat_group3")
     result = ds.run_statistical_testing(
         ["MALAT1", "B2M"],
@@ -857,7 +980,15 @@ def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
         table = result.tables[key]
         assert set(ANOVA_COLUMNS) <= set(table.columns)
         assert table.loc[0, "df_between"] == 2
-        assert table["p_value"].between(0, 1).all()
+        assert table.loc[0, "df_within"] == result.n_cells - 3
+        values = _library_size_values(ds, key)
+        expected = stats.f_oneway(
+            *(values[groups3 == group] for group in ("g0", "g1", "g2"))
+        )
+        assert table.loc[0, "f_statistic"] == pytest.approx(
+            expected.statistic, rel=1e-9
+        )
+        assert table.loc[0, "p_value"] == pytest.approx(expected.pvalue, rel=1e-9)
     assert result.artifact is not None
     loaded = ds.get_statistical_tests(result.artifact)
     assert loaded.equal_var is None

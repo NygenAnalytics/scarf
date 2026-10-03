@@ -34,57 +34,73 @@ When sources must be analysed together in one store, start with {doc}`dataset_me
 In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
 The shared author labels let us evaluate the result.
 
-Mapping currently supports RNA queries. The catalog stores were rebuilt with the current count
-layout, and documentation execution downloads separate writable copies. The reference and query
-must remain different stores.
+Mapping currently supports RNA queries. Keep the reference and query in separate stores;
+the query store must be writable so Scarf can save the mapping and transferred labels.
 
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
+# Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize the query populations in a labeled table.
 import pandas as pd
 
+# Open count stores and run Scarf analyses.
 import scarf
+# Give the reference and query plots descriptive labels.
+from scarf.plotting import CellField
 
+# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Connect to the public example-data repository.
 repository = scarf.cytebase.connect("scarf_docs")
 
+# Download the unstimulated reference cells.
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the reference count store.
 ds_ctrl = scarf.DataStore(
     f"{ctrl_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
+# Inspect the opened store's cells and features.
+ds_ctrl
 ```
 
 ```{code-cell} ipython3
+# Download the interferon-stimulated query cells.
 stim_path = repository.download_dataset(
     name="kang_14K_ifnb-pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
+# Open the query store where mapping results will be saved.
 ds_stim = scarf.DataStore(
     f"{stim_path}/data.zarr",
     default_assay="RNA",
     nthreads=4,
 )
+# Inspect the opened store's cells and features.
+ds_stim
 ```
 
-The two page-local stores keep reference and query lineage isolated.
+First, look at the author labels in both datasets.
 
 ```{code-cell} ipython3
+# Inspect the published labels in the control reference.
 ds_ctrl.plots.embedding(
     layout_key="RNA_UMAP",
-    color_by="cluster_labels",
+    color_by=CellField("cluster_labels", label="Control reference"),
 )
+# Inspect the published labels in the stimulated query.
 ds_stim.plots.embedding(
     layout_key="RNA_UMAP",
-    color_by="cluster_labels",
+    color_by=CellField("cluster_labels", label="Stimulated query"),
 )
 ```
 
@@ -94,13 +110,20 @@ The shared label vocabulary is what we use for evaluation.
 
 ## 2. Prepare a labelled, reusable reference
 
-Package the frozen reference run's neighbour chain as an immutable mapping reference.
+The control store already contains an analysis named `docs_default`. Use its neighbours to
+prepare a reference that later queries can share.
 
 ```{code-cell} ipython3
+# Open the saved analysis and its exact results.
 run = ds_ctrl.pipeline.open(label="docs_default")
+# Keep the reference UMAP fixed for mapping-score plots.
 reference_layout = run["umap"]
+# Prepare a reusable reference from the saved neighbors.
 reference_ref = ds_ctrl.build_mapping_reference(run["neighbors"])
+# Load the saved reference model.
 reference = ds_ctrl.get_mapping_reference(reference_ref)
+# Inspect the reference saved for future query datasets.
+reference_ref
 ```
 
 The completed `MappingReference` is immutable.
@@ -111,13 +134,6 @@ weight landed.
 The mapping reference does not contain that layout or the reference labels. Label transfer
 freezes the labels it uses when it runs (section 5).
 
-This example intentionally uses a plain PCA reference. A Harmony-backed Symphony reference is
-appropriate only when the reference neighbours were corrected using genuine technical-batch
-metadata. Query batch metadata must likewise describe a measured technical source. A constant query
-label provides no within-query comparison and, by itself, is not evidence that a batch effect was
-estimated or removed. Do not substitute stimulation, disease, or another biological condition for a
-technical batch. When no defensible technical batch exists, use the plain-PCA path shown here.
-
 ## 3. Map the query
 
 `run_mapping` runs on the writable query datastore.
@@ -125,50 +141,33 @@ It aligns query features to the reference panel, applies the reference normaliza
 Query cells are never inserted into the reference index.
 
 We map the cells of the query's own pipeline run, so that the results can be drawn on that run's
-UMAP later.
+UMAP later. The default mapping keeps the three nearest reference neighbours for each query cell.
 
 ```{code-cell} ipython3
+# Open the saved analysis of the query cells.
 query_run = ds_stim.pipeline.open(label="docs_default")
+# Keep the query UMAP for displaying transferred labels.
 query_layout = query_run["umap"]
-mapping_ref = ds_stim.run_mapping(
-    reference,
-    query_run["analysis_cell_selection"],
-    query_assay="RNA",
-    save_k=5,
-    missing_feature_policy="reference_mean",
-)
+# Map the selected query cells onto the fixed reference.
+mapping_ref = ds_stim.run_mapping(reference, query_run['analysis_cell_selection'])
+# Inspect the saved query-mapping reference.
+mapping_ref
 ```
 
-To check the neighbour arrays, reload the projection with `get_mapping_result()`.
-Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns.
-`indices` identifies the nearest reference cells.
-`distances` contains finite distances between each query cell and its reference neighbours.
+Reload the saved mapping to inspect its diagnostics:
 
 ```{code-cell} ipython3
-mapping = ds_stim.get_mapping_result(
-    mapping_ref,
-    reference=reference,
-    load_arrays=True,
-)
-mapping.n_cells, int(mapping.indices.shape[1]), mapping.indices[:3], mapping.distances[:3]
-```
-
-`reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
-Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
-
-`mapping.diagnostics["queryScaledDispersion"]` is calculated from comparing query spread with the reference after scaling.
-Only informative query cells and the reference features the query measured enter it, so the missing-feature fill does not change it.
-Values near 1 mean the query occupies a similar region of feature space.
-Values much below 1 mean the query is compressed toward the centre of the reference cloud and neighbour labels become less trustworthy.
-RNA normalization renormalizes counts over the selected features by default (`renormalize_subset=True`).
-With that setting and `featureCoverage` below 1, query cells are renormalized over fewer features than the reference used, so the value is not comparable with 1.
-
-A query cell is uninformative when its raw counts are zero in every reference feature that the query measured.
-Such a cell carries no query evidence. It is flagged in `mapping.uninformative` and counted by `mapping.diagnostics["uninformativeCellCount"]`.
-
-```{code-cell} ipython3
+# Load the saved mapping and its diagnostics.
+mapping = ds_stim.get_mapping_result(mapping_ref, reference=reference)
+# Inspect feature coverage and query mapping diagnostics.
 mapping.diagnostics
 ```
+
+By default, an absent query feature is filled with the reference mean, which becomes zero after
+reference scaling. Check `featureCoverage` in the diagnostics before interpreting transferred labels.
+
+Cells with no counts in the measured reference features are flagged as uninformative.
+They cannot provide evidence for a transferred label.
 
 ## 4. Where did the query land?
 
@@ -178,21 +177,34 @@ we can split by a few known query populations to see whether each population lan
 The author labels of the mapped cells are read in the order of the run's cells.
 
 ```{code-cell} ipython3
+# Find the query cell rows included in the saved analysis.
 mapped_rows = np.flatnonzero(query_run.cells.fetch_all("I"))
+# Read the published labels in mapped-cell order.
 query_labels = np.asarray(ds_stim.cells.fetch_all("cluster_labels"))[mapped_rows]
+# Use text labels consistently when forming plot groups.
 query_labels = query_labels.astype(str)
+# Choose a few known populations for separate mapping-score panels.
 focus = {"CD 14 Mono", "CD4 Memory T", "CD4 naive T", "NK"}
+# Keep the selected populations and group the remaining labels as other.
 score_groups = np.array(
     [label if label in focus else "other" for label in query_labels],
     dtype=object,
 )
+# Count cells in each mapping-score group.
+pd.Series(score_groups, name="query population").value_counts().to_frame("cells")
+```
+
+Show where each query population contributes weight on the reference map:
+
+```{code-cell} ipython3
+# Show where each query group contributes weight on the reference.
 ds_stim.plots.mapping_score(
     mapping_ref,
     reference=reference,
     layout=reference_layout,
     target_groups=score_groups,
     size_by_score=True,
-    figsize=(14, 3.4),
+    figsize=(12, 7),
 )
 ```
 
@@ -204,7 +216,8 @@ Alternatively, concentration in an unrelated pocket suggests a domain shift or a
 ## 5. Transfer labels and inspect evidence
 
 Label transfer aggregates neighbour weights for each query cell.
-The winning label must clear `threshold_fraction`; otherwise the cell abstains and gets no label.
+By default, a unique winning label needs at least half of the total vote weight.
+Otherwise the cell abstains and gets no label.
 A high vote fraction only means the neighbours agreed.
 It is not a calibrated probability that the label is biologically correct.
 
@@ -213,13 +226,15 @@ datastore and returns its reference. It first freezes the reference labels it re
 datastore, so later edits to the reference annotations cannot change this result.
 
 ```{code-cell} ipython3
+# Transfer reference labels with the default abstention threshold.
 transfer_ref = ds_stim.run_label_transfer(
     mapping_ref,
     reference=reference,
     reference_labels="cluster_labels",
-    threshold_fraction=0.6,
 )
+# Load the transferred labels and their supporting evidence.
 transfer = ds_stim.get_label_transfer(transfer_ref)
+# Count cells in each reported category.
 transfer.labels.notna().value_counts().rename(
     index={True: "labelled", False: "abstained"}
 ).rename("query cells")
@@ -237,6 +252,7 @@ says why:
 Uninformative cells also add nothing to mapping scores.
 
 ```{code-cell} ipython3
+# Count cells in each reported category.
 transfer.evidence["abstentionReason"].value_counts()
 ```
 
@@ -245,6 +261,7 @@ A label artifact colours an embedding directly, so nothing is written into the q
 Abstained cells are drawn as missing, which shows the geography of abstention.
 
 ```{code-cell} ipython3
+# Compare published and transferred labels on the query UMAP.
 ds_stim.plots.embedding(
     layout=query_layout,
     color_by=["cluster_labels", transfer_ref],
@@ -263,6 +280,7 @@ To also abstain by distance, pass `max_distance` to `run_label_transfer`. That s
 transfer and leaves this one unchanged.
 
 ```{code-cell} ipython3
+# Inspect the evidence supporting transferred labels.
 ds_stim.plots.mapping_evidence(
     transfer_ref,
     target_groups=query_labels,
@@ -276,6 +294,7 @@ Because this query dataset also carries original author labels, we can compare t
 with the transferred labels.
 
 ```{code-cell} ipython3
+# Compare transferred labels with the known query labels.
 ds_stim.plots.mapping_confusion(
     transfer_ref,
     known_labels=query_labels,
@@ -283,96 +302,72 @@ ds_stim.plots.mapping_confusion(
 )
 ```
 
-The diagonal is recall within each known query label.
-Off-diagonal blocks are systematic swaps.
+Cells where the known and predicted labels match show recall within each known query label.
+Blocks between different labels show systematic swaps.
 The `Abstained` column holds the cells that did not receive a transferred label.
-Take note of the monocyte rows in this figure: stimulated CD14 Mono and DC often spill into CD16 Mono rather than a clean match, which is a domain-shift failure mode rather than a plotting artifact.
+Pay particular attention to the monocyte rows. Stimulation can change expression enough that a
+query population maps to another reference label. Inspect such swaps before accepting the labels.
 
 Because known labels are available, `mapping_calibration` shows how label accuracy trades off against retained coverage as the vote threshold rises.
 It applies each threshold to the candidate labels saved with the transfer, so nothing is recomputed.
 The red marker is the transfer's own `threshold_fraction`.
-Higher thresholds keep fewer cells and usually raise accuracy among the cells that remain.
+Higher thresholds keep fewer cells. Use this curve to check whether the retained labels are
+also more accurate in this dataset.
 
 ```{code-cell} ipython3
-ds_stim.plots.mapping_calibration(
-    transfer_ref,
-    known_labels=query_labels,
-)
+# Compare label accuracy and retained coverage across thresholds.
+ds_stim.plots.mapping_calibration(transfer_ref, known_labels=query_labels)
 ```
 
-## 6. Mapping scores by reference cluster
+## 6. Choose stricter settings when needed
 
-For a focused query population, you can find which reference clusters absorbed the mapping weight.
-Per-reference-cell scores are mostly zero, so cell-level box plots collapse to a flat line even when a few reference cells carry real weight.
-Instead, we can sum the raw (non-log) scores within each reference cluster.
-That score now becomes readable, and still keep the same sparse scores on the reference UMAP as shown in the embeddings below.
+The first pass used the defaults. If too many uncertain labels remain, raise
+`threshold_fraction` in `run_label_transfer`. For example, `threshold_fraction=0.6` requires
+60% of the neighbour weight to support the winning label. It saves a separate transfer,
+so you can compare it with the first one. Use the confusion matrix and calibration curve to
+judge the tradeoff between coverage and agreement with known labels.
 
-Here we will focus on the monocyte groups we saw in the confusion matrix which were off-diagonal. We will also include NK group to use as a comparison.
+You can also change `save_k` in `run_mapping` to consider more reference neighbours.
+This creates a new mapping and can change which populations receive weight. More neighbours
+are not automatically better, especially near boundaries between cell types.
 
-```{code-cell} ipython3
-focus_labels = ("CD 14 Mono", "CD16 Mono", "NK")
-focus_groups = np.array(
-    [label if label in focus_labels else "other" for label in query_labels],
-    dtype=object,
-)
-ref_classes = np.asarray(
-    reference.fetch_cell_column("cluster_labels"),
-    dtype=object,
-)
-score_mass: dict[str, pd.Series] = {}
-for group, values in ds_stim.get_mapping_score(
-    mapping_ref,
-    target_groups=focus_groups,
-    reference=reference,
-    log_transform=False,
-):
-    if group == "other":
-        continue
-    score_mass[str(group)] = (
-        pd.Series(np.asarray(values, dtype=np.float64), index=ref_classes)
-        .groupby(level=0, sort=False)
-        .sum()
-    )
-score_mass_table = pd.DataFrame(
-    {label: score_mass[label] for label in focus_labels if label in score_mass}
-).fillna(0.0)
-score_mass_table.loc[
-    score_mass_table.max(axis=1).sort_values(ascending=False).index
-].round(3)
-```
+For missing features, `missing_feature_policy="error"` requires complete overlap;
+`"zero"` fills an absent feature with a normalized zero. The default, `"reference_mean"`,
+is the path used above.
 
-```{code-cell} ipython3
-ds_stim.plots.mapping_score(
-    mapping_ref,
-    reference=reference,
-    layout=reference_layout,
-    target_groups=focus_groups,
-    size_by_score=True,
-    figsize=(14, 3.4),
-)
-```
+`mapping.diagnostics["queryScaledDispersion"]` is calculated from comparing query spread with the reference after scaling.
+Only informative query cells and the reference features the query measured enter it, so the missing-feature fill does not change it.
+Values near 1 mean a similar average scaled distance from the reference centre;
+they do not establish matching cell types.
+Values much below 1 mean the query is compressed toward the centre of the reference cloud and neighbour labels become less trustworthy.
+RNA normalization renormalizes counts over the selected features by default (`renormalize_subset=True`).
+With that setting and `featureCoverage` below 1, query cells are renormalized over fewer features than the reference used, so the value is not comparable with 1.
 
-Most of the NK scores matches the reference NK cluster and has clearly lit up in the reference NK cluster on the UMAP.
-CD14 Mono scores have spread toward CD16 Mono rather than CD14 Mono; this matches the monocyte swaps seen previously in the confusion matrix.
-If the scores were spread across multiple unrelated clusters, then it would be reasonable to inspect feature coverage or the composition of the query dataset.
+A query cell is uninformative when its raw counts are zero in every reference feature that the query measured.
+Such a cell carries no query evidence. It is flagged in `mapping.uninformative` and counted by `mapping.diagnostics["uninformativeCellCount"]`.
+
+This example uses a plain PCA reference. Use a Harmony-backed Symphony reference only when
+both reference and query have defensible technical-batch metadata. Stimulation and disease
+are biological conditions, so they should not be substituted for technical batches.
 
 ```{raw} html
 <span id="reference-atlas-mapping"></span>
 ```
 
-## 7. Reuse and govern a prepared atlas
+## 7. Reuse the reference and saved labels
 
 In a later session, retain the mapping-reference, projection, and label-transfer artifact refs,
 reopen both stores, and reload the exact results. A saved transfer loads from the query datastore
 alone:
 
 ```{code-cell} ipython3
+# Load the saved reference model.
 reference = ds_ctrl.get_mapping_reference(reference_ref)
-reloaded_mapping = ds_stim.get_mapping_result(
-    mapping_ref,
-    reference=reference,
-)
+# Reload the exact mapping without recomputing it.
+reloaded_mapping = ds_stim.get_mapping_result(mapping_ref, reference=reference)
+# Reload the saved labels from the query store.
 reloaded_transfer = ds_stim.get_label_transfer(transfer_ref)
+# Check the reloaded cell count, correction, label source, and threshold.
 (
     reloaded_mapping.n_cells,
     reloaded_mapping.correction_method,
@@ -399,6 +394,7 @@ through the threshold, the frozen reference labels, and the projection, to the r
 the cells it was built from.
 
 ```{code-cell} ipython3
+# Display the saved result and its upstream inputs.
 ds_stim.lineage(transfer_ref, references=reference)
 ```
 

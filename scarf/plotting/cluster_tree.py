@@ -148,7 +148,11 @@ def _tree_color_series(
     )
     series = pd.Series(apply_missing_mask(values, missing, labels=categorical))
     if series.nunique() == 1:
-        return pd.Series(np.ones(len(series)), index=series.index), False
+        # One observed value colors every observed cell alike; missing cells
+        # stay missing, so a cluster without values still shows as missing.
+        return pd.Series(
+            np.where(series.notna(), 1.0, np.nan), index=series.index
+        ), False
     if categorical:
         return series.astype("category"), True
     return series.astype(np.float64), False

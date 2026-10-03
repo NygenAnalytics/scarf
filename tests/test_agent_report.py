@@ -13,7 +13,7 @@ import pytest
 from scarf.agent.records import RecordError, RunRecords
 from scarf.agent.result import AnalysisRun
 
-from .test_agent_result import _records
+from .test_agent_result import _copy_template, _records
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
@@ -121,6 +121,10 @@ def _complete(records: RunRecords, stage: str, name: str, value: Any) -> None:
 
 
 def _rich_records(tmp_path: Path) -> RunRecords:
+    return _copy_template(tmp_path, ("rich",), _build_rich_records)
+
+
+def _build_rich_records(tmp_path: Path) -> RunRecords:
     records = _records(tmp_path)
     _complete(records, "context", "established-context", {"sampleColumn": None})
     prepared = records.read_json("evidence/inspect.json")

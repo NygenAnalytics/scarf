@@ -136,16 +136,31 @@ def _terminal_run(**changes: Any) -> PipelineRunRecord:
 
 def test_pipeline_scalar_and_json_contract_rejections() -> None:
     invalid_calls = (
-        (run_storage._validate_bool, (1, "value"), TypeError),
-        (run_storage._validate_non_negative_int, (True, "value"), TypeError),
-        (run_storage._validate_positive_int, (0, "value"), TypeError),
-        (run_storage._validate_non_negative_float, (object(), "value"), TypeError),
-        (run_storage._validate_non_negative_float, (float("inf"), "value"), ValueError),
-        (run_storage._validate_positive_float, (0, "value"), ValueError),
-        (run_storage._mapping, ([], "value"), TypeError),
+        (run_storage._validate_bool, (1, "value"), TypeError, "a boolean"),
+        (
+            run_storage._validate_non_negative_int,
+            (True, "value"),
+            TypeError,
+            "a non-negative integer",
+        ),
+        (run_storage._validate_positive_int, (0, "value"), TypeError, "a positive"),
+        (
+            run_storage._validate_non_negative_float,
+            (object(), "value"),
+            TypeError,
+            "a non-negative number",
+        ),
+        (
+            run_storage._validate_non_negative_float,
+            (float("inf"), "value"),
+            ValueError,
+            "finite and non-negative",
+        ),
+        (run_storage._validate_positive_float, (0, "value"), ValueError, "positive"),
+        (run_storage._mapping, ([], "value"), TypeError, "a mapping"),
     )
-    for function, arguments, error_type in invalid_calls:
-        with pytest.raises(error_type):
+    for function, arguments, error_type, message in invalid_calls:
+        with pytest.raises(error_type, match=f"^value must be {message}"):
             function(*arguments)
 
     assert run_storage._validate_nullable_non_negative_int(None, "value") is None
@@ -414,20 +429,42 @@ def _recipe_kwargs() -> dict[str, Any]:
 
 
 def test_pipeline_recipe_helper_validation() -> None:
-    for value in ("name", ["ok", ""], ["same", "same"]):
-        with pytest.raises((TypeError, ValueError)):
+    for value, error_type, message in (
+        ("name", TypeError, "columns must be a sequence of column names"),
+        (["ok", ""], TypeError, "columns must contain non-empty strings"),
+        (["same", "same"], ValueError, "columns must not contain duplicates"),
+    ):
+        with pytest.raises(error_type, match=f"^{message}$"):
             recipe_module._column_sequence(value, "columns")
-    for value in (True, "one", float("inf"), 0):
-        with pytest.raises((TypeError, ValueError)):
+    assert recipe_module._column_sequence(["b", "a"], "columns") == ("b", "a")
+    for value, error_type, message in (
+        (True, TypeError, "Leiden resolution must be a number"),
+        ("one", TypeError, "Leiden resolution must be a number"),
+        (float("inf"), ValueError, "Leiden resolution must be finite and positive"),
+        (0, ValueError, "Leiden resolution must be finite and positive"),
+    ):
+        with pytest.raises(error_type, match=f"^{message}$"):
             canonical_resolution(value)
-    for value in (1, {}, {"partitions": "one"}, {"partitions": []}):
-        with pytest.raises((TypeError, ValueError)):
+    for value, error_type, message in (
+        (1, TypeError, "leiden must be a mapping or bool"),
+        ({}, ValueError, "leiden must contain exactly 'partitions'"),
+        ({"partitions": "one"}, TypeError, "leiden partitions must be a non-empty"),
+        ({"partitions": []}, ValueError, "leiden partitions must not be empty"),
+        ({"partitions": [1, 1.0]}, ValueError, "contain duplicate resolutions"),
+    ):
+        with pytest.raises(error_type, match=message):
             recipe_module._resolve_leiden(value)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="duplicate"):
-        recipe_module._resolve_leiden({"partitions": [1, 1.0]})
-    for value in (False, "bad", float("nan")):
-        with pytest.raises((TypeError, ValueError)):
+    # Integer and float spellings of one resolution share one key.
+    assert recipe_module._resolve_leiden({"partitions": [2, 0.5]}) == (
+        ("2.0", 2.0),
+        ("0.5", 0.5),
+    )
+    for value, error_type in ((False, TypeError), ("bad", TypeError)):
+        with pytest.raises(error_type, match="^value must be a finite number$"):
             recipe_module._finite_real(value, "value")
+    with pytest.raises(ValueError, match="^value must be a finite number$"):
+        recipe_module._finite_real(float("nan"), "value")
+    assert recipe_module._finite_real(3, "value") == 3.0
 
 
 def test_pipeline_filtering_contract_errors() -> None:
@@ -598,14 +635,20 @@ def test_run_ledger_records_and_interruption_helpers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ledger = RunLedger(object(), "run", None)
-    with pytest.raises(RuntimeError, match="not observed"):
+    with pytest.raises(
+        RuntimeError, match=r"not observed by artifact planning: \['out'\]"
+    ):
         ledger._records((("out", _ref()),), ())
     plans = (
         ArtifactPlanReceipt("op", _ref(), "reused"),
         ArtifactPlanReceipt("op", _ref(), "created"),
     )
+    # An output counts as reused only when every plan for it reused it.
     assert ledger._records((("out", _ref()),), plans)[0].reused is False
-    assert ledger._plans(plans)[0].operation == "op"
+    assert ledger._records((("out", _ref()),), plans[:1])[0].reused is True
+    assert [
+        (plan.operation, plan.ref, plan.disposition) for plan in ledger._plans(plans)
+    ] == [("op", _ref(), "reused"), ("op", _ref(), "created")]
     assert ledger_module.interruption_record(asyncio.CancelledError()).kind == (
         "asyncio_cancelled"
     )
@@ -633,7 +676,10 @@ def test_run_ledger_records_and_interruption_helpers(
         lambda *args, **kwargs: interrupted.append((args, kwargs)),
     )
     ledger.interrupt_pending(KeyboardInterrupt(), "stage")
-    assert interrupted and events[-1].kind == "pipeline_interrupted"
+    ((_args, kwargs),) = interrupted
+    assert kwargs["run_id"] == "run"
+    assert kwargs["interruption"].kind == "keyboard_interrupt"
+    assert (events[-1].kind, events[-1].stage) == ("pipeline_interrupted", "stage")
     assert ledger._fallback_metrics(0).sample_count >= 1
 
 
@@ -703,8 +749,21 @@ def test_run_ledger_skip_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         "start_pipeline_stage_record",
         lambda *a, **k: (_ for _ in ()).throw(ValueError("bad")),
     )
-    with pytest.raises(PipelineExecutionError):
+    failed_runs: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        ledger_module,
+        "fail_pipeline_run_record",
+        lambda _root, **kwargs: failed_runs.append(kwargs),
+    )
+    with pytest.raises(
+        PipelineExecutionError, match="failed during stage 'failed': bad$"
+    ) as caught:
         RunLedger(object(), "run", None).skip("failed")
+    assert isinstance(caught.value.__cause__, ValueError)
+    # A stage that never started still ends its run as failed.
+    assert [(kwargs["run_id"], str(kwargs["error"])) for kwargs in failed_runs] == [
+        ("run", "bad")
+    ]
 
 
 def test_run_ledger_run_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:

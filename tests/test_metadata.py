@@ -27,8 +27,20 @@ def test_metadata_attrs(dummy_metadata):
 
 
 def test_metadata_fetch(dummy_metadata):
-    assert len(dummy_metadata.fetch("I")) == 7
-    assert len(dummy_metadata.fetch_all("I")) == 9
+    dummy_metadata.insert("order", np.arange(10, 19))
+    dummy_metadata.insert("keep_tail", np.arange(9) >= 6)
+
+    np.testing.assert_array_equal(dummy_metadata.fetch("I"), [True] * 7)
+    np.testing.assert_array_equal(
+        dummy_metadata.fetch_all("I"), [1, 1, 1, 1, 0, 0, 1, 1, 1]
+    )
+    np.testing.assert_array_equal(
+        dummy_metadata.fetch("order"), [10, 11, 12, 13, 16, 17, 18]
+    )
+    np.testing.assert_array_equal(
+        dummy_metadata.fetch("order", key="keep_tail"), [16, 17, 18]
+    )
+    np.testing.assert_array_equal(dummy_metadata.fetch_all("order"), np.arange(10, 19))
 
 
 def test_metadata_grep_preserves_regex_character_classes(dummy_metadata):

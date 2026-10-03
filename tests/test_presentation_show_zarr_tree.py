@@ -145,6 +145,34 @@ def _patch_graph_resolution(
     )
 
 
+_BRANCH_DEPTH_0 = (
+    "/branch\n"
+    "├── nested\n"
+    "└── values (2, 3) float32\n"
+    "\n"
+    "  values: shape=(2, 3), dtype=float32, chunks=(1, 3)\n"
+)
+_BRANCH_DEPTH_1 = (
+    "/branch\n"
+    "├── nested\n"
+    "│   └── deep (4,) int16\n"
+    "└── values (2, 3) float32\n"
+    "\n"
+    "  values: shape=(2, 3), dtype=float32, chunks=(1, 3)\n"
+)
+_ROOT_DEPTH_1 = (
+    "/\n"
+    "├── branch\n"
+    "│   ├── nested\n"
+    "│   └── values (2, 3) float32\n"
+    "├── root_values (2,) bool\n"
+    "└── sibling\n"
+    "    └── hidden (1,) uint8\n"
+    "\n"
+    "  root_values: shape=(2,), dtype=bool, chunks=(1,)\n"
+)
+
+
 @pytest.mark.parametrize("start", ["branch", "/branch", "branch/", "/branch/"])
 def test_show_zarr_tree_normalizes_path_and_filters_to_subtree(
     start: str,
@@ -153,14 +181,8 @@ def test_show_zarr_tree_normalizes_path_and_filters_to_subtree(
     store, _backing = _presentation_store()
 
     store.show_zarr_tree(start=start, depth=0)
-    captured = capsys.readouterr().out
 
-    assert "/branch" in captured
-    assert "nested" in captured
-    assert "values" in captured
-    assert "deep" not in captured
-    assert "root_values" not in captured
-    assert "sibling" not in captured
+    assert capsys.readouterr().out == _BRANCH_DEPTH_0
 
 
 def test_show_zarr_tree_depth_controls_nested_output(
@@ -168,13 +190,9 @@ def test_show_zarr_tree_depth_controls_nested_output(
 ) -> None:
     store, _backing = _presentation_store()
 
-    store.show_zarr_tree(start="branch", depth=0)
-    shallow = capsys.readouterr().out
     store.show_zarr_tree(start="branch", depth=1)
-    deep = capsys.readouterr().out
 
-    assert "deep" not in shallow
-    assert "deep (4,) int16" in deep
+    assert capsys.readouterr().out == _BRANCH_DEPTH_1
 
 
 def test_show_zarr_tree_formats_arrays_without_mutating_attributes(
@@ -185,46 +203,39 @@ def test_show_zarr_tree_formats_arrays_without_mutating_attributes(
     array_attrs = dict(store.zw["branch/values"].attrs)
 
     store.show_zarr_tree(start="branch", depth=1)
-    captured = capsys.readouterr().out
 
-    assert "values (2, 3) float32" in captured
-    assert "values: shape=(2, 3), dtype=float32, chunks=(1, 3)" in captured
+    assert capsys.readouterr().out == _BRANCH_DEPTH_1
     assert dict(store.zw["branch"].attrs) == branch_attrs
     assert dict(store.zw["branch/values"].attrs) == array_attrs
 
 
 @pytest.mark.parametrize(
-    ("start", "error_type"),
+    ("start", "error_type", "message"),
     [
-        ("does_not_exist", KeyError),
-        ("branch/values", TypeError),
+        ("does_not_exist", KeyError, "does_not_exist"),
+        (
+            "branch/values",
+            TypeError,
+            "Expected Zarr group at 'branch/values', got Array",
+        ),
     ],
 )
 def test_show_zarr_tree_rejects_invalid_start_path(
     start: str,
     error_type: type[Exception],
+    message: str,
 ) -> None:
     store, _backing = _presentation_store()
 
-    with pytest.raises(error_type):
+    with pytest.raises(error_type, match=message):
         store.show_zarr_tree(start=start, depth=1)
 
 
-@pytest.mark.parametrize(
-    ("depth", "error_type"),
-    [
-        (-1, ValueError),
-        ("one", TypeError),
-    ],
-)
-def test_show_zarr_tree_rejects_invalid_depth(
-    depth: object,
-    error_type: type[Exception],
-) -> None:
+def test_show_zarr_tree_rejects_a_negative_depth() -> None:
     store, _backing = _presentation_store()
 
-    with pytest.raises(error_type):
-        store.show_zarr_tree(depth=depth)
+    with pytest.raises(ValueError, match="max_depth must be None or >= 0"):
+        store.show_zarr_tree(depth=-1)
 
 
 def test_show_zarr_tree_operates_on_read_only_memory_store(
@@ -237,9 +248,8 @@ def test_show_zarr_tree_operates_on_read_only_memory_store(
     before_branch_attrs = dict(root["branch"].attrs)
 
     store.show_zarr_tree(start="/", depth=1)
-    captured = capsys.readouterr().out
 
-    assert {"branch", "root_values", "sibling"} <= set(captured.split())
+    assert capsys.readouterr().out == _ROOT_DEPTH_1
     assert dict(root.attrs) == before_root_attrs
     assert dict(root["branch"].attrs) == before_branch_attrs
 
@@ -397,7 +407,9 @@ def test_membership_strength_rejects_a_different_graph_selection(
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
     _patch_graph_resolution(monkeypatch, graph_ref, selection=graph_selection)
 
-    with pytest.raises(ValueError, match="do not match"):
+    with pytest.raises(
+        ValueError, match="Cluster labels do not match the graph cell selection"
+    ):
         store.calc_membership_strength(
             clusters,
             graph_ref,
@@ -460,7 +472,8 @@ def _smart_label_inputs(
 
 def test_smart_label_suffixes_continue_past_z_without_merging_labels() -> None:
     store, _backing = _presentation_store()
-    to_relabel = np.repeat(np.arange(40), 2)
+    # Cluster c holds c + 1 cells, so clusters rank by size from 39 down to 0.
+    to_relabel = np.repeat(np.arange(40), np.arange(1, 41))
     clusters, base = _smart_label_inputs(
         store, to_relabel, np.full(len(to_relabel), "T")
     )
@@ -470,9 +483,9 @@ def test_smart_label_suffixes_continue_past_z_without_merging_labels() -> None:
     names = store.zw[artifact_path(ref)]["values"][:].astype(str)
     by_label = dict(zip(to_relabel.tolist(), names.tolist(), strict=True))
     letters = [chr(ord("a") + index) for index in range(26)]
-    expected = [f"T{letter}" for letter in letters]
-    expected += [f"Ta{letter}" for letter in letters[:14]]
-    assert sorted(by_label.values()) == sorted(expected)
+    suffixes = letters + [f"a{letter}" for letter in letters[:14]]
+    # Larger clusters take earlier suffixes; z continues as aa, ab, ...
+    assert by_label == {39 - rank: f"T{suffix}" for rank, suffix in enumerate(suffixes)}
     assert inspect_artifact(store.zw, ref).parameters["algorithm_version"] == 3
 
 

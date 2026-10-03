@@ -327,6 +327,15 @@ def test_symphony_handles_empty_cluster_batch_statistics_without_nan():
 
     assert np.all(np.isfinite(correction.batch_offsets))
     np.testing.assert_array_equal(correction.batch_offsets[1], np.zeros((1, 2)))
+    # The populated batch solves [[6, 2], [2, 3]] beta = [s, s] with the unit
+    # ridge and the reference mass of 4, so its offset is 4 s / 14.
+    np.testing.assert_allclose(
+        correction.batch_offsets[0],
+        [[8.0 / 7.0, -4.0 / 7.0]],
+        rtol=0,
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(correction.batch_counts, [[2.0], [0.0]])
 
 
 def test_symphony_no_shift_composition_subset_stays_stable():
@@ -430,6 +439,14 @@ def test_symphony_joint_ridge_shrinks_query_shift():
         np.zeros(4, dtype=np.int64),
     )
 
+    # Four cells against a reference mass of 4 and a unit ridge give the batch
+    # offset 4 * (32, -12) / 24, which removes two thirds of the shift.
+    np.testing.assert_allclose(
+        corrected,
+        reference + np.array([8.0 / 3.0, -1.0]),
+        rtol=0,
+        atol=1e-12,
+    )
     assert np.linalg.norm(corrected.mean(axis=0)) < np.linalg.norm(shifted.mean(axis=0))
 
 
@@ -659,7 +676,7 @@ def test_query_batch_design_keeps_mixed_types_with_distinct_text():
     batches = pd.DataFrame({"batch": pd.Series([1, "2", 1, "2"], dtype=object)})
     codes, design = _MappingOperationsMixin._query_batch_design(batches, 4)
     assert codes.tolist() == [0, 1, 0, 1]
-    assert design.shape == (2, 2)
+    np.testing.assert_array_equal(design.toarray(), np.eye(2))
 
 
 @pytest.mark.parametrize("n_variables", [1, 2, 3])

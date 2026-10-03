@@ -1,5 +1,5 @@
 import inspect
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import fields
 from types import SimpleNamespace
 
 import numpy as np
@@ -150,7 +150,7 @@ def test_result_facades_and_constructor_fields_are_stable():
     assert mapping_parameters["reference"].default is inspect.Parameter.empty
 
 
-def test_result_records_reject_attribute_assignment():
+def test_result_records_accept_valid_inputs_and_attach_identity_once():
     feature_selection = scarf.ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -271,11 +271,8 @@ def test_result_records_reject_attribute_assignment():
         ),
     )
 
-    for record in records:
-        first_field = fields(record)[0].name
-        with pytest.raises(FrozenInstanceError):
-            setattr(record, first_field, None)
-
+    # Every record above was accepted; test_result_facades_and_constructor_
+    # fields_are_stable pins that their fields are frozen.
     aggregation = records[-1]
     assert isinstance(aggregation, trajectory.PseudotimeAggregationResult)
     assert not hasattr(aggregation, "__dict__")

@@ -1,6 +1,5 @@
 import threading
 import weakref
-import time
 
 import numpy as np
 import pytest
@@ -79,19 +78,22 @@ def test_stream_shards_bounds_in_flight():
     lock = threading.Lock()
     in_flight = 0
     max_seen = 0
+    # Each item waits for seven others, so the stream finishes only if eight
+    # items run at once.
+    barrier = threading.Barrier(8, timeout=10)
 
     def produce(value):
         nonlocal in_flight, max_seen
         with lock:
             in_flight += 1
             max_seen = max(max_seen, in_flight)
-        time.sleep(0.01)
+        barrier.wait()
         with lock:
             in_flight -= 1
         return value
 
-    list(stream_shards(range(16), produce, workers=8))
-    assert 1 < max_seen <= 8
+    assert list(stream_shards(range(16), produce, workers=8)) == list(range(16))
+    assert max_seen == 8
 
 
 def test_paused_serial_stream_does_not_mark_its_consumer_as_a_worker():
@@ -182,13 +184,14 @@ def test_stream_shards_cancels_unconsumed_work():
     def work(value):
         with lock:
             started.append(value)
-        time.sleep(0.02)
         return value
 
     stream = stream_shards(range(100), work, workers=2)
     assert next(stream) == 0
     stream.close()
-    assert set(started).issubset({0, 1, 2})
+    # Two items are read ahead, and the next is submitted only when the
+    # consumer asks for it, so closing leaves the rest of the source unread.
+    assert set(started) <= {0, 1}
 
 
 @pytest.mark.parametrize("workers", [1, 2])
@@ -217,7 +220,6 @@ def test_stream_shards_cancels_pending_work_after_failure():
             started.append(value)
         if value == 0:
             raise RuntimeError("injected worker failure")
-        time.sleep(0.05)
         return value
 
     with pytest.raises(RuntimeError, match="injected worker failure"):
@@ -304,6 +306,7 @@ def test_stream_counts_the_consumed_block_toward_its_limit():
     alive = []
     maximum = 0
     lock = threading.Lock()
+    produced = [threading.Event() for _ in range(12)]
 
     def produce(index):
         nonlocal maximum
@@ -311,6 +314,7 @@ def test_stream_counts_the_consumed_block_toward_its_limit():
         with lock:
             alive.append(weakref.ref(block))
             maximum = max(maximum, sum(ref() is not None for ref in alive))
+        produced[index].set()
         return block
 
     stream = stream_shards(range(12), produce, workers=2)
@@ -318,7 +322,9 @@ def test_stream_counts_the_consumed_block_toward_its_limit():
         for index in range(12):
             block = next(stream)
             np.testing.assert_array_equal(block, index)
-            time.sleep(0.001)
+            # Hold the block until the next one exists beside it.
+            if index + 1 < 12:
+                assert produced[index + 1].wait(10)
             del block
     finally:
         stream.close()
@@ -335,6 +341,104 @@ def test_serial_source_observes_previous_consumption():
     for item in stream_shards(source(), lambda value: value, workers=1):
         consumed.append(item)
     assert consumed == [0, 1, 2, 3]
+
+
+def test_stream_cleanup_reports_the_failure_with_every_cleanup_error():
+    closed = []
+
+    def source():
+        try:
+            yield from range(10)
+        finally:
+            closed.append("source")
+            raise OSError("source cleanup failed")
+
+    def work(value):
+        if value == 0:
+            raise ValueError("worker failed")
+        return value
+
+    with pytest.raises(
+        BaseExceptionGroup, match="Block stream failed during cleanup"
+    ) as caught:
+        list(stream_shards(source(), work, workers=2))
+    assert [(type(error), str(error)) for error in caught.value.exceptions] == [
+        (ValueError, "worker failed"),
+        (OSError, "source cleanup failed"),
+    ]
+    assert closed == ["source"]
+
+
+def test_failed_pool_shutdown_still_closes_the_source(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import scarf.storage.parallel as parallel
+
+    class FailingShutdown(ThreadPoolExecutor):
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            super().shutdown(wait, cancel_futures=cancel_futures)
+            raise RuntimeError("pool shutdown interrupted")
+
+    monkeypatch.setattr(parallel, "ThreadPoolExecutor", FailingShutdown)
+    closed = []
+
+    def source():
+        try:
+            yield from range(4)
+        finally:
+            closed.append("source")
+
+    stream = stream_shards(source(), lambda value: value, workers=2)
+    assert next(stream) == 0
+    # Closing early is no failure of its own, so the cleanup error stands alone.
+    with pytest.raises(RuntimeError, match="pool shutdown interrupted"):
+        stream.close()
+    assert closed == ["source"]
+
+
+def test_progress_stream_reports_a_failure_with_its_cleanup_errors(monkeypatch):
+    from scarf.utils import progress
+
+    class Display:
+        def update(self):
+            pass
+
+        def close(self):
+            raise OSError("display cleanup")
+
+    def failing():
+        yield 1
+        raise ValueError("producer failed")
+
+    monkeypatch.setattr(progress, "tqdmbar", lambda **kwargs: Display())
+    with pytest.raises(BaseExceptionGroup, match="Progress stream cleanup") as caught:
+        list(progress.iter_progress(failing()))
+    assert [(type(error), str(error)) for error in caught.value.exceptions] == [
+        (ValueError, "producer failed"),
+        (OSError, "display cleanup"),
+    ]
+
+    stream = progress.iter_progress(iter([1, 2]))
+    assert next(stream) == 1
+    with pytest.raises(OSError, match="display cleanup"):
+        stream.close()
+
+
+def test_progress_bars_let_explicit_settings_replace_scarf_defaults(monkeypatch):
+    import tqdm.auto
+
+    from scarf.utils.progress import tqdm_params, tqdmbar
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        tqdm.auto, "tqdm", lambda *args, **kwargs: captured.append(kwargs)
+    )
+    tqdmbar(total=3, bar_format="{n}/{total}")
+
+    assert captured[0]["bar_format"] == "{n}/{total}"
+    assert captured[0]["total"] == 3
+    assert captured[0]["colour"] == tqdm_params["colour"]
+    assert captured[0]["dynamic_ncols"] is True
 
 
 def test_early_close_surfaces_worker_failure():

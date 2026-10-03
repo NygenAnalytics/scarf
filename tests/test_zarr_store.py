@@ -7,10 +7,15 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.matrix.chunked import ChunkedArray
-from scarf.storage.arrays import create_metadata_column, create_numeric_array
+from scarf.storage.arrays import (
+    create_metadata_column,
+    create_numeric_array,
+    create_zarr_dataset,
+)
 from scarf.storage.artifacts import fingerprint_stored_strings
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.copy import (
+    copy_metadata_array,
     copy_zarr_array,
     copy_zarr_group_tree,
     create_or_open_staged_normed_array,
@@ -20,6 +25,7 @@ from scarf.storage.layout import (
     _CODEC_MAX_BYTES,
     count_array_spec,
     get_compressors,
+    normalize_chunks,
     normed_array_spec,
     row_sharded_array_spec,
 )
@@ -197,13 +203,16 @@ def test_count_plan_uses_paired_rotate_once_geometry():
     from scarf.storage.count_matrix import plan_count_matrix_pair
 
     spec = count_array_spec(250_000, 45_525, "uint16", profile="cloud")
-    expected = plan_count_matrix_pair(250_000, 45_525, "uint16", profile="cloud").counts
+    paired = plan_count_matrix_pair(250_000, 45_525, "uint16", profile="cloud")
+    assert spec == paired.counts
     assert spec.shards is not None
     assert spec.shards[1] >= 45_525
-    assert spec.chunks == expected.chunks
-    assert spec.shards == expected.shards
     assert spec.shards[0] % spec.chunks[0] == 0
     assert spec.shards[1] % spec.chunks[1] == 0
+    # The pair rotates once: a countsT shard holds whole counts chunks, so a
+    # transpose decodes each source chunk once.
+    assert paired.countsT.shards[0] == spec.chunks[1]
+    assert paired.countsT.shards[1] % spec.chunks[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -323,7 +332,61 @@ def test_normed_plan_respects_codec_limit():
         profile="cloud",
     )
     assert spec.shards is None
-    assert spec.chunks[0] * spec.chunks[1] * 4 <= _CODEC_MAX_BYTES
+    # Full-width rows of 8,000 bytes fill the 128 MiB chunk target.
+    assert spec.chunks == ((128 * 1024**2) // 8_000, 2_000) == (16_777, 2_000)
+    assert spec.dtype == "float32"
+    assert spec.fillValue == 0.0
+    assert spec.compressors == get_compressors("cloud")
+    assert normed_array_spec(3, 2_000, profile="cloud").chunks == (3, 2_000)
+    assert normed_array_spec(
+        100, 10, profile="fast_local", targetChunkBytes=120
+    ).chunks == (3, 10)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"nFeats": 2**29}, "One full-width row requires 2147483648 bytes"),
+        ({"targetChunkBytes": 0}, "Chunk target must be positive"),
+    ],
+)
+def test_normed_plan_rejects_rows_past_the_codec_and_empty_targets(arguments, message):
+    with pytest.raises(ValueError, match=message):
+        normed_array_spec(**{"nCells": 10, "nFeats": 4, **arguments}, profile="cloud")
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "options", "message"),
+    [
+        ((), np.float32, {}, "require at least one dimension"),
+        ((-1, 4), np.float32, {}, "dimensions cannot be negative"),
+        ((10, 4), np.float32, {"band_rows": 0}, "band_rows must be positive"),
+        ((10, 0), np.float32, {}, "One full-width row requires 0 bytes"),
+        ((10, 2**28), np.float64, {}, "One full-width row requires 2147483648 bytes"),
+        (
+            (10, 4),
+            np.float32,
+            {"target_chunk_bytes": 0},
+            "Chunk target must be positive",
+        ),
+    ],
+)
+def test_row_sharded_plan_rejects_unplannable_arrays(shape, dtype, options, message):
+    with pytest.raises(ValueError, match=message):
+        row_sharded_array_spec(
+            shape, dtype, profile="cloud", **{"band_rows": 5, **options}
+        )
+
+
+def test_normalize_chunks_maps_one_size_to_the_first_axis():
+    assert normalize_chunks(4, (10,)) == (4,)
+    assert normalize_chunks(40, (10, 3)) == (10, 3)
+    assert normalize_chunks((4, 8), (10, 3)) == (4, 3)
+    assert normalize_chunks((0,), (0,)) == (1,)
+    with pytest.raises(
+        ValueError, match=r"Cannot map chunks \(2, 3\) to array shape \(4,\)"
+    ):
+        normalize_chunks((2, 3), (4,))
 
 
 def test_row_sharded_plan_uses_full_width_divisible_chunks():
@@ -335,8 +398,9 @@ def test_row_sharded_plan_uses_full_width_divisible_chunks():
     )
 
     assert spec.shards == (1_000_000, 100)
-    assert spec.chunks[1] == 100
-    assert spec.shards[0] % spec.chunks[0] == 0
+    # Rows of 400 bytes put 335,544 rows in the 128 MiB target, and 250,000
+    # is the divisor of the 1,000,000-row shard closest to it.
+    assert spec.chunks == (250_000, 100)
     assert np.prod(spec.chunks) * np.dtype(spec.dtype).itemsize <= 128 * 1024**2
 
 
@@ -373,6 +437,69 @@ def test_metadata_columns_accept_empty_values():
 
     assert mask.shape == ids.shape == (0,)
     assert mask.chunks == ids.chunks == (1,)
+    with pytest.raises(ValueError, match="shape is required when data is None"):
+        create_metadata_column(root, "unsized", dtype="U3")
+    assert "unsized" not in root
+
+
+def test_zarr_dataset_and_numeric_array_check_their_chunk_layout():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    vector = create_zarr_dataset(root, "vector", chunks=4, dtype="f8", shape=(10,))
+    matrix = create_zarr_dataset(root, "matrix", chunks=4, dtype="u2", shape=(10, 3))
+    assert vector.chunks == (4,)
+    assert matrix.chunks == (4, 3)
+    assert matrix.dtype == np.dtype(np.uint16)
+
+    spec = ZarrArraySpec(
+        shape=(8, 4),
+        chunks=(2, 2),
+        shards=(4,),
+        dtype="uint16",
+        compressors=get_compressors("fast_local"),
+    )
+    with pytest.raises(
+        ValueError, match=r"Array shards \(4,\) do not match chunks \(2, 2\)"
+    ):
+        create_numeric_array(root, "counts", spec)
+    assert "counts" not in root
+
+
+def test_copy_group_tree_recurses_with_top_level_exclusions_and_row_order():
+    source = zarr.open_group(store=MemoryStore(), mode="w")
+    source.create_array("ids", data=np.array(["a", "b", "c"]))
+    source.create_array("skip", data=np.arange(3))
+    nested = source.create_group("nested")
+    nested.create_array("skip", data=np.array([10, 20, 30]))
+    nested.create_array("score", data=np.array([0.5, 1.5, 2.5]))
+    target = zarr.open_group(store=MemoryStore(), mode="w")
+
+    copy_zarr_group_tree(
+        source, target, exclude_members={"skip"}, row_indices=np.array([2, 0])
+    )
+
+    # Exclusions apply to the source's own members, and every copied column
+    # follows the requested rows, nested ones included.
+    assert sorted(target.array_keys()) == ["ids"]
+    np.testing.assert_array_equal(target["ids"][:], ["c", "a"])
+    assert sorted(target["nested"].array_keys()) == ["score", "skip"]
+    np.testing.assert_array_equal(target["nested/skip"][:], [30, 10])
+    np.testing.assert_array_equal(target["nested/score"][:], [2.5, 0.5])
+
+
+def test_copy_metadata_array_drops_presentation_attributes():
+    source = zarr.open_group(store=MemoryStore(), mode="w")
+    names = source.create_array("names", data=np.array(["Gene 1", "G2"]))
+    names.attrs.update({"display": {"label": "Name"}, "levels": ["G2", "Gene 1"]})
+    target = zarr.open_group(store=MemoryStore(), mode="w")
+
+    copied = copy_metadata_array(names, target, "feature_names")
+
+    assert copied.path == "feature_names"
+    assert copied.attrs.asdict() == {}
+    np.testing.assert_array_equal(copied[:], ["Gene 1", "G2"])
+    assert np.dtype(copied.dtype) == np.dtype("U6")
+    # The source keeps its attributes.
+    assert names.attrs["display"] == {"label": "Name"}
 
 
 def test_copy_group_tree_rejects_multidimensional_metadata():

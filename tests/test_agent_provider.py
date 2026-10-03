@@ -325,7 +325,7 @@ def test_request_limit_counts_failures(records: Any) -> None:
 
 def test_explicit_resume_resets_local_but_not_global_budget(records: Any) -> None:
     records.append("invocationStarted", invocationId="first")
-    with pytest.raises(DecisionValidationError):
+    with pytest.raises(DecisionValidationError, match="identical invalid response"):
         run_decision(
             scripted_model(lambda messages, info: response("invented")), records
         )
@@ -1007,3 +1007,52 @@ def test_offline_replay_rejects_modified_prompt_or_evidence(
             schemas={"select": Decision},
             validators={"select": lambda output, evidence: validate(output)},
         )
+
+
+def test_unclassified_errors_are_not_retried_without_the_optional_openai_sdk(
+    records: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    # A None entry makes "from openai import ..." raise ImportError.
+    monkeypatch.setitem(sys.modules, "openai", None)
+    attempts = 0
+
+    def model(messages: Any, info: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("private transport detail")
+
+    with pytest.raises(
+        ProviderError, match=r"Provider request failed \(RuntimeError\)"
+    ):
+        run_decision(scripted_model(model), records)
+    assert attempts == 1
+    failure = records.latest("modelFailure")
+    assert failure["transient"] is False
+    assert failure["errorType"] == "RuntimeError"
+    assert "private" not in json.dumps(records.events())
+
+
+def test_openai_connection_errors_use_the_single_transient_retry(
+    records: Any,
+) -> None:
+    openai = pytest.importorskip("openai")
+    attempts = 0
+
+    def model(messages: Any, info: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise openai.APIConnectionError(
+                message="private connection detail",
+                request=httpx.Request("POST", "https://model.invalid/v1"),
+            )
+        return response()
+
+    assert run_decision(scripted_model(model), records).choice == "baseline"
+    assert attempts == 2
+    failure = records.latest("modelFailure")
+    assert failure["transient"] is True
+    assert failure["errorType"] == "APIConnectionError"
+    assert "private" not in json.dumps(records.events())

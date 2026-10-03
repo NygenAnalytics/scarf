@@ -1,9 +1,13 @@
+import shutil
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 import zarr
 from zarr.storage import MemoryStore
 
+from scarf import DataStore
 from scarf.datastore._operations import graph as graph_operations
 from scarf.embeddings.harmony import fit_harmony
 from scarf.graph.feature_projection import resolve_native_graph_inputs
@@ -169,7 +173,29 @@ def test_streaming_lsi_block_rows_respect_memory_budget() -> None:
         )
 
 
-def _prepare_graph_features(datastore) -> tuple[ArtifactRef, ArtifactRef]:
+def _batch_labels(n_cells: int) -> np.ndarray:
+    """The ``graph_batch`` column the template stores: alternating ``b`` and ``a``."""
+    return np.where(np.arange(n_cells) % 2, "a", "b")
+
+
+def _open_store(zarr_loc: Path, **options) -> DataStore:
+    return DataStore(str(zarr_loc), default_assay="RNA", **options)
+
+
+@pytest.fixture(scope="module")
+def graph_template(
+    datastore_zarr_root,
+    tmp_path_factory,
+) -> tuple[Path, dict[str, ArtifactRef]]:
+    """The 1K PBMC store with filtered cells, 100 HVGs, and their normalized data.
+
+    Selecting HVGs dominates the cost of every graph test, so tests copy this
+    store instead of repeating the selection. It also holds the alternating
+    ``graph_batch`` column the Harmony tests correct for.
+    """
+    zarr_loc = tmp_path_factory.mktemp("graph_construction") / "store.zarr"
+    shutil.copytree(datastore_zarr_root, zarr_loc)
+    datastore = _open_store(zarr_loc)
     cell_selection = datastore.auto_filter_cells()
     features = datastore.select_hvgs(
         cell_selection,
@@ -177,7 +203,29 @@ def _prepare_graph_features(datastore) -> tuple[ArtifactRef, ArtifactRef]:
         top_n=100,
         show_plot=False,
     )
-    return cell_selection, features
+    datastore.cells.insert("graph_batch", _batch_labels(datastore.cells.N))
+    normalized = datastore.run_normalization(cell_selection, features)
+    return zarr_loc, {
+        "cells": cell_selection,
+        "features": features,
+        "normalized": normalized,
+    }
+
+
+@pytest.fixture
+def graph_store(graph_template, tmp_path) -> tuple[DataStore, dict[str, ArtifactRef]]:
+    """A private writable copy of the template."""
+    zarr_loc, refs = graph_template
+    target = tmp_path / "store.zarr"
+    shutil.copytree(zarr_loc, target)
+    return _open_store(target), refs
+
+
+@pytest.fixture(scope="module")
+def read_only_store(graph_template) -> tuple[DataStore, dict[str, ArtifactRef]]:
+    """The template opened read only, for calls that must fail before writing."""
+    zarr_loc, refs = graph_template
+    return _open_store(zarr_loc, zarr_mode="r"), refs
 
 
 def _single_artifact(datastore, kind: str) -> ArtifactRef:
@@ -204,7 +252,6 @@ def test_pca_reopens_with_center_and_rebuilds_legacy_artifacts(
 ) -> None:
     from scipy.sparse import csr_matrix
 
-    from scarf import DataStore
     from scarf.writers import SparseToZarr
 
     values = np.random.default_rng(31).integers(10, 100, size=(30, 6))
@@ -267,10 +314,10 @@ def test_pca_reopens_with_center_and_rebuilds_legacy_artifacts(
 
 
 def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
+    datastore, refs = graph_store
+    cell_selection, features = refs["cells"], refs["features"]
 
     normalized = datastore.run_normalization(cell_selection, features)
     pca = datastore.run_pca(normalized, dims=5, batch_size=100)
@@ -278,6 +325,7 @@ def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
     neighbors = datastore.query_neighbors(ann, k=3, batch_size=100)
     graph = datastore.build_connectivity_map(neighbors)
 
+    assert normalized == refs["normalized"]
     assert all(
         isinstance(ref, ArtifactRef) for ref in (normalized, pca, ann, neighbors, graph)
     )
@@ -372,11 +420,9 @@ def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
     assert np.isfinite(loaded.data).all()
 
 
-def test_ann_index_logs_rebuild_and_reuse_accurately(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=3)
+def test_ann_index_logs_rebuild_and_reuse_accurately(graph_store) -> None:
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=3)
     messages: list[str] = []
     sink = logger.add(
         lambda message: messages.append(message.record["message"]),
@@ -394,28 +440,44 @@ def test_ann_index_logs_rebuild_and_reuse_accurately(datastore_ephemeral) -> Non
     assert all("Loaded existing ANN stream" not in message for message in messages)
 
 
-@pytest.mark.parametrize("dims", [0, -1, 1.5, True])
-def test_reduction_rejects_invalid_dimensions(datastore_ephemeral, dims) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-
-    with pytest.raises((TypeError, ValueError), match="dims"):
-        datastore.run_pca(normalized, dims=dims)
-
-
-@pytest.mark.parametrize("batch_size", [0, -1, 1.5, True])
-def test_reduction_rejects_invalid_batch_sizes(
-    datastore_ephemeral,
-    batch_size,
+@pytest.mark.parametrize(
+    ("dims", "error", "message"),
+    [
+        (0, ValueError, "dims must be at least 1"),
+        (-1, ValueError, "dims must be at least 1"),
+        (1.5, TypeError, "dims must be an integer"),
+        (True, TypeError, "dims must be an integer"),
+    ],
+)
+def test_reduction_rejects_invalid_dimensions(
+    read_only_store, dims, error, message
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+    datastore, refs = read_only_store
 
-    with pytest.raises((TypeError, ValueError), match="batch_size"):
+    with pytest.raises(error, match=message):
+        datastore.run_pca(refs["normalized"], dims=dims)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "error", "message"),
+    [
+        (0, ValueError, "batch_size must be at least 1"),
+        (-1, ValueError, "batch_size must be at least 1"),
+        (1.5, TypeError, "batch_size must be an integer"),
+        (True, TypeError, "batch_size must be an integer"),
+    ],
+)
+def test_reduction_rejects_invalid_batch_sizes(
+    read_only_store,
+    batch_size,
+    error,
+    message,
+) -> None:
+    datastore, refs = read_only_store
+
+    with pytest.raises(error, match=message):
         datastore.run_pca(
-            normalized,
+            refs["normalized"],
             dims=3,
             batch_size=batch_size,
         )
@@ -437,10 +499,8 @@ def test_row_block_expands_to_aligned_minimum(monkeypatch) -> None:
     assert any("below the required minimum of 5" in message for message in warnings)
 
 
-def test_pca_rejects_empty_fit_selection(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+def test_pca_rejects_empty_fit_selection(graph_store) -> None:
+    datastore, refs = graph_store
     datastore.cells.insert(
         "no_pca_cells",
         np.zeros(datastore.cells.N, dtype=bool),
@@ -450,30 +510,22 @@ def test_pca_rejects_empty_fit_selection(datastore_ephemeral) -> None:
 
     with pytest.raises(ValueError, match="dims \\+ 1 selected cells"):
         datastore.run_pca(
-            normalized,
+            refs["normalized"],
             dims=3,
             pca_cell_selection=empty_selection,
         )
 
 
-def test_pca_rejects_fit_selection_outside_normalized_cells(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    wider_selection = datastore.auto_filter_cells()
+def test_pca_rejects_fit_selection_outside_normalized_cells(graph_store) -> None:
+    datastore, refs = graph_store
+    wider_selection = refs["cells"]
     normalized_mask = _selection_mask(datastore, wider_selection)
     normalized_mask[np.flatnonzero(normalized_mask)[0]] = False
     datastore.cells.insert("normalized_cells", normalized_mask, overwrite=True)
     normalized_selection = datastore.snapshot_cell_selection(
         cell_key="normalized_cells"
     )
-    features = datastore.select_hvgs(
-        normalized_selection,
-        from_assay="RNA",
-        top_n=100,
-        show_plot=False,
-    )
-    normalized = datastore.run_normalization(normalized_selection, features)
+    normalized = datastore.run_normalization(normalized_selection, refs["features"])
 
     with pytest.raises(
         ArtifactResolutionError,
@@ -488,32 +540,38 @@ def test_pca_rejects_fit_selection_outside_normalized_cells(
     assert caught.value.code == "row_mismatch"
 
 
-def test_custom_reduction_rejects_invalid_loadings(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+@pytest.mark.parametrize(
+    ("loadings", "error", "message"),
+    [
+        (np.ones(4), ValueError, "two-dimensional matrix with columns"),
+        (np.ones((100, 0)), ValueError, "two-dimensional matrix with columns"),
+        (np.ones((100, 2), dtype=complex), TypeError, "must contain real numbers"),
+        (np.full((100, 2), np.nan), ValueError, "must contain only finite values"),
+    ],
+    ids=["one_dimensional", "no_columns", "complex", "non_finite"],
+)
+def test_custom_reduction_rejects_invalid_loadings(
+    read_only_store, loadings, error, message
+) -> None:
+    datastore, refs = read_only_store
 
-    with pytest.raises(ValueError, match="two-dimensional"):
-        datastore.run_custom_reduction(
-            np.ones(4),
-            normalized,
-        )
+    with pytest.raises(error, match=message):
+        datastore.run_custom_reduction(loadings, refs["normalized"])
 
 
 def test_graph_construction_operations_reuse_persistent_local_cache(
-    datastore_ephemeral,
+    graph_store,
     monkeypatch,
     tmp_path,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
+    datastore, refs = graph_store
     cache_path = tmp_path / "normalized_cache"
     monkeypatch.setattr(
         graph_operations,
         "is_remote_datastore",
         lambda *_args: True,
     )
-    normalized = datastore.run_normalization(cell_selection, features)
+    normalized = datastore.run_normalization(refs["cells"], refs["features"])
     normalized_data = datastore.load_artifact(normalized)["data"]
     assert normalized_data.chunks[0] == normalized_data.shape[0]
     reduction = datastore.run_pca(
@@ -546,14 +604,14 @@ def test_graph_construction_operations_reuse_persistent_local_cache(
 
 @pytest.mark.parametrize("local_cache", [True, "auto"])
 def test_temporary_local_cache_is_removed_after_success(
-    datastore_ephemeral,
+    graph_template,
     monkeypatch,
     tmp_path,
     local_cache,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+    # Staging only reads the store, so a read-only view of the template serves.
+    zarr_loc, refs = graph_template
+    datastore = _open_store(zarr_loc, zarr_mode="r")
     cache_root = tmp_path / str(local_cache).lower()
 
     def make_cache_dir(*_args, **_kwargs):
@@ -568,23 +626,28 @@ def test_temporary_local_cache_is_removed_after_success(
     monkeypatch.setattr(graph_operations.tempfile, "mkdtemp", make_cache_dir)
 
     with datastore._cache_normalized_artifact(
-        normalized,
+        refs["normalized"],
         local_cache,
         100,
     ):
         assert cache_root.is_dir()
+        staged = datastore._normalizedArtifactCache[refs["normalized"]]
+        np.testing.assert_array_equal(
+            staged.compute(),
+            datastore.load_artifact(refs["normalized"])["data"][:],
+        )
 
     assert not cache_root.exists()
+    assert refs["normalized"] not in datastore._normalizedArtifactCache
 
 
 def test_temporary_local_cache_is_removed_after_failure(
-    datastore_ephemeral,
+    graph_template,
     monkeypatch,
     tmp_path,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+    zarr_loc, refs = graph_template
+    datastore = _open_store(zarr_loc, zarr_mode="r")
     cache_root = tmp_path / "failed"
 
     def make_cache_dir(*_args, **_kwargs):
@@ -599,68 +662,108 @@ def test_temporary_local_cache_is_removed_after_failure(
     monkeypatch.setattr(graph_operations.tempfile, "mkdtemp", make_cache_dir)
 
     with pytest.raises(RuntimeError, match="stop after staging"):
-        with datastore._cache_normalized_artifact(normalized, "auto", 100):
+        with datastore._cache_normalized_artifact(refs["normalized"], "auto", 100):
             raise RuntimeError("stop after staging")
 
     assert not cache_root.exists()
 
 
-def test_embedding_initialization_persists_expected_payload(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=4)
+def test_embedding_initialization_persists_expected_payload(graph_store) -> None:
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=4)
+    coordinates = datastore.load_artifact(reduction)["data"][:].astype(np.float64)
 
+    # Blocks of 100 rows stream in nine reads, each coalesced into K-means
+    # updates of five rows.
     initialization = datastore.build_embedding_initialization(
         reduction,
         n_centroids=5,
-        batch_size=2,
+        batch_size=100,
         kmeans_batch_size=5,
     )
 
     initialization_group = datastore.load_artifact(initialization)
-    assert initialization_group["cluster_centers"].shape == (5, 4)
+    centers = initialization_group["cluster_centers"][:]
+    labels = initialization_group["cluster_labels"][:]
+    assert centers.shape == (5, 4)
     assert initialization_group["cluster_labels"].dtype == np.uint32
+    assert labels.shape == (len(coordinates),)
+    assert set(np.unique(labels)) <= set(range(5))
+    # Each stored label names the stored centroid nearest to its cell.
+    squared = np.square(coordinates[:, np.newaxis, :] - centers[np.newaxis]).sum(axis=2)
+    labelled = squared[np.arange(len(labels)), labels]
+    np.testing.assert_allclose(labelled, squared.min(axis=1), rtol=1e-5, atol=1e-6)
+    # Centroids are averages of cells, so they lie inside the coordinate range.
+    assert np.all(centers >= coordinates.min(axis=0) - 1e-6)
+    assert np.all(centers <= coordinates.max(axis=0) + 1e-6)
     inputs = datastore.inspect_artifact(initialization).inputs
     assert inputs is not None
     assert ArtifactRef.from_dict(inputs["coordinates"]) == reduction
 
 
+@pytest.fixture(scope="module")
+def neighbors_store(graph_template, tmp_path_factory) -> tuple[DataStore, ArtifactRef]:
+    """A read-only copy of the template with 3-neighbor graph inputs."""
+    zarr_loc, refs = graph_template
+    target = tmp_path_factory.mktemp("graph_neighbors") / "store.zarr"
+    shutil.copytree(zarr_loc, target)
+    writable = _open_store(target)
+    reduction = writable.run_pca(refs["normalized"], dims=4)
+    neighbors = writable.query_neighbors(writable.build_ann_index(reduction), k=3)
+    return _open_store(target, zarr_mode="r"), neighbors
+
+
+@pytest.mark.parametrize(
+    ("values", "error", "message"),
+    [
+        (
+            {"local_connectivity": -1.0},
+            ValueError,
+            "local_connectivity must be finite and non-negative",
+        ),
+        (
+            {"local_connectivity": np.nan},
+            ValueError,
+            "local_connectivity must be finite and non-negative",
+        ),
+        (
+            {"local_connectivity": True},
+            TypeError,
+            "local_connectivity must be a real number",
+        ),
+        (
+            {"bandwidth": 0.0},
+            ValueError,
+            "bandwidth must be finite and greater than zero",
+        ),
+        (
+            {"bandwidth": -1.0},
+            ValueError,
+            "bandwidth must be finite and greater than zero",
+        ),
+        (
+            {"bandwidth": np.nan},
+            ValueError,
+            "bandwidth must be finite and greater than zero",
+        ),
+        ({"bandwidth": True}, TypeError, "bandwidth must be a real number"),
+    ],
+)
 def test_connectivity_rejects_invalid_kernel_parameters(
-    datastore_ephemeral,
+    neighbors_store,
+    values,
+    error,
+    message,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=4)
-    ann = datastore.build_ann_index(reduction)
-    neighbors = datastore.query_neighbors(ann, k=3)
+    datastore, neighbors = neighbors_store
 
-    for values in (
-        {"local_connectivity": -1.0},
-        {"local_connectivity": np.nan},
-        {"local_connectivity": True},
-        {"bandwidth": 0.0},
-        {"bandwidth": -1.0},
-        {"bandwidth": np.nan},
-        {"bandwidth": True},
-    ):
-        with pytest.raises((TypeError, ValueError)):
-            datastore.build_connectivity_map(
-                neighbors,
-                **values,
-            )
+    with pytest.raises(error, match=message):
+        datastore.build_connectivity_map(neighbors, **values)
 
 
-def test_ann_index_rejects_invalid_runtime_parameters(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=4)
+def test_ann_index_rejects_invalid_runtime_parameters(graph_store) -> None:
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=4)
 
     for values, error, match in (
         ({"ann_metric": "ip"}, ValueError, "l2, cosine"),
@@ -675,14 +778,15 @@ def test_ann_index_rejects_invalid_runtime_parameters(
                 reduction,
                 **values,
             )
+    assert not datastore.list_artifacts(kind="ann_index", from_assay="RNA")
 
 
 def test_neighbor_count_changes_only_neighbor_and_connectivity_artifacts(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+    datastore, refs = graph_store
+    cell_selection, features = refs["cells"], refs["features"]
+    normalized = refs["normalized"]
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
     neighbors_three = datastore.query_neighbors(
@@ -707,6 +811,8 @@ def test_neighbor_count_changes_only_neighbor_and_connectivity_artifacts(
     assert datastore.build_ann_index(reduction) == ann
     assert neighbors_three != neighbors_four
     assert connectivity_three != connectivity_four
+    assert datastore.load_artifact(neighbors_three)["indices"].shape[1] == 3
+    assert datastore.load_artifact(neighbors_four)["indices"].shape[1] == 4
 
 
 def test_cache_identity_distinguishes_parameters_from_execution_options(
@@ -783,29 +889,24 @@ def test_seeded_graph_rebuild_is_deterministic(
     np.testing.assert_allclose(first_weights, second_weights, rtol=0, atol=0)
 
 
-def test_explicit_graph_preserves_exact_feature_selection_ref(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=3)
+def test_explicit_graph_preserves_exact_feature_selection_ref(graph_store) -> None:
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=3)
     ann = datastore.build_ann_index(reduction)
     neighbors = datastore.query_neighbors(ann, k=3)
     connectivity = datastore.build_connectivity_map(neighbors)
     ancestry = resolve_native_graph_inputs(datastore.zw, connectivity)
 
-    assert ancestry.feature_selection == features
+    assert ancestry.feature_selection == refs["features"]
+    assert ancestry.cell_selection == refs["cells"]
     cell_status = datastore.inspect_artifact(ancestry.cell_selection)
     assert cell_status.operation == "auto_filter_cells"
     assert cell_status.execution_options == {"source_column": "artifact"}
 
 
-def test_historical_neighbors_preserve_named_lineage_inputs(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    original_selection, features = _prepare_graph_features(datastore)
+def test_historical_neighbors_preserve_named_lineage_inputs(graph_store) -> None:
+    datastore, refs = graph_store
+    original_selection, features = refs["cells"], refs["features"]
     mask = _selection_mask(datastore, original_selection)
     datastore.cells.insert("selection_a", mask, overwrite=True)
     datastore.cells.insert("selection_b", mask, overwrite=True)
@@ -823,18 +924,13 @@ def test_historical_neighbors_preserve_named_lineage_inputs(
 
 
 def test_reduction_and_harmony_keep_immutable_selection_after_live_alias_change(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+    datastore, refs = graph_store
+    cell_selection, normalized = refs["cells"], refs["normalized"]
     reduction = datastore.run_pca(normalized, dims=4)
-    datastore.cells.insert(
-        "graph_batch",
-        np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
-        overwrite=True,
-    )
     mask = _selection_mask(datastore, cell_selection)
+    frozen_mask = mask.copy()
     selected = np.flatnonzero(mask)
     excluded = np.flatnonzero(~mask)
     assert len(selected) > 0 and len(excluded) > 0
@@ -853,24 +949,32 @@ def test_reduction_and_harmony_keep_immutable_selection_after_live_alias_change(
         harmony_params={"nclust": 5},
         invalidate_cache=True,
     )
+
     assert datastore.inspect_artifact(new_reduction).complete
     assert datastore.inspect_artifact(corrected).complete
+    # Both fits keep the normalized artifact's frozen cells, not the live ``I``.
+    n_frozen = int(frozen_mask.sum())
+    assert datastore.load_artifact(new_reduction)["data"].shape == (n_frozen, 5)
+    scores = datastore.load_artifact(reduction)["data"][:]
+    frozen_batches = pd.DataFrame(
+        {"graph_batch": _batch_labels(datastore.cells.N)[frozen_mask]}
+    ).astype(object)
+    expected = fit_harmony(
+        np.asarray(scores.T, dtype=np.float64), frozen_batches, nclust=5
+    )
+    np.testing.assert_allclose(
+        datastore.load_artifact(corrected)["data"][:],
+        expected.corrected.T,
+        rtol=2e-5,
+        atol=2e-6,
+    )
 
 
 def test_run_harmony_refuses_read_only_store_before_writing_a_snapshot(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    from scarf.datastore.datastore import DataStore
-
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    datastore.cells.insert(
-        "graph_batch",
-        np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
-        overwrite=True,
-    )
-    normalized = datastore.run_normalization(cell_selection, features)
-    pca = datastore.run_pca(normalized, dims=5)
+    datastore, refs = graph_store
+    pca = datastore.run_pca(refs["normalized"], dims=5)
     snapshots = datastore.list_artifacts(kind="metadata_snapshot", scope="datastore")
 
     read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
@@ -882,34 +986,45 @@ def test_run_harmony_refuses_read_only_store_before_writing_a_snapshot(
     )
 
 
-def test_datastore_inspects_and_loads_artifact_read_only(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    ref = datastore.run_normalization(cell_selection, features)
+def test_datastore_inspects_and_loads_artifact_read_only(graph_store) -> None:
+    datastore, refs = graph_store
+    ref = refs["normalized"]
 
     status = datastore.inspect_artifact(ref)
     group = datastore.load_artifact(ref)
 
     assert status.complete
     assert status.operation == "run_normalization"
-    assert status.parameters is not None
-    assert "data" in group
-    with pytest.raises(ValueError):
+    assert status.parameters == {
+        "normalization_method": {
+            "external_hook": True,
+            "module": "scarf.assay",
+            "qualname": "norm_lib_size",
+        },
+        "size_factor": 1000.0,
+        "log_transform": True,
+        "renormalize_subset": True,
+    }
+    assert status.input_ref("cell_selection") == refs["cells"]
+    assert status.input_ref("feature_selection") == refs["features"]
+    assert group["data"].shape == (
+        int(_selection_mask(datastore, refs["cells"]).sum()),
+        100,
+    )
+    # The store itself is writable; the loaded view is not.
+    with pytest.raises(ValueError, match="read-only mode"):
         group.attrs["invalid"] = True
+    assert "invalid" not in datastore.zw[artifact_path(ref)].attrs
 
 
 def test_graph_harmony_is_an_explicit_ann_coordinate_source(
-    datastore_ephemeral,
+    graph_store,
     monkeypatch,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    batches = np.where(np.arange(datastore.cells.N) % 2, "a", "b")
-    datastore.cells.insert("graph_batch", batches, overwrite=True)
-    normalized = datastore.run_normalization(cell_selection, features)
-    pca = datastore.run_pca(normalized, dims=5)
+    datastore, refs = graph_store
+    cell_selection = refs["cells"]
+    batches = _batch_labels(datastore.cells.N)
+    pca = datastore.run_pca(refs["normalized"], dims=5)
     pca_scores = datastore.load_artifact(pca)["data"][:]
     active_batches = pd.DataFrame(
         {"graph_batch": batches[_selection_mask(datastore, cell_selection)]}
@@ -960,12 +1075,9 @@ def test_graph_harmony_is_an_explicit_ann_coordinate_source(
     } <= set(correction_group.array_keys())
 
 
-def test_lsi_and_custom_reduction_have_distinct_public_methods(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
+def test_lsi_and_custom_reduction_have_distinct_public_methods(graph_store) -> None:
+    datastore, refs = graph_store
+    normalized = refs["normalized"]
     lsi = datastore.run_lsi(
         normalized,
         dims=3,
@@ -979,7 +1091,8 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
         n_iter=1,
         n_oversamples=2,
     )
-    n_features = datastore.load_artifact(normalized)["data"].shape[1]
+    normalized_values = datastore.load_artifact(normalized)["data"][:]
+    n_features = normalized_values.shape[1]
     loadings = np.eye(n_features, 2, dtype=np.float64)
     custom = datastore.run_custom_reduction(
         loadings,
@@ -996,6 +1109,12 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
     )
     assert materialized_lsi != lsi
     assert datastore.inspect_artifact(custom).operation == "run_custom_reduction"
+    # Unscaled custom loadings project the normalized values directly.
+    np.testing.assert_allclose(
+        datastore.load_artifact(custom)["data"][:],
+        normalized_values[:, :2],
+        rtol=1e-6,
+    )
     ann = datastore.build_ann_index(custom)
     neighbors = datastore.query_neighbors(ann, k=3)
     connectivity = datastore.build_connectivity_map(neighbors)
@@ -1051,13 +1170,9 @@ def test_graph_chain_matches_released_knn_golden(
     )
 
 
-def test_connectivity_rebuild_requires_named_distance_metric(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=4)
+def test_connectivity_rebuild_requires_named_distance_metric(graph_store) -> None:
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=4)
     ann = datastore.build_ann_index(reduction)
     neighbors = datastore.query_neighbors(ann, k=3)
 
@@ -1092,12 +1207,10 @@ def test_connectivity_rebuild_requires_named_distance_metric(
 
 
 def test_ann_reuse_checks_metadata_and_explicit_validation_checks_bytes(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    datastore = datastore_ephemeral
-    cell_selection, features = _prepare_graph_features(datastore)
-    normalized = datastore.run_normalization(cell_selection, features)
-    reduction = datastore.run_pca(normalized, dims=3)
+    datastore, refs = graph_store
+    reduction = datastore.run_pca(refs["normalized"], dims=3)
     current = datastore.build_ann_index(reduction)
     for attribute, invalid_value in (
         ("metric", "cosine"),

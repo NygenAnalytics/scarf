@@ -21,6 +21,7 @@ from scarf.readers._seurat import (
     DtypeMatrixSource,
     FeatureBindMatrixSource,
     FragmentDerivedMatrixSource,
+    FragmentSource,
     H5ADMatrixSource,
     H5SparseMatrixSource,
     HDF5CompressedMatrixSource,
@@ -567,7 +568,10 @@ def test_dense_r_column_major_source_is_bounded_and_oriented() -> None:
     assert source.column_names == ("c1", "c2", "c3")
     np.testing.assert_array_equal(source.read_cells(1, 3), [[2, 5], [3, 6]])
     assert tracked.reads == [(2, 6)]
-    assert source.estimate_read_memory(1, 3).blockBytes > 0
+    # Two cells of two int16 values: the 8-byte column window and its output.
+    # Only the five names (2 UTF-8 bytes and an 8-byte reference each) stay
+    # resident, because the vector is read lazily.
+    assert source.estimate_read_memory(1, 3) == MemoryEstimate(50, 8, 8)
 
 
 def test_dense_source_enforces_block_memory_limit() -> None:
@@ -593,8 +597,9 @@ def test_matrix_source_public_accessors_bounds_and_dtype_validation() -> None:
     assert source.is_sparse is False
     assert source.zero_preserving is True
 
-    estimate = source.estimate_read_memory(0, 1)
-    assert estimate.blockBytes == estimate.workingBytes + estimate.outputBytes
+    # One cell of two int16 values; the in-memory array (12 bytes) and the
+    # five names (50 bytes) are resident.
+    assert source.estimate_read_memory(0, 1) == MemoryEstimate(62, 4, 4)
 
     with pytest.raises(TypeError, match="cell bounds must be integers"):
         source.read_cells(True, 1)
@@ -923,6 +928,9 @@ def test_operation_registry_builds_structural_nodes() -> None:
     assert isinstance(renamed, RenamedMatrixSource)
     assert renamed.row_names == ("a", "b")
 
+    assert renamed.column_names == ("x", "y")
+    np.testing.assert_array_equal(renamed.read_cells(0, 2), [[1, 3], [2, 4]])
+
     cast = build_matrix_operation(
         {
             "operation": "dtype",
@@ -933,6 +941,9 @@ def test_operation_registry_builds_structural_nodes() -> None:
     )
     assert isinstance(cast, DtypeMatrixSource)
     assert cast.dtype == np.dtype(np.float32)
+    cast_values = cast.read_cells(0, 2)
+    assert cast_values.dtype == np.dtype(np.float32)
+    np.testing.assert_array_equal(cast_values, [[1, 3], [2, 4]])
 
     bound = build_matrix_operation(
         {
@@ -1255,10 +1266,12 @@ def test_factory_resolves_nested_bpcells_operations_and_fragments(
     )
 
 
+@pytest.mark.parametrize("backend", ["MatrixDir", "MatrixH5"])
 @pytest.mark.parametrize("values_shape", [(2, 3), (2, 2)])
 def test_matrix_dir_transpose_flag_is_compared_with_stored_order(
     tmp_path: Path,
     values_shape: tuple[int, int],
+    backend: str,
 ) -> None:
     values = np.arange(1, 1 + values_shape[0] * values_shape[1], dtype=np.uint32)
     values = values.reshape(values_shape)
@@ -1268,13 +1281,18 @@ def test_matrix_dir_transpose_flag_is_compared_with_stored_order(
         version=2,
         storage_order="row",
     )
-    _write_bpcells_directory(tmp_path / "row-matrix", payload, version=2)
+    if backend == "MatrixDir":
+        _write_bpcells_directory(tmp_path / "row-matrix", payload, version=2)
+        location: dict[str, Any] = {"dir": "row-matrix"}
+    else:
+        _write_bpcells_hdf5(tmp_path / "row-matrix.h5", payload, version=2)
+        location = {"path": "row-matrix.h5", "group": "matrix"}
 
     source = matrix_source_from_slots(
         {
-            "class": ["MatrixDir", "IterableMatrix"],
+            "class": [backend, "IterableMatrix"],
             "slots": {
-                "dir": "row-matrix",
+                **location,
                 "dim": list(values.shape),
                 "transpose": True,
             },
@@ -1283,13 +1301,13 @@ def test_matrix_dir_transpose_flag_is_compared_with_stored_order(
     )
     np.testing.assert_array_equal(source.read_cells(0, 2).toarray(), values.T[:2])
 
-    # t() of an opened directory flips only the flag and dim, so a square
+    # t() of an opened matrix flips only the flag and dim, so a square
     # matrix must still be transposed.
     transposed = matrix_source_from_slots(
         {
-            "class": ["MatrixDir", "IterableMatrix"],
+            "class": [backend, "IterableMatrix"],
             "slots": {
-                "dir": "row-matrix",
+                **location,
                 "dim": list(values.shape[::-1]),
                 "transpose": False,
             },
@@ -1837,22 +1855,35 @@ def test_documented_fragment_wrappers_execute(tmp_path: Path) -> None:
     np.testing.assert_array_equal(first_shifted.starts, first_original.starts + 1)
     np.testing.assert_array_equal(first_shifted.ends, first_original.ends + 2)
 
-    length_selected = wrap("SelectLength", min_len=10, max_len=12)
-    assert all(
-        np.all((block.ends - block.starts >= 10) & (block.ends - block.starts <= 12))
-        for chromosome in range(len(length_selected.chromosomeNames))
-        for block in length_selected.iter_chromosome(chromosome)
-    )
+    # The source holds chr1 fragments (cell, start, end) (0, 0, 10), (1, 5, 15),
+    # (0, 10, 20), (2, 12, 18), (1, 20, 30) and chr2 (2, 1, 9), (0, 4, 12).
+    # Both bounds are inclusive: only the length-10 fragments remain.
+    length_selected = wrap("SelectLength", min_len=10, max_len=10)
+    assert _fragment_records(length_selected) == [
+        (0, 0, 0, 10),
+        (0, 1, 5, 15),
+        (0, 0, 10, 20),
+        (0, 1, 20, 30),
+    ]
 
     chromosome_by_name = wrap("ChrSelectName", chr_names=["chr2"])
     chromosome_by_index = wrap("ChrSelectIndex", chr_index_selection=[2])
-    assert chromosome_by_name.chromosomeNames == ("chr2",)
-    assert chromosome_by_index.chromosomeNames == ("chr2",)
+    for selected in (chromosome_by_name, chromosome_by_index):
+        assert selected.chromosomeNames == ("chr2",)
+        assert _fragment_records(selected) == [(0, 2, 1, 9), (0, 0, 4, 12)]
 
     cells_by_name = wrap("CellSelectName", cell_names=["c3", "c1"])
     cells_by_index = wrap("CellSelectIndex", cell_index_selection=[3, 1])
-    assert cells_by_name.cellNames == ("c3", "c1")
-    assert cells_by_index.cellNames == ("c3", "c1")
+    for selected in (cells_by_name, cells_by_index):
+        assert selected.cellNames == ("c3", "c1")
+        # c3 becomes cell 0, c1 cell 1, and c2's fragments are dropped.
+        assert _fragment_records(selected) == [
+            (0, 1, 0, 10),
+            (0, 1, 10, 20),
+            (0, 0, 12, 18),
+            (1, 0, 1, 9),
+            (1, 1, 4, 12),
+        ]
 
     merged_cells = wrap(
         "CellMerge",
@@ -1860,6 +1891,15 @@ def test_documented_fragment_wrappers_execute(tmp_path: Path) -> None:
         group_names=["ab", "c"],
     )
     assert merged_cells.cellNames == ("ab", "c")
+    assert [record[1] for record in _fragment_records(merged_cells)] == [
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+    ]
 
     renamed_chromosomes = wrap(
         "ChrRename",
@@ -1882,10 +1922,8 @@ def test_documented_fragment_wrappers_execute(tmp_path: Path) -> None:
         chr_levels=["chr1", "chr2"],
         invert_selection=False,
     )
-    assert all(
-        np.all((block.starts <= 10) & (block.ends >= 0))
-        for block in selected_regions.iter_chromosome(0)
-    )
+    # Only fragments overlapping [0, 10) on chr1 remain; chr2 has no region.
+    assert _fragment_records(selected_regions) == [(0, 0, 0, 10), (0, 1, 5, 15)]
 
     merged = fragment_source_from_slots(
         {
@@ -1896,11 +1934,18 @@ def test_documented_fragment_wrappers_execute(tmp_path: Path) -> None:
     )
     assert merged.chromosomeNames == ("chr1", "chr2")
     assert merged.cellNames == ("c1", "c2", "c3", "c1", "c2", "c3")
-    assert all(
-        int(block.cellIds.max(initial=0)) < len(merged.cellNames)
-        for chromosome in range(len(merged.chromosomeNames))
-        for block in merged.iter_chromosome(chromosome)
+    # The second copy's cells are offset by three; fragments stay start-sorted.
+    merged_records = _fragment_records(merged)
+    assert sorted(merged_records) == sorted(
+        _FRAGMENT_RECORDS
+        + [
+            (chromosome, cell + 3, start, end)
+            for chromosome, cell, start, end in _FRAGMENT_RECORDS
+        ]
     )
+    for chromosome in (0, 1):
+        starts = [record[2] for record in merged_records if record[0] == chromosome]
+        assert starts == sorted(starts)
 
 
 @pytest.mark.parametrize("class_name", ["FragmentsTsv", "IterableFragments"])
@@ -2214,6 +2259,17 @@ def test_matrix_multiply_validates_contract_and_memory_limit() -> None:
         MatrixMultiplySource(left, right=right)
     with pytest.raises(MatrixSourceError, match="requires a right operand"):
         MatrixMultiplySource(left)
+    compatible_right = DenseMatrixSource(np.ones((4, 2), dtype=np.float64))
+    assert MatrixMultiplySource(left, right=compatible_right, shape=(3, 2)).shape == (
+        3,
+        2,
+    )
+    with pytest.raises(
+        MatrixSourceError,
+        match=r"^matrix multiplication shape \(2, 3\) does not match inferred "
+        r"shape \(3, 2\)$",
+    ):
+        MatrixMultiplySource(left, right=compatible_right, shape=(2, 3))
 
     compatible = DenseMatrixSource(np.ones((4, 2), dtype=np.float64))
     limited = MatrixMultiplySource(
@@ -2930,6 +2986,19 @@ def test_tenx_source_orientation_and_names(tmp_path: Path) -> None:
     np.testing.assert_array_equal(source.read_cells(0, 3).toarray(), logical.T)
     assert source.row_names == ("f1", "f2")
     assert source.column_names == ("c1", "c2", "c3")
+    for slots in (
+        {"class": "TENxMatrixSeed", "filepath": path.name, "group": "matrix"},
+        {"class": "10xMatrixH5", "path": path.name},
+    ):
+        seeded = matrix_source_from_slots(slots, sidecar_root=tmp_path)
+        assert seeded.row_names == ("f1", "f2")
+        np.testing.assert_array_equal(seeded.read_cells(1, 3).toarray(), logical.T[1:])
+
+    grouped_shape = tmp_path / "grouped-shape.h5"
+    with h5py.File(grouped_shape, mode="w") as handle:
+        handle.create_group("matrix").create_group("shape")
+    with pytest.raises(MatrixSourceError, match="^10x shape path must be a dataset$"):
+        TenXMatrixSource(grouped_shape)
 
 
 def test_sidecar_path_resolution_anchors_remaps_and_contains(
@@ -3053,16 +3122,21 @@ def test_hdf5_rejects_external_storage_virtual_and_reference_data(
         validate_hdf5_file(references)
 
 
-def test_hdf5_rejects_unknown_required_filter(
+@pytest.mark.parametrize(
+    "filter_state", ["decodable", "absent", "lookup-fails", "encode-only"]
+)
+def test_hdf5_rejects_a_required_filter_it_cannot_decode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filter_state: str,
 ) -> None:
-    path = tmp_path / "unknown-filter.h5"
+    path = tmp_path / "required-filter.h5"
     filter_id = h5py.h5z.FILTER_DEFLATE
     with h5py.File(path, mode="w") as handle:
         space = h5py.h5s.create_simple((1,))
         properties = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
         properties.set_chunk((1,))
+        # Flags 0 make the filter mandatory; h5py marks its own gzip optional.
         properties.set_filter(filter_id, 0, (1,))
         h5py.h5d.create(
             handle.id,
@@ -3072,12 +3146,36 @@ def test_hdf5_rejects_unknown_required_filter(
             dcpl=properties,
         )
     available = h5py.h5z.filter_avail
-    monkeypatch.setattr(
-        h5py.h5z,
-        "filter_avail",
-        lambda candidate: False if candidate == filter_id else available(candidate),
-    )
-    with pytest.raises(UnsafeSidecarError, match="requires unavailable filter"):
+    information = h5py.h5z.get_filter_info
+
+    def failing_lookup(candidate: int) -> int:
+        if candidate == filter_id:
+            raise RuntimeError("filter information is unavailable")
+        return information(candidate)
+
+    replacements: dict[str, tuple[str, Any]] = {
+        "absent": (
+            "filter_avail",
+            lambda candidate: False if candidate == filter_id else available(candidate),
+        ),
+        "lookup-fails": ("get_filter_info", failing_lookup),
+        "encode-only": (
+            "get_filter_info",
+            lambda candidate: (
+                int(h5py.h5z.FILTER_CONFIG_ENCODE_ENABLED)
+                if candidate == filter_id
+                else information(candidate)
+            ),
+        ),
+    }
+    if filter_state == "decodable":
+        assert validate_hdf5_file(path) == path.resolve()
+        return
+    monkeypatch.setattr(h5py.h5z, *replacements[filter_state])
+    with pytest.raises(
+        UnsafeSidecarError,
+        match=r"^HDF5 dataset '/data' requires unavailable filter 1 \(deflate\)$",
+    ):
         validate_hdf5_file(path)
 
 
@@ -3486,14 +3584,19 @@ def test_hdf5_dense_reshape_delegation_and_handle_ownership(
         handle.create_dataset("X", data=logical.T)
         _write_axis_names(handle, ["f1", "f2"], ["c1", "c2", "c3"])
     delegated = H5ADMatrixSource(h5ad_path)
+    direct = HDF5DenseMatrixSource(
+        h5ad_path, "X", row_names=["f1", "f2"], column_names=["c1", "c2", "c3"]
+    )
     assert delegated.shape == (2, 3)
     assert delegated.dtype == np.dtype(np.float64)
     assert delegated.row_names == ("f1", "f2")
     assert delegated.column_names == ("c1", "c2", "c3")
     assert delegated.is_sparse is False
     assert delegated.zero_preserving is True
-    assert delegated.resident_bytes > 0
-    assert delegated.estimate_read_memory(0, 1).blockBytes > 0
+    # The facade reports exactly what the dense dataset source it wraps does.
+    assert delegated.resident_bytes == direct.resident_bytes == 50
+    assert delegated.estimate_read_memory(0, 2) == direct.estimate_read_memory(0, 2)
+    np.testing.assert_array_equal(delegated.read_cells(0, 3), logical.T)
 
 
 def test_hdf5_compressed_sources_validate_structure_and_infer_layout(
@@ -3690,8 +3793,12 @@ def test_hdf5_compressed_sources_validate_structure_and_infer_layout(
         [0, 1],
         [0, 1, 1, 2],
     )
+    # Four pointers for three stored rows: the rows are cells (CSR).
     inferred_csr = H5SparseMatrixSource(csr_path, "matrix")
     assert inferred_csr.shape == (2, 3)
+    np.testing.assert_array_equal(
+        inferred_csr.read_cells(0, 3).toarray(), [[1, 0], [0, 0], [0, 2]]
+    )
 
     csc_path = write_inferred(
         "inferred-csc",
@@ -3700,9 +3807,12 @@ def test_hdf5_compressed_sources_validate_structure_and_infer_layout(
         [0, 0],
         [0, 1, 2],
     )
+    # Three pointers for two stored columns: the columns are features (CSC).
     inferred_csc = H5SparseMatrixSource(csc_path, "matrix")
     assert inferred_csc.read_cells(1, 1).shape == (0, 2)
-    assert inferred_csc.read_cells(1, 2).nnz == 0
+    np.testing.assert_array_equal(
+        inferred_csc.read_cells(0, 3).toarray(), [[1, 2], [0, 0], [0, 0]]
+    )
 
     ambiguous_path = write_inferred(
         "ambiguous",
@@ -3719,8 +3829,12 @@ def test_hdf5_compressed_sources_validate_structure_and_infer_layout(
         H5SparseMatrixSource(csr_path, "matrix", shape=(2, 2))
     with pytest.raises(MatrixSourceError, match="sparse_layout must describe"):
         H5SparseMatrixSource(csr_path, "matrix", sparse_layout="coo")
+    # A logical CSR layout over cells is stored physically as CSC.
     explicitly_csc = H5SparseMatrixSource(csc_path, "matrix", sparse_layout="csr")
     assert explicitly_csc.shape == (2, 3)
+    np.testing.assert_array_equal(
+        explicitly_csc.read_cells(0, 3).toarray(), [[1, 2], [0, 0], [0, 0]]
+    )
 
 
 def test_paths_validate_local_resolution_hdf5_names_and_shapes(
@@ -3874,6 +3988,28 @@ def test_operations_validate_recipes_and_execute_sparse_local_paths() -> None:
     with pytest.raises(UnsupportedMatrixOperation, match="unknown binary function"):
         BinaryTransformMatrixSource(sparse, 1, "custom")
 
+    class _ObjectSource:
+        """A custom source whose object dtype no kernel can produce numbers from."""
+
+        shape = (1, 1)
+        dtype = np.dtype(object)
+        row_names = None
+        column_names = None
+        is_sparse = False
+        zero_preserving = True
+        resident_bytes = 0
+
+        def estimate_read_memory(self, start: int, stop: int) -> MemoryEstimate:
+            return MemoryEstimate()
+
+        def read_cells(self, start: int, stop: int) -> NDArray[Any]:
+            return np.zeros((stop - start, 1), dtype=object)
+
+    with pytest.raises(
+        TypeError, match="^operation produces unsupported dtype object$"
+    ):
+        UnaryTransformMatrixSource(_ObjectSource(), "abs")  # type: ignore[arg-type]
+
     conflicting_rows = DenseMatrixSource(
         values,
         row_names=["other", "rows"],
@@ -3895,6 +4031,9 @@ def test_operations_validate_recipes_and_execute_sparse_local_paths() -> None:
         dtype=np.float32,
     )
     assert explicit_dtype.dtype == np.dtype(np.float32)
+    doubled = explicit_dtype.read_cells(0, 3)
+    assert doubled.dtype == np.dtype(np.float32)
+    np.testing.assert_array_equal(doubled.toarray(), values.T * 2)
 
     mask = DenseMatrixSource(np.asarray([[1, 0, 1], [0, 1, 0]], dtype=bool))
     inverted = MaskMatrixSource(sparse, mask, keep_nonzero=False)
@@ -3987,7 +4126,8 @@ def test_subassignment_residual_and_rank_validation_paths() -> None:
             Subassignment(np.asarray([], dtype=np.int64), [1], 5),
         ],
     )
-    assert assigned.estimate_read_memory(0, 3).workingBytes > 0
+    # Three float64 cells of two features (48 bytes) plus the replacement read.
+    assert assigned.estimate_read_memory(0, 3) == MemoryEstimate(120, 160, 48)
     np.testing.assert_array_equal(
         assigned.read_cells(0, 3),
         [[9, 7], [1, 4], [8, 6]],
@@ -4030,12 +4170,28 @@ def test_subassignment_residual_and_rank_validation_paths() -> None:
         RankMatrixSource(DenseMatrixSource(np.asarray([[np.inf]]))).read_cells(0, 1)
 
     dense_scan = DenseMatrixSource(np.asarray([[1.0, np.inf]]))
-    with pytest.raises(MatrixSourceError, match="non-finite"):
-        RankMatrixSource(
-            dense_scan,
-            axis="row",
-            limits=SourceLimits(tileCells=1),
-        ).read_cells(0, 1)
+    row_ranked = RankMatrixSource(
+        dense_scan,
+        axis="row",
+        limits=SourceLimits(tileCells=1),
+    )
+    # The infinite value sits in the scanned tile, then in the target block.
+    for start, stop in ((0, 1), (1, 2)):
+        with pytest.raises(
+            MatrixSourceError, match="^rank input contains non-finite values$"
+        ):
+            row_ranked.read_cells(start, stop)
+
+    from scarf.readers._seurat.operations import _rank_values
+
+    # -1 ranks first, the two implicit zeros share rank 2.5, and 2 ranks fourth;
+    # ranks are shifted so zeros stay zero.
+    np.testing.assert_array_equal(_rank_values(np.asarray([2.0, -1.0]), 4), [1.5, -1.5])
+    for values in (np.zeros((2, 2)), np.zeros(4)):
+        with pytest.raises(
+            MatrixSourceError, match="^rank input has an invalid shape$"
+        ):
+            _rank_values(values, 3)
 
     sparse_values = csc_matrix(np.asarray([[1.0, np.inf]]))
     sparse_scan = CscMatrixSource(
@@ -4400,7 +4556,8 @@ def _dense_block(block: Any) -> NDArray[Any]:
 def test_layer_stitch_estimate_is_sparse_per_run_and_excludes_resident_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    n_features, n_cells = 70_000, 1_200
+    n_features, n_cells = 7_000, 1_200
+    max_block_bytes = 160 * 1024
     matrix = csc_matrix(
         (np.ones(n_cells), (np.arange(n_cells) % n_features, np.arange(n_cells))),
         shape=(n_features, n_cells),
@@ -4428,7 +4585,7 @@ def test_layer_stitch_estimate_is_sparse_per_run_and_excludes_resident_bytes(
             ],
             row_names=feature_names,
             column_names=cell_names,
-            limits=SourceLimits(maxBlockBytes=1024 * 1024),
+            limits=SourceLimits(maxBlockBytes=max_block_bytes),
         )
         return leaf, stitched
 
@@ -4437,7 +4594,12 @@ def test_layer_stitch_estimate_is_sparse_per_run_and_excludes_resident_bytes(
     estimate = named.estimate_read_memory(0, 1_000)
     assert estimate.outputBytes < 1_000 * n_features * named.dtype.itemsize // 100
     assert estimate.blockBytes == unnamed.estimate_read_memory(0, 1_000).blockBytes
-    assert named.read_cells(0, 1_000).nnz == 1_000
+    # The names and indexes alone exceed the block limit, so the read below is
+    # admitted only because resident bytes are not part of a block.
+    assert named.resident_bytes > max_block_bytes > estimate.blockBytes
+    block = named.read_cells(0, 1_000)
+    assert block.nnz == 1_000
+    np.testing.assert_array_equal(block.indices, np.arange(1_000))
 
     calls: list[tuple[int, int]] = []
     original = named_leaf.estimate_read_memory
@@ -4671,8 +4833,21 @@ class _OversizedVector:
         raise AssertionError("an oversized slot was read before its length check")
 
 
-@pytest.mark.parametrize("slot", ["transpose", "Dim", "row_selection"])
-def test_oversized_slots_are_rejected_before_they_are_read(slot: str) -> None:
+@pytest.mark.parametrize(
+    ("slot", "message"),
+    [
+        ("transpose", r"^transpose at \$ must contain one logical value$"),
+        ("Dim", r"^dim slot at \$ must contain two integers$"),
+        (
+            "row_selection",
+            r"^vector at row_selection at \$ has 2000000000 values; at most "
+            r"33554432 are allowed$",
+        ),
+    ],
+)
+def test_oversized_slots_are_rejected_before_they_are_read(
+    slot: str, message: str
+) -> None:
     matrix = csc_matrix(np.asarray([[1.0, 0.0], [0.0, 2.0]]))
     slots: dict[str, Any] = {
         "x": matrix.data,
@@ -4692,5 +4867,886 @@ def test_oversized_slots_are_rejected_before_they_are_read(slot: str) -> None:
         }
     else:
         slots[slot] = _OversizedVector()
-    with pytest.raises(MatrixSourceError):
+    with pytest.raises(MatrixSourceError, match=message):
         matrix_source_from_slots(specification)
+
+
+def _packed_uint_arrays(
+    values: NDArray[Any],
+) -> tuple[str, dict[str, Any]]:
+    payload = _bpcells_payload(values, packed=True, version=2, storage_order="col")
+    arrays = {
+        name: value
+        for name, value in payload.items()
+        if name not in {"version", "storage_order", "row_names", "col_names"}
+    }
+    return payload["version"], arrays
+
+
+def test_bpcells_packed_index_metadata_is_validated(tmp_path: Path) -> None:
+    values = np.asarray([[1, 0, 2, 0], [3, 4, 0, 5], [0, 6, 7, 8]], dtype=np.uint32)
+    version, arrays = _packed_uint_arrays(values)
+
+    def memory(
+        replaced: dict[str, Any],
+        limits: SourceLimits = SourceLimits(),
+    ) -> BPCellsMemoryMatrixSource:
+        return BPCellsMemoryMatrixSource(
+            version,
+            {**arrays, **replaced},
+            shape=values.shape,
+            storage_order="col",
+            limits=limits,
+        )
+
+    np.testing.assert_array_equal(memory({}).read_cells(0, 4).toarray(), values.T)
+    starts_late = arrays["index_idx"].copy()
+    starts_late[0] = 4
+    cases: list[tuple[dict[str, Any], SourceLimits, type[Exception], str]] = [
+        (
+            {},
+            SourceLimits(maxMetadataBytes=12),
+            ResourceLimitError,
+            "^BPCells index_idx_offsets exceeds metadata limit$",
+        ),
+        (
+            {"index_idx_offsets": np.asarray([0, 1], dtype=np.uint64)},
+            SourceLimits(),
+            MatrixSourceError,
+            "^BPCells index_idx_offsets does not partition idx$",
+        ),
+        (
+            {"index_idx": starts_late},
+            SourceLimits(),
+            MatrixSourceError,
+            "^BPCells index_idx must start at zero$",
+        ),
+        (
+            {"index_data": arrays["index_data"][:-4]},
+            SourceLimits(),
+            MatrixSourceError,
+            "^BPCells index_idx ends at 12; data has length 8$",
+        ),
+        # A second idx segment adds 2**32 to every later word offset.
+        (
+            {"index_idx_offsets": np.asarray([0, 1, 2], dtype=np.uint64)},
+            SourceLimits(),
+            MatrixSourceError,
+            f"^BPCells index_idx ends at {12 + 2**32}; data has length 12$",
+        ),
+    ]
+    for replaced, limits, error_type, message in cases:
+        with pytest.raises(error_type, match=message):
+            memory(replaced, limits)
+
+    payload = _bpcells_payload(values, packed=True, version=2, storage_order="col")
+    # A version 1 writer omits idx_offsets, which a version 2 matrix requires.
+    _write_bpcells_directory(tmp_path / "no-offsets", payload, version=1)
+    with pytest.raises(
+        MatrixSourceError, match="^BPCells packed v2 array 'index' has no idx_offsets$"
+    ):
+        BPCellsDirectoryMatrixSource(tmp_path / "no-offsets")
+
+
+def test_bp128_index_offsets_expand_later_segments_past_32_bits() -> None:
+    # Segment two holds idx[2:3], so its word offset 8 expands to 8 + 2**32.
+    with pytest.raises(
+        MatrixSourceError,
+        match=f"^BP128 data has 8 words; idx ends at {8 + 2**32}$",
+    ):
+        decode_bp128(
+            np.zeros(8, dtype=np.uint32),
+            np.asarray([0, 4, 8], dtype=np.uint32),
+            256,
+            index_offsets=np.asarray([0, 2, 3], dtype=np.uint64),
+        )
+
+
+def test_bpcells_directories_reject_escapes_and_malformed_arrays(
+    tmp_path: Path,
+) -> None:
+    values = np.asarray([[1, 0, 2, 0], [3, 4, 0, 5], [0, 6, 7, 8]], dtype=np.uint32)
+    payload = _bpcells_payload(values, packed=False, version=2, storage_order="col")
+
+    def directory(name: str) -> Path:
+        path = tmp_path / name
+        _write_bpcells_directory(path, payload, version=2)
+        return path
+
+    unnamed = directory("empty-names")
+    (unnamed / "row_names").write_text("")
+    source = BPCellsDirectoryMatrixSource(unnamed)
+    assert source.row_names is None
+    assert source.column_names == ("c0", "c1", "c2", "c3")
+    np.testing.assert_array_equal(source.read_cells(0, 4).toarray(), values.T)
+
+    escaping = directory("escaping")
+    outside = tmp_path / "outside-names"
+    outside.write_text("x\ny\nz\n")
+    (escaping / "row_names").unlink()
+    try:
+        (escaping / "row_names").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are not available")
+    with pytest.raises(
+        UnsafeSidecarError, match="^BPCells array 'row_names' escapes its directory$"
+    ):
+        BPCellsDirectoryMatrixSource(escaping)
+
+    cases = (
+        (
+            "version",
+            lambda path: (path / "version").write_text("packed-uint-matrix-v3\n"),
+            "^unsupported BPCells matrix format 'packed-uint-matrix-v3'$",
+        ),
+        (
+            "storage-order",
+            lambda path: (path / "storage_order").write_text("diagonal\n"),
+            "^BPCells storage_order must contain exactly 'row' or 'col'$",
+        ),
+        (
+            "shape-dtype",
+            lambda path: _write_numeric_file(
+                path, "shape", np.asarray([3, 4], dtype=np.uint64)
+            ),
+            "^BPCells array 'shape' has dtype uint64; expected uint32$",
+        ),
+        (
+            "shape-length",
+            lambda path: _write_numeric_file(
+                path, "shape", np.asarray([3, 4, 1], dtype=np.uint32)
+            ),
+            "^BPCells array 'shape' has length 3; expected 2$",
+        ),
+    )
+    for name, corrupt, message in cases:
+        path = directory(name)
+        corrupt(path)
+        with pytest.raises(MatrixSourceError, match=message):
+            BPCellsDirectoryMatrixSource(path)
+
+
+def test_bpcells_hdf5_groups_require_a_text_version_and_arrays(
+    tmp_path: Path,
+) -> None:
+    values = np.asarray([[1, 0], [0, 2]], dtype=np.uint32)
+    payload = _bpcells_payload(values, packed=False, version=2, storage_order="col")
+    string_dtype = h5py.string_dtype("utf-8")
+
+    def two_dimensional(group: h5py.Group, name: str, dtype: Any = None) -> None:
+        data = group[name][()]
+        del group[name]
+        group.create_dataset(
+            name, data=np.asarray([data, data] if dtype is None else [[data]], dtype)
+        )
+
+    cases: tuple[tuple[str, Any, type[Exception], str], ...] = (
+        (
+            "no-version",
+            lambda group: group.attrs.__delitem__("version"),
+            MatrixSourceError,
+            "^BPCells HDF5 group '/matrix' has no version attribute$",
+        ),
+        (
+            "vector-version",
+            lambda group: group.attrs.__setitem__(
+                "version", np.asarray(["a", "b"], dtype=string_dtype)
+            ),
+            MatrixSourceError,
+            "^BPCells HDF5 version attribute must be scalar$",
+        ),
+        (
+            "integer-version",
+            lambda group: group.attrs.__setitem__("version", 3),
+            MatrixSourceError,
+            "^BPCells HDF5 version attribute must be text$",
+        ),
+        (
+            "no-pointers",
+            lambda group: group.__delitem__("idxptr"),
+            MatrixSourceError,
+            "^BPCells HDF5 numeric array 'idxptr' is missing$",
+        ),
+        (
+            "matrix-pointers",
+            lambda group: two_dimensional(group, "idxptr"),
+            TypeError,
+            "^BPCells HDF5 numeric array 'idxptr' must be numeric and one-dimensional$",
+        ),
+        (
+            "no-storage-order",
+            lambda group: group.__delitem__("storage_order"),
+            MatrixSourceError,
+            "^BPCells HDF5 text array 'storage_order' is missing$",
+        ),
+        (
+            "matrix-storage-order",
+            lambda group: two_dimensional(group, "storage_order", string_dtype),
+            MatrixSourceError,
+            "BPCells HDF5 text array 'storage_order'\" must be scalar or 1D$",
+        ),
+    )
+    for name, corrupt, error_type, message in cases:
+        path = tmp_path / f"{name}.h5"
+        _write_bpcells_hdf5(path, payload, version=2)
+        with h5py.File(path, "r+") as handle:
+            corrupt(handle["matrix"])
+        with pytest.raises(error_type, match=message):
+            BPCellsHDF5MatrixSource(path, group="matrix")
+
+
+def test_bpcells_array_stores_validate_names_and_windows(tmp_path: Path) -> None:
+    from scarf.readers._seurat.bpcells import (
+        _DirectoryArrayStore,
+        _HDF5ArrayStore,
+        _MemoryArrayStore,
+        _StoredBP128Array,
+        _unpack_bp128_block,
+    )
+
+    # Callers validate these inputs first; the stores still reject them.
+    memory = _MemoryArrayStore(
+        "unpacked-uint-matrix-v2",
+        {"values": np.arange(3, dtype=np.uint32)},
+        {"values": np.dtype(np.uint32)},
+        float_bit_arrays=frozenset(),
+        text={"names": None},
+        limits=SourceLimits(),
+    )
+    with pytest.raises(MatrixSourceError, match="^BPCells memory array 'absent'"):
+        memory.numeric_info("absent")
+    with pytest.raises(IndexError, match=r"window \[2, 4\) is outside \[0, 3\)$"):
+        memory.read_numeric("values", 2, 4)
+    with pytest.raises(MatrixSourceError, match="memory text array 'names' is missing"):
+        memory.read_text("names")
+
+    values = np.asarray([[1, 0], [0, 2]], dtype=np.uint32)
+    payload = _bpcells_payload(values, packed=False, version=2, storage_order="col")
+    _write_bpcells_directory(tmp_path / "matrix", payload, version=2)
+    directory = _DirectoryArrayStore(tmp_path / "matrix", SourceLimits())
+    for name in ("nested/shape", "", ".", ".."):
+        with pytest.raises(UnsafeSidecarError, match="^invalid BPCells array name"):
+            directory.has(name)
+    with pytest.raises(IndexError, match=r"window \[1, 3\) is outside \[0, 2\)$"):
+        directory.read_numeric("shape", 1, 3)
+    _write_bpcells_hdf5(tmp_path / "matrix.h5", payload, version=2)
+    hdf5 = _HDF5ArrayStore(tmp_path / "matrix.h5", "matrix", SourceLimits())
+    with pytest.raises(IndexError, match=r"window \[0, 3\) is outside \[0, 2\)$"):
+        hdf5.read_numeric("shape", 0, 3)
+
+    packed_values = np.arange(1, 140, dtype=np.uint32)
+    data, indexes, offsets, _ = _encode_bp128(packed_values, "plain")
+    packed = _MemoryArrayStore(
+        "packed-uint-matrix-v2",
+        {"value_data": data, "value_idx": indexes, "value_idx_offsets": offsets},
+        {
+            "value_data": np.dtype(np.uint32),
+            "value_idx": np.dtype(np.uint32),
+            "value_idx_offsets": np.dtype(np.uint64),
+        },
+        float_bit_arrays=frozenset(),
+        text={},
+        limits=SourceLimits(),
+    )
+    reader = _StoredBP128Array(
+        packed,
+        "value",
+        packed_values.size,
+        "plain",
+        require_offsets=True,
+        limits=SourceLimits(),
+    )
+    np.testing.assert_array_equal(reader.read(126, 131), packed_values[126:131])
+    assert reader.read(5, 5).size == 0
+    with pytest.raises(IndexError, match=r"window \[0, 140\) is outside \[0, 139\)$"):
+        reader.read(0, 140)
+    with pytest.raises(
+        MatrixSourceError, match="^BP128 block has 3 words; expected 4$"
+    ):
+        _unpack_bp128_block(np.zeros(3, dtype=np.uint32), 1)
+
+
+def test_h5_sparse_groups_find_shape_metadata_or_fail(tmp_path: Path) -> None:
+    logical = np.asarray([[1, 0, 2], [0, 3, 4]], dtype=np.float32)
+    physical = csr_matrix(logical.T)
+    path = tmp_path / "sparse.h5"
+    with h5py.File(path, mode="w") as handle:
+        for name, attributes, datasets in (
+            ("shape-dataset", {}, {"shape": logical.T.shape}),
+            ("h5sparse-shape", {"h5sparse_shape": logical.T.shape}, {}),
+            ("dim-dataset", {}, {"dim": logical.T.shape}),
+            ("no-shape", {}, {}),
+        ):
+            group = handle.create_group(name)
+            group.attrs.update(attributes)
+            for dataset, shape in datasets.items():
+                group.create_dataset(dataset, data=np.asarray(shape))
+            group.create_dataset("data", data=physical.data)
+            group.create_dataset("indices", data=physical.indices.astype(np.int64))
+            group.create_dataset("indptr", data=physical.indptr.astype(np.int64))
+        unpointed = handle.create_group("no-indptr")
+        unpointed.create_dataset("data", data=physical.data)
+
+    for name in ("shape-dataset", "h5sparse-shape", "dim-dataset"):
+        source = H5SparseMatrixSource(path, name)
+        assert source.shape == logical.shape
+        np.testing.assert_array_equal(source.read_cells(0, 3).toarray(), logical.T)
+    with pytest.raises(
+        MatrixSourceError, match="^HDF5 sparse group '/no-shape' has no shape metadata$"
+    ):
+        H5SparseMatrixSource(path, "no-shape")
+    with pytest.raises(
+        MatrixSourceError, match="^HDF5 sparse group '/no-indptr' has no indptr$"
+    ):
+        H5SparseMatrixSource(path, "no-indptr", shape=logical.shape)
+
+
+def test_h5ad_sources_reject_ambiguous_paths_and_unusable_nodes(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        (
+            "vector",
+            lambda handle: handle.create_dataset("X", data=np.arange(3.0)),
+            "^H5AD dense matrix '/X' must be two-dimensional$",
+        ),
+        (
+            "unshaped",
+            lambda handle: handle.create_group("X").attrs.__setitem__(
+                "encoding-type", "csr_matrix"
+            ),
+            "^H5AD sparse matrix '/X' has no shape metadata$",
+        ),
+        (
+            # Assigning a dtype commits a named datatype, neither group nor dataset.
+            "datatype",
+            lambda handle: handle.__setitem__("X", np.dtype("f4")),
+            "^H5AD matrix path '/X' has an unsupported node type$",
+        ),
+    )
+    for name, write, message in cases:
+        path = tmp_path / f"{name}.h5ad"
+        with h5py.File(path, mode="w") as handle:
+            write(handle)
+        with pytest.raises(MatrixSourceError, match=message):
+            H5ADMatrixSource(path)
+    with pytest.raises(ValueError, match="^provide layer or matrix_path, not both$"):
+        H5ADMatrixSource(tmp_path / "vector.h5ad", layer="counts", matrix_path="X")
+
+
+def test_hdf5_validation_inspects_nested_dtypes_and_attribute_payloads(
+    tmp_path: Path,
+) -> None:
+    accepted = tmp_path / "nested-numbers.h5"
+    with h5py.File(accepted, mode="w") as handle:
+        handle.create_dataset(
+            "pairs", data=np.zeros(2, dtype=[("count", "i4"), ("score", "f8")])
+        )
+        handle.create_dataset("triples", shape=(2,), dtype=np.dtype(("i4", (3,))))
+    assert validate_hdf5_file(accepted) == accepted.resolve()
+
+    compound_reference = tmp_path / "compound-reference.h5"
+    with h5py.File(compound_reference, mode="w") as handle:
+        handle.create_dataset(
+            "rows", shape=(1,), dtype=[("count", "i4"), ("target", h5py.ref_dtype)]
+        )
+    with pytest.raises(UnsafeSidecarError, match="reference dataset '/rows'"):
+        validate_hdf5_file(compound_reference)
+
+    reference_attribute = tmp_path / "reference-array-attribute.h5"
+    with h5py.File(reference_attribute, mode="w") as handle:
+        target = handle.create_dataset("target", data=np.arange(2))
+        handle.attrs.create(
+            "refs",
+            data=np.asarray([target.ref, target.ref], dtype=h5py.ref_dtype),
+            dtype=h5py.ref_dtype,
+        )
+    with pytest.raises(
+        UnsafeSidecarError, match="^HDF5 reference dtype is rejected at /@refs$"
+    ):
+        validate_hdf5_file(reference_attribute)
+
+    # Two 10-byte strings store 20 bytes; the check also counts their 20 text
+    # bytes, so 40 bytes is the smallest budget that admits them.
+    bytes_attribute = tmp_path / "bytes-attribute.h5"
+    with h5py.File(bytes_attribute, mode="w") as handle:
+        handle.attrs["a"] = np.asarray([b"x" * 10] * 2, dtype="S10")
+    assert (
+        validate_hdf5_file(bytes_attribute, limits=SourceLimits(maxMetadataBytes=40))
+        == bytes_attribute.resolve()
+    )
+    with pytest.raises(
+        ResourceLimitError, match="^HDF5 attribute /@a exceeds maxMetadataBytes=39$"
+    ):
+        validate_hdf5_file(bytes_attribute, limits=SourceLimits(maxMetadataBytes=39))
+
+    numeric_attribute = tmp_path / "numeric-attribute.h5"
+    with h5py.File(numeric_attribute, mode="w") as handle:
+        handle.attrs["values"] = np.zeros(10)
+    with pytest.raises(
+        ResourceLimitError, match="^HDF5 attributes exceed maxMetadataBytes=32$"
+    ):
+        validate_hdf5_file(numeric_attribute, limits=SourceLimits(maxMetadataBytes=32))
+
+    long_name = tmp_path / "long-name.h5"
+    with h5py.File(long_name, mode="w") as handle:
+        handle.create_dataset("x" * 40, data=np.arange(1))
+    with pytest.raises(
+        ResourceLimitError, match="^HDF5 object metadata exceeds maxMetadataBytes=32$"
+    ):
+        validate_hdf5_file(long_name, limits=SourceLimits(maxMetadataBytes=32))
+
+    group_data = tmp_path / "group-data.h5"
+    with h5py.File(group_data, mode="w") as handle:
+        group = handle.create_group("matrix")
+        group.create_group("data")
+        group.create_dataset("indices", data=np.arange(1))
+        group.create_dataset("indptr", data=np.arange(2))
+    with pytest.raises(
+        MatrixSourceError, match="^HDF5 path /matrix/data is not a dataset$"
+    ):
+        HDF5CompressedMatrixSource(
+            group_data,
+            "matrix",
+            physical_shape=(1, 1),
+            physical_layout="csr",
+            physical_order="cell_by_feature",
+        )
+
+
+def _memory_fragments(**replaced: Any) -> dict[str, Any]:
+    """Seven unpacked fragments of three cells on chr1 (five) and chr2 (two)."""
+    slots: dict[str, Any] = {
+        "version": ["unpacked-fragments-v2"],
+        "cell": np.asarray([0, 1, 0, 2, 1, 2, 0], dtype=np.int32),
+        "start": np.asarray([0, 5, 10, 12, 20, 1, 4], dtype=np.int32),
+        "end": np.asarray([10, 15, 20, 18, 30, 9, 12], dtype=np.int32),
+        "end_max": np.asarray([30], dtype=np.int32),
+        "chr_ptr": np.asarray([0, 5, 5, 7], dtype=np.float64),
+        "chr_names": ["chr1", "chr2"],
+        "cell_names": ["c1", "c2", "c3"],
+    }
+    slots.update(replaced)
+    return {"class": ["UnpackedMemFragments", "IterableFragments"], "slots": slots}
+
+
+def _fragment_records(source: Any) -> list[tuple[int, int, int, int]]:
+    return [
+        (chromosome, int(cell), int(start), int(end))
+        for chromosome in range(len(source.chromosomeNames))
+        for block in source.iter_chromosome(chromosome)
+        for cell, start, end in zip(
+            block.cellIds, block.starts, block.ends, strict=True
+        )
+    ]
+
+
+_FRAGMENT_RECORDS = [
+    (0, 0, 0, 10),
+    (0, 1, 5, 15),
+    (0, 0, 10, 20),
+    (0, 2, 12, 18),
+    (0, 1, 20, 30),
+    (1, 2, 1, 9),
+    (1, 0, 4, 12),
+]
+
+
+def test_memory_fragment_arrays_are_coerced_to_unsigned_integers() -> None:
+    # Pointers are uint64 in version 2; int64 R doubles and integers convert.
+    for pointers in (
+        np.asarray([0, 5, 5, 7], dtype=np.int64),
+        np.asarray([0, 5, 5, 7], dtype=np.float64),
+    ):
+        source = fragment_source_from_slots(_memory_fragments(chr_ptr=pointers))
+        assert _fragment_records(source) == _FRAGMENT_RECORDS
+    wide_cells = np.asarray([0, 1, 0, 2, 1, 2, 0], dtype=np.int64)
+    source = fragment_source_from_slots(_memory_fragments(cell=wide_cells))
+    assert _fragment_records(source) == _FRAGMENT_RECORDS
+
+    cases: tuple[tuple[dict[str, Any], type[Exception], str], ...] = (
+        (
+            {"chr_ptr": np.asarray([0, -5, 5, 7], dtype=np.int64)},
+            MatrixSourceError,
+            r"^array at \$@chr_ptr contains a negative value$",
+        ),
+        (
+            {"cell": np.asarray([0, 1, 0, 2, 1, 2, -1], dtype=np.int64)},
+            MatrixSourceError,
+            r"^array at \$@cell contains a negative value$",
+        ),
+        (
+            {"cell": np.asarray([0, 1, 0, 2, 1, 2, 2**33], dtype=np.int64)},
+            MatrixSourceError,
+            r"^array at \$@cell exceeds uint32$",
+        ),
+        (
+            {"chr_ptr": np.asarray([0, 5.5, 5.5, 7])},
+            MatrixSourceError,
+            r"^array at \$@chr_ptr must contain finite unsigned integers$",
+        ),
+        (
+            {
+                "version": ["unpacked-fragments-v1"],
+                "chr_ptr": np.asarray([0, 5, 5, 2.0**33]),
+            },
+            MatrixSourceError,
+            r"^array at \$@chr_ptr cannot be represented exactly as uint32$",
+        ),
+        (
+            {"cell": np.asarray(["c1"] * 7)},
+            TypeError,
+            r"^array at \$@cell must contain numeric integers$",
+        ),
+    )
+    for replaced, error_type, message in cases:
+        with pytest.raises(error_type, match=message):
+            fragment_source_from_slots(_memory_fragments(**replaced))
+
+
+def test_fragment_pointers_and_required_arrays_are_validated() -> None:
+    cases: tuple[tuple[dict[str, Any], SourceLimits, type[Exception], str], ...] = (
+        (
+            {"chr_ptr": np.asarray([0, 5, 5], dtype=np.float64)},
+            SourceLimits(),
+            MatrixSourceError,
+            "^BPCells chr_ptr must contain start/end pairs$",
+        ),
+        (
+            {},
+            SourceLimits(maxMetadataBytes=16),
+            ResourceLimitError,
+            "^BPCells chr_ptr exceeds maxMetadataBytes=16$",
+        ),
+        (
+            {"chr_ptr": np.asarray([0, 5, 5, 3], dtype=np.float64)},
+            SourceLimits(),
+            MatrixSourceError,
+            "^BPCells chr_ptr chromosome 1 has decreasing bounds$",
+        ),
+        # With one record per block, unsorted starts span two blocks.
+        (
+            {
+                "start": np.asarray([5, 0, 10, 12, 20, 1, 4], dtype=np.int32),
+                "end": np.asarray([15, 10, 20, 18, 30, 9, 12], dtype=np.int32),
+            },
+            SourceLimits(compressedChunkNnz=1),
+            MatrixSourceError,
+            "^fragment starts are not sorted on chromosome 0$",
+        ),
+    )
+    for replaced, limits, error_type, message in cases:
+        with pytest.raises(error_type, match=message):
+            fragment_source_from_slots(_memory_fragments(**replaced), limits=limits)
+
+    for missing, message in (
+        ("end_max", "^BPCells numeric array 'end_max' is missing$"),
+        ("chr_names", "^BPCells text array 'chr_names' is missing$"),
+    ):
+        specification = _memory_fragments()
+        del specification["slots"][missing]
+        with pytest.raises(MatrixSourceError, match=message):
+            fragment_source_from_slots(specification)
+
+
+def test_packed_fragment_ends_must_fit_uint32() -> None:
+    def packed(lengths: list[int]) -> dict[str, Any]:
+        slots: dict[str, Any] = {
+            "version": ["packed-fragments-v1"],
+            "chr_ptr": np.asarray([0, 2], dtype=np.float64),
+            "end_max": np.asarray([2**32 - 1], dtype=np.uint32).view(np.int32),
+            "chr_names": ["chr1"],
+            "cell_names": ["c1"],
+        }
+        for name, values, transform in (
+            ("cell", [0, 0], "plain"),
+            ("start", [2**32 - 20, 2**32 - 5], "d1"),
+            ("end", lengths, "plain"),
+        ):
+            data, indexes, _, starts = _encode_bp128(values, transform)
+            slots[f"{name}_data"] = data.view(np.int32)
+            slots[f"{name}_idx"] = indexes.view(np.int32)
+            if name == "start":
+                slots["start_starts"] = starts.view(np.int32)
+        return {"class": ["PackedMemFragments", "IterableFragments"], "slots": slots}
+
+    # Ends are stored as lengths; the last fragment may end exactly at 2**32 - 1.
+    fitting = fragment_source_from_slots(packed([10, 4]))
+    assert _fragment_records(fitting) == [
+        (0, 0, 2**32 - 20, 2**32 - 10),
+        (0, 0, 2**32 - 5, 2**32 - 1),
+    ]
+    with pytest.raises(
+        MatrixSourceError, match="^packed fragment end coordinate overflows uint32$"
+    ):
+        fragment_source_from_slots(packed([10, 5]))
+
+
+def test_fragment_stores_and_wrappers_guard_their_inputs() -> None:
+    from scarf.readers._seurat.fragments import (
+        CellMappedFragmentSource,
+        FragmentBlock,
+        MergedFragmentSource,
+        StoredFragmentSource,
+        _MemoryArrayStore,
+        _memory_dtypes,
+    )
+
+    slots = _memory_fragments()["slots"]
+    version = "unpacked-fragments-v2"
+    # The factory only asks the store for numeric arrays in bounded windows.
+    store = _MemoryArrayStore(
+        slots, version, _memory_dtypes(version), SourceLimits(), "$"
+    )
+    with pytest.raises(MatrixSourceError, match="^BPCells array 'chr_names' is not"):
+        store.numeric_info("chr_names")
+    with pytest.raises(IndexError, match=r"window \[5, 9\) is outside \[0, 7\)$"):
+        store.read_numeric("cell", 5, 9)
+    custom = _MemoryArrayStore(slots, "custom-fragments-v9", {}, SourceLimits(), "$")
+    with pytest.raises(
+        MatrixSourceError, match="^unsupported BPCells fragment format 'custom-"
+    ):
+        StoredFragmentSource(custom, object_path="$", class_name="Custom")
+
+    base = fragment_source_from_slots(_memory_fragments())
+    with pytest.raises(MatrixSourceError, match="cell mapping has an invalid length$"):
+        CellMappedFragmentSource(base, np.zeros(2, dtype=np.int64), ["merged"])
+
+    def block(cells: list[int]) -> Any:
+        values = np.asarray(cells, dtype=np.uint32)
+        return FragmentBlock(values, values, values + 1)
+
+    shifted = MergedFragmentSource._offset_cells(block([0, 1]), 2**32 - 2)
+    np.testing.assert_array_equal(shifted.cellIds, [2**32 - 2, 2**32 - 1])
+    with pytest.raises(MatrixSourceError, match="cell IDs overflow uint32$"):
+        MergedFragmentSource._offset_cells(block([0, 1]), 2**32 - 1)
+
+
+def test_fragment_directories_read_their_names_and_validate_slots(
+    tmp_path: Path,
+) -> None:
+    payload = _fragment_payload(packed=False, version=2)
+    _write_fragment_directory(tmp_path / "fragments", payload, version=2)
+    _write_fragment_directory(
+        tmp_path / "future", {**payload, "version": "packed-fragments-v7"}, version=2
+    )
+    source = fragment_source_from_slots(
+        {
+            "class": ["FragmentsDir", "IterableFragments"],
+            "slots": {"dir": "fragments", "compressed": False},
+        },
+        sidecar_root=tmp_path,
+    )
+    # Without override slots, the names come from the directory itself.
+    assert source.chromosomeNames == ("chr1", "chr2")
+    assert source.cellNames == ("c1", "c2", "c3")
+    assert _fragment_records(source) == _FRAGMENT_RECORDS
+
+    cases: tuple[tuple[dict[str, Any], Path | None, type[Exception], str], ...] = (
+        (
+            {"dir": "fragments", "compressed": False},
+            None,
+            UnsafeSidecarError,
+            r"^sidecar path at \$@dir needs an anchor directory$",
+        ),
+        (
+            {"dir": "future", "compressed": True},
+            tmp_path,
+            MatrixSourceError,
+            "^unsupported BPCells fragment format 'packed-fragments-v7'$",
+        ),
+        (
+            {"dir": "fragments"},
+            tmp_path,
+            MatrixSourceError,
+            r"^fragment source at \$ has no compressed slot$",
+        ),
+    )
+    for slots, root, error_type, message in cases:
+        with pytest.raises(error_type, match=message):
+            fragment_source_from_slots(
+                {"class": ["FragmentsDir", "IterableFragments"], "slots": slots},
+                sidecar_root=root,
+            )
+
+
+def test_fragment_derived_builder_validates_its_specification() -> None:
+    base = fragment_source_from_slots(_memory_fragments())
+
+    def build(**replaced: Any) -> MatrixSource:
+        specification: dict[str, Any] = {
+            "operation": "fragment-derived",
+            "matrixType": "PeakMatrix",
+            "fragments": base,
+            "chrId": [0],
+            "start": [0],
+            "end": [10],
+            "chrLevels": ["chr1", "chr2"],
+            "mode": "insertions",
+        }
+        specification.update(replaced)
+        return build_matrix_operation(specification)
+
+    # Peak [0, 10) holds both endpoints of c1's first fragment and c2's start.
+    np.testing.assert_array_equal(build().read_cells(0, 3).toarray(), [[2], [1], [0]])
+    cases: tuple[tuple[dict[str, Any], type[Exception], str], ...] = (
+        (
+            {"fragments": 5},
+            TypeError,
+            r"^fragment input at \$@fragments is not a FragmentSource$",
+        ),
+        (
+            {"start": None, "mode": None},
+            MatrixSourceError,
+            r"^PeakMatrix at \$ is missing starts, mode$",
+        ),
+        (
+            {"matrixType": None, "chrLevels": None},
+            MatrixSourceError,
+            r"^fragment matrix at \$ is missing chromosome_levels$",
+        ),
+        (
+            {"matrixType": "GeneMatrix"},
+            UnsupportedMatrixOperation,
+            "unknown fragment-derived matrix class",
+        ),
+        (
+            {"tileWidths": [5]},
+            MatrixSourceError,
+            "^PeakMatrix cannot contain tile widths$",
+        ),
+        # Two whole chromosomes of one-base tiles need 2**32 + 9 features.
+        (
+            {
+                "matrixType": "TileMatrix",
+                "chrId": [0, 1],
+                "start": [0, 0],
+                "end": [2**32 - 1, 10],
+                "tileWidths": [1, 1],
+            },
+            ResourceLimitError,
+            r"^TileMatrix at \$ exceeds uint32 feature capacity$",
+        ),
+        # Exactly 2**32 - 1 tiles fit uint32 and then meet the feature limit.
+        (
+            {
+                "matrixType": "TileMatrix",
+                "chrId": [0, 1],
+                "start": [0, 0],
+                "end": [2**32 - 11, 10],
+                "tileWidths": [1, 1],
+            },
+            ResourceLimitError,
+            f"^feature count {2**32 - 1} exceeds maxFeatures=",
+        ),
+    )
+    for replaced, error_type, message in cases:
+        with pytest.raises(error_type, match=message):
+            build(**replaced)
+    with pytest.raises(TypeError, match="is not a FragmentSource$"):
+        FragmentDerivedMatrixSource(
+            object(),  # type: ignore[arg-type]
+            matrix_type="PeakMatrix",
+            chromosome_ids=[0],
+            starts=[0],
+            ends=[1],
+            chromosome_levels=["chr1"],
+            mode="insertions",
+        )
+    limits = SourceLimits(maxMetadataBytes=base.residentBytes + 10)
+    with pytest.raises(
+        ResourceLimitError,
+        match=f"^fragment-derived metadata exceeds maxMetadataBytes={limits.maxMetadataBytes}$",
+    ):
+        build_matrix_operation(
+            {
+                "operation": "fragment-derived",
+                "matrixType": "PeakMatrix",
+                "fragments": base,
+                "chrId": [0],
+                "start": [0],
+                "end": [10],
+                "chrLevels": ["chr1", "chr2"],
+                "mode": "insertions",
+            },
+            limits=limits,
+        )
+
+
+def test_peak_counts_ignore_empty_fragment_blocks() -> None:
+    from scarf.readers._seurat.fragments import FragmentBlock
+
+    base = fragment_source_from_slots(_memory_fragments())
+
+    class _Gappy:
+        """A custom source that yields an empty block before every block."""
+
+        chromosomeNames = base.chromosomeNames
+        cellNames = base.cellNames
+        recordCount = base.recordCount
+        residentBytes = base.residentBytes
+        metadataBytes = base.metadataBytes
+        blockWorkingBytes = base.blockWorkingBytes
+
+        def iter_chromosome(self, chromosome_id: int) -> Any:
+            empty = np.empty(0, dtype=np.uint32)
+            for block in base.iter_chromosome(chromosome_id):
+                yield FragmentBlock(empty, empty, empty)
+                yield block
+
+    assert isinstance(_Gappy(), FragmentSource)
+    for mode in ("insertions", "overlaps"):
+        counts = [
+            build_matrix_operation(
+                {
+                    "operation": "fragment-derived",
+                    "matrixType": "PeakMatrix",
+                    "fragments": fragments,
+                    "chrId": [0, 0, 1],
+                    "start": [0, 11, 0],
+                    "end": [10, 14, 10],
+                    "chrLevels": ["chr1", "chr2"],
+                    "mode": mode,
+                }
+            )
+            .read_cells(0, 3)
+            .toarray()
+            for fragments in (base, _Gappy())
+        ]
+        np.testing.assert_array_equal(counts[1], counts[0])
+    np.testing.assert_array_equal(counts[0], [[1, 1, 1], [1, 1, 0], [0, 1, 1]])
+
+
+def test_fragment_matrix_without_cells_prepares_no_storage(tmp_path: Path) -> None:
+    from scarf.readers._seurat.sources import prepare_matrix_sources
+
+    empty = np.zeros(0, dtype=np.int32)
+    fragments = fragment_source_from_slots(
+        _memory_fragments(
+            cell=empty,
+            start=empty,
+            end=empty,
+            end_max=empty,
+            chr_ptr=np.asarray([0, 0], dtype=np.float64),
+            chr_names=["chr1"],
+            cell_names=[],
+        )
+    )
+    source = build_matrix_operation(
+        {
+            "operation": "fragment-derived",
+            "matrixType": "PeakMatrix",
+            "fragments": fragments,
+            "chrId": [0],
+            "start": [0],
+            "end": [10],
+            "chrLevels": ["chr1"],
+            "mode": "insertions",
+        }
+    )
+    source._tempDir = tmp_path
+    assert source.shape == (1, 0)
+    prepare_matrix_sources(source)
+    assert source._rowStore is None
+    assert list(tmp_path.iterdir()) == []
+    assert source.read_cells(0, 0).shape == (0, 1)

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from scarf.neighbors.index import fix_knn_query
 
@@ -80,3 +81,18 @@ def test_fix_knn_query_removes_only_the_first_repeated_self_label():
     assert missed_self_hits == 0
     np.testing.assert_array_equal(fixed_indices, [[8, 3, 9]])
     np.testing.assert_allclose(fixed_distances, [[0.1, 0.2, 0.3]])
+
+
+@pytest.mark.parametrize(
+    ("indices", "distances", "ref_idx"),
+    [
+        (np.arange(3), np.zeros(3), np.arange(3)),
+        (np.zeros((2, 3), dtype=int), np.zeros((2, 2)), np.arange(2)),
+        (np.zeros((2, 3), dtype=int), np.zeros((2, 3)), np.arange(3)),
+        (np.zeros((2, 1), dtype=int), np.zeros((2, 1)), np.arange(2)),
+    ],
+    ids=["one_dimensional", "distance_shape", "reference_length", "single_column"],
+)
+def test_fix_knn_query_rejects_incompatible_shapes(indices, distances, ref_idx):
+    with pytest.raises(ValueError, match="incompatible shapes"):
+        fix_knn_query(indices, distances, ref_idx)

@@ -15,11 +15,13 @@ kernelspec:
 
 # Analyze Garrido-Trigo RNA with Scarf agents
 
-This notebook copies the Garrido-Trigo IBD and healthy-control RNA dataset from Cytebase,
-prepares a local Scarf store, and runs the automated RNA workflow. The agent chooses
-among bounded analysis settings, compares the resulting clusters, and produces
-provisional annotations and a report. No manual parameter choices or cluster labels
-are supplied during execution.
+Use Scarf agents to explore RNA profiles from an intestinal IBD and healthy-control study.
+We will prepare a local copy, describe the study, run the analysis with default scientific
+settings, and inspect the proposed identities.
+
+The input preparation is longer than the analysis call because this published store needs
+local preparation before the current agent can use it. Do this once; later visits can resume
+the saved analysis. For the shorter general API example, start with {doc}`agent_workflow`.
 
 {nb-download}`Download the notebook <garrido_trigo_agents.ipynb>`.
 The general workflow and an example without provider credentials are in
@@ -70,7 +72,7 @@ data_path = work_dir / "data.zarr"
 run_dir = work_dir / "agent_runs" / "garrido-trigo"
 ```
 
-## Copy and prepare the Cytebase dataset
+## Prepare the input once
 
 `Catalog.mount_datastore()` creates a writable local mount whose counts remain
 remote. It has no full-copy option. The published version used here also predates
@@ -242,13 +244,12 @@ resolution 0.5, producing 18 clusters with two explicitly unassigned. Selecting
 baseline settings here followed the measured alternatives; it did not skip
 exploration. These provisional identities are not an annotation accuracy benchmark.
 
-## Verify storage and preserve the report
+## Keep the results and report
 
-The external run directory retains `run.json`, `events/`, `evidence/`, `calls/`,
-annotations, and the existing report and figures. The local Zarr store also holds
-a compact result object in the attributes of `agent_results/<run-id>`. It links
-the selected core pipeline to the external history. Full numerical configuration
-and artifacts remain authoritative in the core pipeline record.
+Keep both the local dataset and the agent run directory. The dataset contains the numerical
+results; the run directory contains the report, figures, annotations, and decision history.
+The checks below confirm that the saved result points to the selected analysis and that the
+input cells and genes stayed unchanged.
 
 ```{code-cell} ipython3
 import numpy as np

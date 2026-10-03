@@ -598,8 +598,10 @@ def test_mount_datastore_does_not_overwrite_a_receipt_created_meanwhile(
 ):
     sidecar = tmp_path / "analysis.zarr.cytebase.json"
     _change_record_on_read(fake_hub, 2, lambda: sidecar.write_text("claimed"))
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError) as raised:
         connector.mount_datastore(
             ready_dataset.bucket, CYTEBASE_ID, tmp_path / "analysis.zarr"
         )
+    # The exclusive create of the receipt refused the claimed sidecar.
+    assert raised.value.filename == str(sidecar)
     assert sidecar.read_text() == "claimed"

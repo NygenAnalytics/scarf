@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from scipy import stats
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
@@ -112,13 +113,24 @@ def test_counts_t_write_matches_paired_plan_and_data():
     np.testing.assert_array_equal(written[:], values.T)
 
 
-def test_write_counts_t_marks_incomplete_until_finished():
+def test_write_counts_t_marks_incomplete_until_finished(monkeypatch):
+    from scarf.storage.async_execution import AsyncStorageRunner
+
     values = np.arange(12, dtype=np.uint32).reshape(4, 3)
     group, counts = _counts_array(values)
+    during: list[object] = []
+    run = AsyncStorageRunner.run
+
+    def observed(self, operation):  # type: ignore[no-untyped-def]
+        # The destination exists before any value is transposed into it.
+        during.append(group["countsT"].attrs.get("complete"))
+        return run(self, operation)
+
+    monkeypatch.setattr(AsyncStorageRunner, "run", observed)
     counts_t = write_counts_t(counts, group)
-    assert counts_t is not None
+    assert during == [False]
     assert counts_t.attrs["complete"] is True
-    np.testing.assert_array_equal(counts_t[:], counts[:].T)
+    np.testing.assert_array_equal(counts_t[:], values.T)
 
 
 def test_write_counts_t_uses_paired_layout_from_source_plan():
@@ -173,7 +185,8 @@ def test_assay_rejects_wrong_shape_dtype_or_group_node():
         fill_value=0,
     )
     root["RNA/countsT"].attrs["complete"] = True
-    with pytest.raises((ValueError, TypeError)):
+    mismatch = "countsT is incomplete or does not match finalized counts"
+    with pytest.raises(ValueError, match=mismatch):
         Assay(root, None, "RNA", cells, nthreads=1)
 
     del root["RNA/countsT"]
@@ -185,12 +198,12 @@ def test_assay_rejects_wrong_shape_dtype_or_group_node():
         fill_value=0,
     )
     root["RNA/countsT"].attrs["complete"] = True
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError, match=mismatch):
         Assay(root, None, "RNA", cells, nthreads=1)
 
     del root["RNA/countsT"]
     root["RNA"].create_group("countsT")
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(TypeError, match="Expected Zarr array at 'countsT', got Group"):
         Assay(root, None, "RNA", cells, nthreads=1)
 
 
@@ -214,8 +227,12 @@ def test_rna_requires_strip_counts_t():
     cell_idx = np.array([0, 2, 3])
     feat_idx = np.array([1, 3, 0])
     stats = assay._streaming_feature_stats(cell_idx, feat_idx)
+    selected = values[cell_idx][:, feat_idx]
+    normalized = 1000 * selected / values.sum(axis=1)[cell_idx, None]
     assert set(stats) == {"normed_tot", "normed_n", "sigmas"}
-    assert stats["normed_tot"].shape == (3,)
+    np.testing.assert_allclose(stats["normed_tot"], normalized.sum(axis=0))
+    np.testing.assert_array_equal(stats["normed_n"], (selected > 0).sum(axis=0))
+    np.testing.assert_allclose(stats["sigmas"], normalized.var(axis=0))
 
     del root["RNA/countsT"]
     with pytest.raises(ValueError, match="Required countsT matrix is missing"):
@@ -260,7 +277,27 @@ def test_marker_results_on_strip_counts_t():
     )
     np.testing.assert_array_equal(results.group_ids, ["a", "b"])
     np.testing.assert_array_equal(results.feature_index, np.arange(4))
-    assert len(results.table("a", np.asarray(assay.feats.fetch_all("names")))) == 4
+    table = results.table("a", np.asarray(assay.feats.fetch_all("names")))
+    table = table.set_index("feature_index").sort_index()
+    normalized = 1000.0 * values / values.sum(axis=1, keepdims=True)
+    inside, outside = normalized[:2], normalized[2:]
+    np.testing.assert_allclose(table["mean"], inside.mean(axis=0), rtol=1e-6)
+    np.testing.assert_allclose(table["mean_rest"], outside.mean(axis=0), rtol=1e-6)
+    np.testing.assert_array_equal(table["frac_exp"], (inside > 0).mean(axis=0))
+    np.testing.assert_array_equal(table["frac_exp_rest"], (outside > 0).mean(axis=0))
+    tests = [
+        stats.mannwhitneyu(
+            inside[:, feature],
+            outside[:, feature],
+            alternative="two-sided",
+            method="asymptotic",
+        )
+        for feature in range(4)
+    ]
+    np.testing.assert_allclose(table["auc"], [test.statistic / 4 for test in tests])
+    np.testing.assert_allclose(
+        table["p_value"], [test.pvalue for test in tests], rtol=1e-5
+    )
 
 
 def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
@@ -298,9 +335,11 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
             as_dataframe=True,
         )
     )
-    assert batches
+    assert [batch.shape for batch in batches] == [(4, 2), (4, 2)]
     joined = np.concatenate([batch.to_numpy() for batch in batches], axis=1)
-    assert joined.shape[0] == 4
+    np.testing.assert_allclose(
+        joined, 1000.0 * values / values.sum(axis=1, keepdims=True), rtol=1e-12
+    )
     assert len(stream_calls) == 1
     np.testing.assert_array_equal(stream_calls[0], np.arange(values.shape[1]))
     np.testing.assert_array_equal(
@@ -343,7 +382,7 @@ def test_iter_normed_feature_wise_log_transform_matches_log1p():
     assert not np.allclose(joined, log2_expected, rtol=1e-3)
 
 
-def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
+def test_iter_normed_feature_wise_batches_and_rejects_two_dimensional_indices():
     root = _memory_root()
     values = (np.arange(8 * 32, dtype=np.uint32) % 7).reshape(8, 32)
     _write_small_assay(
@@ -366,9 +405,14 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
             as_dataframe=False,
         )
     )
-    assert matrices
+    expected = 1000.0 * values / n_counts[:, None]
+    # One feature per batch, each a row of the selected cells.
+    assert [matrix.shape for matrix, _labels in matrices] == [(1, 8)] * 32
+    np.testing.assert_array_equal(
+        np.concatenate([labels for _matrix, labels in matrices]), np.arange(32)
+    )
     joined = np.concatenate([matrix for matrix, _labels in matrices], axis=0)
-    assert joined.shape == (values.shape[1], values.shape[0])
+    np.testing.assert_allclose(joined, expected.T, rtol=1e-12)
     wide = list(
         assay.iter_normed_feature_wise(
             cell_idx=np.arange(values.shape[0], dtype=np.int64),
@@ -378,7 +422,21 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
             as_dataframe=True,
         )
     )
-    assert sum(batch.shape[1] for batch in wide) == values.shape[1]
+    assert [batch.shape[1] for batch in wide] == [3] * 10 + [2]
+    np.testing.assert_allclose(
+        np.concatenate([batch.to_numpy() for batch in wide], axis=1),
+        expected,
+        rtol=1e-12,
+    )
+    with pytest.raises(ValueError, match="must be one-dimensional"):
+        list(
+            assay.iter_normed_feature_wise(
+                cell_idx=np.arange(values.shape[0]).reshape(2, 4),
+                feat_idx=np.arange(values.shape[1]),
+                batch_size=3,
+                msg=None,
+            )
+        )
 
 
 def test_iter_normed_feature_wise_splits_read_groups_to_fit_consumer_scratch():
@@ -504,7 +562,15 @@ def test_regression_on_strip_counts_t():
         min_cells=1,
         batch_size=2,
     )
-    assert len(table) == 4
+    normalized = 1000.0 * values / values.sum(axis=1, keepdims=True)
+    expected = [stats.pearsonr(regressor, normalized[:, index]) for index in range(4)]
+    np.testing.assert_array_equal(table.index, np.arange(4))
+    np.testing.assert_allclose(
+        table["r_value"], [result.statistic for result in expected], rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        table["p_value"], [result.pvalue for result in expected], rtol=1e-6
+    )
 
 
 def test_iter_normed_feature_wise_uses_base_path_when_ineligible(monkeypatch):
@@ -558,16 +624,24 @@ def test_renormalize_subset_path_batches_features():
     )
     assay.prepare({"RNA_percentMito": None, "RNA_percentRibo": None})
     assay.sf = 1000.0
+    features = np.array([0, 1, 3, 4, 6])
     frames = list(
         assay.iter_normed_feature_wise(
             np.arange(values.shape[0], dtype=np.int64),
-            np.arange(values.shape[1], dtype=np.int64),
-            4,
+            features,
+            2,
             None,
             renormalize_subset=True,
         )
     )
-    assert sum(frame.shape[1] for frame in frames) == 7
+    assert [list(frame.columns) for frame in frames] == [[0, 1], [3, 4], [6]]
+    # Each cell is normalized by its total over the selected features only.
+    subset = values[:, features]
+    np.testing.assert_allclose(
+        np.concatenate([frame.to_numpy() for frame in frames], axis=1),
+        1000.0 * subset / subset.sum(axis=1, keepdims=True),
+        rtol=1e-12,
+    )
 
 
 def test_melded_counts_leave_counts_t_on_demand():
@@ -710,6 +784,7 @@ def test_explicit_assay_type_can_declare_custom_group_as_rna(tmp_path):
     finalize_writer_counts_t(root, "CUSTOM_NAME", None, assay_type="RNA")
     assert root.attrs["assayTypes"]["CUSTOM_NAME"] == "RNA"
     assert root["CUSTOM_NAME/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(root["CUSTOM_NAME/countsT"][:], values.T)
 
 
 def _counts_array(
@@ -793,30 +868,26 @@ def test_write_counts_t_geometry_matches_serial_baseline():
     assert metadata[0][2] == expected.shards
 
 
-def test_write_counts_t_covers_edge_strips():
+def test_write_counts_t_is_exact_and_complete_across_edge_strips():
+    from scarf.storage.types import array_metadata_shards
+
     values = _dense_values(22, 7)
-    group, counts = _counts_array(values)
+    group, counts = _counts_array(
+        values, policy=CountMatrixPolicy(unitBytes=64, chunkBytes=16)
+    )
     counts_t = write_counts_t(
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
     )
-    np.testing.assert_array_equal(counts_t[:], values.T)
-    np.testing.assert_array_equal(counts_t[0:1, :], values[:, 0:1].T)
-    np.testing.assert_array_equal(counts_t[6:7, :], values[:, 6:7].T)
-
-
-def test_write_counts_t_is_exact_and_complete():
-    values = _dense_values(22, 7)
-    group, counts = _counts_array(values)
-    counts_t = write_counts_t(
-        counts,
-        group,
-        resources=ResourceBudget(8 * 1024**3, 4),
-    )
-    assert counts_t is not None
+    # Shards of two features and eight cells leave a one-feature strip and a
+    # six-cell strip, which ends inside a four-cell chunk.
+    assert array_metadata_shards(counts_t) == (2, 8)
+    assert counts_t.chunks == (1, 4)
     assert counts_t.attrs["complete"] is True
     np.testing.assert_array_equal(counts_t[:], values.T)
+    np.testing.assert_array_equal(counts_t[6:7, :], values[:, 6:7].T)
+    np.testing.assert_array_equal(counts_t[:, 16:22], values[16:22, :].T)
 
 
 def test_write_counts_t_saves_exact_feature_set_totals():
@@ -867,17 +938,24 @@ def test_preflight_counts_t_spec_rejects_when_one_shard_cannot_fit():
 def test_write_counts_t_overwrite_leaves_no_stale_chunks():
     store = RecordingStore()
     values = _dense_values(22, 7)
-    group, counts = _counts_array(values, store=store)
+    policy = CountMatrixPolicy(unitBytes=64, chunkBytes=16)
+    group, counts = _counts_array(values, store=store, policy=policy)
     write_counts_t(
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
         overwrite=True,
     )
-    stale = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
+    # Shards of two features and eight cells: a 4 x 3 grid over 7 x 22.
+    stale = {k for k in store._store_dict if k.startswith("RNA/countsT/c/")}
+    assert stale == {
+        f"RNA/countsT/c/{row}/{col}" for row in range(4) for col in range(3)
+    }
 
     smaller = values[:6]
-    plan = plan_count_matrix_pair(smaller.shape[0], smaller.shape[1], smaller.dtype)
+    plan = plan_count_matrix_pair(
+        smaller.shape[0], smaller.shape[1], smaller.dtype, policy=policy
+    )
     del group["counts"]
     counts = group.create_array(
         "counts",
@@ -899,9 +977,10 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
         overwrite=True,
     )
 
-    live = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
-    assert live == sorted(set(live))
-    assert len(live) <= len(stale)
+    # Shards of two features and six cells cover 7 x 6 in one shard column,
+    # and no shard of the wider array is left behind.
+    live = {k for k in store._store_dict if k.startswith("RNA/countsT/c/")}
+    assert live == {f"RNA/countsT/c/{row}/0" for row in range(4)}
     np.testing.assert_array_equal(counts_t[:], smaller.T)
 
 
@@ -953,6 +1032,13 @@ def _replace_counts_t(group: zarr.Group, shape: tuple[int, int], dtype: str) -> 
     )
 
 
+def _flatten_counts(group: zarr.Group) -> None:
+    attrs = dict(group["counts"].attrs)
+    flat = np.asarray(group["counts"][:]).ravel()
+    del group["counts"]
+    group.create_array("counts", data=flat).attrs.update(attrs)
+
+
 def _drop_layout(group: zarr.Group) -> None:
     for node in (group, group["counts"], group["countsT"]):
         del node.attrs[COUNT_MATRIX_LAYOUT_KEY]
@@ -990,6 +1076,7 @@ def _disagree_layout(group: zarr.Group) -> None:
         ),
         (_drop_layout, "layout metadata is missing"),
         (_disagree_layout, "does not agree"),
+        (_flatten_counts, "Raw counts must have two dimensions"),
     ],
     ids=[
         "missing",
@@ -1000,6 +1087,7 @@ def _disagree_layout(group: zarr.Group) -> None:
         "unfinalized-counts",
         "missing-layout",
         "disagreeing-layout",
+        "one-dimensional-counts",
     ],
 )
 def test_count_matrix_validation_rejects_each_damaged_component(damage, message):
@@ -1032,12 +1120,14 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
     assert incomplete.outcome == "incomplete"
+    assert incomplete.reason == "countsT is not complete for 'RNA'"
 
     root["RNA/countsT"].attrs["complete"] = True
     blocked = assess_counts_t_reuse(
         root, "RNA", None, n_cells=3, n_features=4, dtype="float32"
     )
     assert blocked.outcome == "invalid"
+    assert blocked.reason == "countsT dtype for 'RNA' is uint32, expected float32"
 
     # A complete countsT in another layout is invalid, not rewritten.
     del root["RNA/countsT"]
@@ -1133,6 +1223,9 @@ def test_subset_preserves_gene_activity_alias(tmp_path):
     subset_root = zarr.open_group(out, mode="r")
     assert subset_root.attrs["assayTypes"]["GeneActivity"] == "GeneActivity"
     assert subset_root["GeneActivity/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(
+        subset_root["GeneActivity/countsT"][:], np.array([[1, 3], [0, 4]])
+    )
 
 
 def test_seed_assay_type_is_idempotent() -> None:
@@ -1190,7 +1283,7 @@ def test_paired_layout_predicates_and_preflight_failures() -> None:
             profile="cloud",
             resources=ResourceBudget(1024, 1),
         )
-    with pytest.raises(MemoryError):
+    with pytest.raises(MemoryError, match="countsT write needs"):
         preflight_counts_t_spec(
             spec,
             profile="cloud",

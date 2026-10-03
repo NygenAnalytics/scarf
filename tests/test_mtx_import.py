@@ -97,7 +97,10 @@ def test_inspect_and_stream_canonical_mixed_compression(
     finally:
         reader.close()
         explicit.close()
-    np.testing.assert_array_equal(observed, expected)
+    # Rows are cells and columns features; cell 3 holds no counts.
+    cells_by_features = [[2, 0, 4, 0], [0, 3, 0, 0], [0, 0, 0, 0], [0, 0, 0, 5]]
+    np.testing.assert_array_equal(observed, cells_by_features)
+    np.testing.assert_array_equal(expected, cells_by_features)
 
 
 @pytest.mark.parametrize(
@@ -552,7 +555,11 @@ def test_feature_major_disk_csr_parity_filtering_and_cleanup(tmp_path: Path) -> 
 
     first = zarr.open_group(store=stores[0], mode="r")["RNA/counts"][:]
     second = zarr.open_group(store=stores[1], mode="r")["RNA/counts"][:]
-    np.testing.assert_array_equal(first, second)
+    # Feature 2 of cell 2 sums its two entries, and cell 4, whose total does
+    # not exceed the cutoff, is dropped.
+    expected = [[1, 0, 4, 0], [0, 3, 0, 0], [2, 0, 0, 0]]
+    np.testing.assert_array_equal(first, expected)
+    np.testing.assert_array_equal(second, expected)
     assert not list(tmp_path.glob("scarf-mtx-csr-*"))
 
 
@@ -1000,7 +1007,10 @@ def test_feature_major_consume_uses_parse_budget_and_cleans_up_on_close(
     assert not list(tmp_path.glob("scarf-mtx-csr-*"))
     completed = list(reader.consume(2, lines_in_mem=2))
     assert not list(tmp_path.glob("scarf-mtx-csr-*"))
-    assert np.vstack([batch.toarray() for batch in completed]).sum() == 10
+    np.testing.assert_array_equal(
+        np.vstack([batch.toarray() for batch in completed]),
+        [[1, 0, 4], [0, 3, 0], [2, 0, 0]],
+    )
 
 
 def test_multimodal_mex_names_feature_reference_and_related_files(
@@ -1057,6 +1067,14 @@ def test_multimodal_mex_names_feature_reference_and_related_files(
         root["CRISPR/featureData/sequence"][:],
         ["SEQ1"],
     )
+    # Feature i of the single cell holds the count i, one feature per assay.
+    for count, assay in enumerate(
+        ("RNA", "CRISPR", "HTO", "ANTIGEN", "CUSTOM", "ADT"), start=1
+    ):
+        np.testing.assert_array_equal(root[f"{assay}/counts"][:], [[count]])
+        np.testing.assert_array_equal(
+            root[f"{assay}/featureData/ids"][:], [f"feature-{count - 1}"]
+        )
     assert "feature_call" not in root["cellData"]
     datastore = DataStore(
         store,

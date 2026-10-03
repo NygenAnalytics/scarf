@@ -13,15 +13,17 @@ This is separate from integrating RNA and ADT measurements: demultiplexing class
 ## 1. Run HTO demultiplexing
 
 Scarf expects an HTO assay, named `HTO` by default, in the same datastore as the biological assays.
+Open that datastore as `ds` before following the examples. The assay must be declared as type
+`HTO` when imported; naming an ordinary RNA or ADT assay `HTO` is not enough.
 `run_hto_demultiplexing` normalizes the hashtag counts, estimates background, and returns an immutable
 identity artifact without changing shared cell metadata.
 
 ```python
+# Freeze the active cells for hashtag demultiplexing.
 cell_selection = ds.snapshot_cell_selection("I")
-identities = ds.run_hto_demultiplexing(
-    cell_selection,
-    from_assay="HTO",
-)
+# Assign hashtag identities, negatives, and doublets.
+identities = ds.run_hto_demultiplexing(cell_selection)
+# Inspect the assigned hashtag identities.
 ds.load_artifact(identities)["values"][:]
 ```
 
@@ -32,8 +34,12 @@ Singlet labels can define downstream selections or pseudobulk groups. To retain 
 without creating a metadata column, select the exact HTO identifiers:
 
 ```python
+# Read the hashtag identifiers that represent singlets.
 singlet_labels = ds.HTO.feats.fetch_all("ids").astype(str).tolist()
+# Keep cells assigned to one of those hashtags.
 singlets = ds.select_cells(identities, include=singlet_labels)
+# Count cells assigned to a single hashtag.
+int(ds.load_artifact(singlets)["values"][:].sum())
 ```
 
 Negative cells do not have a confident hashtag assignment.

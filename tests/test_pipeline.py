@@ -1,5 +1,7 @@
 import inspect
 import pickle
+import re
+import shutil
 import threading
 from collections.abc import Mapping
 from itertools import pairwise
@@ -11,8 +13,11 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf import PipelineExecutionError, PipelineRun
-from scarf.datastore._pipeline_cluster_selection import run_cluster_selection
+from scarf import DataStore, PipelineExecutionError, PipelineRun
+from scarf.datastore._pipeline_cluster_selection import (
+    cluster_label_values,
+    run_cluster_selection,
+)
 from scarf.datastore._pipeline_fields import (
     categorical_array_display,
     continuous_array_display,
@@ -31,6 +36,7 @@ from scarf.storage.pipeline_runs import load_pipeline_stage_records
 from scarf.storage.refs import ArtifactScope
 from scarf.storage.selections import resolve_stored_selection_artifact
 from scarf.utils.shutdown import ShutdownRequested, current_shutdown_token
+from tests.storage_helpers import insert_nullable_cell_column
 
 
 def _minimal_run_options() -> dict[str, Any]:
@@ -46,6 +52,55 @@ def _minimal_run_options() -> dict[str, Any]:
         "doublets": False,
         "markers": False,
     }
+
+
+@pytest.fixture(scope="module")
+def minimal_base(datastore_zarr_root: str, tmp_path_factory) -> SimpleNamespace:
+    """Commit the minimal recipe once on a private copy of the PBMC store.
+
+    Tests read this run, or copy the store so that their own runs reuse its
+    snapshot, feature, normalization, PCA, and graph artifacts.
+    """
+    location = tmp_path_factory.mktemp("pipeline_base") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, location)
+    datastore = DataStore(str(location), default_assay="RNA")
+    assay = datastore.get_assay("RNA")
+    before = SimpleNamespace(
+        cell_columns=frozenset(datastore.cells.columns),
+        feature_columns=frozenset(assay.feats.columns),
+        assay_attrs=dict(assay.attrs),
+    )
+    events: list[PipelineEvent] = []
+
+    def reject_embedding_initialization(*_args, **_kwargs):
+        raise AssertionError("umap=False must not build embedding initialization")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            DataStore,
+            "build_embedding_initialization",
+            reject_embedding_initialization,
+        )
+        run = datastore.pipeline.run(
+            label="baseline",
+            callback=events.append,
+            **_minimal_run_options(),
+        )
+    return SimpleNamespace(
+        location=str(location),
+        datastore=datastore,
+        run=run,
+        events=tuple(events),
+        before=before,
+    )
+
+
+@pytest.fixture
+def pipeline_store(minimal_base: SimpleNamespace, tmp_path) -> DataStore:
+    """A writable copy of the base store, holding the committed minimal run."""
+    location = tmp_path / "data.zarr"
+    shutil.copytree(minimal_base.location, location)
+    return DataStore(str(location), default_assay="RNA")
 
 
 def test_pipeline_callback_baseexceptions_do_not_escape() -> None:
@@ -65,19 +120,6 @@ def test_pipeline_event_keeps_its_public_pickle_identity() -> None:
 
     assert PipelineEvent.__module__ == "scarf.datastore.pipeline_accessor"
     assert pickle.loads(pickle.dumps(event)) == event
-
-
-def _insert_nullable_cell_column(
-    datastore: Any,
-    name: str,
-    values: np.ndarray,
-    missing: np.ndarray,
-) -> None:
-    cell_data = datastore.zw["cellData"]
-    missing_name = f"__scarf_missing__{name}"
-    cell_data.create_array(name, data=np.asarray(values))
-    cell_data.create_array(missing_name, data=np.asarray(missing, dtype=bool))
-    cell_data[name].attrs["missing_mask"] = missing_name
 
 
 class _ClusterSelectionStore:
@@ -125,6 +167,14 @@ def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
     assert [item["value"] for item in categorical["categories"]] == [1.0, 2.0, 3.0]
     assert categorical["missing_label"] == "NA"
     assert len(labels.reads) == 3
+
+    # A chunk without finite values leaves the range of the other chunks.
+    scores = ChunkedArray(np.asarray([np.nan, np.inf, 5.0, -1.0, np.nan]), 2)
+    display = continuous_array_display(scores)
+    assert (display["minimum"], display["maximum"]) == (-1.0, 5.0)
+    assert len(scores.reads) == 3
+    empty = continuous_array_display(ChunkedArray(np.full(3, np.nan), 2))
+    assert (empty["minimum"], empty["maximum"]) == (None, None)
 
 
 def _array_artifact(
@@ -315,11 +365,26 @@ def _cluster_labels(
     cell_selection: ArtifactRef,
     graph: ArtifactRef,
 ) -> ArtifactRef:
+    return _cluster_labels_payload(
+        root,
+        payload={"values": values},
+        cell_selection=cell_selection,
+        graph=graph,
+    )
+
+
+def _cluster_labels_payload(
+    root: Any,
+    *,
+    payload: dict[str, np.ndarray],
+    cell_selection: ArtifactRef,
+    graph: ArtifactRef,
+) -> ArtifactRef:
     return _array_artifact(
         root,
         kind="cluster_labels",
         operation="run_leiden_clustering",
-        values={"values": values},
+        values=payload,
         inputs={"graph": graph, "cell_selection": cell_selection},
     )
 
@@ -467,32 +532,18 @@ def test_pipeline_requested_filtering_requires_at_least_one_qc_column(
 
 
 def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
-    datastore_ephemeral,
-    monkeypatch: pytest.MonkeyPatch,
+    minimal_base: SimpleNamespace,
 ) -> None:
-    datastore = datastore_ephemeral
-
-    def reject_embedding_initialization(*_args, **_kwargs):
-        raise AssertionError("umap=False must not build embedding initialization")
-
-    monkeypatch.setattr(
-        type(datastore),
-        "build_embedding_initialization",
-        reject_embedding_initialization,
-    )
-    cells_before = frozenset(datastore.cells.columns)
+    # The module fixture committed the run with embedding initialization
+    # patched to fail; a fresh DataStore opens it cold.
+    returned = minimal_base.run
+    events = minimal_base.events
+    datastore = DataStore(minimal_base.location, default_assay="RNA")
     assay = datastore.get_assay("RNA")
-    features_before = frozenset(assay.feats.columns)
-    assay_attrs_before = dict(assay.attrs)
-    events: list[PipelineEvent] = []
+    run = datastore.pipeline.open(run_id=returned.run_id)
 
-    run = datastore.pipeline.run(
-        label="baseline",
-        callback=events.append,
-        **_minimal_run_options(),
-    )
-
-    assert isinstance(run, PipelineRun)
+    assert isinstance(returned, PipelineRun)
+    assert returned.status == "completed"
     assert run.status == "completed"
     assert run.label == "baseline"
     assert list(run) == [
@@ -516,9 +567,9 @@ def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
         "names",
         "highly_variable_features",
     )
-    assert frozenset(datastore.cells.columns) == cells_before
-    assert frozenset(assay.feats.columns) == features_before
-    assert dict(assay.attrs) == assay_attrs_before
+    assert frozenset(datastore.cells.columns) == minimal_base.before.cell_columns
+    assert frozenset(assay.feats.columns) == minimal_base.before.feature_columns
+    assert dict(assay.attrs) == minimal_base.before.assay_attrs
 
     expected_stages = (
         "input_snapshot",
@@ -564,10 +615,10 @@ def test_minimal_pipeline_is_artifact_only_cold_openable_and_ordered(
 
 
 def test_pipeline_failure_exposes_openable_run_and_original_cause(
-    datastore_ephemeral,
+    pipeline_store,
     monkeypatch,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     expected = RuntimeError("deliberate PCA failure")
     events: list[PipelineEvent] = []
 
@@ -590,8 +641,24 @@ def test_pipeline_failure_exposes_openable_run_and_original_cause(
     assert failed.label is None
     report = failed.report()
     assert report["run"]["requestedLabel"] == "failed-baseline"
-    assert report["run"]["error"]["type"] == "RuntimeError"
-    assert events[-1].kind == "stage_failed"
+    assert report["run"]["error"] == {
+        "type": "RuntimeError",
+        "message": "deliberate PCA failure",
+    }
+    # Stages before PCA completed; PCA failed; later stages never started.
+    assert [(stage["stage"], stage["status"]) for stage in report["stages"]] == [
+        ("input_snapshot", "completed"),
+        ("filtering", "skipped"),
+        ("cell_cycle", "skipped"),
+        ("highly_variable_features", "completed"),
+        ("normalization", "completed"),
+        ("pca", "failed"),
+    ]
+    assert [(event.kind, event.stage) for event in events][-2:] == [
+        ("stage_started", "pca"),
+        ("stage_failed", "pca"),
+    ]
+    assert events[-1].error is expected
     with pytest.raises(RuntimeError, match="requires a completed run"):
         list(failed)
     with pytest.raises(KeyError, match="No completed pipeline run"):
@@ -688,10 +755,10 @@ def test_completed_stage_bookkeeping_failure_commits_failed_stage_and_run(
 
 
 def test_pipeline_interruption_is_durable_before_callbacks(
-    datastore_ephemeral,
+    pipeline_store,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     events: list[PipelineEvent] = []
 
     def interrupt_pca(self, *_args, **_kwargs):
@@ -747,6 +814,38 @@ def test_pending_shutdown_propagates_when_interruption_cleanup_fails(
         datastore.pipeline.run(**_minimal_run_options())
 
 
+def _filtering_stage_selection(
+    datastore: DataStore,
+    filtering: Mapping[str, object],
+) -> ArtifactRef:
+    """Run the pipeline through its filtering stage and return its selection.
+
+    The run stops between stages once filtering completes, so no later stage
+    recomputes features for the new selection.
+    """
+
+    def stop_after_filtering(event: PipelineEvent) -> None:
+        if (event.kind, event.stage) == ("stage_completed", "filtering"):
+            token = current_shutdown_token()
+            assert token is not None
+            token.request(reason="stop after filtering")
+
+    with pytest.raises(ShutdownRequested, match="stop after filtering"):
+        datastore.pipeline.run(
+            callback=stop_after_filtering,
+            **{**_minimal_run_options(), "filtering": filtering},
+        )
+    (run,) = datastore.pipeline.list_runs(status="interrupted")
+    report = run.report()
+    assert [(stage["stage"], stage["status"]) for stage in report["stages"]] == [
+        ("input_snapshot", "completed"),
+        ("filtering", "completed"),
+    ]
+    (output,) = report["stages"][1]["outputs"]
+    assert output["outputKey"] == "analysis_cell_selection"
+    return ArtifactRef.from_dict(output["artifact"])
+
+
 def test_automatic_filtering_threads_one_distinct_analysis_selection(
     datastore_ephemeral,
 ) -> None:
@@ -760,6 +859,10 @@ def test_automatic_filtering_threads_one_distinct_analysis_selection(
     assert run["analysis_cell_selection"] != run["input_cell_selection"]
     analysis_count = int(np.count_nonzero(run.cells.fetch_all("I")))
     assert 0 < analysis_count < input_count
+    np.testing.assert_array_equal(
+        run.cells.fetch_all("I"),
+        datastore.load_artifact(run["analysis_cell_selection"])["values"][:],
+    )
     assert len(run.cells.fetch("ids")) == analysis_count
     normalized = datastore.inspect_artifact(run["normalized"])
     assert (
@@ -776,39 +879,42 @@ def test_pipeline_filtering_excludes_nullable_integer_metric_rows(
     missing = np.zeros(active.shape, dtype=bool)
     missing_index = int(np.flatnonzero(active)[0])
     missing[missing_index] = True
-    _insert_nullable_cell_column(
+    insert_nullable_cell_column(
         datastore,
         "nullable_qc",
         np.full(active.shape, 10, dtype=np.int32),
         missing,
     )
-    options = _minimal_run_options()
-    options["filtering"] = {
-        "method": "manual",
-        "attrs": ["nullable_qc"],
-        "lows": [0],
-        "highs": [20],
-        "keep_bounds": True,
-    }
 
-    run = datastore.pipeline.run(**options)
+    selection = _filtering_stage_selection(
+        datastore,
+        {
+            "method": "manual",
+            "attrs": ["nullable_qc"],
+            "lows": [0],
+            "highs": [20],
+            "keep_bounds": True,
+        },
+    )
 
     expected = active.copy()
     expected[missing_index] = False
-    np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
+    np.testing.assert_array_equal(
+        datastore.load_artifact(selection)["values"][:], expected
+    )
 
 
 def test_pipeline_auto_filtering_retains_constant_metric(datastore_ephemeral):
     datastore = datastore_ephemeral
     expected = datastore.cells.fetch_all("I")
     datastore.cells.insert("constant_qc", np.zeros(datastore.cells.N))
-    options = _minimal_run_options()
-    options["filtering"] = {"attrs": ["constant_qc"]}
 
-    run = datastore.pipeline.run(**options)
+    selection = _filtering_stage_selection(datastore, {"attrs": ["constant_qc"]})
 
-    np.testing.assert_array_equal(run.cells.fetch_all("I"), expected)
-    status = datastore.inspect_artifact(run["analysis_cell_selection"])
+    np.testing.assert_array_equal(
+        datastore.load_artifact(selection)["values"][:], expected
+    )
+    status = datastore.inspect_artifact(selection)
     assert status.parameters["method"] == "mad"
     bounds = status.parameters["mad"]["resolved_bounds"]["all"]["constant_qc"]
     assert bounds["low"] is None
@@ -902,6 +1008,30 @@ def test_pooled_mad_defaults_match_pipeline_and_preserve_gaussian_option(
     np.testing.assert_array_equal(store.cells.fetch_all("I"), active)
 
 
+def test_snapshot_filter_columns_are_one_dimensional_with_linked_masks() -> None:
+    from scarf.datastore._pipeline_filtering import snapshot_column_values
+
+    snapshot = zarr.open_group(store=MemoryStore(), mode="w").create_group("frozen")
+    snapshot.create_array("count", data=np.asarray([3, 4, 5], dtype=np.int32))
+    snapshot.create_array(
+        "__scarf_missing__count", data=np.asarray([False, True, False])
+    )
+    snapshot["count"].attrs["missing_mask"] = "__scarf_missing__count"
+    snapshot.create_array("plain", data=np.asarray([1.0, 2.0, 3.0]))
+    snapshot.create_array("matrix", data=np.ones((3, 2)))
+
+    values, missing = snapshot_column_values(snapshot, "count")
+    np.testing.assert_array_equal(values, [3, 4, 5])
+    np.testing.assert_array_equal(missing, [False, True, False])
+    values, missing = snapshot_column_values(snapshot, "plain")
+    np.testing.assert_array_equal(values, [1.0, 2.0, 3.0])
+    assert missing is None
+    with pytest.raises(
+        ValueError, match="^Snapshot column 'matrix' must be one-dimensional$"
+    ):
+        snapshot_column_values(snapshot, "matrix")
+
+
 def test_pipeline_filtering_rejects_nullable_active_sample_label(
     datastore_ephemeral,
 ) -> None:
@@ -909,7 +1039,7 @@ def test_pipeline_filtering_rejects_nullable_active_sample_label(
     active = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
     missing = np.zeros(active.shape, dtype=bool)
     missing[int(np.flatnonzero(active)[0])] = True
-    _insert_nullable_cell_column(
+    insert_nullable_cell_column(
         datastore,
         "nullable_sample",
         np.full(active.shape, "sample-a"),
@@ -931,9 +1061,9 @@ def test_pipeline_filtering_rejects_nullable_active_sample_label(
 
 
 def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
-    datastore_ephemeral,
+    pipeline_store,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     cells_before = {
         column: np.asarray(datastore.cells.fetch_all(column)).copy()
         for column in datastore.cells.columns
@@ -955,16 +1085,24 @@ def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
     assert tuple(decision.attrs["tieOrder"]) == partitions
     assert "paris" not in decision.attrs["candidateKeys"]
     selected_key = decision.attrs["selectedKey"]
-    assert selected_key in partitions
     assert run["clusters"] == run[selected_key]
     scores = np.asarray(decision["scores"][:], dtype=float)
     assert scores.shape == (4,)
     assert np.isfinite(scores).any()
-    assert decision["sample_indices"].shape[0] <= 10_000
-    assert dict(decision.attrs["sampleDefinition"])["sampleStrategy"] == (
-        "sharedClusterQuota"
-    )
-    assert dict(decision.attrs["sampleDefinition"])["minClusterQuota"] == 2
+    # The first candidate in tie order with the highest silhouette wins.
+    best = int(np.flatnonzero(scores == np.nanmax(scores))[0])
+    assert selected_key == partitions[best]
+    n_cells = int(np.count_nonzero(run.cells.fetch_all("I")))
+    sample_size = min(n_cells, 10_000)
+    assert decision["sample_indices"].shape == (sample_size,)
+    assert dict(decision.attrs["sampleDefinition"]) == {
+        "seed": 4466,
+        "populationSize": n_cells,
+        "sampleSize": sample_size,
+        "maxSampleSize": 10_000,
+        "sampleStrategy": "sharedClusterQuota",
+        "minClusterQuota": 2,
+    }
     status = require_complete_artifact(datastore.zw, run["cluster_selection"])
     assert status.inputs is not None
     assert ArtifactRef.from_dict(status.inputs["coordinates"]) == run["pca"]
@@ -985,29 +1123,32 @@ def test_default_clustering_is_selected_by_a_persisted_silhouette_decision(
 
 
 def test_custom_leiden_uses_only_the_requested_candidate_set(
-    datastore_ephemeral,
+    pipeline_store,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     options = _minimal_run_options()
     options["leiden"] = {"partitions": [0.4, 0.8]}
     run = datastore.pipeline.run(**options)
 
     assert "leiden_0.4" in run
     assert "leiden_0.8" in run
-    assert run["clusters"] in {run["leiden_0.4"], run["leiden_0.8"]}
     decision = artifact_group(datastore.zw, run["cluster_selection"])
     assert tuple(decision.attrs["candidateKeys"]) == (
         "leiden_0.4",
         "leiden_0.8",
     )
-    assert "leiden_1.0" not in run
+    assert run["clusters"] == run[decision.attrs["selectedKey"]]
+    assert [key for key in run if key.startswith("leiden_")] == [
+        "leiden_0.4",
+        "leiden_0.8",
+    ]
 
 
 def test_pipeline_runs_umap_and_leiden_stages_one_at_a_time(
-    datastore_ephemeral,
+    pipeline_store,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     umap_threads: list[threading.Thread] = []
     run_umap = type(datastore)._run_umap_artifact
 
@@ -1206,7 +1347,7 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
         "invalidReasons",
         ["too short"],
     )
-    replace_after_attr_corruption(
+    rereferenced = replace_after_attr_corruption(
         rereferenced,
         "sampleDefinition",
         {
@@ -1216,6 +1357,15 @@ def test_cluster_selection_records_invalid_candidates_ties_and_reuse(
             "maxSampleSize": 10_000,
         },
     )
+    # Lists of the right container type but wrong element types are rejected
+    # before they are compared or rebuilt into a decision.
+    for attribute, value in (
+        ("candidateKeys", [0, 1, 2]),
+        ("tieOrder", [0, 1, 2]),
+        ("candidateRefs", ["invalid", "first", "second"]),
+        ("invalidReasons", [0, None, None]),
+    ):
+        rereferenced = replace_after_attr_corruption(rereferenced, attribute, value)
 
 
 def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
@@ -1494,14 +1644,41 @@ def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
     with pytest.raises(ValueError, match="must reference a Leiden clustering artifact"):
         _select_clusters(store, lineage, (("imported", imported_labels),))
 
+    for payload, error_type, message in (
+        (
+            {"labels": np.asarray([0, 0, 1, 1], dtype=np.int32)},
+            ValueError,
+            "has no 'values' array$",
+        ),
+        (
+            {"values": np.asarray([[0], [0], [1], [1]], dtype=np.int32)},
+            ValueError,
+            "is not one-dimensional$",
+        ),
+        (
+            {"values": np.asarray([0.0, 0.0, 1.0, 1.0])},
+            TypeError,
+            "labels must be integers$",
+        ),
+    ):
+        malformed = _cluster_labels_payload(
+            root, payload=payload, cell_selection=selection, graph=graph
+        )
+        with pytest.raises(
+            error_type, match=f"^Cluster candidate {re.escape(repr(malformed))} "
+        ):
+            _select_clusters(store, lineage, (("malformed", malformed),))
+        with pytest.raises(error_type, match=message):
+            cluster_label_values(root, malformed)
+
 
 def test_empty_filtering_mapping_uses_automatic_defaults(
-    datastore_ephemeral,
+    minimal_base: SimpleNamespace,
 ) -> None:
     from scarf.datastore._pipeline_recipe import resolve_pipeline_recipe
 
     recipe = resolve_pipeline_recipe(
-        datastore_ephemeral,
+        minimal_base.datastore,
         assay=None,
         label=None,
         cell_key="I",
@@ -1699,10 +1876,10 @@ def test_rich_pipeline_views_plots_and_markers_remain_frozen_after_live_i_drift(
 
 
 def test_harmony_doublets_record_an_uncorrected_internal_graph_only(
-    datastore_ephemeral,
+    pipeline_store,
     monkeypatch,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     batch = np.where(np.arange(datastore.cells.N) % 2, "b", "a")
     datastore.cells.insert("pipeline_batch", batch)
     captured: dict[str, Any] = {}
@@ -1760,9 +1937,9 @@ def test_harmony_doublets_record_an_uncorrected_internal_graph_only(
 
 
 def test_paris_only_pipeline_keeps_paris_as_a_diagnostic_without_clusters(
-    datastore_ephemeral,
+    pipeline_store,
 ) -> None:
-    datastore = datastore_ephemeral
+    datastore = pipeline_store
     run = datastore.pipeline.run(
         **{
             **_minimal_run_options(),
@@ -1776,19 +1953,72 @@ def test_paris_only_pipeline_keeps_paris_as_a_diagnostic_without_clusters(
     assert "cluster_selection" not in run
     assert "leiden_1.0" not in run
     assert list(run).count("paris") == 1
+    assert run["paris"].kind == "cluster_cut"
+    statuses = {stage["stage"]: stage["status"] for stage in run.report()["stages"]}
+    assert (statuses["paris"], statuses["cluster_selection"]) == (
+        "completed",
+        "skipped",
+    )
+    # The cut is a frozen categorical cell field over the analysis selection.
+    assert run.cells.columns == ("I", "ids", "names", "paris")
+    labels = run.cells.fetch("paris")
+    np.testing.assert_array_equal(
+        labels, artifact_group(datastore.zw, run["paris"])["labels"][:]
+    )
+    assert len(labels) == int(np.count_nonzero(run.cells.fetch_all("I")))
+    assert [
+        category["value"]
+        for category in run.cells._field_display("paris")["categories"]
+    ] == np.unique(labels).tolist()
+
+
+def test_snapshot_columns_freeze_user_metadata_with_dtype_fills(
+    pipeline_store,
+) -> None:
+    datastore = pipeline_store
+    flags = np.arange(datastore.cells.N) % 3 == 0
+    visits = np.arange(datastore.cells.N, dtype=np.int64)
+    datastore.cells.insert("doublet_flag", flags)
+    datastore.cells.insert("visit", visits)
+
+    run = datastore.pipeline.run(
+        snapshot_columns=("doublet_flag", "visit"),
+        **_minimal_run_options(),
+    )
+    # Later edits of the live columns do not reach the frozen run.
+    datastore.cells.insert("doublet_flag", ~flags, overwrite=True)
+    datastore.cells.insert("visit", visits[::-1].copy(), overwrite=True)
+    reopened = datastore.pipeline.open(run_id=run.run_id)
+
+    assert reopened.cells.columns == ("I", "ids", "names", "doublet_flag", "visit")
+    np.testing.assert_array_equal(reopened.cells.fetch_all("doublet_flag"), flags)
+    np.testing.assert_array_equal(reopened.cells.fetch_all("visit"), visits)
+    fields = {
+        field["key"]: field
+        for field in reopened.report()["run"]["fields"]
+        if field["axis"] == "cells"
+    }
+    # Each field records the fill that matches its stored dtype.
+    assert (fields["doublet_flag"]["dtype"], fields["doublet_flag"]["fill"]) == (
+        "|b1",
+        False,
+    )
+    assert (fields["visit"]["dtype"], fields["visit"]["fill"]) == ("<i8", -1)
 
 
 def test_pipeline_run_cells_fetch_live_ids_and_the_frozen_selection(
-    datastore_ephemeral,
+    minimal_base: SimpleNamespace,
 ) -> None:
-    datastore = datastore_ephemeral
-    run = datastore.pipeline.run(**_minimal_run_options())
+    datastore = minimal_base.datastore
+    run = datastore.pipeline.open(run_id=minimal_base.run.run_id)
 
     ids = run.cells.fetch_all("ids")
     np.testing.assert_array_equal(ids, datastore.cells.fetch_all("ids"))
     selection = run.cells.fetch_all("I")
-    assert selection.dtype == np.dtype(bool)
-    assert selection.shape == ids.shape
+    np.testing.assert_array_equal(
+        selection,
+        datastore.load_artifact(run["analysis_cell_selection"])["values"][:],
+    )
     np.testing.assert_array_equal(run.cells.fetch("ids"), ids[selection])
     with pytest.raises(TypeError, match="non-empty string"):
         run.cells.fetch_all("")

@@ -3,6 +3,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib
 
@@ -13,9 +14,7 @@ import pandas as pd
 import pytest
 
 import scarf.plotting as splt
-from scarf.metadata.artifacts import artifact_values
 from scarf.storage import ArtifactRef
-from scarf.storage.artifacts import artifact_group
 
 
 class _ArrayCells:
@@ -80,9 +79,9 @@ class _ArrayStore:
     nthreads = 1
     zw = None
 
-    def __init__(self, columns, feature_values):
+    def __init__(self, columns, feature_values, names=("GeneA", "GeneB")):
         self.cells = _ArrayCells(columns)
-        self.RNA = _ArrayAssay(feature_values, ["GeneA", "GeneB"])
+        self.RNA = _ArrayAssay(feature_values, list(names))
 
     def _get_assay(self, name):
         if name != "RNA":
@@ -92,6 +91,72 @@ class _ArrayStore:
     @staticmethod
     def _stored_display_metadata(_column):
         return None
+
+
+def _imported_plot_store(
+    directory,
+    *,
+    coordinates,
+    clusters,
+    genes=("CD3E", "MS4A1", "LYZ", "NKG7", "GNLY", "FCGR3A"),
+    seed=7,
+):
+    """Import a small AnnData file with one embedding and one cluster labelling.
+
+    The store holds real immutable artifacts (an imported embedding, cluster
+    labels and their shared cell selection) without building a graph, so
+    artifact-backed plots run in about a second. Returns the opened store, the
+    import result and the imported counts.
+    """
+    anndata = pytest.importorskip("anndata")
+    from scipy.sparse import csr_matrix
+
+    from scarf.datastore.datastore import DataStore
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    n_cells = len(coordinates)
+    counts = (
+        np.random.default_rng(seed)
+        .poisson(3.0, size=(n_cells, len(genes)))
+        .astype(np.float32)
+    )
+    obs = pd.DataFrame(
+        {"clusters": pd.array(np.asarray(clusters), dtype="Int64")},
+        index=[f"c{index}" for index in range(n_cells)],
+    )
+    var = pd.DataFrame(
+        {"gene_short_name": list(genes)},
+        index=[f"f{index}" for index in range(len(genes))],
+    )
+    source = Path(directory) / "plot_inputs.h5ad"
+    anndata.AnnData(
+        X=csr_matrix(counts),
+        obs=obs,
+        var=var,
+        obsm={"X_umap": coordinates},
+    ).write_h5ad(source)
+    reader = H5adReader(
+        str(source),
+        embedding_roles={"X_umap": "umap"},
+        cluster_keys=("clusters",),
+    )
+    try:
+        imported = H5adToZarr(
+            reader,
+            zarr_loc=str(Path(directory) / "plot_inputs.zarr"),
+            nthreads=1,
+        ).dump()
+    finally:
+        reader.h5.close()
+    store = DataStore(
+        str(Path(directory) / "plot_inputs.zarr"),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    return store, imported, counts
 
 
 def _summarize(
@@ -153,7 +218,20 @@ def synthetic_plot_store():
         "invalid_condition": np.full(12, "", dtype=object),
         "subject": subject,
         "inconsistent_subject": inconsistent_subject,
+        # A layout on x = 0..11 with y cycling 0, 1.5, 3, 4.5, a second layout,
+        # and a continuous score that jumps between two conditions.
+        "plot_layout1": np.arange(12, dtype=np.float64),
+        "plot_layout2": (np.arange(12) % 4) * 1.5,
+        "plot_mirror1": -np.arange(12, dtype=np.float64),
+        "plot_mirror2": np.arange(12, dtype=np.float64)[::-1],
+        "plot_condition": np.repeat(["low", "high"], 6).astype(object),
+        "plot_score": np.concatenate(
+            (np.linspace(0.0, 1.0, 6), np.linspace(10.0, 11.0, 6))
+        ),
+        "keep": np.arange(12) < 8,
+        "paired_category": np.array(list("AABABBBBBAAA"), dtype=object),
     }
+    columns["plot_score_scaled"] = columns["plot_score"] * 10
     feature_values = np.column_stack(
         (
             np.linspace(0.0, 5.5, 12),
@@ -161,58 +239,6 @@ def synthetic_plot_store():
         )
     )
     return _ArrayStore(columns, feature_values)
-
-
-def test_import_plotting_exports():
-    function_names = (
-        "cluster_connectivity",
-        "cluster_tree",
-        "compose_results",
-        "composition",
-        "distribution",
-        "dotplot",
-        "elbow",
-        "embedding",
-        "embedding_raster",
-        "graph_qc",
-        "highly_variable_features",
-        "label_panels",
-        "marker_heatmap",
-        "mapping_calibration",
-        "mapping_confusion",
-        "mapping_evidence",
-        "mapping_score",
-        "matrixplot",
-        "modality_weights",
-        "pseudotime_heatmap",
-        "qc",
-        "run_recipe",
-        "theme_context",
-    )
-    result_names = (
-        "CategoricalScale",
-        "CellField",
-        "ColorScale",
-        "DensityOverlay",
-        "FeatureRef",
-        "Highlight",
-        "LegendSpec",
-        "NormalizationSpec",
-        "PlotProvenance",
-        "PlotOutput",
-        "PlotOutputSettings",
-        "PlotPanelTarget",
-        "PlotRecipe",
-        "PlotRecipeResult",
-        "PlotResult",
-        "PlotStep",
-        "SizeScale",
-        "StudyDesign",
-    )
-
-    assert all(name in splt.__all__ for name in (*function_names, *result_names))
-    assert all(callable(getattr(splt, name)) for name in function_names)
-    assert all(getattr(splt, name) is not None for name in result_names)
 
 
 @pytest.mark.parametrize("name", ["mapping_correction", "unified_embedding"])
@@ -349,36 +375,6 @@ def test_plot_provenance_falls_back_when_distribution_metadata_is_unavailable(
     _contracts.installed_scarf_version.cache_clear()
 
 
-def test_equal_weight_sample_aggregation_fixture():
-    """Two samples of very different size must weight equally."""
-    ps = pd.DataFrame(
-        {
-            "sample": ["A", "B"],
-            "group": ["g1", "g1"],
-            "feature": ["f1", "f1"],
-            "mean": [1.0, 10.0],
-            "fraction": [0.1, 0.9],
-            "n_cells": [10, 1000],
-        }
-    )
-    agg = (
-        ps.groupby(["group", "feature"], observed=False)
-        .agg(
-            mean=("mean", "mean"),
-            fraction=("fraction", "mean"),
-            n_cells=("n_cells", "sum"),
-        )
-        .reset_index()
-    )
-    assert len(agg) == 1
-    assert agg["mean"].iloc[0] == pytest.approx(5.5)
-    assert agg["fraction"].iloc[0] == pytest.approx(0.5)
-    # Cell-weighted would be ~9.91, not 5.5
-    cell_weighted = np.average(ps["mean"], weights=ps["n_cells"])
-    assert cell_weighted == pytest.approx(9.910891, rel=1e-5)
-    assert agg["mean"].iloc[0] != pytest.approx(cell_weighted)
-
-
 @pytest.mark.parametrize("block_size", [1, 3, 7])
 @pytest.mark.parametrize("sample_by", [None, "sample_with_missing"])
 def test_feature_summary_matches_cell_table_across_blocks(
@@ -457,10 +453,11 @@ def test_feature_summary_matches_cell_table_across_blocks(
     pd.testing.assert_frame_equal(aggregate, expected)
 
 
-@pytest.mark.parametrize("block_size", [1, 2, 4])
+# Row 11 with blocks of 4 puts the infinity in the third streamed block.
+@pytest.mark.parametrize(("row", "block_size"), [(0, 1), (11, 4)])
 @pytest.mark.parametrize("value", [np.inf, -np.inf])
 def test_feature_summary_rejects_infinite_values(
-    synthetic_plot_store, block_size, value
+    synthetic_plot_store, row, block_size, value
 ):
     import zarr
 
@@ -468,7 +465,7 @@ def test_feature_summary_rejects_infinite_values(
 
     store = synthetic_plot_store
     values = store.RNA._values.copy()
-    values[0, 0] = value
+    values[row, 0] = value
     store.RNA.rawData = ChunkedArray(zarr.array(values, chunks=(block_size, 2)))
 
     with pytest.raises(ValueError, match="infinity after normalization"):
@@ -494,7 +491,11 @@ def test_feature_summary_excludes_invalid_samples_before_infinity_check(
         normalization=splt.NormalizationSpec(source="raw"),
     )
 
-    assert np.isfinite(aggregate["mean"]).all()
+    # Cell 0 holds the infinity but has no sample, so it never counts.
+    by_group = aggregate.set_index("group").loc[["group1", "group2", "group10"]]
+    np.testing.assert_allclose(by_group["mean"], [4.5, 2.75, 1.125])
+    assert by_group["n_cells"].tolist() == [4, 4, 3]
+    assert by_group["n_samples"].tolist() == [2, 2, 2]
 
 
 def test_feature_summary_releases_source_blocks(synthetic_plot_store, monkeypatch):
@@ -599,59 +600,127 @@ def test_embedding_keeps_square_panel_with_side_legend():
     result.close()
 
 
-def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datastore):
-    ds = datastore
-    # Point sizes and sort order are part of the native embedding contract.
-    n = len(artifact_values(artifact_group(ds.zw, umap), "values"))
-    sizes = np.linspace(5, 40, n)
+@pytest.fixture(scope="module")
+def plot_artifacts(tmp_path_factory):
+    """Real layout and cluster artifacts on a small imported store.
+
+    Twelve cells lie on x = 0..11 with y cycling through 0, 1.5, 3 and 4.5, in
+    clusters 10, 2 and 1 of four cells each.
+    """
+    x = np.arange(12, dtype=np.float64)
+    coordinates = np.column_stack((x, (x % 4) * 1.5))
+    labels = np.repeat([10, 2, 1], 4)
+    store, imported, counts = _imported_plot_store(
+        tmp_path_factory.mktemp("plot_artifacts"),
+        coordinates=coordinates,
+        clusters=labels,
+    )
+    return SimpleNamespace(
+        store=store,
+        layout=imported.embeddingArtifacts["X_umap"],
+        clusters=imported.clusterArtifacts["clusters"],
+        selection=imported.cellSelection,
+        coordinates=coordinates,
+        labels=labels,
+        # The RNA assay normalizes each cell's counts to 1000.
+        normalized=counts / counts.sum(axis=1, keepdims=True) * 1000.0,
+    )
+
+
+def _facecolor_rgba(collection):
+    collection.update_scalarmappable()
+    return np.asarray(collection.get_facecolors())
+
+
+def test_embedding_dotplot_matrixplot_on_artifacts(plot_artifacts):
+    from matplotlib.colors import Normalize, to_rgba
+
+    data = plot_artifacts
+    sizes = np.linspace(5, 40, 12)
     emb = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=leiden_clustering,
+        data.store,
+        layout=data.layout,
+        color_by=data.clusters,
         point_sizes=sizes,
         sort_values=False,
         show=False,
     )
     assert emb.owns_figure
-    assert len(emb.axes) == 1
-    assert emb.figure.legends or next(iter(emb.axes.values())).get_legend() is not None
+    (ax,) = emb.axes.values()
+    (points,) = ax.collections
+    # Unsorted cells keep layout order with their own sizes.
+    np.testing.assert_allclose(points.get_offsets(), data.coordinates)
+    np.testing.assert_allclose(points.get_sizes(), sizes)
+    scale = emb.scales[1]
+    assert scale.order == (1, 2, 10)
+    np.testing.assert_allclose(
+        _facecolor_rgba(points),
+        [to_rgba(scale.palette[label]) for label in data.labels],
+    )
+    legend = emb.figure.legends[0]
+    assert [text.get_text() for text in legend.get_texts()] == ["1", "2", "10"]
     emb.close()
 
-    # Gene coloring with sort_values (high expression on top)
-    names = ds.RNA.feats.fetch_all("names")
-    gene = str(names[0])
+    # Gene coloring with sort_values draws the highest expression last.
+    expression = data.normalized[:, 0]
     emb2 = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=gene,
+        data.store,
+        layout=data.layout,
+        color_by="CD3E",
         sort_values=True,
         show=False,
     )
-    assert emb2.provenance.extras.get("sort_values") is True
+    (points,) = emb2.axes["CD3E"].collections
+    drawn = np.asarray(points.get_offsets())[:, 0].astype(int)
+    assert sorted(drawn) == list(range(12))
+    assert np.all(np.diff(expression[drawn]) >= -1e-4)
+    limits = emb2.provenance.extras["color_limits"]["CD3E"]
+    assert limits == pytest.approx((expression.min(), expression.max()), rel=1e-5)
+    np.testing.assert_allclose(
+        _facecolor_rgba(points),
+        plt_colormap("viridis")(Normalize(*limits)(expression[drawn])),
+        atol=1e-6,
+    )
     emb2.close()
 
+    # Group means of the normalized gene, and the share of expressing cells.
+    groups = [1, 2, 10]
+    means = [expression[data.labels == group].mean() for group in groups]
+    fractions = [(expression[data.labels == group] > 0).mean() for group in groups]
     dp = splt.dotplot(
-        ds,
-        features=[gene],
-        groups=leiden_clustering,
+        data.store,
+        features=["CD3E"],
+        groups=data.clusters,
         show=False,
     )
-    assert "aggregate" in dp.tables
-    assert "mean" in dp.tables["aggregate"].columns
-    assert "fraction" in dp.tables["aggregate"].columns
-    assert dp.provenance.n_cells == n
-    assert dp.figure.legends or next(iter(dp.axes.values())).get_legend() is not None
+    aggregate = dp.tables["aggregate"]
+    assert aggregate["groups"].tolist() == groups
+    np.testing.assert_allclose(aggregate["mean"], means, rtol=1e-5)
+    np.testing.assert_allclose(aggregate["fraction"], fractions)
+    assert aggregate["n_cells"].tolist() == [4, 4, 4]
+    dots = next(iter(dp.axes.values())).collections[0]
+    np.testing.assert_allclose(dots.get_array(), means, rtol=1e-5)
+    assert dp.provenance.n_cells == 12
+    assert dp.figure.legends
     dp.close()
 
     mp = splt.matrixplot(
-        ds,
-        features=[gene],
-        groups=leiden_clustering,
+        data.store,
+        features=["CD3E"],
+        groups=data.clusters,
         show=False,
     )
-    assert "matrix" in mp.tables
-    assert mp.provenance.n_cells == n
+    np.testing.assert_allclose(
+        mp.axes["matrixplot"].images[0].get_array(), [means], rtol=1e-5
+    )
+    assert mp.provenance.n_cells == 12
     mp.close()
+
+
+def plt_colormap(name):
+    import matplotlib
+
+    return matplotlib.colormaps[name]
 
 
 def _artifact_color_cache(monkeypatch, values, *, kind, grouping_indices=None):
@@ -727,160 +796,176 @@ def test_embedding_classifies_discrete_artifact_values_as_categorical(
     assert is_uniform is False
 
 
-def test_feature_ref_duplicate_raises(datastore):
-    # Looking up by a nonsense name
-    with pytest.raises(KeyError):
-        splt.FeatureRef  # noqa: B018 - ensure import path
-        from scarf.plotting._data import resolve_feature
+def test_resolve_feature_reports_missing_and_ambiguous_names(synthetic_plot_store):
+    from scarf.plotting._data import resolve_feature
 
-        resolve_feature(datastore, "___not_a_real_feature___")
+    with pytest.raises(
+        KeyError,
+        match="Feature '___not_a_real_feature___' not found in assay 'RNA' by 'name'",
+    ):
+        resolve_feature(synthetic_plot_store, "___not_a_real_feature___")
+
+    synthetic_plot_store.RNA = _ArrayAssay(
+        synthetic_plot_store.RNA._values, ["GeneA", "GENEA"]
+    )
+    # Names match case-insensitively, so both features answer "genea".
+    with pytest.raises(
+        ValueError, match=r"matches 2 entries in assay 'RNA' at indices \[0, 1\]"
+    ):
+        resolve_feature(synthetic_plot_store, "genea")
+    pooled = resolve_feature(
+        synthetic_plot_store, splt.FeatureRef("genea", reduction="mean")
+    )
+    assert pooled.indices == (0, 1)
+    assert pooled.label == "genea:mean"
 
 
-def test_caller_owned_target(umap, datastore):
+def test_caller_owned_target(plot_artifacts):
     import matplotlib.pyplot as plt
+    from matplotlib.colors import to_hex
 
+    data = plot_artifacts
     fig, ax = plt.subplots()
     result = splt.embedding(
-        datastore,
-        layout=umap,
+        data.store,
+        layout=data.layout,
         target=ax,
         show=False,
     )
     assert result.owns_figure is False
+    assert result.figure is fig
+    assert list(result.axes.values()) == [ax]
+    (points,) = ax.collections
+    np.testing.assert_allclose(points.get_offsets(), data.coordinates)
+    assert {to_hex(color) for color in points.get_facecolors()} == {"#4682b4"}
     result.close()  # must not close foreign figure
     assert plt.fignum_exists(fig.number)
+
+    grouped = splt.embedding(
+        data.store,
+        layout=data.layout,
+        color_by=data.clusters,
+        target=ax,
+        show=False,
+    )
+    legend = ax.get_legend()
+    assert [text.get_text() for text in legend.get_texts()] == ["1", "2", "10"]
+    assert fig.legends == []
+    grouped.close()
     plt.close(fig)
 
 
-def test_summary_and_composition_accept_foreign_targets(leiden_clustering, datastore):
+def test_summary_and_composition_accept_foreign_targets(plot_artifacts):
     import matplotlib.pyplot as plt
 
-    ds = datastore
-    gene = str(ds.RNA.feats.fetch_all("names")[0])
+    data = plot_artifacts
     fig, axes = plt.subplots(1, 3)
     results = [
         splt.dotplot(
-            ds,
-            features=[gene],
-            groups=leiden_clustering,
+            data.store,
+            features=["CD3E"],
+            groups=data.clusters,
             target=axes[0],
             show=False,
         ),
         splt.matrixplot(
-            ds,
-            features=[gene],
-            groups=leiden_clustering,
+            data.store,
+            features=["CD3E"],
+            groups=data.clusters,
             target=axes[1],
             show=False,
         ),
         splt.composition(
-            ds,
-            categories=leiden_clustering,
+            data.store,
+            categories=data.clusters,
             kind="stacked",
             target=axes[2],
             show=False,
         ),
     ]
     assert all(result.owns_figure is False for result in results)
+    for result, axis in zip(results, axes, strict=True):
+        assert result.figure is fig
+        assert list(result.axes.values()) == [axis]
+    # Each cluster holds a third of the cells in the one stacked bar.
+    np.testing.assert_allclose(
+        results[2].tables["aggregate"]["proportion"], [1 / 3] * 3
+    )
+    assert fig.legends == []
     for result in results:
         result.close()
     assert plt.fignum_exists(fig.number)
     plt.close(fig)
 
 
-def test_sample_by_equal_weight_on_datastore(leiden_clustering, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    # Unbalanced samples among active cells: 5 vs rest
-    sample = np.array(["big"] * active_n, dtype=object)
-    sample[:5] = "small"
-    ds.cells.insert("plot_sample_id", sample, overwrite=True)
-
-    gene = str(ds.RNA.feats.fetch_all("names")[0])
-    agg, per = _summarize(
-        ds,
-        features=[gene],
-        groups=leiden_clustering,
-        sample_by="plot_sample_id",
-    )
-    assert per is not None
-    assert set(per["sample"].unique()) == {"big", "small"}
-
-    # For each group×feature present in both samples, aggregate mean ==
-    # unweighted mean of per-sample means (not cell-weighted).
-    both = per.groupby(["groups", "feature"], observed=False)["sample"].nunique()
-    shared = both[both == 2].index
-    assert len(shared) > 0
-    for cluster, feature in shared:
-        rows = per[(per["groups"] == cluster) & (per["feature"] == feature)]
-        expected = float(rows["mean"].mean())
-        cell_weighted = float(np.average(rows["mean"], weights=rows["n_cells"]))
-        got = float(
-            agg.loc[
-                (agg["groups"] == cluster) & (agg["feature"] == feature),
-                "mean",
-            ].iloc[0]
-        )
-        assert got == pytest.approx(expected, rel=1e-6, abs=1e-8)
-        # When sample sizes and per-sample means differ, equal-weight != cell-weight
-        if (
-            rows["n_cells"].nunique() > 1
-            and rows["mean"].nunique() > 1
-            and not np.allclose(rows["mean"], 0)
-        ):
-            assert got != pytest.approx(cell_weighted, rel=1e-3)
-
-    dp = splt.dotplot(
-        ds,
-        features=[gene],
-        groups=leiden_clustering,
-        sample_by="plot_sample_id",
+def test_dotplot_weights_each_sample_equally(synthetic_plot_store):
+    result = splt.dotplot(
+        synthetic_plot_store,
+        features=["GeneA"],
+        group_by="group",
+        sample_by="sample_with_missing",
         show=False,
     )
-    assert "per_sample" in dp.tables
-    assert "n_samples" in dp.tables["aggregate"].columns
-    assert dp.provenance.n_samples == 2
-    assert dp.provenance.extras["dropped_sample_cells"] == 0
-    dp.close()
 
-
-def test_facet_shared_color_limits(umap, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    condition = np.array(["low"] * active_n, dtype=object)
-    condition[active_n // 2 :] = "high"
-    score = np.zeros(active_n, dtype=np.float64)
-    score[condition == "low"] = np.linspace(0.0, 1.0, int((condition == "low").sum()))
-    score[condition == "high"] = np.linspace(
-        10.0, 11.0, int((condition == "high").sum())
+    # GeneA is 0, 0.5, ..., 5.5 over the cells; cell 0 has no sample. Each
+    # group averages its per-sample means: group1 = (4 + 5) / 2, group2 =
+    # (2.25 + 3.25) / 2 and group10 = (0.75 + 1.5) / 2. Weighting by cells
+    # would give group1 4.75 and group10 1.0 instead.
+    aggregate = result.tables["aggregate"].set_index("group")
+    np.testing.assert_allclose(
+        aggregate.loc[["group1", "group2", "group10"], "mean"], [4.5, 2.75, 1.125]
     )
-    ds.cells.insert("plot_condition", condition, overwrite=True)
-    ds.cells.insert("plot_score", score, overwrite=True)
+    assert aggregate.loc[["group1", "group2", "group10"], "n_samples"].tolist() == [
+        2,
+        2,
+        2,
+    ]
+    assert result.provenance.n_samples == 4
+    assert result.provenance.extras["dropped_sample_cells"] == 1
+    result.close()
 
+
+def _colorbar_limits(figure):
+    return [
+        (axis._colorbar.norm.vmin, axis._colorbar.norm.vmax)
+        for axis in figure.axes
+        if getattr(axis, "_colorbar", None) is not None
+    ]
+
+
+def test_facet_shared_color_limits(synthetic_plot_store):
+    from matplotlib.colors import Normalize
+
+    store = synthetic_plot_store
+    score = store.cells.fetch_all("plot_score")
+    low = store.cells.fetch_all("plot_condition") == "low"
+    viridis = plt_colormap("viridis")
     result = splt.embedding(
-        ds,
-        layout=umap,
+        store,
+        layout_key="plot_layout",
         color_by=splt.CellField("plot_score", kind="continuous"),
         facet_by="plot_condition",
         facet_order=["low", "high"],
         show=False,
     )
-    limits = result.provenance.extras["color_limits"]
-    assert "plot_score" in limits
-    vmin, vmax = limits["plot_score"]
-    assert vmin == pytest.approx(0.0, abs=1e-6)
-    assert vmax == pytest.approx(11.0, abs=1e-6)
-    # Both facet panels must exist and share coordinate limits
+    assert result.provenance.extras["color_limits"]["plot_score"] == pytest.approx(
+        (0.0, 11.0)
+    )
+    # Both facets share coordinate limits and one colorbar spanning both.
     assert len(result.axes) == 2
-    xlims = {ax.get_xlim() for ax in result.axes.values()}
-    ylims = {ax.get_ylim() for ax in result.axes.values()}
-    assert len(xlims) == 1
-    assert len(ylims) == 1
+    assert len({ax.get_xlim() for ax in result.axes.values()}) == 1
+    assert len({ax.get_ylim() for ax in result.axes.values()}) == 1
+    assert _colorbar_limits(result.figure) == [pytest.approx((0.0, 11.0))]
+    for axis, cells in zip(result.axes.values(), (low, ~low), strict=True):
+        np.testing.assert_allclose(
+            _facecolor_rgba(axis.collections[0]),
+            viridis(Normalize(0.0, 11.0)(score[cells])),
+        )
     result.close()
 
     panel_result = splt.embedding(
-        ds,
-        layout=umap,
+        store,
+        layout_key="plot_layout",
         color_by=splt.CellField("plot_score", kind="continuous"),
         facet_by="plot_condition",
         facet_order=["low", "high"],
@@ -891,12 +976,18 @@ def test_facet_shared_color_limits(umap, datastore):
     assert panel_limits[0] == pytest.approx((0.0, 1.0))
     assert panel_limits[1] == pytest.approx((10.0, 11.0))
     assert len(panel_result.figure.axes) == 4
+    for axis, cells, limits in zip(
+        panel_result.axes.values(), (low, ~low), panel_limits, strict=True
+    ):
+        np.testing.assert_allclose(
+            _facecolor_rgba(axis.collections[0]),
+            viridis(Normalize(*limits)(score[cells])),
+        )
     panel_result.close()
 
-    ds.cells.insert("plot_score_scaled", score * 10, overwrite=True)
     shared_result = splt.embedding(
-        ds,
-        layout=umap,
+        store,
+        layout_key="plot_layout",
         color_by=[
             splt.CellField("plot_score", kind="continuous"),
             splt.CellField("plot_score_scaled", kind="continuous"),
@@ -905,46 +996,55 @@ def test_facet_shared_color_limits(umap, datastore):
         show=False,
     )
     shared_limits = list(shared_result.provenance.extras["color_limits"].values())
-    assert shared_limits[0] == pytest.approx(shared_limits[1])
-    assert shared_limits[1][1] == pytest.approx(110.0)
+    assert shared_limits == [pytest.approx((0.0, 110.0))] * 2
     shared_result.close()
 
 
-def test_composition_and_export(leiden_clustering, datastore, tmp_path):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    sample = np.array([f"s{i % 3}" for i in range(active_n)], dtype=object)
-    ds.cells.insert("plot_comp_sample", sample, overwrite=True)
+def test_composition_and_export(synthetic_plot_store, tmp_path):
+    from PIL import Image
 
     result = splt.composition(
-        ds,
-        categories=leiden_clustering,
-        sample_by="plot_comp_sample",
+        synthetic_plot_store,
+        category_by="category_complete",
+        sample_by="sample",
         kind="per_sample",
         show=False,
     )
-    assert "per_sample" in result.tables
+    # Samples hold categories B, A, B or A, B, A in turn.
+    per_sample = result.tables["per_sample"]
+    assert per_sample["sample"].tolist() == ["s1", "s2", "s3", "s4"] * 2
+    assert per_sample["category"].tolist() == ["A"] * 4 + ["B"] * 4
+    np.testing.assert_allclose(
+        per_sample["proportion"],
+        [1 / 3, 2 / 3, 1 / 3, 2 / 3, 2 / 3, 1 / 3, 2 / 3, 1 / 3],
+    )
+    assert per_sample["n_cells"].tolist() == [1, 2, 1, 2, 2, 1, 2, 1]
+    width, height = result.figure.get_size_inches()
     out = result.save(tmp_path / "composition.png", dpi=100)
-    assert out.exists() and out.stat().st_size > 0
+    with Image.open(out) as image:
+        assert image.size == (round(width * 100), round(height * 100))
     result.close()
 
     stacked = splt.composition(
-        ds,
-        categories=leiden_clustering,
-        sample_by="plot_comp_sample",
+        synthetic_plot_store,
+        category_by="category_complete",
+        sample_by="sample",
         show=False,
     )
+    width, height = stacked.figure.get_size_inches()
     pdf = stacked.save(tmp_path / "composition.pdf", exact_size=True)
-    assert pdf.exists()
+    payload = pdf.read_bytes()
+    assert payload.startswith(b"%PDF-")
+    media_box = f"/MediaBox [ 0 0 {width * 72:g} {height * 72:g} ]".encode()
+    assert media_box in payload
     stacked.close()
 
 
-def test_feature_plotting_uses_assay_normalization_adapter(
-    umap, datastore, monkeypatch
-):
-    ds = datastore
-    assay = ds.RNA
-    gene = str(assay.feats.fetch_all("names")[0])
+def test_feature_plotting_uses_assay_normalization_adapter(plot_artifacts, monkeypatch):
+    from matplotlib.colors import Normalize
+
+    data = plot_artifacts
+    assay = data.store.RNA
     native_normed = assay.normed
     calls = []
 
@@ -954,12 +1054,20 @@ def test_feature_plotting_uses_assay_normalization_adapter(
 
     monkeypatch.setattr(assay, "normed", tracked_normed)
     result = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=gene,
+        data.store,
+        layout=data.layout,
+        color_by="LYZ",
         normalization=splt.NormalizationSpec(transform="log1p"),
         sort_values=True,
         show=False,
+    )
+    (points,) = result.axes["LYZ"].collections
+    values = np.log1p(data.normalized[:, 2])
+    drawn = np.asarray(points.get_offsets())[:, 0].astype(int)
+    np.testing.assert_allclose(
+        _facecolor_rgba(points),
+        plt_colormap("viridis")(Normalize(values.min(), values.max())(values[drawn])),
+        atol=1e-5,
     )
     result.close()
     assert len(calls) == 1
@@ -1141,50 +1249,51 @@ def test_normalization_spec_supports_raw_and_log1p(datastore):
     assert np.allclose(logged, np.log1p(normalized))
 
 
-def test_figsize_rejected_with_owned_target(umap, datastore):
+def test_figsize_rejected_with_caller_owned_target(synthetic_plot_store):
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots()
-    with pytest.raises(ValueError, match="figsize"):
+    with pytest.raises(
+        ValueError, match="^figsize is invalid when a caller-owned target is provided$"
+    ):
         splt.embedding(
-            datastore,
-            layout=umap,
+            synthetic_plot_store,
+            layout_key="plot_layout",
             target=ax,
             figsize=(3, 3),
             show=False,
         )
+    assert len(ax.collections) == 0
     plt.close(fig)
 
 
-def test_multi_gene_by_condition_embedding(umap, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    condition = np.array(["ctrl"] * active_n, dtype=object)
-    condition[active_n // 2 :] = "stim"
-    ds.cells.insert("plot_condition_mg", condition, overwrite=True)
-
-    names = [str(x) for x in ds.RNA.feats.fetch_all("names")[:2]]
+def test_multi_gene_by_condition_embedding(synthetic_plot_store):
     result = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=names,
-        facet_by="plot_condition_mg",
-        facet_order=["ctrl", "stim"],
+        synthetic_plot_store,
+        layout_key="plot_layout",
+        color_by=["GeneA", "GeneB"],
+        facet_by="plot_condition",
+        facet_order=["low", "high"],
         sort_values=True,
         show=False,
     )
     assert result.provenance.extras["n_colors"] == 2
     assert result.provenance.extras["n_facets"] == 2
-    assert len(result.axes) == 4
-    limits = result.provenance.extras["color_limits"]
-    for gene in names:
-        assert gene in limits
-        vmin, vmax = limits[gene]
-        assert vmax >= vmin
-    # Panel keys are (gene, condition)
-    for gene in names:
-        for cond in ("ctrl", "stim"):
-            assert (gene, cond) in result.axes
+    # Panel keys are (gene, condition), one row per gene.
+    assert list(result.axes) == [
+        ("GeneA", "low"),
+        ("GeneA", "high"),
+        ("GeneB", "low"),
+        ("GeneB", "high"),
+    ]
+    # Each gene's limits span its values over both conditions.
+    assert result.provenance.extras["color_limits"] == {
+        "GeneA": pytest.approx((0.0, 5.5)),
+        "GeneB": pytest.approx((0.0, 16.0)),
+    }
+    for (gene, condition), axis in result.axes.items():
+        assert len(axis.collections[0].get_offsets()) == 6
+        assert axis.get_title() == f"{gene} | plot_condition={condition}"
     result.close()
 
 
@@ -1201,13 +1310,13 @@ def _add_synthetic_embeddings(datastore, assay_name):
     return layouts
 
 
-def test_multi_layout_multi_color_embedding(datastore):
-    layouts = _add_synthetic_embeddings(datastore, "RNA")
-    colors = ["RNA_nCounts", "RNA_nFeatures"]
+def test_multi_layout_multi_color_embedding(synthetic_plot_store):
+    layouts = ["plot_layout", "plot_mirror"]
+    colors = ["metricA", "metricB"]
     expected_keys = [(layout, color) for layout in layouts for color in colors]
 
     result = splt.embedding(
-        datastore,
+        synthetic_plot_store,
         layout_key=layouts,
         color_by=colors,
         show=False,
@@ -1219,15 +1328,21 @@ def test_multi_layout_multi_color_embedding(datastore):
     assert result.provenance.extras["n_layouts"] == 2
     assert set(result.provenance.extras["layout_provenance"]) == set(layouts)
     assert "multi_layout" in result.provenance.notes
-    assert len(result.legends) == 2
     assert len(result.scales) == 1
-    assert {legend.kind for legend in result.legends} == {"colorbar"}
-    assert {legend.label for legend in result.legends} == set(colors)
     assert isinstance(result.scales[0], splt.ColorScale)
-    assert all(
-        np.isfinite([legend.extras["vmin"], legend.extras["vmax"]]).all()
-        for legend in result.legends
-    )
+    # One colorbar per color, spanning that column's values.
+    assert [
+        (legend.kind, legend.label, legend.extras) for legend in result.legends
+    ] == [
+        ("colorbar", "metricA", {"vmin": 1.0, "vmax": 11.0}),
+        ("colorbar", "metricB", {"vmin": 20.0, "vmax": 31.0}),
+    ]
+    for (layout, _color), axis in result.axes.items():
+        offsets = np.asarray(axis.collections[0].get_offsets())
+        np.testing.assert_allclose(
+            offsets[:, 0],
+            synthetic_plot_store.cells.fetch_all(f"{layout}1"),
+        )
     result.close()
 
 
@@ -1284,17 +1399,17 @@ def test_multi_layout_embedding_uses_native_feature_values(
     result.close()
 
 
-def test_multi_layout_embedding_accepts_matching_target_axes(datastore):
+def test_multi_layout_embedding_accepts_matching_target_axes(synthetic_plot_store):
     import matplotlib.pyplot as plt
 
-    layouts = _add_synthetic_embeddings(datastore, "RNA")
-    colors = ["RNA_nCounts", "RNA_nFeatures"]
+    layouts = ["plot_layout", "plot_mirror"]
+    colors = ["metricA", "metricB"]
     panel_keys = [(layout, color) for layout in layouts for color in colors]
     figure, target_axes = plt.subplots(2, 2)
     target = dict(zip(panel_keys, target_axes.ravel(), strict=True))
 
     result = splt.embedding(
-        datastore,
+        synthetic_plot_store,
         layout_key=layouts,
         color_by=colors,
         target=target,
@@ -1304,14 +1419,14 @@ def test_multi_layout_embedding_accepts_matching_target_axes(datastore):
     assert result.owns_figure is False
     assert result.figure is figure
     assert result.axes == target
+    assert all(len(axis.collections[0].get_offsets()) == 12 for axis in target.values())
     result.close()
     assert plt.fignum_exists(figure.number)
     plt.close(figure)
 
 
 def test_embedding_show_default_suppression_and_later_show(
-    umap,
-    datastore,
+    synthetic_plot_store,
     monkeypatch,
 ):
     shown = []
@@ -1321,14 +1436,14 @@ def test_embedding_show_default_suppression_and_later_show(
 
     monkeypatch.setattr(splt.PlotResult, "show", track_show)
     default_result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
+        synthetic_plot_store,
+        layout_key="plot_layout",
+        color_by="metricA",
     )
     suppressed_result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
+        synthetic_plot_store,
+        layout_key="plot_layout",
+        color_by="metricA",
         show=False,
     )
 
@@ -1339,277 +1454,254 @@ def test_embedding_show_default_suppression_and_later_show(
     suppressed_result.close()
 
 
-def test_resolve_feature_by_index(datastore):
-    from scarf.plotting._data import resolve_feature
+def test_resolve_feature_by_index(synthetic_plot_store):
+    from scarf.plotting._data import ResolvedFeature, resolve_feature
 
-    resolved = resolve_feature(
-        datastore, splt.FeatureRef(value=0, by="index", assay="RNA")
+    ref = splt.FeatureRef(value=1, by="index", assay="RNA")
+    assert resolve_feature(synthetic_plot_store, ref) == ResolvedFeature(
+        assay="RNA",
+        by="index",
+        indices=(1,),
+        ids=("feature-1",),
+        names=("GeneB",),
+        label="GeneB",
+        reduction=None,
+        raw=ref,
     )
-    assert resolved.indices == (0,)
-    assert resolved.assay == "RNA"
-    assert resolved.label
+    with pytest.raises(
+        KeyError, match=r"Feature index 2 out of range for assay 'RNA' \(N=2\)"
+    ):
+        resolve_feature(
+            synthetic_plot_store, splt.FeatureRef(value=2, by="index", assay="RNA")
+        )
 
 
-def test_label_panels_on_caller_owned_embeddings(umap, leiden_clustering, datastore):
-    import matplotlib.pyplot as plt
-
-    ds = datastore
-    fig, axes = plt.subplot_mosaic([["A", "B"]], figsize=(6, 3))
-    a = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=leiden_clustering,
-        target=axes["A"],
-        show=False,
-    )
-    gene = str(ds.RNA.feats.fetch_all("names")[0])
-    b = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=gene,
-        target=axes["B"],
-        show=False,
-    )
-    splt.label_panels({"A": axes["A"], "B": axes["B"]}, labels=["A", "B"])
-    assert [text.get_text() for text in axes["A"].texts][-1] == "A"
-    assert [text.get_text() for text in axes["B"].texts][-1] == "B"
-    assert a.legends and b.legends
-    a.close()
-    b.close()
-    plt.close(fig)
-
-
-def test_paired_composition_draws_subject_lines(leiden_clustering, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    sample = np.array([f"s{i % 6}" for i in range(active_n)], dtype=object)
-    subject = np.array([f"d{i % 3}" for i in range(active_n)], dtype=object)
-    condition = np.array(
-        ["before" if i % 6 < 3 else "after" for i in range(active_n)],
-        dtype=object,
-    )
-    # Two samples per subject (s0,s3 -> d0; s1,s4 -> d1; s2,s5 -> d2)
-    ds.cells.insert("plot_pair_sample", sample, overwrite=True)
-    ds.cells.insert("plot_pair_subject", subject, overwrite=True)
-    ds.cells.insert("plot_pair_condition", condition, overwrite=True)
-
+def test_paired_composition_draws_subject_lines(synthetic_plot_store):
     result = splt.composition(
-        ds,
-        categories=leiden_clustering,
+        synthetic_plot_store,
+        category_by="paired_category",
         study_design=splt.StudyDesign(
-            sample_by="plot_pair_sample",
-            subject_by="plot_pair_subject",
-            condition_by="plot_pair_condition",
+            sample_by="sample",
+            subject_by="subject",
+            condition_by="condition",
         ),
         kind="per_sample",
         show=False,
     )
-    assert "subject" in result.tables["per_sample"].columns
-    assert result.provenance.extras["n_pair_lines"] >= 1
-    assert any("paired_by=subject" in n for n in result.provenance.notes)
+
+    per_sample = result.tables["per_sample"].drop_duplicates("sample")
+    assert per_sample.set_index("sample")["subject"].to_dict() == {
+        "s1": "donor1",
+        "s2": "donor2",
+        "s3": "donor1",
+        "s4": "donor2",
+    }
+    assert result.provenance.extras["n_pair_lines"] == 4
+    assert "paired_by=subject" in result.provenance.notes
+    # Category A falls from 2/3 to 0 for donor1 and rises from 1/3 to 1 for
+    # donor2; category B mirrors it. Blocks hold (control, treated) per category.
+    assert _pair_lines(result.axes["composition"]) == [
+        ([0.0, 1.0], [pytest.approx(2 / 3), 0.0]),
+        ([0.0, 1.0], [pytest.approx(1 / 3), 1.0]),
+        ([2.0, 3.0], [pytest.approx(1 / 3), 1.0]),
+        ([2.0, 3.0], [pytest.approx(2 / 3), 0.0]),
+    ]
     result.close()
 
 
-def test_paired_composition_requires_condition(leiden_clustering, datastore):
-    with pytest.raises(ValueError, match="requires condition_by"):
-        splt.composition(
-            datastore,
-            categories=leiden_clustering,
-            sample_by="I",
-            subject_by="I",
-            kind="per_sample",
-            show=False,
-        )
-
-
-def test_embedding_clip_and_subset(umap, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    keep = np.zeros(active_n, dtype=bool)
-    keep[: max(10, active_n // 2)] = True
-    ds.cells.insert("plot_keep", keep, overwrite=True)
-    gene = str(ds.RNA.feats.fetch_all("names")[0])
+def test_embedding_clip_and_subset(synthetic_plot_store):
     result = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=gene,
-        clip_fraction=0.01,
-        subset_by="plot_keep",
+        synthetic_plot_store,
+        layout_key="plot_layout",
+        color_by="GeneB",
+        clip_fraction=0.1,
+        subset_by="keep",
         show=False,
     )
-    assert result.provenance.extras["clip_fraction"] == 0.01
-    assert result.provenance.extras["subset_by"] == "plot_keep"
+
+    # Only the first eight cells pass subset_by.
+    (points,) = result.axes["GeneB"].collections
+    offsets = np.asarray(points.get_offsets())
+    np.testing.assert_allclose(sorted(offsets[:, 0]), np.arange(8.0))
+    assert result.provenance.n_cells == 8
+    assert result.provenance.extras["clip_fraction"] == 0.1
+    assert result.provenance.extras["subset_by"] == "keep"
     result.close()
 
 
-def test_embedding_groups_filters_categories(umap, leiden_clustering, datastore):
-    ds = datastore
-    labels = list(
-        pd.unique(
-            artifact_values(
-                artifact_group(ds.zw, leiden_clustering),
-                "values",
-            )
-        )
-    )
-    assert len(labels) >= 2
-    keep = labels[:2]
+def test_embedding_groups_filters_categories(synthetic_plot_store):
+    from matplotlib.colors import to_hex
+
+    palette = {"group1": "#3366cc", "group2": "#dc3912", "group10": "#109618"}
     result = splt.embedding(
-        ds,
-        layout=umap,
-        color_by=leiden_clustering,
-        groups=keep,
+        synthetic_plot_store,
+        layout_key="plot_layout",
+        color_by="group",
+        groups=["group2", "group10"],
+        categorical_scale=splt.CategoricalScale(palette=palette),
         show=False,
     )
-    assert result.provenance.extras["groups"] == list(keep)
+
+    assert result.provenance.extras["groups"] == ["group2", "group10"]
     cat_scale = next(s for s in result.scales if isinstance(s, splt.CategoricalScale))
-    assert list(cat_scale.order) == list(keep)
+    assert list(cat_scale.order) == ["group2", "group10"]
+    # Cells 0-3 are group10 and cells 4-7 group2; group1 is not drawn.
+    (points,) = result.axes["group"].collections
+    offsets = np.asarray(points.get_offsets())
+    colors = [to_hex(color) for color in points.get_facecolors()]
+    assert dict(zip(offsets[:, 0].astype(int), colors, strict=True)) == {
+        **{cell: "#109618" for cell in range(4)},
+        **{cell: "#dc3912" for cell in range(4, 8)},
+    }
+    legend = result.figure.legends[0]
+    assert [text.get_text() for text in legend.get_texts()] == ["group2", "group10"]
     result.close()
 
 
-def test_distribution_violin(leiden_clustering, datastore):
-    ds = datastore
-    cell_selection = ds.snapshot_cell_selection("I")
+def test_distribution_violin(synthetic_plot_store, plot_artifacts):
+    from matplotlib.colors import to_rgba
+    from seaborn.utils import desaturate
+
     result = splt.distribution(
-        ds,
-        keys=["RNA_nCounts", "RNA_nFeatures"],
-        grouping=leiden_clustering,
+        synthetic_plot_store,
+        keys=["metricA", "metricB"],
+        grouping=splt.CellField("group"),
         kind="violin",
-        max_points=200,
+        max_points=5,
         seed=1,
         show=False,
     )
-    assert len(result.axes) == 2
-    assert "RNA_nCounts" in result.tables
+    assert list(result.axes) == ["metricA", "metricB"]
+    np.testing.assert_array_equal(
+        result.tables["metricA"]["value"], synthetic_plot_store.cells.fetch("metricA")
+    )
     assert result.provenance.extras["approximate"] is True
     assert "subsampled_display" in result.provenance.notes
-    ax = next(iter(result.axes.values()))
-    rotations = {tick.get_rotation() for tick in ax.get_xticklabels()}
-    assert 45 in rotations or any(abs(r - 45) < 1e-6 for r in rotations)
-    # Grouped violins should not be a single steelblue fill.
-    face_colors = {
-        tuple(np.round(c.get_facecolor()[0][:3], 3))
-        for c in ax.collections
-        if hasattr(c, "get_facecolor") and len(c.get_facecolor())
-    }
-    assert len(face_colors) >= 2
+    ax = result.axes["metricA"]
+    assert [tick.get_rotation() for tick in ax.get_xticklabels()] == [45.0] * 3
+    # Violins take the group palette, desaturated by seaborn and faded.
+    palette = result.scales[0].palette
+    bodies = ax.collections[:3]
+    for body, group in zip(bodies, ("group1", "group2", "group10"), strict=True):
+        np.testing.assert_allclose(
+            body.get_facecolor()[0], to_rgba(desaturate(palette[group], 0.9), 0.9)
+        )
     result.close()
 
-    gene = str(ds.RNA.feats.fetch_all("names")[0])
-    result2 = splt.distribution(
-        ds,
-        keys=gene,
-        cell_selection=cell_selection,
+    data = plot_artifacts
+    boxes = splt.distribution(
+        data.store,
+        keys="CD3E",
+        cell_selection=data.selection,
         kind="box",
-        max_points=100,
-        show=False,
-    )
-    assert len(result2.axes) == 1
-    result2.close()
-
-
-def test_distribution_without_cell_selection_includes_all_cells(datastore):
-    result = splt.distribution(
-        datastore,
-        keys="RNA_nCounts",
         max_points=0,
         show=False,
     )
+    assert list(boxes.axes) == ["CD3E"]
+    np.testing.assert_allclose(
+        boxes.tables["CD3E"]["value"], data.normalized[:, 0], rtol=1e-5
+    )
+    assert boxes.provenance.extras["cell_selection"] == data.selection.to_dict()
+    boxes.close()
+
+
+def test_distribution_without_cell_selection_includes_all_cells():
+    values = np.arange(6, dtype=np.float64)
+    store = _ArrayStore(
+        {"I": np.array([True, False] * 3), "metric": values},
+        np.zeros((6, 2)),
+    )
+
+    result = splt.distribution(
+        store,
+        keys="metric",
+        max_points=0,
+        show=False,
+    )
+
+    # Without a selection every stored cell is plotted, active or not.
     assert result.provenance.extras["cell_selection"] is None
-    assert result.provenance.n_cells == datastore.cells.N
-    assert len(result.tables["RNA_nCounts"]) == datastore.cells.N
+    assert result.provenance.n_cells == 6
+    np.testing.assert_array_equal(result.tables["metric"]["value"], values)
     result.close()
 
 
-def test_distribution_subset_and_groups(leiden_clustering, datastore):
-    ds = datastore
-    active_n = len(ds.cells.active_index("I"))
-    keep = np.zeros(active_n, dtype=bool)
-    keep[: max(20, active_n // 2)] = True
-    ds.cells.insert("dist_keep", keep, overwrite=True)
-    labels = list(
-        pd.unique(
-            artifact_values(
-                artifact_group(ds.zw, leiden_clustering),
-                "values",
-            )
-        )
-    )
-    keep_groups = labels[:2]
+def test_distribution_subset_and_groups(synthetic_plot_store):
     result = splt.distribution(
-        ds,
-        keys="RNA_nCounts",
-        grouping=leiden_clustering,
-        groups=keep_groups,
-        subset_by="dist_keep",
+        synthetic_plot_store,
+        keys="metricA",
+        grouping=splt.CellField("group"),
+        groups=["group2", "group10"],
+        subset_by="keep",
         kind="box",
         max_points=0,
         show=False,
     )
-    assert result.provenance.extras["subset_by"] == "dist_keep"
-    assert result.provenance.extras["groups"] == list(keep_groups)
-    table_groups = set(result.tables["RNA_nCounts"]["group"].unique())
-    assert table_groups == set(keep_groups)
-    assert result.provenance.n_cells == len(result.tables["RNA_nCounts"])
-    assert result.provenance.n_cells < active_n
+    assert result.provenance.extras["subset_by"] == "keep"
+    assert result.provenance.extras["groups"] == ["group2", "group10"]
+    # Kept cells 0-7 belong to group10 (0-3) and group2 (4-7).
+    table = result.tables["metricA"]
+    np.testing.assert_array_equal(
+        table["value"], [10.0, 11.0, 9.0, 10.5, 4.0, 5.0, 6.0, 5.5]
+    )
+    assert table["group"].tolist() == ["group10"] * 4 + ["group2"] * 4
+    assert [tick.get_text() for tick in result.axes["metricA"].get_xticklabels()] == [
+        "group2",
+        "group10",
+    ]
+    assert result.provenance.n_cells == 8
     result.close()
 
 
-def test_distribution_hist_and_ecdf(leiden_clustering, datastore):
-    ds = datastore
-    cell_selection = ds.snapshot_cell_selection("I")
+def test_distribution_hist_and_ecdf(synthetic_plot_store, plot_artifacts):
+    store = synthetic_plot_store
+    values = store.cells.fetch("metricA")
+    groups = store.cells.fetch("group")
     hist = splt.distribution(
-        ds,
-        keys="RNA_nCounts",
-        grouping=leiden_clustering,
+        store,
+        keys="metricA",
+        grouping=splt.CellField("group"),
         kind="hist",
-        bins=20,
+        bins=4,
         show=False,
     )
-    assert hist.provenance.extras["bins"] == 20
+    assert hist.provenance.extras["bins"] == 4
     assert hist.provenance.extras["approximate"] is False
-    ax = next(iter(hist.axes.values()))
-    n_groups = len(
-        np.unique(
-            artifact_values(
-                artifact_group(ds.zw, leiden_clustering),
-                "values",
-            )
-        )
-    )
-    assert len(ax.patches) == n_groups * 20
-    first_bins = [(patch.get_x(), patch.get_width()) for patch in ax.patches[:20]]
-    for group_index in range(1, n_groups):
-        offset = group_index * 20
-        group_bins = [
-            (patch.get_x(), patch.get_width())
-            for patch in ax.patches[offset : offset + 20]
-        ]
-        assert group_bins == pytest.approx(first_bins)
+    ax = hist.axes["metricA"]
+    # Every group shares the bin edges of all values.
+    edges = np.histogram_bin_edges(values, bins=4)
+    assert len(ax.patches) == 12
+    for index, group in enumerate(("group1", "group2", "group10")):
+        patches = ax.patches[4 * index : 4 * index + 4]
+        expected, _ = np.histogram(values[groups == group], bins=edges)
+        assert [patch.get_height() for patch in patches] == expected.tolist()
+        np.testing.assert_allclose([patch.get_x() for patch in patches], edges[:-1])
     hist.close()
 
+    data = plot_artifacts
     ecdf = splt.distribution(
-        ds,
-        keys="RNA_nFeatures",
-        cell_selection=cell_selection,
+        data.store,
+        keys="RNA_nCounts",
+        cell_selection=data.selection,
         kind="ecdf",
         max_points=500,
-        seed=2,
         show=False,
     )
     assert "ecdf" in ecdf.provenance.notes
-    assert ecdf.provenance.extras["approximate"] is True
+    (line,) = ecdf.axes["RNA_nCounts"].lines
+    totals = np.sort(data.store.cells.fetch_all("RNA_nCounts").astype(float))
+    np.testing.assert_allclose(line.get_xdata(), totals)
+    np.testing.assert_allclose(line.get_ydata(), np.arange(1, 13) / 12)
     ecdf.close()
 
     duplicates = splt.distribution(
-        ds,
-        keys=["RNA_nCounts", "RNA_nCounts"],
-        cell_selection=cell_selection,
+        store,
+        keys=["metricA", "metricA"],
         kind="hist",
         bins=5,
         show=False,
     )
-    assert set(duplicates.tables) == {"0:RNA_nCounts", "1:RNA_nCounts"}
+    assert set(duplicates.tables) == {"0:metricA", "1:metricA"}
     duplicates.close()
 
 
@@ -1666,6 +1758,65 @@ def test_grouped_violin_and_horizontal_box_follow_explicit_order(
     box.close()
 
 
+def test_ungrouped_ecdf_draws_a_subsample_of_at_most_max_points(plot_artifacts):
+    data = plot_artifacts
+    totals = data.store.cells.fetch_all("RNA_nCounts").astype(float)
+    result = splt.distribution(
+        data.store,
+        keys="RNA_nCounts",
+        cell_selection=data.selection,
+        kind="ecdf",
+        max_points=5,
+        show=False,
+    )
+    (line,) = result.axes["RNA_nCounts"].lines
+    drawn = line.get_xdata()
+    assert len(drawn) == 5
+    assert np.all(np.diff(drawn) >= 0)
+    # The drawn steps are a sample of the cells' own totals, without repeats.
+    remaining = list(totals)
+    for value in drawn:
+        remaining.remove(value)
+    np.testing.assert_allclose(line.get_ydata(), np.arange(1, 6) / 5)
+    assert "subsampled_display" in result.provenance.notes
+    assert result.provenance.extras["approximate"] is True
+    result.close()
+
+
+def test_split_violin_dodges_points_by_split_level(synthetic_plot_store):
+    from matplotlib.collections import PathCollection
+
+    store = synthetic_plot_store
+    values = store.cells.fetch("metricA")
+    groups = store.cells.fetch("group")
+    split = store.cells.fetch("split")
+    result = splt.distribution(
+        store,
+        keys="metricA",
+        grouping=splt.CellField("group"),
+        split_by="split",
+        kind="violin",
+        max_points=1000,
+        show=False,
+    )
+    ax = result.axes["metricA"]
+    points = [c for c in ax.collections if isinstance(c, PathCollection)]
+    assert len(points) == 6
+    for position, group in enumerate(("group1", "group2", "group10")):
+        for offset, (side, level) in enumerate(((-1, "left"), (1, "right"))):
+            drawn = np.asarray(points[2 * position + offset].get_offsets())
+            expected = np.sort(values[(groups == group) & (split == level)])
+            np.testing.assert_allclose(np.sort(drawn[:, 1]), expected)
+            # Dodging puts each level's points on its own side of the group.
+            assert np.all(np.sign(drawn[:, 0] - position) == side)
+    # The points add no legend entries of their own.
+    assert [text.get_text() for text in ax.get_legend().get_texts()] == [
+        "left",
+        "right",
+    ]
+    result.close()
+
+
 def test_grouped_ecdf_uses_order_palette_and_probability_limits(
     synthetic_plot_store,
 ):
@@ -1689,9 +1840,14 @@ def test_grouped_ecdf_uses_order_palette_and_probability_limits(
     assert [matplotlib.colors.to_hex(line.get_color()) for line in axis.lines] == [
         scale.palette[group] for group in scale.order
     ]
+    # Each group's four sorted values rise in steps of a quarter.
+    assert [line.get_xdata().tolist() for line in axis.lines] == [
+        [4.0, 5.0, 5.5, 6.0],
+        [1.0, 2.0, 2.5, 3.0],
+        [9.0, 10.0, 10.5, 11.0],
+    ]
     for line in axis.lines:
-        assert np.all(np.diff(line.get_xdata()) >= 0)
-        assert line.get_ydata()[-1] == pytest.approx(1.0)
+        np.testing.assert_allclose(line.get_ydata(), [0.25, 0.5, 0.75, 1.0])
     assert axis.get_ylim() == pytest.approx((-0.02, 1.02))
     result.close()
 
@@ -1771,6 +1927,198 @@ def test_distribution_rejects_invalid_grouped_options(
             show=False,
             **options,
         )
+
+
+_CELL_CYCLE_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cell_cycle",
+    artifact_id="c" * 64,
+)
+
+
+@pytest.mark.parametrize(
+    ("keys", "kwargs", "error", "message"),
+    [
+        pytest.param(
+            _CELL_CYCLE_REF,
+            {"from_assay": "RNA"},
+            ValueError,
+            "from_assay cannot be used with artifact-backed keys",
+            id="artifact-from-assay",
+        ),
+        pytest.param(
+            _CELL_CYCLE_REF,
+            {"normalization": splt.NormalizationSpec()},
+            ValueError,
+            "normalization cannot be used with artifact-backed keys",
+            id="artifact-normalization",
+        ),
+        pytest.param(
+            "metricA",
+            {"color_by": "median"},
+            ValueError,
+            "color_by must be 'group' or 'mean'",
+            id="color-by",
+        ),
+        pytest.param(
+            "metricA",
+            {"color_by": "mean", "grouping": splt.CellField("group")},
+            ValueError,
+            "color_by='mean' is available only for stacked_violin",
+            id="mean-color-kind",
+        ),
+        pytest.param(
+            "metricA",
+            {"color_by": "mean", "kind": "stacked_violin"},
+            ValueError,
+            "color_by='mean' requires grouping",
+            id="mean-color-grouping",
+        ),
+        pytest.param(
+            "metricA",
+            {"grouping": "group"},
+            TypeError,
+            "grouping must be an ArtifactRef, CellField, or None",
+            id="grouping-type",
+        ),
+        pytest.param(
+            "metricA",
+            {"cell_selection": "I"},
+            TypeError,
+            "cell_selection must be an ArtifactRef or None",
+            id="cell-selection-type",
+        ),
+        pytest.param(
+            "metricA",
+            {"stats_results": object()},
+            ValueError,
+            "stats_results requires grouping",
+            id="stats-grouping",
+        ),
+        pytest.param(
+            "metricA",
+            {
+                "grouping": splt.CellField("group"),
+                "kind": "hist",
+                "stats_results": object(),
+            },
+            ValueError,
+            "stats annotation applies only to violin, stacked_violin, and box plots",
+            id="stats-kind",
+        ),
+        pytest.param(
+            "metricA",
+            {"sample_by": "invalid_sample"},
+            ValueError,
+            "No cells remain after distribution selections",
+            id="no-valid-samples",
+        ),
+    ],
+)
+def test_distribution_rejects_incompatible_values_and_overlays(
+    synthetic_plot_store,
+    keys,
+    kwargs,
+    error,
+    message,
+):
+    with pytest.raises(error) as raised:
+        splt.distribution(synthetic_plot_store, keys=keys, show=False, **kwargs)
+
+    assert raised.value.args == (message,)
+
+
+def test_distribution_resolves_stored_stats_before_checking_grouping(
+    synthetic_plot_store,
+):
+    stored = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="statistical_tests",
+        artifact_id="d" * 64,
+    )
+    requested = []
+
+    def get_statistical_tests(ref):
+        requested.append(ref)
+        return object()
+
+    synthetic_plot_store.get_statistical_tests = get_statistical_tests
+
+    with pytest.raises(ValueError) as raised:
+        splt.distribution(
+            synthetic_plot_store,
+            keys="metricA",
+            stats_results={"metricA": stored, "metricB": object()},
+            show=False,
+        )
+
+    assert raised.value.args == ("stats_results requires grouping",)
+    assert requested == [stored]
+
+
+def test_distribution_requires_a_complete_cell_cycle_artifact(synthetic_plot_store):
+    import zarr
+    from zarr.storage import MemoryStore
+
+    synthetic_plot_store.zw = zarr.open_group(store=MemoryStore(), mode="w")
+
+    with pytest.raises(ValueError) as raised:
+        splt.distribution(synthetic_plot_store, keys=_CELL_CYCLE_REF, show=False)
+
+    assert raised.value.args == ("Cell-cycle artifact is unavailable or incomplete",)
+
+
+def test_ungrouped_horizontal_distribution_hides_category_ticks_and_titles(
+    synthetic_plot_store,
+):
+    result = splt.distribution(
+        synthetic_plot_store,
+        keys="metricA",
+        kind="box",
+        orientation="horizontal",
+        max_points=0,
+        title="QC metric",
+        show=False,
+    )
+
+    assert result.figure._suptitle.get_text() == "QC metric"
+    assert len(result.axes["metricA"].get_yticks()) == 0
+    assert result.provenance.extras["orientation"] == "horizontal"
+    result.close()
+
+
+@pytest.mark.parametrize("kind", ["box", "violin"])
+def test_ungrouped_horizontal_distribution_draws_one_value_axis_shape(
+    synthetic_plot_store,
+    kind,
+):
+    result = splt.distribution(
+        synthetic_plot_store,
+        keys="metricA",
+        kind=kind,
+        orientation="horizontal",
+        max_points=0,
+        show=False,
+    )
+
+    axis = result.axes["metricA"]
+    shapes = axis.patches if kind == "box" else axis.collections
+    try:
+        assert len(shapes) == 1
+        extent = shapes[0].get_paths()[0] if kind == "violin" else shapes[0].get_path()
+        value_span = extent.vertices[:, 0]
+        values = synthetic_plot_store.cells.fetch("metricA")
+        # A box spans the quartiles and a cut=0 violin the data range, on x.
+        expected = (
+            np.percentile(values, [25, 75])
+            if kind == "box"
+            else [values.min(), values.max()]
+        )
+        assert (value_span.min(), value_span.max()) == pytest.approx(tuple(expected))
+    finally:
+        result.close()
 
 
 def test_distribution_rejects_missing_groups_and_incomplete_scales(
@@ -1894,6 +2242,23 @@ def test_distribution_rejects_malformed_cell_column_lengths(
             "sample",
             {"grouping": splt.CellField("group"), "sample_by": "sample"},
             "sample_by length",
+        ),
+        (
+            "metricA",
+            {},
+            "cell selection index length does not match selected cells",
+        ),
+        (
+            "subject",
+            {
+                "grouping": splt.CellField("group"),
+                "study_design": splt.StudyDesign(
+                    sample_by="sample",
+                    subject_by="subject",
+                ),
+                "stats_results": SimpleNamespace(method="wilcoxon"),
+            },
+            "pair_by length does not match selected cells",
         ),
     ]
     for malformed_column, kwargs, message in cases:
@@ -2183,6 +2548,11 @@ def test_composition_summary_uncertainty_handles_singleton_groups():
             id="subject-needs-sample",
         ),
         pytest.param(
+            {"sample_by": "sample", "subject_by": "subject", "kind": "per_sample"},
+            "requires condition_by",
+            id="subject-needs-condition",
+        ),
+        pytest.param(
             {"cell_key": "none_selected"},
             "No cells selected",
             id="empty-selection",
@@ -2208,7 +2578,7 @@ def test_composition_rejects_invalid_panel_inputs(
     kwargs,
     message,
 ):
-    with pytest.raises((TypeError, ValueError), match=message):
+    with pytest.raises(ValueError, match=message):
         splt.composition(
             synthetic_plot_store,
             category_by="category",
@@ -2227,6 +2597,267 @@ def test_composition_rejects_category_order_missing_observed_value(
             categorical_scale=splt.CategoricalScale(order=("A",)),
             show=False,
         )
+
+
+def _paired_design_store(subjects, conditions):
+    """Two cells per sample: one of category A and one of category B or A."""
+    n_samples = len(subjects)
+    categories = np.array(
+        [
+            value
+            for index in range(n_samples)
+            for value in ("A", "B" if index % 2 else "A")
+        ],
+        dtype=object,
+    )
+    columns = {
+        "I": np.ones(2 * n_samples, dtype=bool),
+        "category": categories,
+        "sample": np.repeat([f"s{index}" for index in range(n_samples)], 2).astype(
+            object
+        ),
+        "subject": np.repeat(np.asarray(subjects, dtype=object), 2),
+        "condition": np.repeat(np.asarray(conditions, dtype=object), 2),
+    }
+    return _ArrayStore(columns, np.zeros((2 * n_samples, 2)))
+
+
+def _pair_lines(axis):
+    from matplotlib.colors import to_rgba
+
+    return [
+        (line.get_xdata().tolist(), line.get_ydata().tolist())
+        for line in axis.lines
+        if to_rgba(line.get_color()) == to_rgba("#757575")
+    ]
+
+
+def test_paired_composition_by_pair_id_connects_only_complete_pairs():
+    # s0 and s1 pair d1 across conditions; d2 and d3 each lack one condition.
+    store = _paired_design_store(
+        subjects=["d1", "d1", "d2", "d3"],
+        conditions=["control", "treated", "control", "treated"],
+    )
+
+    result = splt.composition(
+        store,
+        category_by="category",
+        sample_by="sample",
+        pair_by="subject",
+        condition_by="condition",
+        kind="per_sample",
+        show_summary=False,
+        show=False,
+    )
+
+    per_sample = result.tables["per_sample"]
+    assert per_sample.drop_duplicates("sample").set_index("sample")[
+        "pair"
+    ].to_dict() == {"s0": "d1", "s1": "d1", "s2": "d2", "s3": "d3"}
+    assert result.provenance.notes == ("composition", "per_sample", "paired_by=pair")
+    assert result.provenance.extras["n_pair_lines"] == 2
+    assert result.provenance.extras["n_unpaired_samples"] == 0
+    # Samples s0 (A, A) and s1 (A, B) give d1 A: 1 -> 0.5 and B: 0 -> 0.5.
+    # Category blocks hold (control, treated) at x = (0, 1) for A, (2, 3) for B.
+    assert _pair_lines(result.axes["composition"]) == [
+        ([0.0, 1.0], [1.0, 0.5]),
+        ([2.0, 3.0], [0.0, 0.5]),
+    ]
+    result.close()
+
+
+@pytest.mark.parametrize(
+    ("conditions", "subject_by", "message"),
+    [
+        (
+            ["control", "control"],
+            "subject",
+            "Paired composition requires at least two condition values",
+        ),
+        (["", ""], None, "condition_by has no valid sample values"),
+    ],
+)
+def test_per_sample_composition_rejects_unusable_condition_designs(
+    conditions, subject_by, message
+):
+    store = _paired_design_store(subjects=["d1", "d2"], conditions=conditions)
+
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            store,
+            category_by="category",
+            sample_by="sample",
+            subject_by=subject_by,
+            condition_by="condition",
+            kind="per_sample",
+            show=False,
+        )
+
+    assert raised.value.args == (message,)
+
+
+def test_per_sample_composition_places_legends_on_a_foreign_panel(
+    synthetic_plot_store,
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.legend import Legend
+
+    figure, axis = plt.subplots()
+    result = splt.composition(
+        synthetic_plot_store,
+        category_by="category_complete",
+        sample_by="sample",
+        kind="per_sample",
+        target=axis,
+        show=False,
+    )
+
+    legends = [artist for artist in axis.get_children() if isinstance(artist, Legend)]
+    assert [legend.get_title().get_text() for legend in legends] == [
+        "category_complete",
+        "Summary",
+    ]
+    assert [text.get_text() for text in legends[0].get_texts()] == ["A", "B"]
+    assert figure.legends == []
+    # Each of the four samples holds categories B, A, B or A, B, A.
+    per_sample = result.tables["per_sample"].set_index(["sample", "category"])
+    np.testing.assert_allclose(
+        per_sample.loc[(["s1", "s2", "s3", "s4"], "A"), "proportion"],
+        [1 / 3, 2 / 3, 1 / 3, 2 / 3],
+    )
+    result.close()
+    plt.close(figure)
+
+
+_COMPOSITION_GROUPING = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cluster_cut",
+    artifact_id="5" * 64,
+)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"category_by": "category", "subject_by": "subject"},
+            "grouping cannot be combined with subject, pair, or condition metadata",
+        ),
+        (
+            {"category_by": "category", "condition_by": "condition"},
+            "grouping cannot be combined with subject, pair, or condition metadata",
+        ),
+        (
+            {"category_by": "category", "cell_key": "none_selected"},
+            "cell_key cannot override an artifact's stored cell selection",
+        ),
+        ({}, "Provide exactly one of category_by or categories"),
+    ],
+)
+def test_grouped_composition_rejects_conflicting_inputs(
+    synthetic_plot_store, kwargs, message
+):
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            synthetic_plot_store,
+            grouping=_COMPOSITION_GROUPING,
+            show=False,
+            **kwargs,
+        )
+
+    assert raised.value.args == (message,)
+
+
+def test_artifact_composition_rejects_inputs_it_cannot_align(
+    synthetic_plot_store, monkeypatch
+):
+    from importlib import import_module
+
+    module = import_module("scarf.plotting.composition")
+    categories = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_cut",
+        artifact_id="6" * 64,
+    )
+
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            synthetic_plot_store,
+            categories=categories,
+            cell_key="none_selected",
+            show=False,
+        )
+    assert raised.value.args == (
+        "cell_key cannot override an artifact's stored cell selection",
+    )
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            synthetic_plot_store,
+            category_by="category",
+            categories=categories,
+            show=False,
+        )
+    assert raised.value.args == ("Provide exactly one of category_by or categories",)
+
+    selections = {
+        _COMPOSITION_GROUPING: ArtifactRef(
+            scope="datastore", kind="cell_selection", artifact_id="7" * 64
+        ),
+        categories: ArtifactRef(
+            scope="datastore", kind="cell_selection", artifact_id="7" * 64
+        ),
+    }
+    indices = {_COMPOSITION_GROUPING: [0, 1, 2], categories: [0, 1, 2]}
+
+    def resolve_grouping(_store, *, group_by, groups, cell_key):
+        assert (group_by, cell_key) == (None, "I")
+        values = np.array(["x", "y", "x"], dtype=object)
+        return ("groups",), np.asarray(indices[groups]), [values], None
+
+    monkeypatch.setattr(module, "_resolve_grouping", resolve_grouping)
+    monkeypatch.setattr(
+        module, "_artifact_cell_selection", lambda _store, ref: selections[ref]
+    )
+    result = splt.composition(
+        synthetic_plot_store,
+        categories=categories,
+        grouping=_COMPOSITION_GROUPING,
+        show=False,
+    )
+    # Group "x" holds cells 0 and 2 (both category "x"); group "y" holds cell 1.
+    per_group = result.tables["per_group"].set_index(["sample", "category"])
+    assert per_group.loc[("x", "x"), "proportion"] == 1.0
+    assert per_group.loc[("y", "y"), "proportion"] == 1.0
+    assert per_group.loc[("x", "y"), "proportion"] == 0.0
+    result.close()
+
+    indices[categories] = [0, 2, 1]
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            synthetic_plot_store,
+            categories=categories,
+            grouping=_COMPOSITION_GROUPING,
+            show=False,
+        )
+    assert raised.value.args == (
+        "categories and grouping select cells in a different order",
+    )
+
+    selections[categories] = ArtifactRef(
+        scope="datastore", kind="cell_selection", artifact_id="8" * 64
+    )
+    with pytest.raises(ValueError) as raised:
+        splt.composition(
+            synthetic_plot_store,
+            categories=categories,
+            grouping=_COMPOSITION_GROUPING,
+            show=False,
+        )
+    assert raised.value.args == (
+        "categories and grouping must share the same cell selection",
+    )
 
 
 def test_summary_panels_use_explicit_feature_group_orders(
@@ -2263,16 +2894,36 @@ def test_summary_panels_use_explicit_feature_group_orders(
     assert [tick.get_text() for tick in dot_axis.get_yticklabels()] == feature_order
     assert dot.provenance.extras["group_order"] == group_order
     assert dot.provenance.extras["feature_order"] == feature_order
-    standardized = dot.tables["aggregate"]
-    for _, rows in standardized.groupby("feature", observed=False):
-        assert rows["mean"].mean() == pytest.approx(0.0, abs=1e-12)
+    # Each feature's group means are z-scored across groups (ddof=1).
+    cells = pd.DataFrame(
+        synthetic_plot_store.RNA._values, columns=["GeneA", "GeneB"]
+    ).assign(group=synthetic_plot_store.cells.fetch("group"))
+    means = cells.groupby("group")[["GeneA", "GeneB"]].mean()
+    z_scores = (means - means.mean()) / means.std()
+    fractions = (cells[["GeneA", "GeneB"]] > 0).groupby(cells["group"]).mean()
+    dots = dot_axis.collections[0]
+    drawn = {
+        (group_order[int(x)], feature_order[int(y)]): (value, size)
+        for (x, y), value, size in zip(
+            dots.get_offsets(), dots.get_array(), dots.get_sizes(), strict=True
+        )
+    }
+    assert set(drawn) == {(g, f) for g in group_order for f in feature_order}
+    for (group, feature), (value, size) in drawn.items():
+        assert value == pytest.approx(z_scores.loc[group, feature])
+        assert size == pytest.approx(5 + fractions.loc[group, feature] * 45)
+    assert (dots.norm.vmin, dots.norm.vmax) == (-2.0, 2.0)
+    assert dots.get_cmap().name == "magma"
 
     matrix_table = matrix.tables["matrix"]
     assert matrix_table["feature"].tolist() == ["GeneB", "GeneA"]
     assert matrix_table.columns[1:].tolist() == group_order
-    np.testing.assert_array_less(
-        matrix_table[group_order].to_numpy(dtype=float),
-        np.full((2, 3), 1.0 + 1e-12),
+    expected_fractions = fractions.loc[group_order, ["GeneB", "GeneA"]].T.to_numpy()
+    np.testing.assert_allclose(
+        matrix_table[group_order].to_numpy(dtype=float), expected_fractions
+    )
+    np.testing.assert_allclose(
+        matrix.axes["matrixplot"].images[0].get_array(), expected_fractions
     )
     dot.close()
     matrix.close()
@@ -2301,7 +2952,10 @@ def test_summary_helpers_validate_labels_and_standardization():
     )
     standardized = _standardize_feature(values)
     first = standardized.loc[standardized["feature_group"] == "T"]
-    assert first.loc[first["feature"] == "a", "mean"].mean() == pytest.approx(0.0)
+    # Means 1 and 3 have sample standard deviation sqrt(2).
+    np.testing.assert_allclose(
+        first.loc[first["feature"] == "a", "mean"], [-(0.5**0.5), 0.5**0.5]
+    )
     assert first.loc[first["feature"] == "b", "mean"].isna().all()
     # A feature listed under two bracket groups is standardized once per group,
     # so both rows carry the same values.
@@ -2384,6 +3038,63 @@ def test_summary_panels_reject_incomplete_orders_and_unsupported_scales(
             standardize="group",
             show=False,
         )
+
+
+def test_summary_orders_reject_duplicate_labels(synthetic_plot_store):
+    with pytest.raises(ValueError, match="^feature_order cannot contain duplicates$"):
+        splt.matrixplot(
+            synthetic_plot_store,
+            features=["GeneA", "GeneB"],
+            group_by="group",
+            feature_order=["GeneA", "GeneA", "GeneB"],
+            show=False,
+        )
+
+
+def test_matrixplot_on_a_caller_axis_keeps_annotations_and_sample_table(
+    synthetic_plot_store,
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_hex
+
+    figure, ax = plt.subplots()
+    result = splt.matrixplot(
+        synthetic_plot_store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        sample_by="sample_with_missing",
+        row_annotations={"panel": {"GeneA": "early", "GeneB": "late"}},
+        annotation_scales={
+            "panel": splt.CategoricalScale(
+                order=("early", "late"),
+                palette={"early": "#111111", "late": "#eeeeee"},
+            )
+        },
+        target=ax,
+        show=False,
+    )
+
+    # Annotation legends stay on the caller's axes beside the heatmap.
+    legend = ax.get_legend()
+    assert legend.get_title().get_text() == "Annotations"
+    assert [text.get_text() for text in legend.get_texts()] == [
+        "panel: early",
+        "panel: late",
+    ]
+    assert [
+        to_hex(handle.get_markerfacecolor()) for handle in legend.legend_handles
+    ] == ["#111111", "#eeeeee"]
+    assert figure.legends == []
+    # Group means average the per-sample means, as in the dotplot.
+    per_sample = result.tables["per_sample"]
+    assert sorted(per_sample["sample"].unique()) == ["s1", "s2", "s3", "s4"]
+    matrix = result.tables["matrix"].set_index("feature")
+    np.testing.assert_allclose(
+        matrix.loc["GeneA", ["group1", "group2", "group10"]].to_numpy(dtype=float),
+        [4.5, 2.75, 1.125],
+    )
+    result.close()
+    plt.close(figure)
 
 
 def test_owned_distribution_composition_and_summary_results_close_after_show(

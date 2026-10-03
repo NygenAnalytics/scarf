@@ -1,7 +1,6 @@
 """Compact results remain immutable while external histories can be relocated."""
 
 import asyncio
-import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,15 +10,23 @@ from unittest.mock import Mock
 import pytest
 import zarr
 
-from scarf.agent import AnalysisConfig, RuntimeConfig, Study, analyze_rna, open_analysis
+from scarf.agent import AnalysisConfig, Study, analyze_rna, open_analysis
 from scarf.agent import api, workflow
 from scarf.agent.compact_result import publish_result
 from scarf.agent.records import RecordError, RunRecords, procedure_identity
 from scarf.agent.result import AnalysisRun
 
 
-@pytest.fixture
-def completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def _completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: Any = "agent-storage-test",
+    assay: str = "RNA",
+    workspace: str | None = None,
+    missing_stage: str | None = None,
+    selection_decision: bool = True,
+) -> Any:
     source = tmp_path / "source.zarr"
     root = zarr.open_group(str(source), mode="w")
     root.attrs["unrelated"] = "preserved"
@@ -34,36 +41,39 @@ def completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     }
     final_run = SimpleNamespace(
         run_id="final-core-run",
-        assay="RNA",
+        assay=assay,
         report=lambda: {"run": {"config": config}, "stages": ["not copied"]},
     )
     records = RunRecords.create(
         tmp_path / "history",
         {
-            "runId": "agent-storage-test",
+            "runId": run_id,
             "source": "../source.zarr",
             "study": Study(
                 context="Published RNA", objective="Describe cells"
             ).model_dump(),
-            "config": AnalysisConfig().model_dump(),
+            "config": AnalysisConfig(workspace=workspace).model_dump(),
             "procedureIdentity": procedure_identity(),
         },
     )
     for stage, evidence in {
-        "preprocess": {"fingerprint": "frozen-source-fingerprint", "assay": "RNA"},
+        "preprocess": {"fingerprint": "frozen-source-fingerprint", "assay": assay},
         "explore": {
             "partitions": {"c2:r0.75": {"candidateId": "c2", "resolution": 0.75}},
             "summaries": [{"candidateId": "c2", "actualHvgCount": 1987}],
         },
         "finalize": {"runId": final_run.run_id, "selected": "c2:r0.75"},
     }.items():
+        if stage == missing_stage:
+            continue
         path = records.write_json(f"evidence/{stage}.json", evidence)
         records.append("stageCompleted", stage=stage, evidence=path)
-    records.append(
-        "decisionAccepted",
-        stage="finalists",
-        output={"rationale": "Coherent markers at the measured resolution"},
-    )
+    if selection_decision:
+        records.append(
+            "decisionAccepted",
+            stage="finalists",
+            output={"rationale": "Coherent markers at the measured resolution"},
+        )
     records.append("status", status="completed")
     store = SimpleNamespace(workspace=None)
     bound = Mock(return_value=(store, final_run))
@@ -79,6 +89,11 @@ def completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         store=store,
         bound=bound,
     )
+
+
+@pytest.fixture
+def completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    return _completed(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -199,9 +214,17 @@ def test_reading_absent_or_existing_summary_never_changes_store_or_history(
     assert snapshot() == before
 
 
-@pytest.mark.parametrize("fault", ["source", "runId", "assay", "resolution"])
+@pytest.mark.parametrize(
+    ("fault", "error", "message"),
+    [
+        ("source", ValueError, "Source fingerprint changed"),
+        ("runId", RecordError, "does not match the verified final pipeline"),
+        ("assay", RecordError, "does not match the verified final pipeline"),
+        ("resolution", RecordError, "resolution differs from the accepted selection"),
+    ],
+)
 def test_invalid_final_lineage_prevents_store_publication(
-    completed: Any, fault: str
+    completed: Any, fault: str, error: type[Exception], message: str
 ) -> None:
     if fault == "source":
         completed.bound.side_effect = ValueError("Source fingerprint changed")
@@ -211,7 +234,7 @@ def test_invalid_final_lineage_prevents_store_publication(
         completed.run.assay = "different-assay"
     else:
         completed.config["leiden"]["selected"] = 1.25
-    with pytest.raises((RecordError, ValueError)):
+    with pytest.raises(error, match=message):
         publish_result(completed.result)
     assert "agent_results" not in completed.root
     assert completed.records.latest("resultPublished") is None
@@ -414,6 +437,9 @@ def test_reading_detects_an_edited_original_locator_without_repairing_it(
     before = completed.records.events()
     with pytest.raises(RecordError, match="differs from its publication record"):
         _ = completed.result.compact_result
+    # Publishing again cannot adopt the edited summary as the recorded result.
+    with pytest.raises(RecordError, match="Recorded compact publication differs"):
+        publish_result(completed.result)
     assert child.attrs["result"] == payload
     assert completed.records.events() == before
 
@@ -509,36 +535,70 @@ def test_malformed_external_locator_is_rejected_without_rewriting(
     assert child.attrs["result"] == payload
 
 
-def test_real_numerical_completion_publishes_exact_final_pipeline(
-    agent_rna_source: Path, tmp_path: Path
+@pytest.mark.parametrize("run_id", ["../escape", "nested/run", "", 7])
+def test_invalid_run_identifier_cannot_name_a_result_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: Any
 ) -> None:
-    from scarf import DataStore
-    from tests.test_agent_workflow import scripted_model
+    completed = _completed(tmp_path, monkeypatch, run_id=run_id)
+    for operation in (
+        lambda: publish_result(completed.result),
+        lambda: completed.result.compact_result,
+    ):
+        with pytest.raises(RecordError, match="not a valid local result group name"):
+            operation()
+    assert "agent_results" not in completed.root
+    assert completed.records.latest("resultPublished") is None
 
-    result = analyze_rna(
-        agent_rna_source,
-        run_dir=tmp_path / "real-history",
-        model=scripted_model([]),
-        study=Study(context="One donor, filtered RNA", objective="Describe cells"),
-        config=AnalysisConfig(hvgCount=40, pcaDims=4, neighborsK=7, maxCandidates=4),
-        runtime=RuntimeConfig(nthreads=2, memBudget="512M"),
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("preprocess", "missing frozen selection evidence"),
+        ("explore", "missing frozen selection evidence"),
+        ("finalize", "missing frozen selection evidence"),
+        ("decision", "missing its final selection decision"),
+    ],
+)
+def test_completed_status_without_frozen_selection_cannot_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str, message: str
+) -> None:
+    completed = _completed(
+        tmp_path,
+        monkeypatch,
+        missing_stage=None if damage == "decision" else damage,
+        selection_decision=damage != "decision",
     )
-    assert result.status == "completed"
-    compact = result.compact_result
-    assert compact is not None
-    assert compact["finalPipelineRunId"] == result.pipeline.run_id
-    assert (
-        compact["selectedParameters"]["pipelineConfig"]
-        == result.pipeline.report()["run"]["config"]
+    with pytest.raises(RecordError, match=message):
+        publish_result(completed.result)
+    assert "agent_results" not in completed.root
+    assert completed.records.latest("resultPublished") is None
+
+
+@pytest.mark.parametrize("field", ["assay", "workspace"])
+def test_result_namespace_cannot_be_the_selected_assay_or_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    completed = _completed(tmp_path, monkeypatch, **{field: "agent_results"})
+    with pytest.raises(RecordError, match="already the selected assay or workspace"):
+        publish_result(completed.result)
+    assert "agent_results" not in completed.root
+    assert completed.records.latest("resultPublished") is None
+
+
+def test_stored_result_must_be_a_json_object(completed: Any) -> None:
+    group = completed.root.create_group(
+        "agent_results", attributes={"owner": "scarf.agent"}
     )
-    assert compact["selectedParameters"]["actualHvgCount"] > 0
-    reopened = DataStore(
-        str(agent_rna_source), zarr_mode="r", nthreads=2, mem_budget="512M"
-    )
-    assert reopened.assay_names == ["RNA"]
-    assert (
-        reopened.pipeline.open(run_id=compact["finalPipelineRunId"])["clusters"]
-        == result.artifacts["clusters"]
-    )
-    assert not {"calls", "events", "study"} & set(compact)
-    assert "thinking" not in json.dumps(compact)
+    group.create_group("agent-storage-test", attributes={"result": ["not", "a", "map"]})
+    for operation in (
+        lambda: publish_result(completed.result),
+        lambda: completed.result.compact_result,
+    ):
+        with pytest.raises(RecordError, match="stored compact result is not a JSON"):
+            operation()
+    assert completed.root["agent_results/agent-storage-test"].attrs["result"] == [
+        "not",
+        "a",
+        "map",
+    ]
+    assert completed.records.latest("resultPublished") is None

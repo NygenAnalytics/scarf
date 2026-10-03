@@ -14,18 +14,34 @@ from scarf.agent import AnalysisConfig, analyze_rna, open_analysis, resume_rna
 from scarf.agent import api, workflow
 from scarf.agent.models import AnalysisInputError, Candidate, NeedsInput
 from scarf.agent.records import RunRecords
-from tests.test_agent_recovery import Ref, Run, _analyze, _model, _pipeline, _study
+from tests.test_agent_recovery import (
+    Ref,
+    Run,
+    _analyze,
+    _model,
+    _pipeline,
+    _study,
+    completed_template,
+    restore_completed,
+)
 from tests.test_agent_recovery import records as records
 from tests.test_agent_recovery import science as science
 
 
-@pytest.mark.parametrize("invalid", ["missing-source", "nested-run", "missing-model"])
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        ("missing-source", "source must be an existing prepared local Scarf store"),
+        ("nested-run", "run_dir must be outside the numerical store"),
+        ("missing-model", "Supply a configured model or model identifier"),
+    ],
+)
 def test_invalid_entry_arguments_do_not_create_run_records(
-    science: Any, tmp_path: Path, invalid: str
+    science: Any, tmp_path: Path, invalid: str, message: str
 ) -> None:
     source = tmp_path / "absent" if invalid == "missing-source" else science.source
     destination = source / "analysis" if invalid == "nested-run" else tmp_path / "new"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         analyze_rna(
             source,
             run_dir=destination,
@@ -37,10 +53,18 @@ def test_invalid_entry_arguments_do_not_create_run_records(
     assert science.calls == []
 
 
+@pytest.fixture(scope="module")
+def completed_history(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
+    return completed_template(tmp_path_factory.mktemp("completed-history"))
+
+
 def test_resume_refuses_changed_procedure_before_any_new_work(
-    science: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    science: Any,
+    completed_history: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _analyze(science, tmp_path, _model([]))
+    result = restore_completed(completed_history, science, tmp_path)
     before = RunRecords(result.run_dir).events()
     monkeypatch.setattr(api, "procedure_identity", lambda: "changed-prompts")
     with pytest.raises(ValueError, match="implementation or prompts changed"):
@@ -169,9 +193,9 @@ def test_initial_answer_cannot_replace_an_existing_scientific_policy(
 
 
 def test_verified_relocation_is_saved_and_completed_resume_needs_no_provider(
-    science: Any, tmp_path: Path
+    science: Any, completed_history: SimpleNamespace, tmp_path: Path
 ) -> None:
-    result = _analyze(science, tmp_path, _model([]))
+    result = restore_completed(completed_history, science, tmp_path)
     moved = tmp_path / "relocated-source"
     moved.mkdir()
     resumed = resume_rna(result.run_dir, model=None, source=moved)
@@ -368,12 +392,14 @@ def test_finalization_rejects_changed_lineage_before_annotation(
 
 
 def test_completed_resume_rejects_changed_final_artifact_mapping(
-    science: Any, tmp_path: Path
+    science: Any, completed_history: SimpleNamespace, tmp_path: Path
 ) -> None:
-    result = _analyze(science, tmp_path, _model([]))
+    result = restore_completed(completed_history, science, tmp_path)
+    before = RunRecords(result.run_dir).events()
     science.runs["run-3"]["clusters"] = Ref("replacement")
     with pytest.raises(AnalysisInputError, match="saved artifact mapping"):
         resume_rna(result.run_dir, model=None)
+    assert RunRecords(result.run_dir).events() == before
     assert len(science.calls) == 3
 
 
@@ -542,6 +568,131 @@ def test_correction_selection_uses_matched_measured_evidence(
     replayed = result.replay_decisions()
     assert len(replayed) == 4
     assert all(row["valid"] for row in replayed)
+
+
+@pytest.mark.parametrize("scenario", ["unpinned", "numerical-failure"])
+def test_correction_without_its_pinned_measurement_keeps_only_native_control(
+    science: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    import numpy as np
+
+    from scarf.datastore.pipeline_run import PipelineExecutionError
+
+    science.inspect.return_value["correctionEligible"] = True
+    original_summary = workflow.summarize_candidate
+    execute = workflow.execute_pipeline
+
+    def summarize(*args: Any) -> dict[str, Any]:
+        summary = original_summary(*args)
+        if args[2].useHarmony:
+            # The corrected screen reports a resolution other than its pin.
+            summary["partitions"][0].update(optionId="c4:r1", resolution=1.0)
+        return summary
+
+    def correction_fails(*args: Any, **kwargs: Any) -> Any:
+        if args[2].useHarmony:
+            failed = Run("failed-correction")
+            failed.status = "failed"
+            science.runs[failed.run_id] = failed
+            cause = np.linalg.LinAlgError("Harmony did not converge")
+            raise PipelineExecutionError(failed.run_id, "harmony", cause) from cause
+        return execute(*args, **kwargs)
+
+    if scenario == "unpinned":
+        monkeypatch.setattr(workflow, "summarize_candidate", summarize)
+    else:
+        monkeypatch.setattr(workflow, "execute_pipeline", correction_fails)
+    ordinary = _model([])
+
+    async def correct(messages: Any, info: Any) -> ModelResponse:
+        payload = json.loads(messages[-1].parts[-1].content)
+        if payload["stage"] == "explore":
+            answer = {
+                "action": "experiment",
+                "optionIds": ["c0:r0.5:harmony"],
+                "rationale": "Measure the matched correction",
+                "evidenceIds": ["c0:r0.5"],
+            }
+            return ModelResponse(parts=[ToolCallPart("decision", answer)])
+        return await ordinary.function(messages, info)
+
+    result = analyze_rna(
+        science.source,
+        run_dir=tmp_path / "correction",
+        model=FunctionModel(correct),
+        study=_study(),
+        config=AnalysisConfig(
+            hvgCount=20,
+            pcaDims=4,
+            neighborsK=7,
+            resolutions=(0.5,),
+            maxCandidates=5,
+            scoreDoublets=True,
+        ),
+    )
+    records = RunRecords(result.run_dir)
+    if scenario == "unpinned":
+        assert result.status == "failed"
+        status = records.latest("status")
+        assert status["stage"] == "explore"
+        assert status["message"] == "Corrected screen lacks its pinned resolution"
+        assert records.latest("candidateMeasured")["candidateId"] == "c4"
+        assert workflow.stage_result(records, "explore") is None
+        assert [call["final"] for call in science.calls] == [False, False]
+        return
+    assert result.status == "completed", records.latest("status")
+    explored = records.read_json("evidence/explore.json")
+    assert explored["shortlist"] == ["c0:r0.5"]
+    slot = explored["explorationCoverage"]["slots"][-1]
+    assert {
+        key: slot[key] for key in ("candidateId", "axis", "parentId", "status")
+    } == {
+        "candidateId": "c4",
+        "axis": "harmony",
+        "parentId": "c0",
+        "status": "failed",
+    }
+    assert slot["reason"] == (
+        "Correction failed numerically; retaining its native counterpart"
+    )
+    skipped = records.latest("candidateFailed")
+    assert (skipped["candidateId"], skipped["reason"], skipped["stage"]) == (
+        "c4",
+        "LinAlgError",
+        "harmony",
+    )
+    assert records.read_json("evidence/finalize.json")["selected"] == "c0:r0.5"
+    assert [call["final"] for call in science.calls] == [False, False, True]
+    assert all(row["valid"] for row in result.replay_decisions())
+
+
+def test_unsupported_objective_fails_explicitly_instead_of_asking(
+    science: Any, tmp_path: Path
+) -> None:
+    async def unsupported(messages: Any, info: Any) -> ModelResponse:
+        answer = {
+            "rationale": "Differential testing is outside descriptive discovery",
+            "question": "Should treated cells be tested for differential expression?",
+            "deferralReason": "unsupportedObjective",
+            "evidenceIds": ["source:summary"],
+        }
+        return ModelResponse(parts=[ToolCallPart("decision", answer)])
+
+    result = _analyze(science, tmp_path, FunctionModel(unsupported))
+    records = RunRecords(result.run_dir)
+    assert result.status == "failed"
+    assert result.pending_questions == []
+    status = records.latest("status")
+    assert (status["stage"], status["errorType"], status["message"]) == (
+        "context",
+        "AnalysisInputError",
+        "The requested objective is outside supported descriptive RNA analysis",
+    )
+    accepted = records.latest("decisionAccepted")
+    assert accepted["output"]["deferralReason"] == "unsupportedObjective"
+    assert records.latest("decisionResolved") is None
+    assert workflow.stage_result(records, "context") is None
+    assert science.calls == []
 
 
 def test_corrected_probe_compares_only_its_pinned_resolution(

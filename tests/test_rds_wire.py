@@ -22,21 +22,33 @@ from scarf.readers._rds import (
     ExternalPointerValue,
     LazyAtomicVector,
     LazyStringVector,
+    LazyVector,
     PairValue,
     PersistentValue,
     PromiseValue,
     R_INT_NA,
     RdsClosedError,
     RdsCompression,
+    RdsEncoding,
     RdsFormatError,
     RdsLimitError,
     RdsLimits,
+    RNode,
     RType,
     WeakReferenceValue,
+    get_attribute,
     get_slot,
+    iter_attributes,
     iter_named,
     iter_pairlist,
     open_rds,
+    symbol_name,
+)
+from scarf.readers._rds._lazy import STRING_SOURCE_DECODED, pack_string_descriptor
+from scarf.readers._rds._storage import (
+    BufferedTempWriter,
+    RandomAccessStorage,
+    TempManager,
 )
 
 
@@ -222,8 +234,6 @@ def test_xdr_numeric_vector_is_lazy_and_matches_rdata(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("encoding", ["xdr", "ascii"])
 def test_lazy_strings_batch_descriptor_and_payload_reads(encoding, monkeypatch):
-    from scarf.readers._rds._storage import RandomAccessStorage
-
     wire = Wire(encoding)
     expected = [f"cell-{index}" for index in range(4097)]
     payload = wire.document(wire.string_vector([value.encode() for value in expected]))
@@ -1071,3 +1081,633 @@ def test_r_strings_decode_by_their_encoding_flags(raw, gp, encoding, expected):
     from scarf.readers._rds._lazy import decode_r_string
 
     assert decode_r_string(raw, gp, encoding) == expected
+
+
+def test_limits_reject_negative_values_and_accept_zero() -> None:
+    names = (
+        "max_objects",
+        "max_depth",
+        "max_string_bytes",
+        "max_vector_length",
+        "max_temp_bytes",
+    )
+    for name in names:
+        with pytest.raises(ValueError, match=f"^{name} must be nonnegative$"):
+            RdsLimits(**{name: -1})
+        # Zero is a valid limit: it rejects every object of that kind.
+        RdsLimits(**{name: 0})
+
+
+def test_attribute_names_decode_byte_symbols_and_skip_unnamed_cells() -> None:
+    wire = Wire()
+    # A symbol whose CHARSXP carries the BYTES flag deserializes to bytes.
+    byte_symbol = wire.integer(RType.SYMBOL) + wire.char(b"caf\xc3\xa9", gp=1 << 1)
+    # A symbol whose name is not a CHARSXP names nothing.
+    unnamed_symbol = wire.integer(RType.SYMBOL) + wire.integer_vector([0])
+    slots = wire.pair(
+        wire.integer_vector([1]),
+        wire.pair(
+            wire.integer_vector([2]),
+            wire.pair(wire.integer_vector([3]), wire.nil(), tag=byte_symbol),
+            tag=unnamed_symbol,
+        ),
+    )
+    s4 = wire.integer(wire.flags(RType.S4, attributes=True, object_=True)) + slots
+    with open_rds(io.BytesIO(wire.document(s4))) as document:
+        attributes = list(iter_attributes(document.root))
+        assert [name for name, _ in attributes] == ["café"]
+        assert attributes[0][1].value[0] == 3
+        assert get_attribute(document.root, "café") is attributes[0][1]
+
+    assert symbol_name(None) is None
+    assert symbol_name(RNode(RType.NIL_VALUE)) is None
+    assert symbol_name(RNode(RType.CHAR, value="not-a-symbol")) is None
+    missing_name = RNode(RType.SYMBOL, value=RNode(RType.CHAR, value=None))
+    assert symbol_name(missing_name) is None
+
+
+def test_pairlist_and_named_vector_helpers_reject_malformed_graphs() -> None:
+    wire = Wire()
+    integer_attributes = (
+        wire.integer(wire.flags(RType.INTEGER, attributes=True))
+        + wire.integer(1)
+        + wire.integer(5)
+        + wire.integer_vector([1])
+    )
+    with open_rds(io.BytesIO(wire.document(integer_attributes))) as document:
+        with pytest.raises(
+            TypeError, match=r"^expected a pairlist at \$\.attributes, found INTEGER$"
+        ):
+            get_attribute(document.root, "names")
+        with pytest.raises(TypeError, match="^INTEGER is not a generic named vector$"):
+            list(iter_named(document.root))
+
+    names = wire.pair(
+        wire.string_vector([b"only"]), wire.nil(), tag=wire.symbol("names")
+    )
+    short_names = wire.vector(
+        [wire.integer_vector([1]), wire.integer_vector([2])], attributes=names
+    )
+    with open_rds(io.BytesIO(wire.document(short_names))) as document:
+        with pytest.raises(
+            ValueError, match=r"^name count 1 does not match value count 2 at \$$"
+        ):
+            list(iter_named(document.root))
+
+    # The parser never builds these graphs; the helpers still reject them.
+    first = RNode(RType.PAIRLIST, path="$first")
+    second = RNode(RType.PAIRLIST, path="$second")
+    first.value = PairValue(RNode(RType.NIL_VALUE), second)
+    second.value = PairValue(RNode(RType.NIL_VALUE), first)
+    with pytest.raises(ValueError, match=r"^cycle in pairlist at \$first$"):
+        list(iter_pairlist(first))
+    with pytest.raises(TypeError, match=r"^pairlist node at \$p has no pair value$"):
+        list(iter_pairlist(RNode(RType.PAIRLIST, path="$p")))
+    with pytest.raises(TypeError, match=r"^vector node at \$v has no node sequence$"):
+        list(iter_named(RNode(RType.VECTOR, path="$v")))
+    eager_names = RNode(
+        RType.VECTOR,
+        value=(RNode(RType.NIL_VALUE),),
+        attributes=RNode(
+            RType.PAIRLIST,
+            value=PairValue(
+                RNode(RType.STRING, value=["eager"], path="$n"),
+                RNode(RType.NIL_VALUE),
+            ),
+            tag=RNode(RType.SYMBOL, value=RNode(RType.CHAR, value="names")),
+        ),
+    )
+    with pytest.raises(TypeError, match=r"^names at \$n are not lazily indexed$"):
+        list(iter_named(eager_names))
+
+
+def test_closed_document_cannot_be_reentered() -> None:
+    wire = Wire()
+    document = open_rds(io.BytesIO(wire.document(wire.nil())))
+    with document:
+        assert not document.closed
+    assert document.closed
+    with pytest.raises(RdsClosedError, match=r"^RDS document is closed at \$$"):
+        with document:
+            pass
+
+
+def test_lazy_vectors_validate_windows_steps_and_indexes() -> None:
+    wire = Wire()
+    root = wire.vector(
+        [
+            wire.integer_vector([10, 20, 30]),
+            wire.string_vector([b"a", None, b"c"]),
+        ]
+    )
+    with open_rds(io.BytesIO(wire.document(root))) as document:
+        integers, strings = (node.value for node in document.root.value)
+        assert (integers[-1], integers[-3]) == (30, 10)
+        for index in (3, -4):
+            with pytest.raises(IndexError, match="^vector index out of range$"):
+                integers[index]
+        with pytest.raises(
+            IndexError, match=r"^invalid block \[2:1\] for vector of length 3$"
+        ):
+            integers.read_block(2, 1)
+        with pytest.raises(ValueError, match="^lazy vector slices require a step"):
+            integers[::2]
+
+        assert (strings[-1], strings[1], strings[-3]) == ("c", None, "a")
+        assert list(strings) == ["a", None, "c"]
+        for index in (3, -4):
+            with pytest.raises(IndexError, match="^string vector index out of range$"):
+                strings[index]
+        with pytest.raises(
+            IndexError, match=r"^invalid block \[0:4\] for vector of length 3$"
+        ):
+            strings.read_block(0, 4)
+        with pytest.raises(ValueError, match="^lazy string slices require a step"):
+            strings[::-1]
+
+    with pytest.raises(NotImplementedError):
+        len(LazyVector())
+    with pytest.raises(ValueError, match="^STRING is not an atomic vector type$"):
+        LazyAtomicVector(
+            RandomAccessStorage(io.BytesIO(b""), name="empty", close_file=True),
+            offset=0,
+            length=0,
+            r_type=RType.STRING,
+            byte_order=">",
+            path="$",
+        )
+
+
+def test_decoded_strings_without_their_storage_fail_clearly() -> None:
+    index = RandomAccessStorage(
+        io.BytesIO(pack_string_descriptor(STRING_SOURCE_DECODED, 0, 1, 0)),
+        name="index",
+        close_file=True,
+    )
+    strings = LazyStringVector(
+        index,
+        descriptor_offset=0,
+        length=1,
+        payload_storage=index,
+        decoded_storage=None,
+        default_encoding=None,
+        path="$strings",
+    )
+    with pytest.raises(RuntimeError, match="^decoded string storage is unavailable$"):
+        strings[0]
+    with pytest.raises(RuntimeError, match="^decoded string storage is unavailable$"):
+        strings.read_block(0, 1)
+
+
+def test_lazy_reads_detect_a_backing_file_truncated_after_open(
+    tmp_path: Path,
+) -> None:
+    wire = Wire()
+    payload = wire.document(wire.integer_vector([1, 2, 3, 4]))
+    path = tmp_path / "numbers.rds"
+    path.write_bytes(payload)
+
+    with open_rds(path) as document:
+        vector = document.root.value
+        with path.open("r+b") as handle:
+            handle.truncate(len(payload) - 4)
+        np.testing.assert_array_equal(vector.read_block(0, 3), [1, 2, 3])
+        with pytest.raises(
+            RdsFormatError,
+            match=r"^unexpected end of stream while reading 4 bytes at \$",
+        ) as caught:
+            vector.read_block(3, 4)
+    assert caught.value.offset == len(payload) - 4
+
+
+def test_random_access_storage_guards_offsets_and_closes_once() -> None:
+    closes: list[bool] = []
+
+    class _CountedStream(io.BytesIO):
+        def close(self) -> None:
+            closes.append(True)
+            super().close()
+
+    storage = RandomAccessStorage(_CountedStream(b"abc"), name="s", close_file=True)
+    assert storage.read_at(1, 2) == b"bc"
+    for offset, size in ((-1, 1), (0, -1)):
+        with pytest.raises(ValueError, match="^offset and size must be nonnegative$"):
+            storage.read_at(offset, size)
+    storage.close()
+    storage.close()
+    assert storage.closed
+    assert closes == [True]
+    with pytest.raises(RdsClosedError, match=r"^RDS document is closed at \$x$"):
+        storage.read_at(0, 1, path="$x")
+
+
+def test_document_close_tolerates_a_stream_its_caller_already_closed() -> None:
+    wire = Wire()
+    stream = io.BytesIO(b"prefix" + wire.document(wire.integer_vector([1])))
+    stream.seek(len(b"prefix"))
+    document = open_rds(stream)
+    stream.close()
+    # Restoring the caller's position fails on a closed stream; closing the
+    # document still succeeds.
+    document.close()
+    assert document.closed
+
+
+def test_temp_manager_close_is_idempotent_and_tolerates_removed_files(
+    tmp_path: Path,
+) -> None:
+    wire = Wire()
+    payload = gzip.compress(wire.document(wire.string_vector([b"a", b"b"])))
+    document = open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    temp_paths = [Path(path) for path in document.temp_paths]
+    assert len(temp_paths) == 2
+    # A scratch cleaner may remove the files before the document closes.
+    for path in temp_paths:
+        path.unlink()
+    document.close()
+    assert list(tmp_path.iterdir()) == []
+
+    manager = TempManager(RdsLimits(), temp_dir=tmp_path)
+    storage = manager.create("payload")
+    assert manager.append(storage, b"abc", path="$") == 0
+    manager.close()
+    manager.close()
+    assert storage.closed
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(RdsClosedError, match=r"^RDS document is closed at \$temp$"):
+        manager.create("again")
+
+
+def test_temporary_writes_detect_short_and_interleaved_appends(
+    tmp_path: Path,
+) -> None:
+    manager = TempManager(RdsLimits(), temp_dir=tmp_path)
+    shared = manager.create("shared")
+    first = BufferedTempWriter(manager, shared)
+    second = BufferedTempWriter(manager, shared)
+    assert first.write(b"aa", path="$first") == 0
+    assert second.write(b"bbb", path="$second") == 0
+    second.flush(path="$second")
+    with pytest.raises(RuntimeError, match="^temporary writer was interleaved$"):
+        first.flush(path="$first")
+
+    class _ShortWrites(io.BytesIO):
+        def write(self, data: bytes) -> int:  # type: ignore[override]
+            return super().write(bytes(data)[:-1])
+
+    short = RandomAccessStorage(
+        _ShortWrites(), name=str(tmp_path / "short.tmp"), close_file=True
+    )
+    with pytest.raises(OSError, match="^short temporary-file write$"):
+        manager.append(short, b"abc", path="$")
+    manager.close()
+
+
+def test_scratch_space_inspection_failure_is_reported_while_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(_path: object) -> object:
+        raise OSError("statvfs failed")
+
+    wire = Wire()
+    payload = wire.document(wire.string_vector([b"a"]))
+    monkeypatch.setattr("scarf.readers._rds._storage.shutil.disk_usage", unavailable)
+    with pytest.raises(
+        OSError, match="^Cannot inspect free scratch space for "
+    ) as caught:
+        open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    assert str(caught.value.__cause__) == "statvfs failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_scratch_space_failure_while_spooling_is_not_reported_as_corrupt_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(_path: object) -> object:
+        raise OSError("statvfs failed")
+
+    wire = Wire()
+    payload = gzip.compress(wire.document(wire.integer_vector([1])))
+    monkeypatch.setattr("scarf.readers._rds._storage.shutil.disk_usage", unavailable)
+    with pytest.raises(
+        OSError, match="^Cannot inspect free scratch space for "
+    ) as caught:
+        open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    assert str(caught.value.__cause__) == "statvfs failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_full_scratch_disk_while_spooling_is_not_reported_as_corrupt_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def disk_full(_storage: object, _data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    wire = Wire()
+    payload = gzip.compress(wire.document(wire.integer_vector([1])))
+    monkeypatch.setattr(RandomAccessStorage, "_append_unchecked", disk_full)
+    with pytest.raises(OSError, match="No space left on device") as caught:
+        open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    assert not isinstance(caught.value, RdsFormatError)
+    assert caught.value.errno == 28
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_bytes_like_inputs_are_parsed_without_a_stream() -> None:
+    wire = Wire()
+    payload = wire.document(wire.integer_vector([5, 6]))
+    for source in (payload, bytearray(payload), memoryview(payload)):
+        with open_rds(source) as document:
+            assert document.source.name == "<bytes>"
+            assert document.source.source_bytes == len(payload)
+            assert document.source.source_sha256 == hashlib.sha256(payload).hexdigest()
+            np.testing.assert_array_equal(document.root.value[:], [5, 6])
+
+
+def test_unseekable_streams_are_rejected() -> None:
+    class _Pipe:
+        def read(self, size: int = -1) -> bytes:
+            return b""
+
+        def tell(self) -> int:
+            raise io.UnsupportedOperation("pipes cannot tell")
+
+        def seek(self, offset: int, whence: int = 0) -> int:
+            raise io.UnsupportedOperation("pipes cannot seek")
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(
+        TypeError, match="^RDS input stream must be seekable$"
+    ) as caught:
+        open_rds(_Pipe())
+    assert isinstance(caught.value.__cause__, io.UnsupportedOperation)
+    with pytest.raises(TypeError, match="^RDS input stream must be seekable$"):
+        open_rds(object())  # type: ignore[arg-type]
+
+
+def test_stream_shorter_than_its_reported_size_is_rejected() -> None:
+    class _Overstated(io.BytesIO):
+        def seek(self, offset: int, whence: int = 0) -> int:
+            position = super().seek(offset, whence)
+            return position + 10 if whence == io.SEEK_END else position
+
+    wire = Wire()
+    stream = _Overstated(b"prefix" + wire.document(wire.nil()))
+    start = stream.seek(len(b"prefix"))
+    with pytest.raises(
+        OSError, match="^Input stream ended while computing its digest$"
+    ):
+        open_rds(stream)
+    assert stream.tell() == start
+    assert not stream.closed
+
+
+def test_failed_decompression_closes_owned_inputs_and_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.readers._rds._storage as storage_module
+
+    opened: list[object] = []
+    original = storage_module._open_input
+
+    def recording(source: object) -> object:
+        result = original(source)  # type: ignore[arg-type]
+        opened.append(result.file)
+        return result
+
+    monkeypatch.setattr(storage_module, "_open_input", recording)
+    path = tmp_path / "broken.rds"
+    path.write_bytes(b"\x1f\x8b" + b"not a gzip member")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    for source in (path, path.read_bytes()):
+        with pytest.raises(
+            RdsFormatError, match=r"^invalid gzip compressed stream at \$source$"
+        ):
+            open_rds(source, temp_dir=scratch)
+    assert len(opened) == 2
+    assert all(file.closed for file in opened)  # type: ignore[attr-defined]
+    assert list(scratch.iterdir()) == []
+
+
+def test_a_failed_cleanup_seek_does_not_mask_the_read_error() -> None:
+    class _Disconnected(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            self.close()
+            raise OSError("device disconnected")
+
+    with pytest.raises(OSError, match="^device disconnected$"):
+        open_rds(_Disconnected(b"X\n"))
+
+
+def test_wire_reader_rejects_negative_sizes_and_unknown_native_order() -> None:
+    from scarf.readers._rds._parser import _WireReader
+
+    storage = RandomAccessStorage(io.BytesIO(b"\x00" * 8), name="w", close_file=True)
+    reader = _WireReader(storage, position=0, encoding=RdsEncoding.XDR, byte_order=">")
+    with pytest.raises(ValueError, match="^size must be nonnegative$"):
+        reader.read_exact(-1, path="$")
+    with pytest.raises(ValueError, match="^size must be nonnegative$"):
+        reader.skip(-1, path="$")
+    native = _WireReader(
+        storage, position=0, encoding=RdsEncoding.NATIVE, byte_order=None
+    )
+    with pytest.raises(
+        RdsFormatError, match=r"^native binary byte order is unknown at \$ \(byte 0\)$"
+    ):
+        native.read_int(path="$")
+
+
+@pytest.mark.parametrize(
+    ("root", "message"),
+    [
+        (b"13\n1\nx1\n", "invalid ASCII integer b'x1'"),
+        (b"14\n1\n1.2.3\n", r"invalid ASCII real b'1\.2\.3'"),
+        (b"14\n1\n\xff\n", r"invalid ASCII real b'\\xff'"),
+        (b"24\n1\nzz\n", "invalid ASCII raw byte b'zz'"),
+        (b"24\n1\n1ff\n", "ASCII raw byte 511 is out of range"),
+        (b"24\n1\n-1\n", "ASCII raw byte -1 is out of range"),
+    ],
+)
+def test_ascii_payloads_reject_malformed_numeric_tokens(
+    root: bytes,
+    message: str,
+) -> None:
+    wire = Wire("ascii", version=2)
+    with pytest.raises(RdsFormatError, match=rf"^{message} at \$\[0\]") as caught:
+        open_rds(io.BytesIO(wire.header() + root))
+    assert caught.value.path == "$[0]"
+
+
+def test_crlf_ascii_payloads_and_empty_strings_are_read() -> None:
+    wire = Wire("ascii", version=3)
+    payload = wire.document(wire.string_vector([b"", b"x y", b""]))
+    windows = payload.replace(b"\n", b"\r\n")
+    assert windows.startswith(b"A\r\n")
+    with open_rds(io.BytesIO(windows)) as document:
+        assert document.metadata.encoding is RdsEncoding.ASCII
+        assert document.metadata.native_encoding == "UTF-8"
+        assert document.root.value[:] == ["", "x y", ""]
+
+
+def test_big_endian_native_payloads_are_read() -> None:
+    wire = Wire()
+    # Native big-endian payloads use XDR byte order behind a binary marker.
+    payload = b"B\n" + wire.document(wire.real_vector([1.5, -2.0]))[2:]
+    with open_rds(io.BytesIO(payload)) as document:
+        assert document.metadata.encoding is RdsEncoding.NATIVE
+        assert document.metadata.byte_order == ">"
+        np.testing.assert_array_equal(document.root.value[:], [1.5, -2.0])
+
+
+def test_environment_lock_flags_must_be_logical() -> None:
+    wire = Wire()
+    environment = (
+        wire.integer(RType.ENVIRONMENT)
+        + wire.integer(2)
+        + wire.integer(RType.BASE_ENVIRONMENT)
+        + wire.nil()
+        + wire.nil()
+        + wire.nil()
+    )
+    with pytest.raises(
+        RdsFormatError, match="^environment lock flag must be 0 or 1, found 2"
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(environment)))
+    assert caught.value.path == "$.locked"
+
+
+def test_altrep_descriptions_tolerate_partial_class_information() -> None:
+    wire = Wire()
+    state = wire.real_vector([3.0, 1.0, 1.0])
+    bare_symbol = wire.integer(RType.ALTREP) + wire.symbol("compact_intseq") + state
+    class_only = (
+        wire.integer(RType.ALTREP)
+        + wire.pair(wire.symbol("compact_intseq"), wire.nil())
+        + state
+    )
+    for altrep, expected in (
+        (bare_symbol, (None, None, False)),
+        (class_only, ("compact_intseq", None, True)),
+    ):
+        with open_rds(io.BytesIO(wire.document(altrep + wire.nil()))) as document:
+            value = document.root.value
+            assert isinstance(value, AltRepValue)
+            assert (value.class_name, value.package_name, value.known) == expected
+            np.testing.assert_array_equal(value.state.value[:], [3.0, 1.0, 1.0])
+
+
+def test_persistent_names_require_a_zero_placeholder() -> None:
+    wire = Wire()
+    persistent = (
+        wire.integer(RType.PERSISTENT)
+        + wire.integer(1)
+        + wire.integer(1)
+        + wire.char(b"hook")
+    )
+    with pytest.raises(
+        RdsFormatError, match="^persistent string placeholder must be 0, found 1"
+    ) as caught:
+        open_rds(io.BytesIO(wire.document(persistent)))
+    assert caught.value.path == "$.names.placeholder"
+
+
+def test_bytecode_nested_bodies_and_attributed_language_cells_are_inert() -> None:
+    wire = Wire()
+    srcref = wire.pair(wire.integer_vector([3]), wire.nil(), tag=wire.symbol("srcref"))
+    bytecode = (
+        wire.integer(RType.BYTECODE)
+        + wire.integer(0)
+        + wire.integer_vector([12])
+        + wire.integer(2)
+        # A nested body: code, one constant.
+        + wire.integer(RType.BYTECODE)
+        + wire.integer_vector([7])
+        + wire.integer(1)
+        + wire.integer(RType.INTEGER)
+        + wire.integer_vector([5])
+        # A language cell with attributes, no tag, CAR f, and a NULL tail.
+        + wire.integer(RType.BYTECODE_ATTR_LANGUAGE)
+        + srcref
+        + wire.nil()
+        + wire.integer(0)
+        + wire.symbol("f")
+        + wire.integer(0)
+        + wire.nil()
+    )
+    with open_rds(io.BytesIO(wire.document(bytecode))) as document:
+        value = document.root.value
+        assert isinstance(value, BytecodeValue)
+        assert value.code.value[0] == 12
+        nested, call = value.constants
+        assert nested.type is RType.BYTECODE
+        assert nested.value.code.value[0] == 7
+        assert nested.value.constants[0].value[0] == 5
+        assert call.type is RType.LANGUAGE
+        assert get_attribute(call, "srcref").value[0] == 3
+        assert call.tag is None
+        assert symbol_name(call.value.car) == "f"
+        assert call.value.cdr.is_null
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["definition-position", "definition-type", "repeated-count", "constant-count"],
+)
+def test_bytecode_rejects_invalid_definitions_and_counts(case: str) -> None:
+    wire = Wire()
+
+    def bytecode(repeated: int, constant_count: int, *constants: int) -> bytes:
+        return (
+            wire.integer(RType.BYTECODE)
+            + wire.integer(repeated)
+            + wire.integer_vector([12])
+            + wire.integer(constant_count)
+            + b"".join(wire.integer(value) for value in constants)
+        )
+
+    definition = RType.BYTECODE_DEFINITION
+    cases = {
+        "definition-position": (
+            bytecode(1, 1, definition, 1),
+            "bytecode definition 1 is out of range",
+            "$.constants[0]",
+        ),
+        "definition-type": (
+            bytecode(1, 1, definition, 0, RType.INTEGER),
+            "invalid bytecode pair definition type 13",
+            "$.constants[0]",
+        ),
+        "repeated-count": (
+            wire.integer(RType.BYTECODE) + wire.integer(-1),
+            "negative count -1",
+            "$.repeatedCount",
+        ),
+        "constant-count": (
+            bytecode(0, -1),
+            "negative count -1",
+            "$.constantCount",
+        ),
+    }
+    payload, message, path = cases[case]
+    with pytest.raises(RdsFormatError, match=f"^{message}") as caught:
+        open_rds(io.BytesIO(wire.document(payload)))
+    assert caught.value.path == path
+
+
+def test_vector_children_are_counted_against_max_objects() -> None:
+    wire = Wire()
+    payload = wire.document(wire.vector([wire.nil()] * 5))
+    with pytest.raises(
+        RdsLimitError, match=r"^max_objects exceeded: 6 > 4 at \$"
+    ) as caught:
+        open_rds(io.BytesIO(payload), limits=RdsLimits(max_objects=4))
+    assert caught.value.path == "$"
+    with open_rds(io.BytesIO(payload), limits=RdsLimits(max_objects=6)) as document:
+        assert len(document.root.value) == 5

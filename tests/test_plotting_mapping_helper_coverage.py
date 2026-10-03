@@ -362,11 +362,13 @@ def test_distribution_fetch_and_drawing_edge_cases(monkeypatch) -> None:
     assert values[0] == "a"
     assert pd.isna(values[1])
 
-    monkeypatch.setattr(
-        distribution_plot,
-        "_fetch_metadata_series",
-        lambda *_: (np.array([3.0, 4.0]), "identity"),
-    )
+    requests = []
+
+    def fetch_metadata(*args):
+        requests.append(args)
+        return np.array([3.0, 4.0]), "identity"
+
+    monkeypatch.setattr(distribution_plot, "_fetch_metadata_series", fetch_metadata)
     fetched = distribution_plot._fetch_series(
         store,
         CellField("metric", label="Metric"),
@@ -375,13 +377,10 @@ def test_distribution_fetch_and_drawing_edge_cases(monkeypatch) -> None:
         from_assay=None,
         normalization=NormalizationSpec(),
     )
-    assert fetched == (
-        pytest.approx(np.array([3.0, 4.0])),
-        "Metric",
-        False,
-        "identity",
-        None,
-    )
+    # A CellField reads its key from cell metadata and keeps its own label.
+    assert [(args[0], args[1]) for args in requests] == [(store, "metric")]
+    np.testing.assert_array_equal(requests[0][2], indices)
+    assert fetched[1:] == ("Metric", False, "identity", None)
 
     axis = _AxisProbe()
     frame = pd.DataFrame({"group": ["a"], "value": [1.0]})
@@ -414,7 +413,14 @@ def test_distribution_fetch_and_drawing_edge_cases(monkeypatch) -> None:
         show_legend=True,
     )
     assert was_subsampled
-    assert len(axis.steps) == 1
+    ((args, kwargs),) = axis.steps
+    x, y = args
+    # Two of the four values are kept and drawn as a post-step ECDF.
+    assert len(x) == 2
+    assert set(x) <= {1.0, 2.0, 3.0, 4.0}
+    assert list(x) == sorted(x)
+    np.testing.assert_allclose(y, [0.5, 1.0])
+    assert (kwargs["where"], kwargs["color"], kwargs["label"]) == ("post", "red", "a")
     assert axis.legend_calls == 1
 
 
@@ -852,9 +858,17 @@ def test_mapping_reference_metadata_is_recursively_frozen_and_thawed() -> None:
         },
     }
     reference = _reference(metadata=metadata)
-    frozen_list = reference.metadata["normalization_parameters"]["list"]
+    # Later edits to the caller's objects do not reach the reference.
+    metadata["normalization_parameters"]["list"].append(9)
+    metadata["normalization_parameters"]["array"][0] = 99
+    frozen = reference.metadata["normalization_parameters"]
+    frozen_list = frozen["list"]
     assert frozen_list == [1, {"tuple": (2, 3)}]
     assert frozen_list != "not-a-list"
+    with pytest.raises(TypeError):
+        frozen["size_factor"] = 2.0  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        frozen_list.append(4)  # type: ignore[attr-defined]
     assert reference.normalization_parameters == {
         "size_factor": 1_000.0,
         "list": [1, {"tuple": [2, 3]}],
@@ -1150,8 +1164,13 @@ def test_mapping_artifact_numeric_and_stored_array_helpers(monkeypatch) -> None:
         decreasing,
         nondecreasing=True,
     )
+    bounded = _array(root, "bounded", np.array([0.0, 1.0, 1.0]), chunks=(2,))
+    assert mapping_artifact._numeric_values_are_valid(
+        bounded, minimum=0.0, maximum=1.0, nondecreasing=True
+    )
 
     stored = _array(root, "stored", np.array([1.0, 2.0]))
+    assert mapping_artifact._stored_array_matches_values(stored, np.array([1.0, 2.0]))
     assert not mapping_artifact._stored_array_matches_values(stored, np.ones(3))
     assert not mapping_artifact._stored_array_matches_values(
         stored,
@@ -1164,10 +1183,15 @@ def test_mapping_artifact_numeric_and_stored_array_helpers(monkeypatch) -> None:
 
     short = _array(root, "short", np.array([1.0]))
     other = _array(root, "other", np.array([1.0, 3.0]))
+    same = _array(root, "same", np.array([1.0, 2.0]))
+    assert mapping_artifact._stored_array_matches_array(stored, same)
     assert not mapping_artifact._stored_array_matches_array(short, stored)
     assert not mapping_artifact._stored_array_matches_array(stored, other)
 
     monkeypatch.setattr(mapping_artifact, "array_geometry", lambda _array: None)
+    assert mapping_artifact._stored_string_values_are_unique(
+        _FakeArray(np.array(["a", "b"], dtype=object))  # type: ignore[arg-type]
+    )
     assert not mapping_artifact._stored_string_values_are_unique(
         _FakeArray(np.array(["valid", 3], dtype=object))  # type: ignore[arg-type]
     )

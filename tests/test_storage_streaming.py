@@ -39,16 +39,81 @@ def test_streamed_metadata_column_writes_contiguous_blocks_and_mask():
     assert group[missing_name][:].tolist() == [False, True, False, False]
 
 
-def test_streamed_metadata_column_rejects_gaps():
+def test_streamed_metadata_column_casts_blocks_and_marks_unflagged_rows_present():
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    with pytest.raises(ValueError, match="expected 0, received 1"):
-        create_streamed_metadata_column(
-            root,
-            "bad",
-            shape=1,
-            dtype=np.int32,
-            blocks=(MetadataBlock(1, np.array([], dtype=np.int32)),),
-        )
+    values = create_streamed_metadata_column(
+        root,
+        "count",
+        shape=5,
+        dtype=np.int16,
+        blocks=(
+            MetadataBlock(0, np.array([1, 2], dtype=np.int64), np.array([0, 1])),
+            # A block without a mask holds only present values.
+            MetadataBlock(2, np.array([3.0, 4.0, 5.0])),
+        ),
+        chunkSize=2,
+        hasMissing=True,
+    )
+
+    assert values.dtype == np.dtype(np.int16)
+    assert values.chunks == (2,)
+    np.testing.assert_array_equal(values[:], [1, 2, 3, 4, 5])
+    mask = root[values.attrs["missing_mask"]]
+    np.testing.assert_array_equal(mask[:], [False, True, False, False, False])
+
+
+@pytest.mark.parametrize(
+    ("options", "blocks", "message"),
+    [
+        ({"shape": -1}, (), "shape must be non-negative"),
+        ({"chunkSize": 0}, (), "chunkSize must be positive"),
+        (
+            {},
+            (MetadataBlock(1, np.array([], dtype=np.int32)),),
+            "Metadata blocks must be contiguous; expected 0, received 1",
+        ),
+        (
+            {},
+            (MetadataBlock(0, np.zeros((1, 1), dtype=np.int32)),),
+            "Metadata blocks must be one-dimensional",
+        ),
+        (
+            {},
+            (MetadataBlock(0, np.arange(4, dtype=np.int32)),),
+            "Metadata block exceeds declared shape",
+        ),
+        (
+            {},
+            (MetadataBlock(0, np.arange(3, dtype=np.int32), np.zeros(3)),),
+            "A missing mask was supplied but hasMissing is false",
+        ),
+        (
+            {"hasMissing": True},
+            (MetadataBlock(0, np.arange(3, dtype=np.int32), np.zeros(2)),),
+            "Missing mask must align with metadata values",
+        ),
+        (
+            {},
+            (MetadataBlock(0, np.arange(2, dtype=np.int32)),),
+            "Metadata column is incomplete: wrote 2 of 3 rows",
+        ),
+    ],
+    ids=[
+        "negative-shape",
+        "zero-chunks",
+        "gap",
+        "two-dimensional",
+        "overflow",
+        "unexpected-mask",
+        "misaligned-mask",
+        "incomplete",
+    ],
+)
+def test_streamed_metadata_column_rejects_malformed_blocks(options, blocks, message):
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    arguments = {"shape": 3, "dtype": np.int32, **options}
+    with pytest.raises(ValueError, match=f"^{message}"):
+        create_streamed_metadata_column(root, "bad", blocks=blocks, **arguments)
 
 
 def test_internal_missing_columns_are_not_public_metadata():

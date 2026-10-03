@@ -1,5 +1,5 @@
 ---
-description: Compute and validate immutable multi-sink fate-probability artifacts.
+description: Explore how cells connect to several candidate terminal populations.
 jupytext:
   text_representation:
     extension: .md
@@ -11,195 +11,227 @@ kernelspec:
   language: python
   name: python3
 ---
-# Fate Mapping Primer
+# Explore candidate cell fates
 
-During embryonic development, the pancreas builds its hormone-producing endocrine cells from a pool of progenitor cells. Around embryonic day 15.5 in the mouse, Ductal-like progenitors differentiate into the three major endocrine fates: Alpha cells (glucagon), Beta cells (insulin), and Delta cells (somatostatin). Single-cell RNA sequencing captures cells at discrete points along this transition, but each measurement is a snapshot. It shows cell states, not the direction of travel between them; fate mapping speculates about the end result of the cell state.
+Pseudotime orders cell states along a process. **Fate mapping** adds a different
+question: how strongly does each cell connect to several possible endpoints?
 
-Fate mapping models branching as an **absorbing Markov chain** over the cell graph, with random walks directed forward along pseudotime:
+Scarf models walks through the cell graph, favoring movement toward higher pseudotime.
+The chosen terminal populations act as absorbing endpoints: once a walk reaches one,
+it stops. The probability of reaching each endpoint summarizes the cell's position
+relative to those choices. It does not track a living cell or prove its future identity.
 
-1. **Directed flow:** the graph's transition probabilities are biased along pseudotime, so random walks flow primarily from progenitors toward differentiated endpoints.
-2. **Absorbing sinks:** biological terminal states are defined as absorbing boundaries that trap random walkers.
-3. **Hitting probabilities:** for each transient cell, the algorithm estimates the probability that a walk starting at that cell is absorbed by each terminal sink.
+We continue the developing-pancreas example from {doc}`pseudotime`, using Alpha, Beta,
+and Delta as candidate outcomes. Their familiar markers include Gcg, Ins1/Ins2, and
+Sst, respectively. Published annotations guide this example; another dataset needs its
+own endpoint evidence.
 
-We can think of pseudotime analysis and fate mapping as answering two fundamentally different questions on a branching path:
-
-- Pseudotime measures how far a cell has traveled along differentiation (like a single progress bar), but the issue is that, a single number cannot represent a fork in the road, or a cell differentiating into a different state. Pseudotime can indicate that a cell is differentiating, but not down what path.
-- Fate mapping estimates which branch that cell is likely to take, being a step further than pseudotime. For each cell we have, fate mapping will output a probability for every candidate destination.
-
-These probabilities are an exploratory mathematical summary, and do not provide biological proof that a cell is pursuing this lineage. Fate mapping simply reflects how closely a cell is connected to your chosen endpoints across this specific graph in terms of the mathematics. They do not track living cells over time, and they cannot rescue bad biological assumptions: if you pick the wrong terminal endpoints, the algorithm will still produce clean, confident probabilities toward the wrong destinations, thus maintaining an accurate biological context is key before performing pseudotime mapping.
-
-
-# Estimate terminal-outcome probabilities with fate mapping
-
-Here, we use a pre-run analysis of the developing pancreas to orient a graph from Ductal progenitor cells we discussed toward final fates of Alpha, Beta, or Delta cells. Following this, we use this information to estimate how terminal probability distributes across all three candidate outcomes.
-
-## Reuse the prepared graph and sink labels
+## Open the prepared analysis
 
 ```{code-cell}
 import numpy as np
 import pandas as pd
 
 import scarf
-import scarf.plotting as splt
+from scarf.plotting import CellField, ColorScale
 
+# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
+# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
-    nthreads=4,
-)
-analysis_run = ds.pipeline.open(label="docs_default")
-graph = analysis_run["connectivity_map"]
+```
 
+Open the downloaded store and its saved analysis.
+
+```{code-cell} ipython3
+# Open the datastore for the following analysis.
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
+# Reuse the saved run and its frozen cell selection.
+analysis_run = ds.pipeline.open(label="docs_default")
+# Keep the graph used by the saved analysis.
+graph = analysis_run["connectivity_map"]
+# Inspect the opened assays and their dimensions.
+ds
+```
+
+## Orient the graph
+
+Repeat the source and sink weighting from {doc}`pseudotime`. Ductal cells share a total
+of -1, and all Alpha, Beta, and Delta cells together share +1. These totals balance the
+source against the pooled sinks; they do not give each terminal cell type equal weight.
+
+```{code-cell}
+# Read the published cell-type labels for the selected cells.
 annotations = ds.cells.fetch("clusters", key="I")
+# Mark ductal cells as the source population.
 source = annotations == "Ductal"
+# Mark the pooled terminal populations.
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
+# Require at least one annotated source cell and one sink cell.
 if not source.any() or not sink.any():
     raise ValueError("Source and sink annotations must both be present")
+# Start every graph cell with zero source or sink mass.
 source_sink_vector = np.zeros(len(annotations), dtype=float)
+# Share total mass -1 among the source cells.
 source_sink_vector[source] = -1.0 / source.sum()
+# Share total mass +1 among the pooled sink cells.
 source_sink_vector[sink] = 1.0 / sink.sum()
-
+# Orient the graph using the chosen source and sinks.
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
-pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
+# Check the number of cells used to orient the graph.
+pd.Series({"source cells": int(source.sum()), "sink cells": int(sink.sum())})
+```
+
+## Select the terminal populations
+
+The live `clusters` column above contains published cell-type names. The saved run's
+`clusters` result contains computed integer labels. For this example we choose one
+computed cluster per candidate fate, using its most common published annotation.
+
+First inspect the annotation shares within each computed cluster. These two label
+arrays cover the same selected cells in the prepared store.
+
+```{code-cell}
+# Keep the computed clustering used to define terminal boundaries.
 sink_labels_ref = analysis_run["clusters"]
+# Read its labels in the run's cell order.
 sink_labels = analysis_run.cells.fetch("clusters")
+# Check that imported and computed labels cover the same cell count.
+assert len(annotations) == len(sink_labels)
+# Measure each published annotation's share within each cluster.
+shares = pd.crosstab(
+    sink_labels,
+    annotations,
+    rownames=["cluster"],
+    colnames=["annotation"],
+    normalize="index",
+)
+# Show the majority annotation and its share for every cluster.
+sink_table = pd.DataFrame(
+    {"annotation": shares.idxmax(axis=1), "majority share": shares.max(axis=1)}
+)
+# Inspect every candidate cluster before choosing terminal boundaries.
+sink_table
 ```
 
-Since single-cell neighbor graphs are undirected, a connection between two cells means they look similar, not that one comes before the other (one cell is a precursor of another). To give the graph an arrow of time, we define a potential gradient with the source/sink vector. We can conceptually think of the source/sink vector as (bear with me) a pressure difference across a plumbing network; by pumping water in at the progenitor cells (the start of the graph) and opening the drains at the mature cell types (the terminal of the graph), we can create a continuous downhill slope across the graph that guides flow through the intermediate states.
-
-In this plumbing analogy, the total volume pumped in must exactly equal the volume draining out. The negative source mass ({math}`-1.0`) is divided evenly across all Ductal cells, marking the "start here" point (where the water flows in), and the positive sink mass ({math}`+1.0`) is shared across the mature Alpha, Beta, and Delta cells, marking the "end here" ends (where the water flows out). With this, the total sum is at zero.
-
-This per-cell weighting is deliberate feature here, as dividing mass by group size prevents abundant populations from exerting an unfair gravitational pull over rarer cell types simply due to having a larger cell count. The resulting pressure drop turns undirected neighbor links into a directed downstream flow; Once again, our undirected neighbors are simply are similar cells in a neighborhood. Scoring the graph against it yields pseudotime, which is the continuous coordinate that tracks how far each cell has drifted from the initial progenitor pool (THE START).
-
-
-To truly start the fate-mapping, we need to define the clusters we want to study. These clusters are defined via unsupervised clustering, which assigns cells to arbitrary numbers like cluster 3 or cluster 11. The issue is that developmental biology is defined by functional marker expression, not by clusters: Alpha cells produce glucagon (Gcg), Beta cells produce insulin (Ins1/Ins2), and Delta cells produce somatostatin (Sst). Rather than taking a circular shortcut, such as crowning whichever clusters score the highest pseudotime, we define terminal sinks directly from these biological priors, because only marker-grounded endpoints can support a trustworthy fate map.
-
-
+Keep the clusters whose majority annotations match our three candidate fates. Requiring
+one cluster per fate makes a missing or ambiguous choice visible instead of selecting
+an endpoint arbitrarily.
 
 ```{code-cell}
+# Choose the three candidate terminal identities.
 candidate_fates = ["Alpha", "Beta", "Delta"]
-
-# Map biological names to the run's integer sink labels. Both fetches cover
-# the same cells in the same order, so positional grouping is exact.
-cluster_names = np.asarray(ds.cells.fetch("clusters", key="I"))
-assert len(cluster_names) == len(sink_labels)
-name_by_id = (
-    pd.Series(cluster_names).groupby(sink_labels).agg(lambda s: s.mode().iat[0])
-)
-share_by_id = (
-    pd.Series(cluster_names)
-    .groupby(sink_labels)
-    .agg(lambda s: float((s == s.mode().iat[0]).mean()))
-)
-id_by_name = {}
-for i, name in name_by_id.items():
-    id_by_name.setdefault(name, []).append(int(i))
-missing_fates = [fate for fate in candidate_fates if fate not in id_by_name]
-if missing_fates:
-    raise ValueError(f"Target sinks missing from dataset: {missing_fates}")
-ambiguous_fates = {
-    fate: id_by_name[fate] for fate in candidate_fates if len(id_by_name[fate]) != 1
-}
-if ambiguous_fates:
-    raise ValueError(f"Ambiguous sink mapping, refine the selection: {ambiguous_fates}")
-terminal_labels = [id_by_name[fate][0] for fate in candidate_fates]
-print(f"Tracking differentiation potential into {len(terminal_labels)} fates: {candidate_fates}")
-sink_names = {int(label): str(name_by_id.loc[label]) for label in terminal_labels}
-pd.DataFrame(
-    {
-        "sink label": terminal_labels,
-        "majority annotation": [sink_names[int(label)] for label in terminal_labels],
-        "majority share": [
-            round(float(share_by_id.loc[label]), 3) for label in terminal_labels
-        ],
-    }
-)
+# Keep one cluster for each requested terminal identity.
+selected = sink_table.loc[sink_table["annotation"].isin(candidate_fates)]
+# Count the candidate fates before checking for missing or duplicated matches.
+n_fates = len(candidate_fates)
+# Check that each requested fate identifies exactly one cluster.
+valid_fates = len(selected) == n_fates == selected["annotation"].nunique()
+# Reject a missing or ambiguous terminal-cluster choice.
+if not valid_fates:
+    raise ValueError("Each candidate fate must match exactly one cluster")
+# Keep the computed cluster label as a column.
+selected = selected.reset_index(names="sink label")
+# Index the table by the candidate annotation.
+selected = selected.set_index("annotation")
+# Match the order used for the probability columns and plots.
+selected = selected.loc[candidate_fates]
+# Extract the computed cluster labels for the terminal boundaries.
+terminal_labels = selected["sink label"].astype(int).tolist()
+# Attach readable fate names to those cluster labels.
+sink_names = dict(zip(terminal_labels, candidate_fates, strict=True))
+# Inspect the selected terminal clusters and their annotation purity.
+selected
 ```
 
-The three results we have above come from lineage markers (not shown here), not from ranking pseudotime. The table reports each pick's majority share of where it likely may be mapped. In a real analysis, endpoints must come from study-specific evidence (for example, marker-supported terminal states reviewed against negative controls, as in {doc}`annotation`), because every downstream probability inherits the selected endpoin choice. A defensible sink is one whose probability mass concentrates near its own label on the map below; a sink whose probability spreads evenly or peaks elsewhere is a rejected hypothesis or a improper sink.
+The selected Delta cluster has a majority share of about 0.74, so it includes cells
+with other annotations. Every cell in a selected cluster becomes a boundary for this
+model. This is an exploratory endpoint choice, not a pure set of terminal cells.
+Before using it for a biological claim, inspect marker evidence and compare alternative
+boundaries. See {doc}`annotation` for marker checks.
 
-## Compute the fate probabilities
+## Calculate the probabilities
 
 ```{code-cell}
-# Execute fate mapping across all three lineages.
+# Calculate absorption probabilities for the chosen endpoints.
 fate_ref = ds.run_fate_mapping(
-    pseudotime_ref,
-    sink_labels_ref,
-    sinks=terminal_labels,
+    pseudotime_ref, sink_labels_ref, sinks=terminal_labels
 )
+# Load the probabilities and their validity mask.
 fate = ds.load_fate_mapping(fate_ref)
-{
-    "artifact": fate.ref,
-    "pseudotime": fate.pseudotime,
-    "sink labels": fate.sink_labels,
-    "valid cells": int(fate.valid.sum()),
-}
+# Compare valid probability rows with the complete graph-cell count.
+{"valid probability rows": int(fate.valid.sum()), "graph cells": len(fate.valid)}
 ```
 
+The output reports how many graph cells have valid probabilities. Summarize only those
+rows. Each probability column is one candidate fate, and the columns should sum to one
+for each valid cell.
 
 ```{code-cell}
-valid_probabilities = fate.values[fate.valid]
-probability_summary = pd.DataFrame(
-    valid_probabilities,
-    columns=[str(label) for label in fate.sink_labels],
-)
-# Theoretical check: absorbing probabilities must sum to 1.0 per cell.
-probability_summary["row-sum error"] = np.abs(
-    probability_summary.sum(axis=1) - 1.0
-)
-probability_summary.agg(["min", "median", "max"])
+# Match fate names to the saved probability-column order.
+fate_names = [sink_names[int(label)] for label in fate.sink_labels]
+# Keep valid rows and label each probability column by fate.
+probabilities = pd.DataFrame(fate.values[fate.valid], columns=fate_names)
+# Measure each probability row's deviation from a total of one.
+probabilities["row-sum error"] = abs(probabilities.sum(axis=1) - 1.0)
+# Inspect probability ranges and the error in their row sums.
+probabilities.agg(["min", "median", "max"])
 ```
 
-The summary table above is the depth check for this page. Each row is one valid cell, each probability column is one sink, and `row-sum error measures how far that cell's probabilities deviate from summing to one. THis
+A small row-sum error checks numerical consistency. Likewise, high probability at a
+chosen sink is imposed by the model. Neither check supplies independent evidence that
+the endpoint choice is biologically correct.
 
-We can visualize the probability panels below using the same recipe as {doc}`imputation`: each sink's probability column is inserted as live cell metadata, then one shared-scale panel per sink colors the frozen UMAP. Each title pairs the sink label with its majority annotation from the table above. We can expect smooth color gradients from the progenitor pool into each sink as thats the ground biology. The smoothness is guaranteed output shape because the solver returns the smoothest interpolation consistent with the pinned boundaries, so a gradient cannot prove cells commit gradually in vivo, where circuits such as Pax4/Arx cross-repression can flip abruptly.
+## View the candidate outcomes
+
+Store each probability as a cell column, then plot all three on the same zero-to-one
+color scale. This uses the same UMAP as the preceding trajectory analysis.
 
 ```{code-cell}
-num_sinks = len(fate.sink_labels)
+# Save each fate probability in the matching cell order.
 for index, label in enumerate(fate.sink_labels):
+    # Save the values in cell metadata using the stated selection.
     ds.cells.insert(
         f"fate_prob_{sink_names[int(label)]}",
         fate.values[:, index],
         key="I",
         overwrite=True,
     )
-fate_titles = [
-    f"Fate Probability: {label} ({sink_names[int(label)]})"
-    for label in fate.sink_labels
-]
-fate_comparison = ds.plots.embedding(
+
+# Compare the three fate probabilities on a shared zero-to-one scale.
+ds.plots.embedding(
     layout=analysis_run["umap"],
     color_by=[
-        f"fate_prob_{sink_names[int(label)]}" for label in fate.sink_labels
+        CellField(
+            f"fate_prob_{name}", kind="continuous", label=f"{name} probability"
+        )
+        for name in candidate_fates
     ],
-    n_columns=num_sinks,
-    color_scale=splt.ColorScale(scope="shared"),
+    n_columns=3,
+    color_scale=ColorScale(scope="shared", vmin=0, vmax=1),
     sort_values=True,
-    show_titles=False,
-    show=False,
 )
-for axis, title in zip(
-    fate_comparison.axes.values(),
-    fate_titles,
-    strict=True,
-):
-    axis.set_title(title)
-fate_comparison.figure
 ```
 
-## Important caveats to consider regarding fate mapping
+Look for where the model favors one outcome and where it divides probability between
+outcomes. A mixed probability describes this graph and its endpoints; it does not show
+that a cell has been observed to choose between those fates.
 
-- **Probabilities are model summaries, not lineage proof:** terminal probabilities describe where cells sit relative to supervised endpoints on one explicit graph. They cannot establish that a cell becomes a given type, and they inherit every assumption in the source, sink, and component choices.
-- **Endpoints must come from markers, not heuristics:** this page resolves Alpha, Beta, and Delta names to integer labels through majority annotation, failing loudly on missing or ambiguous fates. A highest-pseudotime rule would be circular here, and forcing fewer sinks than the tissue's lineages manufactures an artificial tug-of-war. A real claim needs endpoints from independent evidence, plus sensitivity checks across plausible alternatives.
-- **Smooth gradients vs. discrete switches:** the absorbing random-walk model generates a mathematically continuous probability gradient across the graph. This does **not** mean in vivo commitment is gradual. If a lineage decision is governed by an abrupt transcriptional switch (e.g., mutual inhibition between *Arx* and *Pax4*), the algorithm still outputs intermediate values (e.g., {math}`P = 0.5`) for cells near the decision boundary simply due to graph neighborhood averaging.
-- **Absorbing assumption:** fate mapping assumes every cell eventually reaches one of the defined sinks, so rows always sum to one. Omit an authentic endpoint and its probability mass is forced into the remaining fates: on this store the rare Epsilon lineage is absent from the sinks, and its cells must land in Alpha, Beta, or Delta columns. Audit the sink set against the tissue's known lineages before interpreting shares.
-- **Component disconnections:** random walks cannot traverse disconnected graph components. Cells with invalid probability masks (`fate.valid == False`) are typically disconnected from the root or the sinks. Never evaluate fate distributions without first inspecting the proportion of unmapped cells.
-- **Keep the ref triple together:** pseudotime, sink-label, and fate refs form one lineage chain. Rebuilding the graph is a new branch, not a repair of the old probabilities.
+## Check the assumptions
 
-See {doc}`pseudotime` for the ordering, {doc}`expression_dynamics` for feature modules along the same axis, and {doc}`trajectory_validation` for broader diagnostics.
+- The candidate list is incomplete: the dataset also contains Epsilon cells. Valid
+  cells must distribute their probability among the three selected outcomes, so this
+  example cannot describe every endocrine fate.
+- Smooth gradients can arise from graph averaging even when a biological transition
+  is abrupt. They do not establish gradual commitment.
+- Invalid cells have no interpretable probabilities. Check their number and graph
+  components before drawing conclusions.
+- Endpoint selection and graph construction can change the result. Compare plausible
+  alternatives using {doc}`trajectory_validation` before making a lineage claim.
+
+Use {doc}`expression_dynamics` to inspect gene profiles along the same pseudotime axis.

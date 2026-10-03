@@ -1,7 +1,11 @@
 import os
 import sys
+from pathlib import Path
 
 import matplotlib
+import nbformat
+from jupyter_cache import get_cache
+from myst_nb.sphinx_ import NbMetadataCollector
 
 sys.path.insert(0, os.path.abspath("../.."))
 
@@ -119,6 +123,27 @@ nb_merge_streams = True
 # Render notebook markdown outputs with MyST so ```mermaid fences become
 # sphinxcontrib.mermaid directives (CommonMark leaves them as unknown lexers).
 nb_render_markdown_format = "myst"
+
+
+def _write_executed_notebook(app, _doctree):
+    execution = NbMetadataCollector.get_exec_data(app.env, app.env.docname)
+    if execution is None or execution["method"] != "cache":
+        return
+
+    config = app.env.mystnb_config
+    notebook_path = Path(config.output_folder) / f"{app.env.docname}.ipynb"
+    notebook = nbformat.read(notebook_path, as_version=4)
+    cache = get_cache(config.execution_cache_path)
+    try:
+        _, notebook = cache.merge_match_into_notebook(notebook)
+    finally:
+        cache.db.dispose()
+    nbformat.write(notebook, notebook_path)
+
+
+def setup(app):
+    app.connect("doctree-read", _write_executed_notebook)
+
 
 matplotlib.use("agg")
 

@@ -88,8 +88,18 @@ def test_symlink_evidence_cannot_escape_or_alias(tmp_path: Path) -> None:
     assert not list(outside.iterdir())
 
 
-@pytest.mark.parametrize("fault", ["gap", "edited", "truncated", "duplicate"])
-def test_inconsistent_events_stop_recovery(tmp_path: Path, fault: str) -> None:
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("gap", "Invalid event sequence at 000002.json"),
+        ("edited", "Invalid event integrity: 000002.json"),
+        ("truncated", "Cannot read record 000002.json"),
+        ("duplicate", "Duplicate JSON key: sequence"),
+    ],
+)
+def test_inconsistent_events_stop_recovery(
+    tmp_path: Path, fault: str, message: str
+) -> None:
     records = RunRecords.create(tmp_path / "run", {})
     records.append("started")
     records.append("completed", result="valid")
@@ -105,7 +115,7 @@ def test_inconsistent_events_stop_recovery(tmp_path: Path, fault: str) -> None:
         last.write_text('{"sequence":')
     else:
         last.write_text('{"sequence":2,"sequence":2}')
-    with pytest.raises(RecordError):
+    with pytest.raises(RecordError, match=message):
         RunRecords(records.path)
 
 
@@ -234,7 +244,7 @@ def test_unknown_process_identity_is_conservative() -> None:
 def test_hashes_are_stable_and_reject_nonfinite_values() -> None:
     assert digest({"a": 1, "b": [2]}) == digest({"b": [2], "a": 1})
     assert digest({"a": 1}) != digest({"a": 2})
-    with pytest.raises(RecordError):
+    with pytest.raises(RecordError, match="Record is not finite, UTF-8 JSON"):
         digest({"infinite": float("inf")})
     assert len(procedure_identity()) == 64
 
@@ -505,3 +515,89 @@ def test_pid_only_recovery_uses_conservative_existence_probe(
         not isinstance(probe, ProcessLookupError)
     )
     assert inspected == [(12345, 0)]
+
+
+def test_swapped_run_directory_symlink_cannot_redirect_records(tmp_path: Path) -> None:
+    records = RunRecords.create(tmp_path / "run", {"seed": 44})
+    records.append("started")
+    # Replace the opened run directory with a symlink to another history.
+    moved = tmp_path / "elsewhere"
+    (tmp_path / "run").rename(moved)
+    (tmp_path / "run").symlink_to(moved, target_is_directory=True)
+    with pytest.raises(RecordError, match="Record path escapes the run directory"):
+        records.read_json("run.json")
+    with pytest.raises(RecordError, match="Record path escapes the run directory"):
+        records.append("redirected")
+    assert sorted(path.name for path in (moved / "events").iterdir()) == ["000001.json"]
+
+
+def test_windows_skips_directory_sync_and_never_probes_processes_with_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scarf.agent.records as records_module
+    from types import SimpleNamespace
+
+    def forbidden(*args: object) -> None:
+        raise AssertionError("Windows cannot open directories or probe with kill")
+
+    windows = SimpleNamespace(name="nt", open=forbidden, kill=forbidden)
+    monkeypatch.setattr(records_module, "os", windows)
+    assert records_module._sync_directory(tmp_path) is None
+    # os.kill(pid, 0) can terminate a process on Windows; liveness stays unknown.
+    assert process_alive({"pid": 12345, "platform": sys.platform})
+
+
+class _FakeMsvcrt:
+    """Record byte-range lock calls with the file position they apply to."""
+
+    LK_UNLCK = 0
+    LK_NBLCK = 2
+
+    def __init__(self, failure: OSError | None = None) -> None:
+        self.failure = failure
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def locking(self, descriptor: int, mode: int, size: int) -> None:
+        position = os.lseek(descriptor, 0, os.SEEK_CUR)
+        self.calls.append((mode, size, position, os.fstat(descriptor).st_size))
+        if mode == self.LK_NBLCK and self.failure is not None:
+            raise self.failure
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (None, None),
+        (OSError(errno.EACCES, "locked by another writer"), RunLockedError),
+        (OSError(errno.EIO, "filesystem cannot lock"), OSError),
+    ],
+)
+def test_windows_writer_lock_uses_one_nonblocking_byte_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: OSError | None,
+    expected: type[BaseException] | None,
+) -> None:
+    import scarf.agent.records as records_module
+    from types import SimpleNamespace
+
+    fake = _FakeMsvcrt(failure)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setattr(records_module, "sys", SimpleNamespace(platform="win32"))
+    lock = tmp_path / ".run.scarf-agent-run.lock"
+    if expected is None:
+        with run_lock(tmp_path / "run"):
+            # An empty lock file receives one byte so that range can be locked.
+            assert lock.read_bytes() == b"\0"
+            assert fake.calls == [(fake.LK_NBLCK, 1, 0, 1)]
+        assert fake.calls[1:] == [(fake.LK_UNLCK, 1, 0, 1)]
+        with run_lock(tmp_path / "run"):
+            assert lock.read_bytes() == b"\0"
+        assert len(fake.calls) == 4
+    else:
+        with pytest.raises(expected) as caught:
+            with run_lock(tmp_path / "run"):
+                pytest.fail("A failed Windows lock admitted a writer")
+        assert caught.value.__cause__ is failure or caught.value is failure
+        assert (type(caught.value) is RunLockedError) is (expected is RunLockedError)
+        assert fake.calls == [(fake.LK_NBLCK, 1, 0, 1)]

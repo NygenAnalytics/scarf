@@ -9,84 +9,47 @@ from scarf.metadata import MetaData
 from scarf.metadata.rows import read_metadata_missing_rows
 from scarf.metadata.selection import CellField, resolve_grouping, valid_category_mask
 from scarf.storage.copy import copy_zarr_group_tree
-from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.storage.identity import read_dataset_fingerprint
-from scarf.storage.schema import create_cell_data, create_zarr_count_assay
+from scarf.storage.schema import create_zarr_count_assay
 from scarf.tools.repack_zarr import repack_store
 from scarf.writers.counts_t import finalize_writer_counts_t
 from scarf.utils.logging import logger
 from scarf.writers.subset import SubsetZarr
 from tests.storage_helpers import finalize_test_counts
-from tests.test_datastore import (
-    _QC_FEATURE_NAMES,
-    _QC_VALUES,
-    _open_qc_store,
-    _qc_store,
+from tests.qc_helpers import (
+    QC_VALUES,
+    create_labelled_qc_store,
+    open_qc_store,
+    fresh_qc_store,
 )
 
 
-def _create_store(path):
-    root = zarr.open_group(str(path), mode="w")
-    create_cell_data(
-        root,
-        None,
-        np.array([f"c{i}" for i in range(6)]),
-        np.array([f"c{i}" for i in range(6)]),
-    )
-    counts = create_zarr_count_assay(
-        root,
-        "RNA",
-        None,
-        6,
-        feat_ids=np.array([f"f{i}" for i in range(6)]),
-        feat_names=_QC_FEATURE_NAMES,
-        dtype="uint32",
-        policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
-    )
-    counts[:] = _QC_VALUES
-    finalize_test_counts(counts)
-    finalize_writer_counts_t(root, "RNA", None)
-    store = DataStore(
-        str(path), default_assay="RNA", min_features_per_cell=0, nthreads=1
-    )
-    store.cells.insert(
-        "label", np.array(["a", None, "b", "a", None, "b"], dtype=object)
-    )
-    cells = store.zw["cellData"]
-    cells.create_array(
-        "__scarf_missing__label",
-        data=np.array([False, True, False, False, True, False]),
-    )
-    cells["label"].attrs["missing_mask"] = "__scarf_missing__label"
-    return store
-
-
 def test_first_preparation_replaces_incorrect_summaries_and_column_attributes():
-    storage, _ = _qc_store()
+    storage, _ = fresh_qc_store()
     root = zarr.open_group(store=storage, mode="r+")
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", np.full(6, 999.0))
     cells.insert("RNA_nFeatures", np.full(6, 999.0))
     root["cellData/RNA_nCounts"].attrs["source_artifact"] = "omitted"
-    store = _open_qc_store(storage)
+    store = open_qc_store(storage)
     np.testing.assert_array_equal(
-        store.cells.fetch_all("RNA_nCounts"), _QC_VALUES.sum(axis=1)
+        store.cells.fetch_all("RNA_nCounts"), QC_VALUES.sum(axis=1)
     )
     np.testing.assert_array_equal(
-        store.cells.fetch_all("RNA_nFeatures"), (_QC_VALUES > 0).sum(axis=1)
+        store.cells.fetch_all("RNA_nFeatures"), (QC_VALUES > 0).sum(axis=1)
     )
     assert "source_artifact" not in store.zw["cellData/RNA_nCounts"].attrs
     assert read_dataset_fingerprint(store.RNA.z)
 
 
 def test_construction_retry_finishes_interrupted_transpose():
-    storage, _ = _qc_store()
+    storage, _ = fresh_qc_store()
     root = zarr.open_group(store=storage, mode="r+")
     root["RNA/countsT"].attrs["complete"] = False
     finalize_writer_counts_t(root, "RNA", None, nthreads=1)
     assert root["RNA/countsT"].attrs["complete"] is True
-    np.testing.assert_array_equal(root["RNA/countsT"][:], _QC_VALUES.T)
-    _open_qc_store(storage)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], QC_VALUES.T)
+    open_qc_store(storage)
     with pytest.raises(ValueError, match="Prepared counts"):
         finalize_writer_counts_t(root, "RNA", None, nthreads=1)
 
@@ -94,8 +57,8 @@ def test_construction_retry_finishes_interrupted_transpose():
 def test_merge_preserves_feature_annotations_and_missing_flags(tmp_path):
     from scarf.merge import DataStoreMerge
 
-    left = _create_store(tmp_path / "left")
-    right = _create_store(tmp_path / "right")
+    left = create_labelled_qc_store(tmp_path / "left")
+    right = create_labelled_qc_store(tmp_path / "right")
     for store in (left, right):
         features = store.RNA.z["featureData"]
         features.create_array("label", data=np.array(["a", "", "c", "d", "e", "f"]))
@@ -150,13 +113,22 @@ def test_merge_preserves_feature_annotations_and_missing_flags(tmp_path):
     ],
 )
 def test_separate_metadata_handle_cannot_replace_protected_columns(table, column):
-    storage, _ = _qc_store()
-    _open_qc_store(storage)
+    storage, _ = fresh_qc_store()
+    open_qc_store(storage)
     other = MetaData(zarr.open_group(store=storage, mode="r+")[table])
     before = other.fetch_all(column)
-    with pytest.raises(ValueError, match="prepared data|protected name"):
+    prepared = f"^Column {column!r} belongs to prepared data and cannot be changed"
+    with pytest.raises(ValueError, match=prepared):
         other.insert(column, before[::-1], force=True, overwrite=True)
-    with pytest.raises(ValueError, match="prepared data|protected name"):
+    # IDs are refused by name before the prepared-data check.
+    with pytest.raises(
+        ValueError,
+        match=(
+            "^ERROR: ids is a protected name in MetaData class"
+            if column == "ids"
+            else prepared
+        ),
+    ):
         other.drop(column)
     np.testing.assert_array_equal(other.fetch_all(column), before)
 
@@ -167,7 +139,7 @@ def test_unchanged_copy_preserves_percentage_proof_and_missing_values(
 ):
     source = tmp_path / "source.zarr"
     target = tmp_path / "target.zarr"
-    original = _create_store(source)
+    original = create_labelled_qc_store(source)
     if operation == "mount":
         mount_datastore(str(source), str(target))
     else:
@@ -194,7 +166,7 @@ def test_unchanged_copy_preserves_percentage_proof_and_missing_values(
 
 
 def test_subset_maps_missing_flags_and_recomputes_statistics(tmp_path):
-    source = _create_store(tmp_path / "source.zarr")
+    source = create_labelled_qc_store(tmp_path / "source.zarr")
     target = tmp_path / "subset.zarr"
     rows = np.array([5, 1, 3])
     writer = SubsetZarr(str(target), [source.RNA], cell_idx=rows, nthreads=1)
@@ -202,13 +174,13 @@ def test_subset_maps_missing_flags_and_recomputes_statistics(tmp_path):
     copied = DataStore(
         str(target), default_assay="RNA", min_features_per_cell=0, nthreads=1
     )
-    np.testing.assert_array_equal(copied.RNA.rawData.compute(), _QC_VALUES[rows])
+    np.testing.assert_array_equal(copied.RNA.rawData.compute(), QC_VALUES[rows])
     np.testing.assert_array_equal(
         read_metadata_missing_rows(copied.cells, "label", np.arange(3)),
         [False, True, False],
     )
     np.testing.assert_array_equal(
-        copied.RNA.feats.fetch_all("nCells"), (_QC_VALUES[rows] > 0).sum(axis=0)
+        copied.RNA.feats.fetch_all("nCells"), (QC_VALUES[rows] > 0).sum(axis=0)
     )
     assert read_dataset_fingerprint(copied.RNA.z) != read_dataset_fingerprint(
         source.RNA.z
@@ -218,7 +190,7 @@ def test_subset_maps_missing_flags_and_recomputes_statistics(tmp_path):
 def test_data_only_rebuild_discards_broken_generated_metadata(tmp_path):
     source = tmp_path / "source.zarr"
     target = tmp_path / "rebuilt.zarr"
-    original = _create_store(source)
+    original = create_labelled_qc_store(source)
     root = zarr.open_group(str(source), mode="r+")
     root["cellData/RNA_nCounts"][:] = 999
     root["cellData/RNA_nCounts"].attrs["missing_mask"] = "missing-array"
@@ -227,7 +199,7 @@ def test_data_only_rebuild_discards_broken_generated_metadata(tmp_path):
     repack_store(str(source), str(target), data_only=True, nthreads=1)
     rebuilt = DataStore(str(target), zarr_mode="r", nthreads=1)
     np.testing.assert_array_equal(
-        rebuilt.cells.fetch_all("RNA_nCounts"), _QC_VALUES.sum(axis=1)
+        rebuilt.cells.fetch_all("RNA_nCounts"), QC_VALUES.sum(axis=1)
     )
     assert "artifacts" not in rebuilt.RNA.z
     np.testing.assert_array_equal(
@@ -268,7 +240,10 @@ def test_shared_physical_matrix_collision_fails_before_writes():
         dtype="uint32",
     )
     counts[:] = [[1, 2], [3, 4]]
-    with pytest.raises(ValueError, match="exists|collision|already has"):
+    with pytest.raises(
+        ValueError,
+        match="^Assay 'RNA' already has metadata or a count matrix; choose a new name$",
+    ):
         create_zarr_count_assay(
             root,
             "RNA",
@@ -283,7 +258,7 @@ def test_shared_physical_matrix_collision_fails_before_writes():
 
 
 def test_first_preparation_discards_imported_percentages_with_warning():
-    storage, _ = _qc_store()
+    storage, _ = fresh_qc_store()
     cells = MetaData(zarr.open_group(store=storage, mode="r+")["cellData"])
     cells.insert("RNA_percentMito", np.full(6, 42.0))
 
@@ -293,7 +268,7 @@ def test_first_preparation_discards_imported_percentages_with_warning():
         level="WARNING",
     )
     try:
-        store = _open_qc_store(storage)
+        store = open_qc_store(storage)
     finally:
         logger.remove(sink)
 
@@ -306,11 +281,11 @@ def test_first_preparation_discards_imported_percentages_with_warning():
 
 
 def test_prepared_store_explains_how_to_add_a_missing_percentage():
-    storage, _ = _qc_store()
-    _open_qc_store(storage, mito_pattern="^NO_SUCH_GENE$")
+    storage, _ = fresh_qc_store()
+    open_qc_store(storage, mito_pattern="^NO_SUCH_GENE$")
 
     with pytest.raises(ValueError) as caught:
-        _open_qc_store(storage, mito_pattern="^MT-")
+        open_qc_store(storage, mito_pattern="^MT-")
     message = str(caught.value)
     assert "'RNA_percentMito' was not computed" in message
     assert "fresh store" in message
@@ -334,7 +309,7 @@ def test_clear_column_fails_closed_on_a_noncanonical_mask_link():
 def test_first_preparation_publishes_identity_with_the_prepared_flag(monkeypatch):
     import json
 
-    storage, _ = _qc_store()
+    storage, _ = fresh_qc_store()
     documents = []
     store_type = type(storage)
     original_set = store_type.set
@@ -345,7 +320,7 @@ def test_first_preparation_publishes_identity_with_the_prepared_flag(monkeypatch
         return await original_set(self, key, value, *args, **kwargs)
 
     monkeypatch.setattr(store_type, "set", recording_set)
-    _open_qc_store(storage)
+    open_qc_store(storage)
 
     prepared = [attrs for attrs in documents if attrs.get("prepared") is True]
     assert prepared

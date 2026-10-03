@@ -4,9 +4,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import zarr
+from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.features import _aligned_feature_labels
+from scarf.metadata import MetaData
 from scarf.metadata.artifacts import artifact_values
+from scarf.metadata.queries import (
+    column_partition_digest,
+    columns_same_partition,
+    reduce_observation_units,
+)
 from scarf.metadata.rows import metadata_column_fingerprint
 from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.utils.logging import logger
@@ -39,32 +47,36 @@ def test_iter_row_blocks_matches_active_index_and_fetch(datastore):
     expected_idx = cells.active_index("I")
     expected_vals = cells.fetch(col, key="I")
 
-    for block_rows in (None, 7, 1, cells.default_block_rows("I")):
+    # Single-row blocks are checked on a small table in test_metadata_contracts.
+    for block_rows in (None, 7, cells.default_block_rows("I")):
         blocks = list(
             cells.iter_row_blocks(cell_key="I", columns=[col], block_rows=block_rows)
         )
-        got_idx = (
-            np.concatenate([b.active_global_indices for b in blocks])
-            if blocks
-            else np.array([], dtype=np.int64)
-        )
-        got_vals = (
-            np.concatenate([b.values[col] for b in blocks]) if blocks else np.array([])
-        )
+        got_idx = np.concatenate([b.active_global_indices for b in blocks])
+        got_vals = np.concatenate([b.values[col] for b in blocks])
         np.testing.assert_array_equal(got_idx, expected_idx)
         np.testing.assert_array_equal(got_vals, expected_vals)
-        assert all(b.start < b.stop for b in blocks)
-        assert blocks[0].start == 0
-        assert blocks[-1].stop == cells.N
+        size = cells.default_block_rows("I") if block_rows is None else block_rows
+        # Blocks tile [0, N) in order with the requested size.
+        assert [(b.start, b.stop) for b in blocks] == [
+            (start, min(start + size, cells.N)) for start in range(0, cells.N, size)
+        ]
+        for block in blocks:
+            assert np.all(block.active_global_indices >= block.start)
+            assert np.all(block.active_global_indices < block.stop)
 
 
 def test_iter_row_blocks_chunk_edges_cover_full_range(datastore):
     cells = datastore.cells
     chunk = cells.default_block_rows("I")
+    # The default block size is the chunk length of the key column.
+    assert chunk == datastore.zw["cellData"]["I"].chunks[0]
     blocks = list(cells.iter_row_blocks(cell_key="I", block_rows=chunk))
+    assert len(blocks) == -(-cells.N // chunk)
     assert sum(b.stop - b.start for b in blocks) == cells.N
     for b in blocks:
         assert b.stop - b.start <= chunk
+        assert b.values == {}
 
 
 def test_iter_row_blocks_respects_subset_cell_key(datastore):
@@ -94,8 +106,8 @@ def test_make_bulk_respects_explicit_subset_selection(leiden_clustering, datasto
         artifact_group(ds.zw, selection),
         "values",
     ).astype(bool)
-    assert active.dtype == bool
     active_idx = np.flatnonzero(active)
+    labels = artifact_values(artifact_group(ds.zw, leiden_clustering), "values")
     drop = np.zeros(ds.cells.N, dtype=bool)
     drop[active_idx[::2]] = True
     subset = active & ~drop
@@ -115,10 +127,23 @@ def test_make_bulk_respects_explicit_subset_selection(leiden_clustering, datasto
         remove_empty_features=False,
         feature_label="index",
     )
-    shared = [c for c in sub.columns if c in full.columns]
-    assert shared
-    for c in shared:
-        assert (sub[c].to_numpy() <= full[c].to_numpy() + 1e-6).all()
+
+    groups = [str(label) for label in np.unique(labels)]
+    assert list(full.columns) == list(sub.columns) == groups
+    # Group totals over every feature equal the per-cell totals recorded at
+    # import, and a sample of features equals the raw counts of the members.
+    n_counts = np.asarray(ds.cells.fetch_all("RNA_nCounts"))
+    in_subset = subset[active_idx]
+    features = np.sort(np.argsort(ds.RNA.feats.fetch_all("nCells"))[-25:])
+    raw = np.asarray(ds.RNA.rawData[active_idx][:, features].compute())
+    for group in groups:
+        members = labels.astype(str) == group
+        for frame, rows in ((full, members), (sub, members & in_subset)):
+            assert frame[group].sum() == n_counts[active_idx[rows]].sum()
+            np.testing.assert_array_equal(
+                frame[group].to_numpy()[features], raw[rows].sum(axis=0)
+            )
+        assert sub[group].sum() < full[group].sum()
 
 
 def test_make_bulk_pseudo_reps_warns_without_changing_values(
@@ -190,79 +215,103 @@ def test_make_bulk_feature_name_index_is_hashable(leiden_clustering, datastore):
         aggr_type="sum",
         remove_empty_features=True,
     )
+    indexed = datastore.make_bulk(
+        leiden_clustering,
+        feature_label="index",
+        aggr_type="sum",
+        remove_empty_features=True,
+    )
     names = np.asarray(datastore.RNA.feats.fetch_all("names"), dtype=object)
-    assert not bulk.empty
-    assert set(bulk.index).issubset(set(names))
+
+    # Names replace the positions of the expressed features, row for row.
+    assert len(bulk) == len(indexed) > 0
+    assert (indexed.sum(axis=1) > 0).all()
+    assert bulk.index.tolist() == names[indexed.index.to_numpy()].tolist()
+    assert all(isinstance(name, str) for name in bulk.index)
+    np.testing.assert_array_equal(bulk.to_numpy(), indexed.to_numpy())
+    assert bulk.loc[bulk.index[0]].shape == (bulk.shape[1],)
 
 
-def test_column_partition_digest_matches_factorization(datastore):
-    from scarf.metadata.queries import column_partition_digest, columns_same_partition
+def _chunked_table(columns: dict[str, list]) -> MetaData:
+    """A table whose two-row chunks make each row block hold two rows."""
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    n_rows = len(next(iter(columns.values())))
+    group.create_array("I", data=np.ones(n_rows, dtype=bool), chunks=(2,))
+    group.create_array(
+        "ids", data=np.array([f"c{i}" for i in range(n_rows)]), chunks=(2,)
+    )
+    for name, values in columns.items():
+        group.create_array(name, data=np.asarray(values), chunks=(2,))
+    return MetaData(group)
 
-    cells = datastore.cells
-    ids = cells.fetch_all("ids")
-    # Renamed labels, same partition as ids under a fresh codebook.
-    alias = np.array([f"alias-{value}" for value in ids], dtype=object)
-    cells.insert("digest_alias_ids", alias, overwrite=True)
 
-    digest_ids = column_partition_digest(cells, "ids")
-    digest_alias = column_partition_digest(cells, "digest_alias_ids")
-    assert digest_ids.digest == digest_alias.digest
-    assert digest_ids.nLevels == digest_alias.nLevels
-    assert digest_ids.nRows == int(cells.active_index("I").size)
+def test_column_partition_digest_matches_factorization():
+    ids = [f"id{index}" for index in range(12)]
+    with_missing = np.arange(12, dtype=float)
+    with_missing[[0, 5]] = np.nan
+    cells = _chunked_table(
+        {
+            "label": ids,
+            # Renamed labels, same partition as label under a fresh codebook.
+            "alias": [f"alias-{value}" for value in ids],
+            "with_missing": with_missing,
+        }
+    )
 
-    same, shown = columns_same_partition(cells, "ids", "digest_alias_ids")
+    digest_ids = column_partition_digest(cells, "label")
+    digest_alias = column_partition_digest(cells, "alias")
+    assert digest_ids == digest_alias
+    assert (digest_ids.nLevels, digest_ids.nMissing, digest_ids.nRows) == (12, 0, 12)
+
+    same, shown = columns_same_partition(cells, "label", "alias")
     assert same is True
-    assert " = " in shown
+    # The first eight correspondences are listed and the rest elided.
+    assert shown == "; ".join(f"{value} = alias-{value}" for value in ids[:8]) + (
+        "; ..."
+    )
 
-    # Missing values use a numeric column so NaN survives storage. Place them on
-    # active rows so the default cell_key="I" scan observes them.
-    with_missing = np.arange(cells.N, dtype=float)
-    active = cells.active_index("I")
-    assert active.size >= 2
-    with_missing[int(active[0])] = np.nan
-    with_missing[int(active[1])] = np.nan
-    cells.insert("digest_alias_missing", with_missing, overwrite=True)
-    digest_missing = column_partition_digest(cells, "digest_alias_missing")
-    assert digest_missing.nMissing == 2
-    assert digest_missing.nLevels == digest_missing.nRows - 1
+    # NaN rows join one missing level that every other value differs from.
+    digest_missing = column_partition_digest(cells, "with_missing")
+    assert (digest_missing.nMissing, digest_missing.nLevels) == (2, 11)
+    assert digest_missing.nRows == 12
     assert digest_missing.digest != digest_alias.digest
 
 
-def test_partition_digest_is_global_across_blocks(datastore):
-    from scarf.metadata.queries import column_partition_digest, columns_same_partition
+def test_partition_digest_is_global_across_blocks():
+    cells = _chunked_table(
+        {
+            "left": ["a", "b", "a", "b"],
+            # Each two-row block of right repeats one of left's patterns, but
+            # the second block swaps the labels.
+            "right": ["a", "b", "b", "a"],
+            "renamed": ["x", "y", "x", "y"],
+        }
+    )
+    assert [len(block.active_global_indices) for block in cells.iter_row_blocks()] == [
+        2,
+        2,
+    ]
 
-    cells = datastore.cells
-    n = cells.N
-    # Two columns with identical per-block patterns but different global partitions.
-    left = np.array(["a", "b"] * (n // 2) + ["a"] * (n % 2), dtype=object)
-    right = left.copy()
-    mid = n // 2
-    if mid + 1 < n:
-        right[mid], right[mid + 1] = right[mid + 1], right[mid]
-    cells.insert("digest_part_left", left, overwrite=True)
-    cells.insert("digest_part_right", right, overwrite=True)
-
-    left_digest = column_partition_digest(cells, "digest_part_left")
-    right_digest = column_partition_digest(cells, "digest_part_right")
-    if np.array_equal(left, right):
-        assert left_digest.digest == right_digest.digest
-    else:
-        assert left_digest.digest != right_digest.digest
-        same, _ = columns_same_partition(cells, "digest_part_left", "digest_part_right")
-        assert same is False
+    left_digest = column_partition_digest(cells, "left")
+    # Per-block codebooks would code both columns 0, 1, 0, 1.
+    assert column_partition_digest(cells, "right").digest != left_digest.digest
+    assert columns_same_partition(cells, "left", "right") == (False, "")
+    assert column_partition_digest(cells, "renamed") == left_digest
+    assert columns_same_partition(cells, "left", "renamed") == (True, "a = x; b = y")
 
 
-def test_reduce_observation_units_respects_cell_key(datastore):
-    from scarf.metadata.queries import reduce_observation_units
-
-    cells = datastore.cells
-    keep = np.zeros(cells.N, dtype=bool)
-    keep[::2] = True
-    cells.insert("digest_unit_subset", keep, overwrite=True)
-    sample = np.array([f"s{i % 3}" for i in range(cells.N)], dtype=object)
-    cells.insert("digest_unit_sample", sample, overwrite=True)
-    disease = np.array(["case" if i % 2 == 0 else "ctrl" for i in range(cells.N)])
-    cells.insert("digest_unit_disease", disease, overwrite=True)
+def test_reduce_observation_units_respects_cell_key():
+    n_cells = 9
+    keep = np.arange(n_cells) % 2 == 0
+    cells = _chunked_table(
+        {
+            "digest_unit_subset": keep,
+            "digest_unit_sample": [f"s{i % 3}" for i in range(n_cells)],
+            "digest_unit_disease": [
+                "case" if i % 2 == 0 else "ctrl" for i in range(n_cells)
+            ],
+        }
+    )
 
     design = reduce_observation_units(
         cells,
@@ -270,5 +319,17 @@ def test_reduce_observation_units_respects_cell_key(datastore):
         ["digest_unit_disease"],
         cell_key="digest_unit_subset",
     )
-    assert len(design) == len(set(sample[keep]))
-    assert set(design.columns) >= {"digest_unit_sample", "digest_unit_disease"}
+    unfiltered = reduce_observation_units(
+        cells, "digest_unit_sample", ["digest_unit_disease"]
+    )
+
+    # The first kept row of each sample is 0 (s0), 2 (s2), and 4 (s1).
+    assert design.to_dict(orient="list") == {
+        "digest_unit_sample": ["s0", "s2", "s1"],
+        "digest_unit_disease": ["case", "case", "case"],
+    }
+    # Without the key, row 1 is the first row of s1, which is a control.
+    assert unfiltered.to_dict(orient="list") == {
+        "digest_unit_sample": ["s0", "s1", "s2"],
+        "digest_unit_disease": ["case", "ctrl", "case"],
+    }

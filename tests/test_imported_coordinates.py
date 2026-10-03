@@ -476,6 +476,18 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
     group = artifact_group(root, neighbors)
     assert group["indices"].shape == (8, 3)
     assert group["distances"].shape == (8, 3)
+    # Eight cells are few enough for the index search to be exact.
+    exact = np.linalg.norm(coordinates[:, None] - coordinates[None], axis=2)
+    np.fill_diagonal(exact, np.inf)
+    np.testing.assert_array_equal(
+        np.sort(group["indices"][:], axis=1),
+        np.sort(np.argsort(exact, axis=1)[:, :3], axis=1),
+    )
+    np.testing.assert_allclose(
+        group["distances"][:],
+        np.take_along_axis(exact, group["indices"][:].astype(np.intp), axis=1),
+        rtol=1e-5,
+    )
 
 
 def test_imported_coordinates_kind_is_assay_scoped() -> None:
@@ -1304,3 +1316,395 @@ def test_imported_artifacts_validate_and_coordinates_reuse_read_only(tmp_path) -
     assert reused == coordinate_ref
     assert pulls == []
     assert tuple(sorted(read_only["cellData"].keys())) == columns_before
+
+
+def _imported_coordinate_artifacts(root: zarr.Group) -> list[ArtifactRef]:
+    return list_artifacts(root, scope="assay", assay="RNA", kind="imported_coordinates")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"dimreduc_key": ""}, "dimreduc_key must be a non-empty string"),
+        ({"role": "UMAP"}, "require a non-layout role"),
+        ({"role": "tsne"}, "require a non-layout role"),
+        ({"role": ""}, "require a non-layout role"),
+        ({"feature_ids": None}, "loadings and feature_ids must be provided together"),
+        (
+            {"feature_ids": np.array(["gene_0", "gene_1", "gene_2"])},
+            "feature_ids must align with loadings rows",
+        ),
+        (
+            {"stdev": np.array([1.0, 2.0])},
+            "stdev length must match coordinate dimensions",
+        ),
+    ],
+    ids=[
+        "empty_key",
+        "layout_role",
+        "tsne_role",
+        "empty_role",
+        "loadings_without_feature_ids",
+        "short_feature_ids",
+        "short_stdev",
+    ],
+)
+def test_imported_coordinates_reject_inconsistent_arguments_before_writing(
+    overrides, message
+) -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    loadings = np.arange(12, dtype=np.float64).reshape(4, 3)
+    feature_ids = np.array([f"gene_{index}" for index in range(4)])
+    stdev = np.array([3.0, 2.0, 1.0])
+    arguments = {
+        "dimreduc_key": "pca",
+        "role": "pca",
+        "loadings": loadings,
+        "feature_ids": feature_ids,
+        "stdev": stdev,
+    } | overrides
+
+    with pytest.raises(ValueError, match=message):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            coordinates=coordinates,
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints=_fingerprints(
+                data=coordinates,
+                loadings=loadings,
+                feature_ids=feature_ids,
+                stdev=stdev,
+            ),
+            source_cell_ids=cell_ids[mask],
+            cell_selection=selection,
+            **arguments,
+        )
+    assert _imported_coordinate_artifacts(root) == []
+
+
+@pytest.mark.parametrize("payload", ["data", "feature_ids"])
+def test_imported_coordinates_reject_a_payload_that_differs_from_its_fingerprint(
+    payload,
+) -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    loadings = np.arange(12, dtype=np.float64).reshape(4, 3)
+    feature_ids = np.array([f"gene_{index}" for index in range(4)])
+    fingerprints = _fingerprints(
+        data=coordinates, loadings=loadings, feature_ids=feature_ids
+    )
+    # The fingerprint of other values is well formed but describes another source.
+    fingerprints[payload] = (
+        fingerprint_array(coordinates + 1)
+        if payload == "data"
+        else fingerprint_strings(feature_ids[::-1])
+    )
+
+    with pytest.raises(
+        ValueError, match=f"{payload} payload fingerprint does not match its source"
+    ):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            dimreduc_key="pca",
+            role="pca",
+            coordinates=coordinates,
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints=fingerprints,
+            source_cell_ids=cell_ids[mask],
+            cell_selection=selection,
+            loadings=loadings,
+            feature_ids=feature_ids,
+        )
+    # The failed write leaves no artifact behind.
+    assert _imported_coordinate_artifacts(root) == []
+
+
+def test_imported_coordinate_stream_skips_empty_blocks() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+
+    def blocks():
+        yield coordinates[:3]
+        yield coordinates[3:3]
+        yield coordinates[3:]
+
+    ref = write_imported_coordinates(
+        root,
+        assay="RNA",
+        dimreduc_key="pca",
+        role="pca",
+        coordinates=blocks,
+        coordinate_shape=coordinates.shape,
+        coordinate_dtype=coordinates.dtype,
+        source_digest=_SOURCE_DIGEST,
+        payload_fingerprints={"data": fingerprint_array(coordinates)},
+        source_cell_ids=cell_ids[mask],
+        cell_selection=selection,
+        block_rows=3,
+    )
+
+    np.testing.assert_array_equal(artifact_group(root, ref)["data"][:], coordinates)
+
+
+@pytest.mark.parametrize(
+    ("feature_ids", "dtype", "message"),
+    [
+        (
+            iter([np.array(["gene_0", "gene_1", "gene_2", "gene_3"], dtype=object)]),
+            object,
+            "require a callable source that can be read twice",
+        ),
+        (
+            lambda: [np.array(["gene_0", "gene_1", "gene_2", "gene_3", "gene_4"])],
+            "<U6",
+            "feature_ids block has an invalid shape",
+        ),
+        (
+            lambda: [np.array(["gene_0"])],
+            "<U6",
+            "feature_ids stream contains 1 rows, expected 4",
+        ),
+    ],
+    ids=["one_shot_object_stream", "long_stream", "short_stream"],
+)
+def test_imported_feature_id_streams_must_match_their_declaration(
+    feature_ids, dtype, message
+) -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    loadings = np.arange(12, dtype=np.float64).reshape(4, 3)
+    declared = np.array([f"gene_{index}" for index in range(4)])
+
+    with pytest.raises(ValueError, match=message):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            dimreduc_key="pca",
+            role="pca",
+            coordinates=coordinates,
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints=_fingerprints(
+                data=coordinates, loadings=loadings, feature_ids=declared
+            ),
+            source_cell_ids=cell_ids[mask],
+            cell_selection=selection,
+            loadings=loadings,
+            feature_ids=feature_ids,
+            feature_id_shape=(4,),
+            feature_id_dtype=dtype,
+        )
+    assert _imported_coordinate_artifacts(root) == []
+
+
+def test_imported_coordinate_alignment_detects_a_selection_changed_while_reading(
+    monkeypatch,
+) -> None:
+    from scarf.embeddings.imported_storage import ImportedArtifactStorage
+
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    fingerprint_selected = ImportedArtifactStorage.fingerprint_selected_strings
+
+    def one_cell_fewer(ids, values):
+        # As if another writer deselected a cell between the two passes.
+        fingerprint, count = fingerprint_selected(ids, values)
+        return fingerprint, count - 1
+
+    monkeypatch.setattr(
+        ImportedArtifactStorage,
+        "fingerprint_selected_strings",
+        staticmethod(one_cell_fewer),
+    )
+
+    with pytest.raises(RuntimeError, match="Selected cell count changed"):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            dimreduc_key="pca",
+            role="pca",
+            coordinates=coordinates,
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints={"data": fingerprint_array(coordinates)},
+            source_cell_ids=cell_ids[mask],
+            cell_selection=selection,
+        )
+    assert _imported_coordinate_artifacts(root) == []
+
+
+def _replace_with_group(name: str):
+    def damage(root: zarr.Group, ref: ArtifactRef) -> None:
+        group = artifact_group(root, ref)
+        del group[name]
+        group.create_group(name)
+
+    return damage
+
+
+def _drop_feature_ids(root: zarr.Group, ref: ArtifactRef) -> None:
+    del artifact_group(root, ref)["feature_ids"]
+    _tamper_artifact_attribute(
+        root, ref, "provenance", ("parameters", "feature_ids_stored"), False
+    )
+
+
+def _drop_stdev_fingerprint(root: zarr.Group, ref: ArtifactRef) -> None:
+    inputs = artifact_group(root, ref).attrs["provenance"]["inputs"]
+    fingerprints = dict(inputs["payload_fingerprints"])
+    del fingerprints["stdev"]
+    _tamper_artifact_attribute(
+        root, ref, "provenance", ("inputs", "payload_fingerprints"), fingerprints
+    )
+
+
+def _undecodable_feature_ids(root: zarr.Group, ref: ArtifactRef) -> None:
+    artifact_group(root, ref).create_array(
+        "feature_ids",
+        data=np.array([b"\xff\xfe", b"g1", b"g2", b"g3"], dtype="S2"),
+        overwrite=True,
+    )
+
+
+# Undecodable feature IDs are stored as fixed-width bytes, a dtype without a
+# Zarr v3 specification.
+@pytest.mark.filterwarnings("ignore::zarr.errors.UnstableSpecificationWarning")
+@pytest.mark.parametrize(
+    ("damage", "code", "message"),
+    [
+        (
+            lambda root, ref: artifact_group(root, ref).attrs.update(
+                {"complete": "yes"}
+            ),
+            "corrupt_payload",
+            "artifact record is malformed",
+        ),
+        (
+            lambda root, ref: artifact_group(root, ref).attrs.update(
+                {"complete": False}
+            ),
+            "incomplete_artifact",
+            "artifact is incomplete",
+        ),
+        (
+            lambda root, ref: _tamper_artifact_attribute(
+                root, ref, "provenance", ("inputs", "cell_selection"), None
+            ),
+            "corrupt_payload",
+            "has no 'cell_selection' artifact input",
+        ),
+        (
+            lambda root, ref: _tamper_artifact_attribute(
+                root,
+                ref,
+                "provenance",
+                ("inputs", "cell_selection"),
+                {"type": "artifact", "scope": "cells"},
+            ),
+            "corrupt_payload",
+            "has a malformed cell_selection input",
+        ),
+        (_replace_with_group("data"), "corrupt_payload", "data payload is malformed"),
+        (
+            _replace_with_group("loadings"),
+            "corrupt_payload",
+            "loadings or feature IDs are malformed",
+        ),
+        (_replace_with_group("stdev"), "corrupt_payload", "stdev payload is malformed"),
+        (
+            _drop_feature_ids,
+            "corrupt_payload",
+            "loadings and feature IDs must be stored together",
+        ),
+        (
+            _drop_stdev_fingerprint,
+            "corrupt_payload",
+            "payload fingerprints do not match stored payloads",
+        ),
+        (
+            _undecodable_feature_ids,
+            "corrupt_payload",
+            "fingerprint for 'feature_ids' is unreadable",
+        ),
+    ],
+    ids=[
+        "malformed_record",
+        "incomplete",
+        "no_cell_selection",
+        "malformed_cell_selection",
+        "data_group",
+        "loadings_group",
+        "stdev_group",
+        "loadings_without_feature_ids",
+        "fingerprint_names",
+        "undecodable_feature_ids",
+    ],
+)
+def test_imported_coordinate_validator_classifies_record_and_payload_damage(
+    damage, code, message
+) -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    ref, _coordinates = _write_coordinate_fixture(
+        root, selection, cell_ids, mask, include_optional=True
+    )
+    validate_imported_coordinates_artifact(root, ref)
+    damage(root, ref)
+
+    with pytest.raises(ArtifactResolutionError, match=message) as caught:
+        validate_imported_coordinates_artifact(root, ref)
+
+    assert caught.value.code == code
+    assert caught.value.context["artifact_id"] == ref.artifact_id
+
+
+def test_imported_coordinate_validator_reports_a_missing_artifact() -> None:
+    root, _selection, _cell_ids, _mask = _root_with_selection()
+    missing = ArtifactRef(
+        scope="assay", assay="RNA", kind="imported_coordinates", artifact_id="0" * 64
+    )
+
+    with pytest.raises(ArtifactResolutionError, match="does not exist") as caught:
+        validate_imported_coordinates_artifact(root, missing)
+
+    assert caught.value.code == "missing_artifact"
+
+
+@pytest.mark.parametrize(
+    ("values", "row_ids"),
+    [
+        (np.ones(3, dtype=bool), np.array(["a", "b"])),
+        (np.ones(2, dtype=np.int8), np.array(["a", "b"])),
+        (np.ones(2, dtype=bool), np.array([1, 2])),
+    ],
+    ids=["misaligned", "integer_mask", "numeric_ids"],
+)
+def test_selected_row_order_reports_a_malformed_alignment_payload(
+    values, row_ids
+) -> None:
+    from scarf.embeddings.imported_storage import require_selected_row_order
+    from scarf.storage.selections import ValidatedStoredSelection
+
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    selection = ValidatedStoredSelection(
+        ref=ArtifactRef(scope="datastore", kind="cell_selection", artifact_id="a" * 64),
+        values=group.create_array("values", data=values),
+        row_ids=group.create_array("ids", data=row_ids),
+        selected_count=2,
+        table_path="cellData",
+        row_ids_fingerprint="0" * 64,
+    )
+
+    with pytest.raises(
+        ArtifactResolutionError, match="Imported cell alignment payload is malformed"
+    ) as caught:
+        require_selected_row_order(
+            selection,
+            row_count=2,
+            ordered_fingerprint="0" * 64,
+            label="Imported",
+            context={"artifact_id": "b" * 64},
+        )
+
+    assert caught.value.code == "corrupt_payload"
+    assert caught.value.context == {"artifact_id": "b" * 64}

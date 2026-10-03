@@ -130,8 +130,7 @@ def test_async_read_and_write_roundtrip_preserves_edge_values() -> None:
             await counts.async_array.getitem((slice(0, 1), slice(0, 1)))
         )
         np.testing.assert_array_equal(written, marker)
-        expected_t = values.T.copy()
-        expected_t[0, 0] = 42
+        # countsT is a separate array, so writing counts leaves it unchanged.
         np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
 
     asyncio.run(_roundtrip())

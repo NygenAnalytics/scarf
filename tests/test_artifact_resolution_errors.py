@@ -6,7 +6,6 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-import scarf
 from scarf.storage.artifacts import artifact_path
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.refs import ArtifactRef
@@ -82,15 +81,34 @@ def _assert_resolution_error(
 
 def test_selection_validation_is_read_only() -> None:
     _, store, ref = _root_with_selection()
+    before = dict(store._store_dict)
+    root = _read_only_root(store)
 
-    validate_stored_selection_integrity(
-        _read_only_root(store),
+    integrity = validate_stored_selection_integrity(
+        root,
         ref,
         kind="cell_selection",
         scope="datastore",
         assay=None,
         table_path="cellData",
     )
+    # The live column still equals the artifact, so the alias check passes too.
+    alias = validate_stored_selection_live_alias(
+        root,
+        ref,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+        column="I",
+    )
+
+    for validated in (integrity, alias):
+        assert validated.ref == ref
+        assert validated.selected_count == 2
+        np.testing.assert_array_equal(validated.values[:], [True, False, True])
+        np.testing.assert_array_equal(validated.row_ids[:], ["a", "b", "c"])
+    assert dict(store._store_dict) == before
 
 
 def test_selection_error_for_reference_mismatch() -> None:
@@ -201,10 +219,59 @@ def test_selection_error_for_changed_values() -> None:
 
 
 def test_artifact_resolution_error_has_public_facades() -> None:
+    # The graph package is not a root attribute; it needs its own import.
+    import scarf.graph
+
     assert scarf.ArtifactResolutionError is ArtifactResolutionError
     assert scarf.storage.ArtifactResolutionError is ArtifactResolutionError
     assert not hasattr(scarf, "ArtifactSelectionError")
     assert not hasattr(scarf.graph, "ArtifactSelectionError")
+
+
+@pytest.mark.parametrize(
+    ("code", "context", "error", "message"),
+    [
+        ("", {}, TypeError, "code must be a non-empty string"),
+        (None, {}, TypeError, "code must be a non-empty string"),
+        ("artifact_missing", {1: "cell_selection"}, TypeError, "keys must be strings"),
+        ("artifact_missing", {"rows": [1, 2]}, TypeError, "must be JSON scalars"),
+        ("artifact_missing", {"ref": object()}, TypeError, "must be JSON scalars"),
+        ("artifact_missing", {"ratio": float("nan")}, ValueError, "must be finite"),
+        ("artifact_missing", {"ratio": -float("inf")}, ValueError, "must be finite"),
+    ],
+)
+def test_artifact_resolution_error_rejects_malformed_codes_and_context(
+    code, context, error, message
+) -> None:
+    with pytest.raises(error, match=f"Artifact resolution error .*{message}"):
+        ArtifactResolutionError(
+            "Stored selection is unavailable", code=code, context=context
+        )
+
+
+def test_artifact_resolution_error_keeps_its_own_copy_of_scalar_context() -> None:
+    context = {
+        "kind": "cell_selection",
+        "rows": 3,
+        "ratio": 0.5,
+        "complete": False,
+        "assay": None,
+    }
+    error = ArtifactResolutionError(
+        "Stored selection is unavailable", code="artifact_missing", context=context
+    )
+    context["kind"] = "feature_selection"
+
+    assert isinstance(error, ValueError)
+    assert str(error) == "Stored selection is unavailable"
+    assert error.code == "artifact_missing"
+    assert error.context == {
+        "kind": "cell_selection",
+        "rows": 3,
+        "ratio": 0.5,
+        "complete": False,
+        "assay": None,
+    }
 
 
 def test_artifact_resolution_error_round_trips_through_pickle() -> None:

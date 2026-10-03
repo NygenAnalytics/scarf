@@ -12,7 +12,11 @@ from scarf.features.enrichment.aucell import (
     score_aucell_block,
 )
 from scarf.features.enrichment.net import prepare_network
-from scarf.features.enrichment.waggr import build_waggr_model, score_waggr_block
+from scarf.features.enrichment.waggr import (
+    WaggrModel,
+    build_waggr_model,
+    score_waggr_block,
+)
 
 
 def _prepared_network(*, weighted: bool):
@@ -69,6 +73,35 @@ def test_waggr_rejects_invalid_values_and_modes():
             model,
             mode="wmean",
         )
+    with pytest.raises(ValueError, match="values must be two-dimensional"):
+        score_waggr_block(np.ones(4), model, mode="wsum")
+    with pytest.raises(ValueError, match="adjacency features are not aligned"):
+        score_waggr_block(np.ones((2, 3)), model, mode="wsum")
+    # Beta weighs the second feature by three, so its sum overflows.
+    for mode in ("wsum", "wmean"):
+        with pytest.raises(ValueError, match="produced non-finite scores"):
+            score_waggr_block(np.array([[0.0, 1e308, 0.0, 0.0]]), model, mode=mode)
+
+
+@pytest.mark.parametrize(
+    ("adjacency", "denominator", "message"),
+    [
+        (np.ones(3), np.ones(3), "adjacency matrix must be two-dimensional"),
+        (np.ones((2, 3)), np.ones((3, 1)), "denominator must be one-dimensional"),
+        (np.ones((2, 3)), np.ones(2), "adjacency and denominator must be aligned"),
+        (np.ones((2, 3)), np.array([1.0, 0.0, 1.0]), "finite and positive"),
+        (np.ones((2, 3)), np.array([1.0, np.inf, 1.0]), "finite and positive"),
+    ],
+    ids=["adjacency", "denominator", "alignment", "zero", "infinite"],
+)
+def test_waggr_model_rejects_malformed_matrices(adjacency, denominator, message):
+    from scipy.sparse import csc_matrix
+
+    if adjacency.ndim == 2:
+        adjacency = csc_matrix(adjacency)
+
+    with pytest.raises(ValueError, match=message):
+        WaggrModel(adjacency=adjacency, denominator=denominator)
 
 
 def test_aucell_matches_frozen_decoupler_2_2_reference():
@@ -325,3 +358,41 @@ def test_score_aucell_block_rejects_invalid_matrix_and_permutation():
     )
     with pytest.raises(ValueError, match="outside the ranking universe"):
         score_aucell_block(values, permutation, out_of_range, n_up=3)
+
+
+def test_score_aucell_block_widens_half_precision_counts():
+    network = _prepared_network(weighted=False)
+    permutation = make_rank_permutation(4, 0)
+    sets = build_gene_set_index(network, np.arange(4)[permutation])
+    # Every count is exact in float16, so widening changes no rank.
+    values = np.array([[4, 3, 2, 1], [1, 4, 3, 2], [2, 2, 0, 7]])
+
+    half = score_aucell_block(values.astype(np.float16), permutation, sets, n_up=3)
+
+    np.testing.assert_array_equal(
+        half, score_aucell_block(values.astype(np.float32), permutation, sets, n_up=3)
+    )
+    np.testing.assert_allclose(
+        half[:2], [[2.0 / 3.0, 1.0 / 3.0], [1.0 / 3.0, 2.0 / 3.0]]
+    )
+
+
+def test_score_aucell_block_bounds_kernel_scores_to_the_unit_interval(monkeypatch):
+    import scarf.features.enrichment.aucell as aucell
+
+    network = _prepared_network(weighted=False)
+    permutation = make_rank_permutation(4, 0)
+    sets = build_gene_set_index(network, np.arange(4)[permutation])
+
+    def score(kernel_scores):
+        # Only a kernel fault leaves the unit interval, so the kernel is replaced.
+        monkeypatch.setattr(
+            aucell, "_score_ranked_block", lambda *_args: np.array(kernel_scores)
+        )
+        return score_aucell_block(np.ones((1, 4)), permutation, sets, n_up=3)
+
+    # Rounding error within 1e-12 of the interval is clipped.
+    np.testing.assert_array_equal(score([[-1e-13, 1.0 + 1e-13]]), [[0.0, 1.0]])
+    for outside in ([[-1e-6, 0.5]], [[0.5, 1.0 + 1e-6]]):
+        with pytest.raises(ValueError, match=r"outside the expected \[0, 1\] range"):
+            score(outside)

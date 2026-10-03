@@ -124,3 +124,122 @@ def test_signal_guard_leaves_handlers_installed_outside_python(
     assert installed[int(signal.SIGTERM)] == signal.SIG_DFL
     assert installed[int(signal.SIGINT)] is signal.default_int_handler
     assert int(signal.SIGHUP) not in installed
+
+
+def test_token_requests_need_a_reason_and_name_unknown_signals() -> None:
+    token = ShutdownToken()
+    for reason in ("", None, 3):
+        with pytest.raises(TypeError, match="reason must be a non-empty string"):
+            token.request(reason=reason)  # type: ignore[arg-type]
+    assert not token.requested
+
+    assert token.request(reason="operator stop", signal_number=1_000)
+    record = token.request_record
+    assert record is not None
+    assert (record.reason, record.signal_number, record.signal_name) == (
+        "operator stop",
+        1_000,
+        "SIGNAL_1000",
+    )
+    assert record.requested_at_ns > 0
+
+
+def test_propagate_continues_with_the_prior_signal_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raised: list[int] = []
+    monkeypatch.setattr(signal, "raise_signal", raised.append)
+
+    # Nothing was requested, so there is nothing to continue.
+    ShutdownToken().propagate()
+
+    called: list[tuple[int, object]] = []
+    frame = object()
+    callable_prior = ShutdownToken()
+    callable_prior.request(
+        reason="received SIGTERM",
+        signal_number=int(signal.SIGTERM),
+        previous_handler=lambda number, current: called.append((number, current)),
+        frame=frame,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ShutdownRequested, match="received SIGTERM"):
+        callable_prior.propagate()
+    assert called == [(int(signal.SIGTERM), frame)]
+
+    ignored = ShutdownToken()
+    ignored.request(
+        reason="received SIGINT",
+        signal_number=int(signal.SIGINT),
+        previous_handler=signal.SIG_IGN,
+    )
+    with pytest.raises(ShutdownRequested, match="received SIGINT"):
+        ignored.propagate()
+    assert raised == []
+
+    default = ShutdownToken()
+    default.request(
+        reason="received SIGHUP",
+        signal_number=int(signal.SIGHUP),
+        previous_handler=signal.SIG_DFL,
+    )
+    with pytest.raises(ShutdownRequested, match="received SIGHUP"):
+        default.propagate()
+    # The default action is delivered again before the interruption is raised.
+    assert raised == [int(signal.SIGHUP)]
+
+
+def test_scopes_and_guards_accept_only_shutdown_tokens() -> None:
+    with pytest.raises(TypeError, match="token must be a ShutdownToken"):
+        with shutdown_scope(object()):  # type: ignore[arg-type]
+            pass
+    with pytest.raises(TypeError, match="token must be a ShutdownToken"):
+        TemporarySignalGuard(object())  # type: ignore[arg-type]
+    assert current_shutdown_token() is None
+
+
+def test_signal_guard_reports_when_no_signal_can_be_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(signal, "getsignal", lambda _number: signal.SIG_IGN)
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda number, handler: installed.__setitem__(int(number), handler),
+    )
+
+    with TemporarySignalGuard(ShutdownToken()) as guard:
+        assert not guard.available
+        assert (
+            guard.unavailable_reason == "no catchable termination signals are available"
+        )
+    assert installed == {}
+
+
+def test_second_signal_with_a_default_prior_delivers_it_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    installed: dict[int, list[object]] = {}
+    raised: list[int] = []
+    monkeypatch.setattr(signal, "getsignal", lambda _number: signal.SIG_DFL)
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda number, handler: installed.setdefault(int(number), []).append(handler),
+    )
+    monkeypatch.setattr(signal, "raise_signal", raised.append)
+    token = ShutdownToken()
+
+    with TemporarySignalGuard(token):
+        handler = installed[int(signal.SIGTERM)][-1]
+        assert callable(handler)
+        handler(int(signal.SIGTERM), None)
+        assert raised == []
+        handler(int(signal.SIGTERM), None)
+        # The second signal restores the default handler and delivers again.
+        assert installed[int(signal.SIGTERM)][-1] == signal.SIG_DFL
+        assert raised == [int(signal.SIGTERM)]
+    assert token.request_record is not None
+    assert token.request_record.signal_name == "SIGTERM"

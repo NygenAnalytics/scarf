@@ -515,6 +515,118 @@ def test_run_metadata_snapshot_rejects_ambiguous_or_misaligned_inputs() -> None:
         snapshot_run_metadata(**common, columns=["missing"])
     with pytest.raises(ValueError, match="cannot set an assay"):
         snapshot_run_metadata(**common, columns=["names"], assay="RNA")
+    with pytest.raises(KeyError, match="table 'featureData' is unavailable"):
+        snapshot_run_metadata(
+            **{**common, "table_path": "featureData"}, columns=["names"]
+        )
+    with pytest.raises(KeyError, match="row ID column 'barcodes' is unavailable"):
+        snapshot_run_metadata(**{**common, "id_column": "barcodes"}, columns=["names"])
+    with pytest.raises(TypeError, match="one-dimensional string column"):
+        snapshot_run_metadata(**{**common, "id_column": "short"}, columns=["names"])
+    assert list(root.group_keys()) == ["cellData"]
+
+
+def _snapshot_table() -> tuple[zarr.Group, ArtifactRef]:
+    """Snapshot a text column and a masked numeric column of three cells."""
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    table = root.create_group("cellData")
+    create_metadata_column(table, "ids", data=np.array(["a", "b", "c"]), dtype=str)
+    create_metadata_column(table, "names", data=np.array(["A", "B", "C"]), dtype=str)
+    score = create_metadata_column(
+        table, "score", data=np.array([1.5, 0.0, 3.5]), dtype=np.float64
+    )
+    create_metadata_column(
+        table,
+        "__scarf_missing__score",
+        data=np.array([False, True, False]),
+        dtype=bool,
+    )
+    score.attrs["missing_mask"] = "__scarf_missing__score"
+    ref = snapshot_run_metadata(
+        root,
+        table_path="cellData",
+        id_column="ids",
+        columns=["names", "score"],
+        axis="cell",
+    )
+    return root, ref
+
+
+def _tamper_extra_array(group: zarr.Group) -> None:
+    group.create_array("extra", data=np.arange(3))
+
+
+def _tamper_column_attribute(group: zarr.Group) -> None:
+    group["names"].attrs["note"] = "edited"
+
+
+def _tamper_value(group: zarr.Group) -> None:
+    group["names"][0] = "Z"
+
+
+def _tamper_mask_link(group: zarr.Group) -> None:
+    group["score"].attrs["missing_mask"] = "__scarf_missing__names"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [_tamper_extra_array, _tamper_column_attribute, _tamper_value, _tamper_mask_link],
+    ids=["extra-array", "column-attribute", "changed-value", "malformed-mask-link"],
+)
+def test_run_metadata_snapshot_reuses_only_an_intact_payload(tamper) -> None:
+    root, first = _snapshot_table()
+    arguments = {
+        "table_path": "cellData",
+        "id_column": "ids",
+        "columns": ["names", "score"],
+        "axis": "cell",
+    }
+    assert snapshot_run_metadata(root, **arguments) == first
+
+    # The table is unchanged, so only the edited payload stops the reuse.
+    tamper(artifact_group(root, first))
+    replacement = snapshot_run_metadata(root, **arguments)
+
+    assert replacement != first
+    group = validate_run_metadata_snapshot(
+        root,
+        replacement,
+        axis="cell",
+        assay=None,
+        table_path="cellData",
+        ordered_columns=["names", "score"],
+    )
+    np.testing.assert_array_equal(group["names"][:], ["A", "B", "C"])
+    np.testing.assert_array_equal(group["__scarf_missing__score"][:], [0, 1, 0])
+    assert snapshot_run_metadata(root, **arguments) == replacement
+
+
+def test_run_metadata_snapshot_validation_names_malformed_ids_and_geometry() -> None:
+    root, ref = _snapshot_table()
+    validate = {
+        "axis": "cell",
+        "assay": None,
+        "table_path": "cellData",
+        "ordered_columns": ["names", "score"],
+    }
+
+    payload = artifact_group(root, ref)
+    names = payload["names"][:]
+    del payload["names"]
+    payload.create_array("names", data=np.stack([names, names], axis=1))
+    with pytest.raises(ArtifactResolutionError) as geometry:
+        validate_run_metadata_snapshot(root, ref, **validate)
+    assert geometry.value.code == "snapshot_values_changed"
+    assert str(geometry.value.__cause__) == "Snapshot values have invalid geometry"
+
+    root, ref = _snapshot_table()
+    del root["cellData/ids"]
+    root["cellData"].create_group("ids")
+    with pytest.raises(
+        ArtifactResolutionError, match="row ID column is malformed"
+    ) as ids:
+        validate_run_metadata_snapshot(root, ref, **validate)
+    assert ids.value.code == "row_identity_mismatch"
 
 
 @pytest.mark.parametrize("name", ["k/b", "k\\b"], ids=["slash", "backslash"])
@@ -805,6 +917,11 @@ def test_metadata_snapshot_reuse_validates_flattened_payload(
     }
     first = resolve_metadata_snapshot(root, **kwargs)
     assert resolve_metadata_snapshot(root, **kwargs) == first
+    expected = (
+        values.reshape(-1).astype(str)
+        if values.dtype.kind in {"O", "S", "U"}
+        else values.reshape(-1)
+    )
 
     artifact_group(root, first)["values"][0] = (
         "changed" if values.dtype.kind in {"O", "S", "U"} else -1
@@ -812,11 +929,18 @@ def test_metadata_snapshot_reuse_validates_flattened_payload(
     replacement = resolve_metadata_snapshot(root, **kwargs)
     assert replacement != first
     np.testing.assert_array_equal(
-        artifact_group(root, replacement)["values"][:],
-        values.reshape(-1).astype(str)
-        if values.dtype.kind in {"O", "S", "U"}
-        else values.reshape(-1),
+        artifact_group(root, replacement)["values"][:], expected
     )
+
+    # A payload of variable-length strings has no stable fingerprint, so it
+    # is not reused even with the right shape.
+    payload = artifact_group(root, replacement)
+    del payload["values"]
+    payload.create_array("values", shape=(4,), dtype="string")
+    payload["values"][:] = expected.astype(str).astype(object)
+    third = resolve_metadata_snapshot(root, **kwargs)
+    assert third not in (first, replacement)
+    np.testing.assert_array_equal(artifact_group(root, third)["values"][:], expected)
 
 
 def test_filter_and_hvg_return_artifacts_without_metadata_aliases(

@@ -2,11 +2,11 @@
 
 import importlib.util
 import os
-import subprocess
-import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 _EXPECTED_OUTPUTS = {
@@ -45,24 +45,25 @@ def _prepare_isolated_store(module, datastore_zarr_root, tmp_path):
     return module._prepare_store(Path(datastore_zarr_root), work_directory)
 
 
-def test_showcase_generator_has_offline_fixture_cli():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "generate_plotting_showcase.py"
-    )
-    completed = subprocess.run(
-        [sys.executable, str(script), "--help"],
-        cwd=script.parents[1],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def test_showcase_generator_has_offline_fixture_cli(capsys):
+    module = _load_showcase_module()
 
-    assert completed.returncode == 0, completed.stderr
-    assert "--fixture" in completed.stdout
-    assert "--layout-fixture" in completed.stdout
-    assert "--output-dir" in completed.stdout
+    with pytest.raises(SystemExit) as exited:
+        module.main(["--help"])
+
+    assert exited.value.code == 0
+    help_text = capsys.readouterr().out
+    for option in ("--fixture", "--layout-fixture", "--output-dir"):
+        assert option in help_text
+    # The defaults point at committed offline fixtures.
+    defaults = module._parser().parse_args([])
+    repository = Path(__file__).resolve().parents[1]
+    assert defaults.fixture == Path("tests/datasets/1K_pbmc_citeseq.zarr.tar.gz")
+    assert defaults.layout_fixture == Path(
+        "tests/visual/showcase/plotting_showcase_layout.npz"
+    )
+    assert defaults.output_dir == Path("plotting_showcase")
+    assert (repository / defaults.layout_fixture).is_file()
 
 
 def test_showcase_keeps_analysis_outputs_as_artifacts():
@@ -101,6 +102,7 @@ def test_generate_showcase_artifacts(
         "RNA_cell_cycle_phase",
         "RNA_leiden_cluster",
     }.isdisjoint(store.cells.columns)
+    columns_before = set(store.cells.columns)
     outputs = module.generate_showcase(
         store,
         output_directory,
@@ -112,7 +114,19 @@ def test_generate_showcase_artifacts(
     )
 
     assert {path.name for path in outputs} == _EXPECTED_OUTPUTS
-    assert all(path.exists() and path.stat().st_size > 0 for path in outputs)
+    columns_after = set(store.cells.columns)
+    # Plots read analysis outputs as artifacts and never add cell metadata.
+    assert columns_after == columns_before
+    by_name = {path.name: path for path in outputs}
+    for path in outputs:
+        if path.suffix == ".png":
+            with Image.open(path) as image:
+                image.verify()
+    # The composite keeps its exact 11 x 6.5 inch page at 220 dpi.
+    with Image.open(by_name["publication_composite.png"]) as image:
+        assert image.size == (2420, 1430)
+    svg = ET.parse(by_name["publication_composite.svg"]).getroot()
+    assert (svg.attrib["width"], svg.attrib["height"]) == ("792pt", "468pt")
 
 
 @pytest.mark.slow

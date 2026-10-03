@@ -53,9 +53,67 @@ def test_process_tree_rss_sums_only_root_and_descendants(tmp_path: Path) -> None
     assert read_process_tree_rss_bytes(100, proc_root=proc_root) == 60 * 1024
 
 
+def test_process_tree_rss_skips_malformed_status_lines() -> None:
+    statuses = {
+        100: "Name:\tpython\nno separator here\nPPid:\t1\nVmRSS:\t10 kB\n",
+        # A parent that is not a number and an unreadable amount are ignored.
+        101: "PPid:\tnot-a-pid\nVmRSS:\tlots kB\n",
+        102: "PPid:\t100\nVmRSS:\t2 mB\nVmRSS:\n",
+        103: "PPid:\t100\nVmRSS:\t5 pages\n",
+    }
+
+    def read_text(path: Path) -> str:
+        return statuses[int(path.parent.name)]
+
+    total = read_process_tree_rss_bytes(
+        100, read_text=read_text, list_pids=lambda _root: list(statuses)
+    )
+    # 10 kB of the root and 2 MiB of its child; 103 reports no known unit.
+    assert total == 10 * 1024 + 2 * 1024**2
+    assert (
+        read_process_tree_rss_bytes(
+            101, read_text=read_text, list_pids=lambda _root: list(statuses)
+        )
+        is None
+    )
+
+
+def test_process_tree_rss_survives_cycles_and_unreadable_roots() -> None:
+    # Each process names the other as its parent, as a recycled PID can.
+    statuses = {
+        100: "PPid:\t101\nVmRSS:\t1 kB\n",
+        101: "PPid:\t100\nVmRSS:\t2 kB\n",
+    }
+
+    def read_text(path: Path) -> str:
+        pid = int(path.parent.name)
+        if pid not in statuses:
+            raise OSError("process exited")
+        return statuses[pid]
+
+    def listing(_root: Path) -> list[int]:
+        return [100, 101]
+
+    assert (
+        read_process_tree_rss_bytes(100, read_text=read_text, list_pids=listing)
+        == 3 * 1024
+    )
+    # A root that exited has no record, so nothing is measured.
+    assert (
+        read_process_tree_rss_bytes(555, read_text=read_text, list_pids=listing) is None
+    )
+    for invalid in (0, -4, True, "100"):
+        assert (
+            read_process_tree_rss_bytes(invalid, read_text=read_text, list_pids=listing)  # type: ignore[arg-type]
+            is None
+        )
+
+
 def test_process_tree_sampler_reports_unavailable_measurements() -> None:
+    # The sampling interval outlasts the test, so exactly the first and the
+    # closing samples are taken.
     with sample_process_tree_rss(
-        interval_seconds=1.0,
+        interval_seconds=3600.0,
         root_pid=123,
         reader=lambda _pid: None,
     ) as measurement:
@@ -64,21 +122,20 @@ def test_process_tree_sampler_reports_unavailable_measurements() -> None:
     assert observed.baseline_bytes is None
     assert observed.peak_bytes is None
     assert observed.incremental_peak_bytes is None
-    assert observed.sample_count >= 1
-    assert observed.sampling_error_count == observed.sample_count
+    assert observed.sample_count == observed.sampling_error_count == 1
+    assert observed.sample_interval_seconds == 3600.0
     assert observed.unavailable_reason == "process-tree RSS is unavailable"
+    final = measurement()
+    assert final.sample_count == final.sampling_error_count == 2
 
 
 def test_process_tree_sampler_preserves_baseline_and_sampled_peak() -> None:
-    readings = iter((100, 140, 120))
-
-    def reader(_pid: int) -> int:
-        return next(readings, 120)
+    readings = iter((100, 140))
 
     with sample_process_tree_rss(
-        interval_seconds=1.0,
+        interval_seconds=3600.0,
         root_pid=123,
-        reader=reader,
+        reader=lambda _pid: next(readings),
     ) as measurement:
         first = measurement()
         assert first.baseline_bytes == 100
@@ -88,6 +145,37 @@ def test_process_tree_sampler_preserves_baseline_and_sampled_peak() -> None:
     assert final.baseline_bytes == 100
     assert final.peak_bytes == 140
     assert final.incremental_peak_bytes == 40
+    assert (final.sample_count, final.sampling_error_count) == (2, 0)
+    assert final.unavailable_reason is None
+
+
+@pytest.mark.parametrize("bad_reading", [RuntimeError("proc unavailable"), -1, True])
+def test_process_tree_sampler_counts_failed_and_invalid_readings(bad_reading) -> None:
+    readings = iter((bad_reading, 300))
+
+    def reader(_pid: int) -> int:
+        reading = next(readings)
+        if isinstance(reading, Exception):
+            raise reading
+        return reading
+
+    with sample_process_tree_rss(
+        interval_seconds=3600.0, root_pid=123, reader=reader
+    ) as measurement:
+        pass
+
+    final = measurement()
+    # The failed first reading leaves the baseline to the next valid one.
+    assert (final.sample_count, final.sampling_error_count) == (2, 1)
+    assert (final.baseline_bytes, final.peak_bytes) == (300, 300)
+    assert final.incremental_peak_bytes == 0
+
+
+@pytest.mark.parametrize("interval", [0.0, -1.0])
+def test_process_tree_sampler_requires_a_positive_interval(interval) -> None:
+    with pytest.raises(ValueError, match="interval_seconds must be positive"):
+        with sample_process_tree_rss(interval_seconds=interval):
+            pass
 
 
 def _standard_descriptors() -> dict[int, tuple[int, int]]:

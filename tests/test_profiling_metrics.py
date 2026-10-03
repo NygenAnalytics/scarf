@@ -1,6 +1,5 @@
 import json
 import threading
-import time
 from dataclasses import asdict, fields
 
 from profiling.metrics import (
@@ -279,7 +278,13 @@ def test_background_sampler_observes_process_and_cgroup_peaks(tmp_path):
 
 
 def test_unavailable_and_protected_metrics_are_empty_not_errors(tmp_path):
+    listings = threading.Semaphore(0)
+
     def unavailable(*_args):
+        raise PermissionError("protected")
+
+    def protected_pids(*_args):
+        listings.release()
         raise PermissionError("protected")
 
     sampler = ResourceSampler(
@@ -289,9 +294,11 @@ def test_unavailable_and_protected_metrics_are_empty_not_errors(tmp_path):
         cgroupPath=tmp_path / "cgroup",
         readText=unavailable,
         writeText=unavailable,
-        listPids=unavailable,
+        listPids=protected_pids,
     ).start()
-    time.sleep(0.005)
+    # The baseline sample, then at least one background sample, hit the errors.
+    assert listings.acquire(timeout=5)
+    assert listings.acquire(timeout=5)
     result = sampler.stop()
 
     assert result.processTreeRssPeakBytes is None

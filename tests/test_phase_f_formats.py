@@ -1,5 +1,7 @@
 """Phase F format locks: ANN byte storage."""
 
+import hashlib
+
 import numpy as np
 import pytest
 import zarr
@@ -38,7 +40,10 @@ def test_save_ann_index_writes_exact_zarr_bytes() -> None:
     assert group["ann_idx_bytes"].attrs["metric"] == "l2"
     assert group["ann_idx_bytes"].attrs["dimensions"] == 4
     assert group["ann_idx_bytes"].attrs["element_count"] == 3
-    assert len(group["ann_idx_bytes"].attrs["payload_sha256"]) == 64
+    assert (
+        group["ann_idx_bytes"].attrs["payload_sha256"]
+        == hashlib.sha256(b"hnsw-bytes").hexdigest()
+    )
 
 
 @pytest.mark.parametrize("attribute", ["byte_length", "payload_sha256", "metric"])

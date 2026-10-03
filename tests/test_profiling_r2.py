@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from profiling.r2 import download_file, put_json, put_json_if_absent
@@ -11,9 +12,10 @@ def test_memory_store_put_get_roundtrip(monkeypatch):
         return store, "results/10000/createStore.json"
 
     monkeypatch.setattr("profiling.r2.open_r2_object", fake_open)
-    put_json("s3://bucket/results/10000/createStore.json", {"status": "ok"})
+    value = {"status": "ok", "seconds": 1.5, "label": "café", "stages": [1, 2]}
+    put_json("s3://bucket/results/10000/createStore.json", value)
     body = bytes(store.get("results/10000/createStore.json").bytes())
-    assert b'"status":"ok"' in body
+    assert json.loads(body) == value
 
 
 def test_put_json_if_absent_claims_once(monkeypatch):
@@ -28,7 +30,7 @@ def test_put_json_if_absent_claims_once(monkeypatch):
     assert put_json_if_absent(uri, {"runTag": "first"}) is True
     assert put_json_if_absent(uri, {"runTag": "second"}) is False
     body = bytes(store.get("results/e2e-claim.json").bytes())
-    assert b'"runTag":"first"' in body
+    assert json.loads(body) == {"runTag": "first"}
 
 
 def test_download_file_writes_concurrent_ranges(tmp_path: Path, monkeypatch) -> None:

@@ -16,7 +16,19 @@ from scarf.storage.artifact_writer import (
 from scarf.storage.artifacts import artifact_path, inspect_artifact
 
 
-def test_artifact_writer_streams_to_random_path_then_reuses_provenance() -> None:
+def test_artifact_writer_streams_to_random_path_then_reuses_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import scarf
+    import scarf.storage.artifact_writer as artifact_writer
+
+    # Each artifact the writer starts is stamped one tick later.
+    ticks = iter(range(1_000, 10_000, 1_000))
+    monkeypatch.setattr(
+        artifact_writer, "time", SimpleNamespace(time_ns=lambda: next(ticks))
+    )
     root = zarr.open_group(store=MemoryStore(), mode="w")
     arguments = {
         "scope": "assay",
@@ -35,8 +47,15 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance() -> None
     finish_artifact(group, planned)
     status = inspect_artifact(root, planned.ref)
     assert status.complete
-    assert status.created_at_ns is not None
-    assert status.scarf_version is not None
+    assert status.created_at_ns == 1_000
+    assert status.scarf_version == scarf.__version__
+    assert status.execution_options == {"batch_size": 100}
+    assert status.provenance == {
+        "operation": "run_normalization",
+        "parameters": {"log_transform": True},
+        "inputs": {"selection": {"artifact_id": "a" * 64}},
+    }
+    assert group.path == artifact_path(planned.ref)
     completed_attrs = dict(group.attrs)
 
     reused = plan_artifact(root, **arguments)
@@ -56,6 +75,8 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance() -> None
     refreshed_group = start_artifact(root, invalidated)
     refreshed_group.create_array("data", data=np.array([4.0, 5.0, 6.0]))
     finish_artifact(refreshed_group, invalidated)
+    assert inspect_artifact(root, invalidated.ref).created_at_ns == 2_000
+    # Both records match; the newer one is preferred.
     preferred = plan_artifact(root, **arguments)
     assert preferred.reused
     assert preferred.ref == invalidated.ref
@@ -156,15 +177,19 @@ def test_missing_required_attribute_prevents_reuse() -> None:
     group.create_array("data", data=np.array([1.0]))
     finish_artifact(group, first)
 
-    second = plan_artifact(
-        root,
-        **arguments,
-        required_arrays=("data",),
-        required_attributes=("reference_metadata",),
-    )
+    requirements = {
+        "required_arrays": ("data",),
+        "required_attributes": ("reference_metadata",),
+    }
+    second = plan_artifact(root, **arguments, **requirements)
 
     assert not second.reused
     assert second.ref != first.ref
+    # The same record with the attribute present is reused.
+    group.attrs["reference_metadata"] = {"method": "symphony"}
+    third = plan_artifact(root, **arguments, **requirements)
+    assert third.reused
+    assert third.ref == first.ref
 
 
 def test_invalid_required_attribute_type_prevents_reuse() -> None:
@@ -183,19 +208,15 @@ def test_invalid_required_attribute_type_prevents_reuse() -> None:
     group.attrs["reference_metadata"] = "invalid"
     finish_artifact(group, first)
 
-    second = plan_artifact(
-        root,
-        **arguments,
-        required_attributes=(
-            AttributeRequirement(
-                "reference_metadata",
-                expected_types=(dict,),
-            ),
-        ),
-    )
+    requirement = AttributeRequirement("reference_metadata", expected_types=(dict,))
+    second = plan_artifact(root, **arguments, required_attributes=(requirement,))
 
     assert not second.reused
     assert second.ref != first.ref
+    group.attrs["reference_metadata"] = {"method": "symphony"}
+    third = plan_artifact(root, **arguments, required_attributes=(requirement,))
+    assert third.reused
+    assert third.ref == first.ref
 
 
 def test_finish_rejects_payload_that_violates_declared_shape() -> None:
@@ -214,7 +235,9 @@ def test_finish_rejects_payload_that_violates_declared_shape() -> None:
     group = start_artifact(root, planned)
     group.create_array("data", data=np.array([1.0, 2.0]))
 
-    with pytest.raises(ValueError, match="does not satisfy"):
+    with pytest.raises(
+        ValueError, match="Artifact array 'data' does not satisfy its contract"
+    ):
         finish_artifact(group, planned)
 
     assert not inspect_artifact(root, planned.ref).complete

@@ -19,6 +19,7 @@ from scarf.mapping.artifact import (
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
 from scarf.storage.ann_index import ANN_INDEX_ARRAY
 from scarf.storage.artifacts import ArtifactRef, artifact_group
+from tests.test_mapping_reference import MappingStoreSource, build_mapping_store
 
 
 def _ref(
@@ -35,24 +36,28 @@ def _ref(
     )
 
 
-def _plain_reference(datastore):
-    graphs = datastore.list_artifacts(
-        kind="connectivity_map",
-        from_assay="RNA",
-        scope="assay",
-        complete_only=True,
+@pytest.fixture(scope="module")
+def mapping_source(tmp_path_factory) -> MappingStoreSource:
+    return build_mapping_store(
+        tmp_path_factory.mktemp("mapping_artifact") / "reference.zarr",
+        with_references=True,
     )
-    assert len(graphs) == 1
-    neighbors = ArtifactRef.from_dict(
-        datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
-    )
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    return datastore.get_mapping_reference(reference_ref)
 
 
-def test_reference_query_rejects_inconsistent_handles(analyzed_datastore_ephemeral):
-    reference = _plain_reference(analyzed_datastore_ephemeral)
-    assert _reference_available_k(reference) > 0
+@pytest.fixture
+def reference_store(mapping_source, tmp_path):
+    return mapping_source.open_copy(tmp_path / "reference.zarr")
+
+
+@pytest.fixture
+def reference(mapping_source, reference_store):
+    """The plain reference of a writable copy of the reference store."""
+    return reference_store.get_mapping_reference(mapping_source.reference)
+
+
+def test_reference_query_rejects_inconsistent_handles(reference):
+    # The reference neighbors were queried with k=5.
+    assert _reference_available_k(reference) == 5
     for changes, message in (
         ({"ref": replace(reference.ref, assay="other")}, "assay identity"),
         ({"feature_ids": reference.feature_ids[:-1]}, "feature dimensions"),
@@ -93,9 +98,8 @@ def test_reference_query_rejects_inconsistent_handles(analyzed_datastore_ephemer
     ],
 )
 def test_reference_query_rejects_corrupted_provenance(
-    analyzed_datastore_ephemeral, source, section, key, value, message
+    reference, source, section, key, value, message
 ):
-    reference = _plain_reference(analyzed_datastore_ephemeral)
     group = artifact_group(reference.datastore.zw, getattr(reference, source))
     provenance = dict(group.attrs["provenance"])
     provenance[section] = dict(provenance[section]) | {key: value}
@@ -105,9 +109,8 @@ def test_reference_query_rejects_corrupted_provenance(
 
 
 def test_reference_query_requires_the_recorded_ann_search_depth(
-    analyzed_datastore_ephemeral,
+    reference,
 ):
-    reference = _plain_reference(analyzed_datastore_ephemeral)
     group = artifact_group(reference.datastore.zw, reference.ann_index)
     provenance = dict(group.attrs["provenance"])
     parameters = dict(provenance["parameters"])
@@ -120,10 +123,7 @@ def test_reference_query_requires_the_recorded_ann_search_depth(
 
 
 @pytest.mark.parametrize("source", ["ref", "reduction", "ann_index", "neighbors"])
-def test_reference_query_rejects_incomplete_graph_chain(
-    analyzed_datastore_ephemeral, source
-):
-    reference = _plain_reference(analyzed_datastore_ephemeral)
+def test_reference_query_rejects_incomplete_graph_chain(reference, source):
     artifact_group(reference.datastore.zw, getattr(reference, source)).attrs[
         "complete"
     ] = False
@@ -132,10 +132,7 @@ def test_reference_query_rejects_incomplete_graph_chain(
 
 
 @pytest.mark.parametrize("payload", ["neighbors", "ann_index"])
-def test_reference_query_rejects_corrupted_payload(
-    analyzed_datastore_ephemeral, payload
-):
-    reference = _plain_reference(analyzed_datastore_ephemeral)
+def test_reference_query_rejects_corrupted_payload(reference, payload):
     group = artifact_group(reference.datastore.zw, getattr(reference, payload))
     if payload == "neighbors":
         group["distances"].resize((reference.selected_cell_count, 1))
@@ -273,11 +270,11 @@ def test_load_rejects_incomplete_input_set_and_pca_with_batch_correction() -> No
 
 @pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_write_and_load_reject_missing_payload_arrays_after_corruption(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
     array_name,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     group = artifact_group(datastore.zw, reference.ref)
     del group[array_name]
 
@@ -296,10 +293,10 @@ def test_write_and_load_reject_missing_payload_arrays_after_corruption(
 
 
 def test_mapping_reference_rejects_source_pca_without_fitted_center(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     del artifact_group(datastore.zw, reference.reduction)["center"]
 
     with pytest.raises(ValueError, match="no fitted center.*recompute PCA"):
@@ -309,10 +306,10 @@ def test_mapping_reference_rejects_source_pca_without_fitted_center(
 
 
 def test_load_rejects_versioned_metadata_and_bad_distance_summary(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     group = artifact_group(datastore.zw, reference.ref)
 
     metadata = dict(group.attrs["reference_metadata"])
@@ -338,10 +335,10 @@ def test_load_rejects_versioned_metadata_and_bad_distance_summary(
 
 
 def test_load_rejects_malformed_scoped_and_missing_input_refs(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     group = artifact_group(datastore.zw, reference.ref)
     original = dict(group.attrs["provenance"])
     original_inputs = dict(original["inputs"])
@@ -374,10 +371,10 @@ def test_load_rejects_malformed_scoped_and_missing_input_refs(
 
 
 def test_load_rejects_coordinate_chain_and_live_fingerprint_mismatches(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     ann_group = artifact_group(datastore.zw, reference.ann_index)
     original_ann_provenance = dict(ann_group.attrs["provenance"])
     ann_provenance = dict(original_ann_provenance)
@@ -402,10 +399,10 @@ def test_load_rejects_coordinate_chain_and_live_fingerprint_mismatches(
 
 
 def test_load_rejects_metadata_model_and_payload_tampering(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     group = artifact_group(datastore.zw, reference.ref)
     original_metadata = dict(group.attrs["reference_metadata"])
 
@@ -649,10 +646,10 @@ def _edit_provenance(group, section, key, value) -> None:
 
 
 def test_load_rejects_each_tampered_graph_chain_record(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
 ) -> None:
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     reduction_status = datastore.inspect_artifact(reference.reduction)
     groups = {
         "reference": artifact_group(datastore.zw, reference.ref),
@@ -693,13 +690,13 @@ def test_load_rejects_each_tampered_graph_chain_record(
 
 
 def test_load_rejects_each_inconsistent_reference_record(
-    analyzed_datastore_ephemeral,
+    reference_store,
+    reference,
     monkeypatch,
 ) -> None:
     import scarf.mapping.artifact as artifact_module
 
-    datastore = analyzed_datastore_ephemeral
-    reference = _plain_reference(datastore)
+    datastore = reference_store
     group = artifact_group(datastore.zw, reference.ref)
     normalized_group = artifact_group(
         datastore.zw,
@@ -771,3 +768,59 @@ def test_load_rejects_each_inconsistent_reference_record(
     data.resize((data.shape[0], data.shape[1] + 1))
     with pytest.raises(ValueError, match="PCA coordinates do not match"):
         load_artifact_mapping_reference(datastore, reference.ref)
+
+
+def test_binding_rejects_handles_that_differ_from_their_stored_artifact(
+    reference_store,
+    reference,
+) -> None:
+    from scarf.mapping.artifact import validate_mapping_reference_binding
+
+    mismatch = "does not match its stored artifact"
+    assert validate_mapping_reference_binding(reference) is reference
+    with pytest.raises(TypeError, match="reference must be a MappingReference"):
+        validate_mapping_reference_binding(object())  # type: ignore[arg-type]
+
+    # Forged handles name another artifact kind or carry metadata that has no
+    # canonical form.
+    for changes in (
+        {"ref": replace(reference.ref, kind="projection")},
+        {"metadata": dict(reference.metadata) | {"unserializable": object()}},
+    ):
+        with pytest.raises(ValueError, match=mismatch):
+            validate_mapping_reference_binding(replace(reference, **changes))
+
+    # A record changed after loading rejects the handle loaded before it.
+    group = artifact_group(reference_store.zw, reference.ref)
+    provenance = group.attrs["provenance"]
+    metadata = group.attrs["reference_metadata"]
+    for name, value in (
+        ("provenance", {**provenance, "operation": "rebuild_mapping_reference"}),
+        ("provenance", {**provenance, "parameters": {"method": "umap"}}),
+        ("reference_metadata", ["not", "a", "mapping"]),
+        (
+            "reference_metadata",
+            {key: value for key, value in metadata.items() if key != "assay"},
+        ),
+    ):
+        group.attrs[name] = value
+        try:
+            with pytest.raises(ValueError, match=mismatch):
+                validate_mapping_reference_binding(reference)
+        finally:
+            group.attrs["provenance"] = provenance
+            group.attrs["reference_metadata"] = metadata
+    assert validate_mapping_reference_binding(reference) is reference
+
+
+def test_label_reads_reject_a_handle_with_another_cell_count(reference) -> None:
+    labels, usable = reference._fetch_cell_labels("ids")
+    np.testing.assert_array_equal(labels, reference.fetch_cell_column("ids"))
+    assert usable.all()
+
+    forged = replace(reference, selected_cell_count=reference.selected_cell_count + 1)
+    # Label reads skip the binding check, so the selection size guards them.
+    with pytest.raises(ValueError, match="selected reference cell count has changed"):
+        forged._fetch_cell_labels("ids")
+    with pytest.raises(ValueError, match="does not match its stored artifact"):
+        forged.fetch_cell_column("ids")

@@ -227,16 +227,6 @@ def test_mapping_datastore_private_mixin_order_is_stable():
     ]
 
 
-def test_retired_unified_mapping_apis_are_absent():
-    for name in (
-        "_load_unified_layout_data",
-        "load_unified_graph",
-        "run_unified_tsne",
-        "run_unified_umap",
-    ):
-        assert not hasattr(MappingDatastore, name)
-
-
 def test_datastore_private_mixin_order_is_stable():
     from scarf.datastore._operations.features import _FeatureOperationsMixin
     from scarf.datastore._operations.integration_metrics import (

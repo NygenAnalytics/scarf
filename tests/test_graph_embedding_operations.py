@@ -301,6 +301,8 @@ def test_densmap_records_its_revision_and_reuses_without_reading_neighbors(
     assert parameters["densmap_algorithm_version"] == DENSMAP_ALGORITHM_VERSION
     values = store.load_artifact(densmap)["values"][:]
     assert np.all(np.isfinite(values))
+    # The density term changes the layout from the same start and seed.
+    assert not np.allclose(values, store.load_artifact(standard)["values"][:])
 
     def fail(*_args, **_kwargs):
         raise AssertionError("reused densMAP must not load neighbor distances")

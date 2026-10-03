@@ -133,6 +133,24 @@ def test_paris_python_contraction_group_kernel_rejects_overlapping_pair() -> Non
         )
 
 
+def test_paris_height_kernel_raises_merges_to_their_child_heights() -> None:
+    # Merge 1 joins leaf 2 and merge 0 (node 4); merge 2 joins leaf 3 and
+    # merge 1 (node 5), so raised heights propagate up the chain.
+    children = np.array([[0, 1], [2, 4], [3, 5]], dtype=np.int64)
+
+    for kernel in (
+        paris_core._raise_to_child_heights,
+        paris_core._raise_to_child_heights.py_func,
+    ):
+        heights = np.array([0.5, 0.4, 0.45])
+        kernel(children, heights, 4)
+        np.testing.assert_array_equal(heights, [0.5, 0.5, 0.5])
+
+        monotone = np.array([0.1, 0.2, 0.3])
+        kernel(children, monotone, 4)
+        np.testing.assert_array_equal(monotone, [0.1, 0.2, 0.3])
+
+
 def test_csr_symmetry_kernel_reports_each_failure_mode() -> None:
     valid = csr_matrix(np.array([[0.0, 1.0], [1.0, 0.0]]))
     self_loop = csr_matrix(np.array([[1.0, 0.0], [0.0, 0.0]]))
@@ -241,13 +259,25 @@ def test_paris_python_offline_lca_kernel_reports_invalid_component_and_lca() -> 
     assert error == 2
 
 
-def test_fate_python_weight_kernel_matches_compiled_kernel() -> None:
-    assert fate._log_biased_weight.py_func(2.0, -1.0, 10.0) == (
-        fate._log_biased_weight(2.0, -1.0, 10.0)
-    )
-    assert fate._log_biased_weight.py_func(2.0, 0.5, 10.0) == (
-        fate._log_biased_weight(2.0, 0.5, 10.0)
-    )
+@pytest.mark.parametrize(
+    ("difference", "beta", "expected"),
+    [
+        # Edges that do not move backward in pseudotime keep their weight.
+        (-1.0, 10.0, np.log(2.0)),
+        (0.0, 10.0, np.log(2.0)),
+        (0.5, 0.0, np.log(2.0)),
+        # Backward edges are scaled by 2 / (1 + exp(beta * difference)).
+        (0.5, 10.0, np.log(2.0 * 2.0 / (1.0 + np.exp(5.0)))),
+        (100.0, 10.0, np.log(2.0 * 2.0) - 1000.0),
+    ],
+)
+def test_fate_python_weight_kernel_matches_compiled_kernel(
+    difference, beta, expected
+) -> None:
+    python = fate._log_biased_weight.py_func(2.0, difference, beta)
+
+    assert python == fate._log_biased_weight(2.0, difference, beta)
+    assert python == pytest.approx(expected, rel=1e-12)
 
 
 def test_fate_python_row_bias_kernel_handles_self_loops_underflow_and_isolates() -> (
@@ -452,6 +482,27 @@ def test_aucell_python_block_kernel_matches_compiled_kernel() -> None:
 
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(actual[1], [0.0, 0.0, 0.0])
+
+    def recovery_auc(row: np.ndarray, n_up: int = 3) -> list[float]:
+        """Area under each set's recovery curve over the top ``n_up`` ranks.
+
+        Ranks follow decreasing permuted values, ties in permuted order, and
+        the area is divided by that of a set holding the top-ranked features.
+        """
+        ranks = np.empty(len(row), dtype=np.int64)
+        ranks[np.argsort(-row[permutation].astype(float), kind="stable")] = (
+            np.arange(len(row)) + 1
+        )
+        scores = []
+        for start, size in zip(starts, offsets, strict=True):
+            members = ranks[connections[start : start + size]]
+            found = sum(int(np.sum(members <= top)) for top in range(1, n_up))
+            best = sum(min(top, size) for top in range(1, n_up))
+            scores.append(found / best)
+        return scores
+
+    np.testing.assert_allclose(actual[0], recovery_auc(matrix[0]), rtol=1e-15)
+    np.testing.assert_allclose(actual[2], recovery_auc(matrix[2]), rtol=1e-15)
 
 
 def test_connectivity_python_union_find_kernels_cover_all_edge_cases() -> None:

@@ -144,11 +144,6 @@ def test_plot_accessor_surface_matches_store_first_plotting_exports():
     assert store_first_exports == set(_STORE_PLOT_METHODS)
 
 
-def test_unified_plot_accessor_is_absent():
-    assert "unified_embedding" not in splt.__all__
-    assert not hasattr(DataStorePlotAccessor, "unified_embedding")
-
-
 @pytest.mark.parametrize("name", _STORE_PLOT_METHODS)
 def test_plot_accessor_signatures_match_standalone_functions(name: str):
     standalone = getattr(splt, name)
@@ -315,180 +310,330 @@ def test_plot_accessor_forwards_to_canonical_function(
     assert calls == [(tuple(expected_args), expected_kwargs)]
 
 
-def test_embedding_run_adapter_uses_exact_outputs_and_frozen_fields(
+class _RunHarness:
+    """A run-backed accessor whose canonical plots record their calls."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import scarf.datastore._plot_accessor as plot_accessor_module
+
+        self.layout = _EMBEDDING_REF
+        clusters = ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="cluster_cut",
+            artifact_id="1" * 64,
+        )
+        self.owner = type("Owner", (), {"zw": object()})()
+        self.frozen_cells = type(
+            "FrozenCells", (), {"columns": ("sample_id", "clusters")}
+        )()
+        harness = self
+
+        class FakeRun:
+            assay = "RNA"
+            cells = harness.frozen_cells
+
+            def __init__(self) -> None:
+                self._owner = harness.owner
+                self._outputs = {"umap": harness.layout, "clusters": clusters}
+
+            def __contains__(self, key: object) -> bool:
+                return key in self._outputs
+
+            def __getitem__(self, key: str) -> ArtifactRef:
+                return self._outputs[key]
+
+        self.run_type = FakeRun
+        self.calls: list[tuple[str, object, dict[str, Any]]] = []
+        self.defaults: dict[str, dict[str, Any]] = {}
+        monkeypatch.setattr(plot_accessor_module, "PipelineRun", FakeRun)
+        for name in ("embedding", "embedding_raster"):
+            parameters = inspect.signature(getattr(splt, name)).parameters
+            self.defaults[name] = {
+                parameter.name: parameter.default
+                for parameter in list(parameters.values())[1:]
+            }
+            monkeypatch.setattr(splt, name, self._recorder(name))
+        self.accessor = DataStorePlotAccessor(self.owner)  # type: ignore[arg-type]
+        self.run = FakeRun()
+
+    def _recorder(self, name: str) -> Callable[..., object]:
+        def canonical(store: object, **kwargs: Any) -> object:
+            self.calls.append((name, store, kwargs))
+            return object()
+
+        return canonical
+
+
+@pytest.mark.parametrize("name", ["embedding", "embedding_raster"])
+def test_run_plots_forward_frozen_cells_and_the_named_output(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+):
+    harness = _RunHarness(monkeypatch)
+    method = getattr(harness.accessor, name)
+
+    for color_by in ("sample_id", "clusters", None):
+        method(run=harness.run, layout="umap", color_by=color_by, show=False)
+        called, proxy, kwargs = harness.calls.pop()
+        expected = dict(harness.defaults[name])
+        expected.update(layout=harness.layout, color_by=color_by, show=False)
+        assert called == name
+        assert kwargs == expected
+        assert proxy is not harness.owner
+        assert proxy._defaultAssay == "RNA"
+        assert proxy.zw is harness.owner.zw
+        assert proxy.cells._cells is harness.frozen_cells
+
+    method(run=harness.run, color_by="sample_id", show=False)
+    _, _, kwargs = harness.calls.pop()
+    assert kwargs["layout"] == harness.layout
+    assert harness.calls == []
+
+
+@pytest.mark.parametrize("name", ["embedding", "embedding_raster"])
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        (
+            {"layout": _EMBEDDING_REF},
+            ValueError,
+            "run is mutually exclusive with layout_key or an ArtifactRef layout",
+        ),
+        (
+            {"layout": "umap", "layout_key": "RNA_UMAP"},
+            ValueError,
+            "run is mutually exclusive with layout_key or an ArtifactRef layout",
+        ),
+        (
+            {"layout": "umap", "color_by": "live_only"},
+            KeyError,
+            "Pipeline run has no frozen cell field 'live_only'",
+        ),
+        (
+            {"layout": "umap", "color_by": "umap"},
+            KeyError,
+            "Pipeline run has no frozen cell field 'umap'",
+        ),
+        (
+            {"layout": "umap", "color_by": _EMBEDDING_REF},
+            TypeError,
+            "color_by must name a frozen cell field or be None",
+        ),
+        (
+            {"layout": "umap", "color_by": splt.CellField("sample_id")},
+            TypeError,
+            "color_by must name a frozen cell field or be None",
+        ),
+        ({"layout": 3}, TypeError, "layout must name a pipeline output"),
+    ],
+)
+def test_run_plots_reject_ambiguous_layouts_and_unfrozen_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    kwargs: dict[str, Any],
+    error: type[Exception],
+    message: str,
+):
+    harness = _RunHarness(monkeypatch)
+
+    with pytest.raises(error) as raised:
+        getattr(harness.accessor, name)(run=harness.run, show=False, **kwargs)
+
+    assert raised.value.args == (message,)
+    assert harness.calls == []
+
+
+@pytest.mark.parametrize("name", ["embedding", "embedding_raster"])
+def test_run_plots_require_a_run_opened_from_this_datastore(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+):
+    harness = _RunHarness(monkeypatch)
+    method = getattr(harness.accessor, name)
+    foreign = harness.run_type()
+    foreign._owner = object()
+
+    with pytest.raises(TypeError, match="^run must be a PipelineRun$"):
+        method(run=object(), layout="umap", show=False)
+    with pytest.raises(ValueError, match="^run must be opened from this datastore$"):
+        method(run=foreign, layout="umap", show=False)
+    with pytest.raises(TypeError, match="^String layout names require a pipeline run$"):
+        method(layout="umap", show=False)
+    assert harness.calls == []
+
+
+_LIVE_ONLY_MESSAGE = (
+    "Run embedding uses frozen layout and color outputs; live selection, "
+    "feature, facet, and subset inputs are unavailable"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs", "message"),
+    [
+        ("embedding", {"cell_key": "filtered"}, _LIVE_ONLY_MESSAGE),
+        ("embedding", {"from_assay": "ADT"}, _LIVE_ONLY_MESSAGE),
+        (
+            "embedding",
+            {"normalization": splt.NormalizationSpec()},
+            _LIVE_ONLY_MESSAGE,
+        ),
+        ("embedding", {"point_sizes": [1.0, 2.0]}, _LIVE_ONLY_MESSAGE),
+        ("embedding", {"facet_by": "sample_id"}, _LIVE_ONLY_MESSAGE),
+        ("embedding", {"facet_order": ["s1"]}, _LIVE_ONLY_MESSAGE),
+        ("embedding", {"subset_by": "sample_id"}, _LIVE_ONLY_MESSAGE),
+        (
+            "embedding",
+            {"density_overlay": splt.DensityOverlay(group_by="sample_id")},
+            "Run embedding density filters cannot use live metadata",
+        ),
+        (
+            "embedding",
+            {"highlight": splt.Highlight(by="sample_id", groups=("s1",))},
+            "Run embedding highlights cannot use live metadata",
+        ),
+        (
+            "embedding_raster",
+            {"cell_key": "filtered"},
+            "Run raster uses the frozen pipeline cell selection",
+        ),
+    ],
+)
+def test_run_plots_reject_live_only_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    kwargs: dict[str, Any],
+    message: str,
+):
+    harness = _RunHarness(monkeypatch)
+
+    with pytest.raises(ValueError) as raised:
+        getattr(harness.accessor, name)(
+            run=harness.run,
+            layout="umap",
+            show=False,
+            **kwargs,
+        )
+
+    assert raised.value.args == (message,)
+    assert harness.calls == []
+
+
+def test_run_embedding_forwards_overlays_that_need_no_live_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    import scarf.datastore._plot_accessor as plot_accessor_module
+    harness = _RunHarness(monkeypatch)
+    overlay = splt.DensityOverlay()
+    highlight = splt.Highlight(indices=(0, 2))
 
-    layout = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="embedding",
-        artifact_id="f" * 64,
-    )
-    clusters = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="cluster_cut",
-        artifact_id="1" * 64,
-    )
-    owner = type("Owner", (), {"zw": object()})()
-    frozen_cells = type("FrozenCells", (), {"columns": ("sample_id", "clusters")})()
-
-    class FakeRun:
-        assay = "RNA"
-        cells = frozen_cells
-
-        def __init__(self) -> None:
-            self._owner = owner
-            self._outputs = {"umap": layout, "clusters": clusters}
-
-        def __contains__(self, key: object) -> bool:
-            return key in self._outputs
-
-        def __getitem__(self, key: str) -> ArtifactRef:
-            return self._outputs[key]
-
-    calls: list[tuple[object, dict[str, Any]]] = []
-
-    def canonical(store: object, **kwargs: Any) -> object:
-        calls.append((store, kwargs))
-        return object()
-
-    monkeypatch.setattr(plot_accessor_module, "PipelineRun", FakeRun)
-    monkeypatch.setattr(splt, "embedding", canonical)
-    accessor = DataStorePlotAccessor(owner)  # type: ignore[arg-type]
-    run = FakeRun()
-
-    accessor.embedding(
-        run=run,  # type: ignore[arg-type]
+    harness.accessor.embedding(
+        run=harness.run,
         layout="umap",
-        color_by="sample_id",
+        density_overlay=overlay,
+        highlight=highlight,
         show=False,
     )
-    proxy, kwargs = calls.pop()
-    assert proxy is not owner
-    assert proxy.zw is owner.zw
-    assert proxy.cells._cells is frozen_cells
-    assert kwargs["layout"] == layout
-    assert kwargs["color_by"] == "sample_id"
 
-    accessor.embedding(
-        run=run,  # type: ignore[arg-type]
-        layout="umap",
-        color_by=None,
-        show=False,
+    (_, _, kwargs) = harness.calls.pop()
+    assert kwargs["density_overlay"] is overlay
+    assert kwargs["highlight"] is highlight
+
+
+def _variadic_positional(self, *values):
+    return values
+
+
+def _positional_only(self, value, /):
+    return value
+
+
+@pytest.mark.parametrize(
+    ("method", "description"),
+    [
+        (_variadic_positional, "variadic positional"),
+        (_positional_only, "positional-only"),
+    ],
+)
+def test_forwarding_layout_rejects_parameters_it_cannot_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    method: Callable[..., Any],
+    description: str,
+):
+    from scarf.datastore._plot_accessor import _forwarding_layout
+
+    monkeypatch.setattr(
+        DataStorePlotAccessor,
+        "_unforwardable",
+        method,
+        raising=False,
     )
-    _, kwargs = calls.pop()
-    assert kwargs["color_by"] is None
 
-    accessor.embedding(
-        run=run,  # type: ignore[arg-type]
-        layout="umap",
-        color_by="clusters",
-        show=False,
+    with pytest.raises(TypeError) as raised:
+        _forwarding_layout("_unforwardable")
+
+    assert raised.value.args == (
+        f"_unforwardable() has an unsupported {description} parameter",
     )
-    _, kwargs = calls.pop()
-    assert kwargs["layout"] == layout
-    assert kwargs["color_by"] == "clusters"
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        accessor.embedding(
-            run=run,  # type: ignore[arg-type]
-            layout=layout,
-            show=False,
-        )
-    with pytest.raises(KeyError, match="no frozen cell field"):
-        accessor.embedding(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by="live_only",
-            show=False,
-        )
-    with pytest.raises(KeyError, match="no frozen cell field"):
-        accessor.embedding(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by="umap",
-            show=False,
-        )
-
-    monkeypatch.setattr(splt, "embedding_raster", canonical)
-    accessor.embedding_raster(
-        run=run,  # type: ignore[arg-type]
-        layout="umap",
-        color_by="sample_id",
-        show=False,
-    )
-    proxy, kwargs = calls.pop()
-    assert proxy is not owner
-    assert proxy.zw is owner.zw
-    assert proxy.cells._cells is frozen_cells
-    assert kwargs["layout"] == layout
-    assert kwargs["color_by"] == "sample_id"
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        accessor.embedding_raster(
-            run=run,  # type: ignore[arg-type]
-            layout=layout,
-            show=False,
-        )
-    with pytest.raises(KeyError, match="no frozen cell field"):
-        accessor.embedding_raster(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by="live_only",
-            show=False,
-        )
-    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
-        accessor.embedding(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by=layout,
-            show=False,
-        )
-    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
-        accessor.embedding_raster(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by=layout,
-            show=False,
-        )
-    with pytest.raises(TypeError, match="color_by must name a frozen cell field"):
-        accessor.embedding_raster(
-            run=run,  # type: ignore[arg-type]
-            layout="umap",
-            color_by=splt.CellField("sample_id"),
-            show=False,
-        )
-
-    accessor.embedding(run=run, color_by="sample_id", show=False)  # type: ignore[arg-type]
-    _, kwargs = calls.pop()
-    assert kwargs["layout"] == layout
-    with pytest.raises(TypeError, match="layout must name a pipeline output"):
-        accessor.embedding(run=run, layout=3, show=False)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="run must be a PipelineRun"):
-        accessor.embedding(run=object(), layout="umap", show=False)  # type: ignore[arg-type]
-    foreign = FakeRun()
-    foreign._owner = object()
-    with pytest.raises(ValueError, match="opened from this datastore"):
-        accessor.embedding(run=foreign, layout="umap", show=False)  # type: ignore[arg-type]
 
 
 def test_frozen_run_plot_cells_fetch_selected_rows_of_the_run() -> None:
-    from scarf.datastore._plot_accessor import _FrozenRunPlotCells
+    from scarf.datastore._plot_accessor import _FrozenRunPlotCells, _FrozenRunPlotStore
+
+    selection = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="3" * 64,
+    )
+    display = {"kind": "categorical", "categories": []}
+    blocks = object()
 
     class CompactCells:
-        columns = ("clusters",)
+        columns = ["clusters", "score"]
+        _selection_ref = selection
 
         def _plot_fetch_selected(self, column: str) -> np.ndarray:
             assert column == "clusters"
             return np.asarray([0, 1])
 
-    cells = _FrozenRunPlotCells(CompactCells())
+        def _plot_fetch_all(self, column: str) -> list[int]:
+            assert column == "clusters"
+            return [5, 0, 1]
+
+        def _field_dtype(self, column: str) -> np.dtype:
+            return {"clusters": np.dtype("int32"), "score": np.dtype("float32")}[column]
+
+        def _field_display(self, column: str) -> dict[str, Any] | None:
+            return display if column == "clusters" else None
+
+        def _iter_selected_blocks(self, columns, block_rows):
+            assert (tuple(columns), block_rows) == (("score",), 2)
+            return blocks
+
+    compact = CompactCells()
+    cells = _FrozenRunPlotCells(compact)
+
+    assert cells.columns == ("clusters", "score")
+    assert cells._selection_ref is selection
     np.testing.assert_array_equal(cells.fetch("clusters"), [0, 1])
+    fetched_all = cells.fetch_all("clusters")
+    assert isinstance(fetched_all, np.ndarray)
+    np.testing.assert_array_equal(fetched_all, [5, 0, 1])
+    assert cells.get_dtype("clusters") == np.dtype("int32")
+    assert cells.get_dtype("score") == np.dtype("float32")
+    assert cells._field_display("clusters") is display
+    assert cells._field_display("score") is None
+    assert cells._iter_selected_blocks(["score"], 2) is blocks
     with pytest.raises(ValueError, match="frozen pipeline cell selection"):
         cells.fetch("clusters", key="filtered")
+
+    owner = type("Owner", (), {"zw": object()})()
+    store = _FrozenRunPlotStore(owner, assay="ADT", cells=compact)  # type: ignore[arg-type]
+    assert store._defaultAssay == "ADT"
+    assert store.zw is owner.zw
+    assert store.cells._cells is compact
+    assert store._stored_display_metadata("clusters") is display
+    assert store._stored_display_metadata("score") is None
 
 
 def test_selected_metadata_column_uses_frozen_fetch_or_full_axis_fallback() -> None:

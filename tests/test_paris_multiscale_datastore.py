@@ -912,6 +912,8 @@ def test_topacedo_rejects_non_cut_artifact() -> None:
     [
         ({"n_clusters": True}, TypeError, "integer or 'auto'"),
         ({"n_clusters": np.bool_(True)}, TypeError, "integer or 'auto'"),
+        ({"n_clusters": 2.0}, TypeError, "integer or 'auto'"),
+        ({"n_clusters": None}, TypeError, "integer or 'auto'"),
         ({"n_clusters": "unknown"}, ValueError, "integer or 'auto'"),
         ({"n_clusters": 0}, ValueError, "positive"),
         ({"n_clusters": 15}, ValueError, "graph size"),
@@ -949,6 +951,9 @@ def test_run_paris_clustering_accepts_numpy_integer_cut_parameters() -> None:
 
     assert fixed.n_clusters == 2
     assert adaptive.labels.shape == (14,)
+    # NumPy integers record the same cut identities as Python integers.
+    assert _run_paris(store, n_clusters=2).ref == fixed.ref
+    assert _run_paris(store, min_cluster_size=2).ref == adaptive.ref
 
 
 def test_unreadable_reused_hierarchy_fails_closed() -> None:
@@ -1078,7 +1083,10 @@ def test_tied_clique_graph_supports_fixed_and_adaptive_cuts() -> None:
 
     assert fixed.n_clusters == 2
     assert np.unique(fixed.labels).size == 2
-    assert adaptive.labels.shape == (n_cells,)
+    # Every merge of a clique ties, so the adaptive cut sees one multiway event
+    # of single cells and keeps the clique whole.
+    assert adaptive.n_clusters == 1
+    assert adaptive.labels.tolist() == [1] * n_cells
 
 
 @pytest.mark.parametrize("recorded_count", [3, 0, True, "2"])
@@ -1306,3 +1314,104 @@ def test_clustering_rejects_non_graph_references(method: str) -> None:
 
     assert _artifacts(store, "cluster_hierarchy") == []
     assert store.load_graph_calls == 0
+
+
+def _tamper_provenance(
+    store: _Store, ref: ArtifactRef, section: str, **changes
+) -> None:
+    group = store.zw[artifact_path(ref)]
+    provenance = dict(group.attrs["provenance"])
+    values = dict(provenance[section])
+    for name, value in changes.items():
+        if value is None:
+            values.pop(name, None)
+        else:
+            values[name] = value
+    provenance[section] = values
+    group.attrs["provenance"] = provenance
+
+
+def test_clustering_requires_a_complete_graph_reference() -> None:
+    store = _Store(_block_graph())
+
+    with pytest.raises(TypeError, match="graph must be an ArtifactRef"):
+        store.run_paris_clustering(artifact_path(store.graph_ref))
+    store.zw[store.graph_loc].attrs["complete"] = False
+    with pytest.raises(ValueError, match="Graph artifact is unavailable or incomplete"):
+        store.run_paris_clustering(store.graph_ref)
+    assert store.load_graph_calls == 0
+
+
+def test_load_paris_clustering_validates_the_cut_reference_and_record() -> None:
+    store = _Store(_block_graph())
+    cut = _run_paris(store, min_cluster_size=2).ref
+    assert cut is not None
+
+    with pytest.raises(TypeError, match="ref must be an ArtifactRef"):
+        store.load_paris_clustering(artifact_path(cut))
+    with pytest.raises(ValueError, match="ref must be a cluster_cut artifact"):
+        store.load_paris_clustering(store.graph_ref)
+
+    _tamper_provenance(store, cut, "parameters", mode="manual")
+    with pytest.raises(ValueError, match="Paris cut mode is invalid"):
+        store.load_paris_clustering(cut)
+    _tamper_provenance(store, cut, "parameters", mode="auto")
+    _tamper_provenance(store, cut, "inputs", cluster_hierarchy=None)
+    with pytest.raises(
+        ArtifactResolutionError, match="does not name its hierarchy"
+    ) as err:
+        store.load_paris_clustering(cut)
+    assert err.value.code == "corrupt_payload"
+    store.zw[artifact_path(cut)].attrs["complete"] = False
+    with pytest.raises(
+        ValueError, match="Paris cut artifact is unavailable or invalid"
+    ):
+        store.load_paris_clustering(cut)
+
+
+@pytest.mark.parametrize(
+    ("damage", "error", "message"),
+    [
+        ("not_a_ref", TypeError, "clusters must be an ArtifactRef"),
+        ("incomplete", ArtifactResolutionError, "complete Paris cluster_cut"),
+        ("other_graph", ValueError, "does not belong to the requested graph"),
+        ("other_cells", ValueError, "does not match the graph cell selection"),
+        ("no_hierarchy", ArtifactResolutionError, "does not name its Paris hierarchy"),
+        ("short_labels", ValueError, "Cluster labels contain 13 cells while graph"),
+    ],
+)
+def test_topacedo_rejects_a_cut_that_does_not_match_its_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    store = _Store(_block_graph())
+    cut = _run_paris(store, min_cluster_size=2).ref
+    assert cut is not None
+    if damage == "not_a_ref":
+        cut = artifact_path(cut)
+    elif damage == "incomplete":
+        store.zw[artifact_path(cut)].attrs["complete"] = False
+    elif damage == "other_graph":
+        other = store.add_integrated_graph("other", _block_graph())
+        cut = store.run_paris_clustering(other, min_cluster_size=2)
+    elif damage == "other_cells":
+        other_cells = ArtifactRef(
+            scope="datastore", kind="cell_selection", artifact_id=new_artifact_id()
+        )
+        _tamper_provenance(store, cut, "inputs", cell_selection=other_cells.to_dict())
+    elif damage == "no_hierarchy":
+        _tamper_provenance(store, cut, "inputs", cluster_hierarchy=None)
+    else:
+        store.zw[artifact_path(cut)].create_array(
+            "labels", data=np.ones(13, dtype=np.int32), overwrite=True
+        )
+    constructed: list[int] = []
+    _install_topacedo(monkeypatch, constructed)
+
+    with pytest.raises(error, match=message):
+        _run_topacedo(store, cut)
+
+    assert constructed == []
+    assert _artifacts(store, "sampling") == []

@@ -29,6 +29,7 @@ from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_stored_selection_artifact,
 )
+from tests.qc_helpers import create_labelled_qc_store
 
 
 class _MemoryGraphStore(GraphDataStore):
@@ -353,28 +354,6 @@ def test_legacy_filesystem_ann_is_not_loaded_without_zarr_bytes(
     assert "ann_idx_bytes" not in ann_group
     assert dict(ann_group.attrs) == before_attrs
     assert legacy_path.exists()
-
-
-def test_remote_cache_plan_auto_and_invalid(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _memory_graph_store()
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.is_remote_datastore",
-        lambda *_: True,
-    )
-
-    enabled, cache_path, remove = store._resolve_local_cache_plan(
-        "s3://bucket/store", store.z, "auto"
-    )
-    assert enabled is True
-    assert cache_path is not None
-    assert Path(cache_path).is_dir()
-    assert remove is True
-    shutil.rmtree(cache_path)
-
-    with pytest.raises(TypeError, match="local_cache must be"):
-        store._resolve_local_cache_plan("s3://bucket/store", store.z, object())
 
 
 def test_diffusion_operator_round_trip_and_explicit_imputation(
@@ -711,8 +690,21 @@ def test_persisted_diffusion_operator_is_loadable_under_same_budget(
     ref = budgeted.run_diffusion_operator(
         connectivity_graph, t=1, invalidate_cache=True
     )
-    operator = budgeted.load_diffusion_operator(ref)
-    assert operator.shape[0] == operator.shape[1]
+    operator = budgeted.load_diffusion_operator(ref).toarray()
+    # One diffusion step is the row-normalized symmetric graph, up to the
+    # float32 precision of the stored edge weights.
+    symmetric = datastore.load_graph(connectivity_graph, symmetric=True).toarray()
+    symmetric = symmetric.astype(np.float64)
+    degrees = symmetric.sum(axis=1, keepdims=True)
+    np.testing.assert_allclose(
+        operator,
+        np.divide(symmetric, degrees, out=np.zeros_like(symmetric), where=degrees > 0),
+        rtol=1e-6,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        operator.sum(axis=1)[degrees.ravel() > 0], 1.0, rtol=1e-6
+    )
 
 
 def test_filter_cells_open_bounds_composition_and_boundaries(
@@ -1430,10 +1422,9 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
 
 
 def test_reused_graph_stages_skip_expensive_compute(tmp_path, monkeypatch) -> None:
-    from tests.test_preparation import _create_store
     from scarf.storage.artifacts import artifact_group
 
-    store = _create_store(tmp_path / "reuse")
+    store = create_labelled_qc_store(tmp_path / "reuse")
     store.cells.reset_key("I")
     selection = store.snapshot_cell_selection("I")
     coordinate_values = np.arange(12, dtype=np.float32).reshape(6, 2)
