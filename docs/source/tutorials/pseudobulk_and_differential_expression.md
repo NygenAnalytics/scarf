@@ -11,40 +11,23 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (pseudobulk_and_differential_expression)=
 
-# Pseudobulk and differential expression
+# Pseudobulk and Differential Expression (DE) Primer
 
-To compare conditions, we need independent biological samples. Here each sample is a donor.
-This tutorial sums raw counts from γδ T cells into one column per donor, keeps the matched
-study design, and exports the result for a method such as edgeR or DESeq2.
-
-Scarf performs the aggregation and export. It does not fit the differential expression model on
-this page. The main Scarf step is `ds.make_bulk("donor_id", aggr_type="sum", ...)`.
-The preparation below identifies which cells and donors belong in that comparison.
+To compare gene expression changes across conditions, we need independent biological samples in each group. Pseudobulking works for single-cell RNA sequencing data because summing raw counts within each donor produces donor-level count data that mirrors bulk RNA-seq count data. Testing for differential expression tells us which genes change between conditions, pointing to the programs driving disease or response. Without it, we can describe what genes are present and potentially driving an effect, but not what is different about them across the conditions.
 
 ## Dataset and study design
 
-The data come from the CZ CELLxGENE collection
-[Single-cell RNA-Seq analysis reveals cell subsets and gene signatures associated with rheumatoid
-arthritis disease activity](https://cellxgene.cziscience.com/collections/e1a9ca56-f2ee-435d-980a-4f49ab7a952b),
-published with [Binvignat et al.](https://doi.org/10.1172/jci.insight.178499). The study contains
-PBMCs from 18 people with rheumatoid arthritis (RA) and 18 matched controls processed across three
-batches.
+The data come from the CZ CELLxGENE collection [Single-cell RNA-Seq analysis reveals cell subsets and gene signatures associated with rheumatoid arthritis disease activity](https://cellxgene.cziscience.com/collections/e1a9ca56-f2ee-435d-980a-4f49ab7a952b), published with [Binvignat et al.](https://doi.org/10.1172/jci.insight.178499). The study contains PBMCs from 18 people with rheumatoid arthritis (RA) and 18 matched controls processed across three batches. If you remember correctly, this is the same dataset used in the {doc}`condition_comparisons`
 
-This page downloads the
-[versioned H5AD file](https://datasets.cellxgene.cziscience.com/3b751975-34bb-409a-a9b7-98380f0450ea.h5ad),
-converts it to a local Zarr store, and mounts that local store into a temporary local analysis
-target. It is a download workflow, not remote analysis.
+Here each sample is a donor. This tutorial simply goes through the motions of preparing our data for true DE analysis, byt summing the raw counts from γδ T cells into one column per donor, keeping the matched study design, and thus exporting the result for a method such as edgeR or DESeq2. Scarf performs the aggregation and export. It does not fit the differential expression model on this page.
 
-## 1. Prepare the study data
+## Prepare the study data
 
-This larger example starts from a published H5AD file. If you already have a count store with
-donor, condition, and cell-type metadata, the same workflow starts with selecting the cells in
-step 3. The download and import are needed only once.
+To begin, simply download the dataset and inspect it to derive the existing information.
 
-```{code-cell} ipython3
+```{code-cell}
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -83,18 +66,9 @@ assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
 }
 ```
 
-The assertions guard the two properties required for pseudobulk: the selected matrix is the raw
-count matrix, and the pinned file has the expected 108,717 cells by 21,648 features. A normalized
-`X` matrix would not be an interchangeable input to a count model.
+After inspection, we see the expected 108,717 cells by 21,648 features (genes). After inspection, we can simply proceed by converting the .h5ad file to its corresponding zarr format.
 
-## 2. Import once and mount a writable analysis store
-
-Convert the H5AD only when its reusable source store is absent. Initializing with
-`min_features_per_cell=0` retains every cell already curated in the published file. The temporary
-mount receives metadata and new selection artifacts while the count matrices remain in the local
-source store.
-
-```{code-cell} ipython3
+```{code-cell}
 source_store = dataset_directory / "binvignat_ra_pbmc.zarr"
 if not source_store.exists():
     with TemporaryDirectory(dir=dataset_directory) as conversion_directory:
@@ -130,12 +104,11 @@ ds = scarf.mount_datastore(
 )
 ```
 
-## 3. Freeze the paired γδ T-cell selection
+## Select the γδ T-cells
 
-The CELLxGENE metadata names this subset `yd T cells`. Keep only cells with a finite matched-pair
-identifier so every selected cell can be assigned to the donor design used below.
+When selecting the cells of interest for pseudobulking, and then downstream DE analysis,  you generally want to keep only cells with a finite matched-pair dentifier so every selected cell can be assigned to the donor design used below.
 
-```{code-cell} ipython3
+```{code-cell}
 cell_metadata = pd.DataFrame(
     {
         column: ds.cells.fetch_all(column)
@@ -174,18 +147,13 @@ pd.Series(
 )
 ```
 
-The selection is frozen before aggregation so the count columns and donor metadata share one exact
-cell population. For the control donor sequenced in multiple batches, only its batch-1 cells carry
-the finite matched-pair identifier and enter this selection. Its other technical repeats are not
-silently reassigned to that pair.
+This selection simply freezes out cells to ensure that the when we conduct the pseudobulking, the count data and the donor metadata is described on the same cells.  
 
-## 4. Sum raw counts by biological donor
+## "Pseudobulk" (sum raw counts by biological donor)
 
-`aggr_type="sum"` streams raw assay counts and produces one column per `donor_id`.
-This option is essential for count-based differential expression: the method's default is a
-mean of normalized values. Empty features are removed by default.
+Pseudobulking is simply just the process of summing the raw counts by biological donor, thus, we use the `aggr_type="sum"` function to take the raw assay counts and produces one column of counts per `donor_id`.
 
-```{code-cell} ipython3
+```{code-cell}
 bulk = ds.make_bulk(
     "donor_id",
     cell_selection=selection,
@@ -196,14 +164,13 @@ assert bulk.shape == (13_547, 36)
 bulk.iloc[:5, :6]
 ```
 
-The result has 13,547 expressed features and 36 donor columns.
+The resulting pseudobulk leaves us with 13,547 expressed features and 36 donor columns. Our features dropped from > 20,000 to ~13000 as this step automatically removes features with zero counts across the selected γδ T cells; the same applies for whatever your selection of cells is.
 
-## 5. Build and verify the donor design
+## Build and verify the donor design
 
-Each donor must have exactly one disease, matched-pair value, and batch within this exact selected
-population. The design is then aligned to the count-matrix columns before export.
+Each donor must have exactly one disease, matched-pair value, and batch within this exact selected population. The design is then aligned to the count-matrix columns before  we export
 
-```{code-cell} ipython3
+```{code-cell}
 selected_metadata = cell_metadata.loc[
     selection_mask,
     ["donor_id", "disease", "batch", "pair_index_CW"],
@@ -238,16 +205,13 @@ assert pair_conditions.eq(2).all()
 donor_metadata.groupby(["batch", "disease"]).size().unstack(fill_value=0)
 ```
 
-The 36 columns are 36 biological replicates, arranged as 18 RA-control pairs. `batch` describes
-the cells that actually contributed to each donor column. It does not reattach excluded technical
-repeats from elsewhere in the source H5AD.
+The 36 columns are 36 biological replicates, arranged as 18 RA-control pairs. The `batch` describes the cells that actually contributed to each donor column.
 
-## 6. Export raw counts and design metadata
+## Export raw counts and design metadata
 
-Write the two tables to a named directory so they remain available after the notebook closes.
-The donor metadata has already been aligned to the count columns.
+With our counts and our metadata table, simply export the 2 tables for DE analysis offline. These will remain available after the notebook closes. The donor metadata has already been aligned to the count columns.
 
-```{code-cell} ipython3
+```{code-cell}
 export_directory = Path("pseudobulk_exports")
 export_directory.mkdir(exist_ok=True)
 counts_csv = export_directory / "yd_t_cell_raw_counts.csv"
@@ -259,21 +223,16 @@ donor_metadata.to_csv(metadata_csv)
 print(counts_csv, metadata_csv, sep="\n")
 ```
 
-Use `bulk` as the raw feature-by-donor count matrix. The external model must use donor-level
-replication and account for the study design. The matched-pair identifier and processing batch
-are both exported, but should not be added blindly as fixed effects: the full model with an
-intercept, disease, pair, and batch is rank deficient for this cohort, so it cannot estimate all
-those effects separately. A paired contrast and the paper's batch-adjusted model answer related
-but distinct questions. The paper used DESeq2 with a likelihood-ratio test corrected for batch;
-reproducing it requires its exact sample definition, model, filtering, and multiple-testing choices.
+Use `bulk` as the raw feature-by-donor count matrix. The external model must use donor-level replication and account for the study design. The linked publication at the top of this notebook allows you find the exact parameters the authors used, and replicate the results yourself.
+
 
 ## Optional: explore a reported γδ T-cell panel
 
-Library-normalized values are useful for a compact descriptive view before modeling. The figure
-below converts the donor pseudobulks to log2 counts per million (CPM) only for visualization.
+Library-normalized values are useful for a compact descriptive view before modeling. These values show each donor's expression on a common per-million scale, so differences between conditions can be eyeballed before any model is fit. This also adjusts for differences in the amount of cells between groups, as the common scale used is counts per million. Doing this only describes the data, and doesn't test it for any changes.  The figure below converts the donor pseudobulks to log2 counts per million (CPM) only for visualization.
+
 Start with one gene, IFNG, so each line can show one matched pair.
 
-```{code-cell} ipython3
+```{code-cell}
 panel_genes = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
 missing_genes = sorted(set(panel_genes).difference(bulk.index))
 assert not missing_genes, f"Missing panel genes: {missing_genes}"
@@ -292,23 +251,12 @@ axis.set_title("IFNG in matched γδ T-cell pseudobulks")
 plt.show()
 ```
 
-This panel shows donor heterogeneity and paired direction, but it does not estimate dispersion,
-adjust for batch, fit the matched design, or test a hypothesis. It must not be reported as a
-differential expression result.
+This panel shows donor heterogeneity and paired direction, but it does not estimate dispersion, adjust for batch, fit the matched design, or test a hypothesis. It must not be reported as a differential expression result.
 
-The paper applied pseudobulk modeling across 18 PBMC subsets and reported 168 differentially
-expressed genes in total. Its γδ T-cell result included downregulation of IFNG, IFIT2, TNF, GZMA,
-ISG15, and S100A4 in RA. Those genes are included in `panel`; change the `values` argument to
-inspect another one. These plots do not reproduce the paper's model or its significance claims.
-
-Do not give these log2 CPM plotting values to edgeR or DESeq2 as count input. Use the raw-count
-file exported above.
 
 ## Pseudo-replicates are not biological replicates
 
-`make_bulk(..., pseudo_reps=2)` randomly divides cells within a donor. Those partitions can support
-descriptive stability checks, but they come from the same person and do not increase the biological
-sample size. This tutorial leaves `pseudo_reps` at its default of one.
+`make_bulk(..., pseudo_reps=2)` randomly divides cells within a donor. Those partitions can support descriptive stability checks, but they come from the same person and do not increase the biologicalsample size. This tutorial leaves `pseudo_reps` at its default of one. Using `pseudo_reps` is usually a last case effort when you don't have enough biological donors, thus limit the use of this. 
 
 ## Common mistakes
 
