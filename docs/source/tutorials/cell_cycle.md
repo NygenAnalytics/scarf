@@ -19,7 +19,7 @@ With sc-RNA seq only capturing a snapshot of a cell at a certain point in time, 
 
 SCARF infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, so technical level and dropout do not inflate the score. Built-in human and mouse S/G2M gene lists come inbuilt. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
 
-Here, we score the prepared pancreas store, map phases and scores onto its UMAP, and check the result against independently imported Scanpy scores.
+Here, we score the prepared pancreas store, and then map phases and scores onto its UMAP.
 
 ## Open the pre-analyzed store
 
@@ -76,7 +76,7 @@ Two markers in the bundled G2M list are absent from this assay; The warning is e
 
 ## Visualize cell-cycle phases
 
-Pass the result directly to the UMAP plot to color cells by phase:
+Pass the result directly to the UMAP plot to color cells by what phase they have been assigned
 
 ```{code-cell}
 ds.plots.embedding(
@@ -88,18 +88,13 @@ ds.plots.embedding(
 Look for populations enriched for S or G2M. Cycling cells may be concentrated in one population
 or spread across several, depending on the tissue and experimental conditions.
 
-Phase composition for the pipeline's selected clustering shows which groups are enriched for S or
-G2M relative to G1:
+We can also the see the cell cycle phase composition for the datasets completed to see what groups are enriched for what for S or G2M relative to G1:
 
 ```{code-cell}
 pd.crosstab(analysis_run.cells.fetch("clusters"), phase, normalize="index")
 ```
 
-Rows are cluster-wise phase fractions among the cells captured by the run.
-
-## Visualize phase-specific scores
-
-The S and G2M score arrays are stored in the same artifact.
+We can also choose to visualize cells enrichment for phases by simply plotting their S or G2M score as the color scale upon the UMAP
 
 ```{code-cell}
 umap = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
@@ -114,34 +109,6 @@ for axis, values, title in (
 figure.tight_layout()
 figure
 ```
-
-## Optional: compare with Scanpy scores
-
-The rebuilt dataset retains cell-cycle scores calculated with Scanpy in the `S_score` and
-`G2M_score` metadata columns. Plot both on the pipeline run's exact UMAP.
-
-```{code-cell}
-ds.plots.embedding(
-    layout=analysis_run["umap"],
-    color_by=["S_score", "G2M_score"],
-    n_columns=2,
-)
-```
-
-The Scanpy scores look similar to Scarf's.
-Quantify the concordance:
-
-```{code-cell}
-pd.Series(
-    {
-        "S": np.corrcoef(s_score, ds.cells.fetch("S_score"))[0, 1],
-        "G2M": np.corrcoef(g2m_score, ds.cells.fetch("G2M_score"))[0, 1],
-    },
-    name="Pearson r",
-)
-```
-
-High correlation coefficients indicate a large degree of concordance between the scores obtained using Scanpy and Scarf.
 
 ## Common mistakes and limitations
 
