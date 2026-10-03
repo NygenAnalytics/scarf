@@ -3997,7 +3997,7 @@ requires-dist = [
     { name = "jedi", marker = "extra == 'docs'" },
     { name = "jinja2", marker = "extra == 'docs'" },
     { name = "jupyter-cache", marker = "extra == 'docs'", specifier = ">=1.0.1" },
-    { name = "kneed", marker = "extra == 'extra'", specifier = ">=0.8" },
+    { name = "kneed", marker = "extra == 'extra'", specifier = ">=0.8.1" },
     { name = "leidenalg", specifier = ">=0.12" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "matplotlib", marker = "extra == 'cytebase'", specifier = ">=3.9" },

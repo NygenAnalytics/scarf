@@ -418,7 +418,7 @@ def _assert_merged_counts(array, expected, rows) -> None:
 
 
 def test_dataset_merge(merged_pbmc):
-    _source, merged = merged_pbmc
+    source, merged = merged_pbmc
     expected, barcodes = _pbmc_counts()
     root = merged.zw
     names, rows = _merged_sources(root["cellData/ids"][:], barcodes)
@@ -429,7 +429,12 @@ def test_dataset_merge(merged_pbmc):
         )
     assert root.attrs["assayTypes"] == {"RNA": "RNA", "assay2": "Assay"}
     for assay_name, counts in expected.items():
-        assert root[f"{assay_name}/counts"].dtype == np.uint32
+        # Merged counts take the common type of the source count dtypes, and
+        # both sources are this one store.
+        assert (
+            root[f"{assay_name}/counts"].dtype
+            == source.zw[f"{assay_name}/counts"].dtype
+        )
         _assert_merged_counts(root[f"{assay_name}/counts"], counts, rows)
     # Only the RNA assay holds the feature-major copy, in merged cell order.
     assert "countsT" not in root["assay2"]
