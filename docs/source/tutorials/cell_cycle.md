@@ -11,27 +11,21 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (cell_cycle)=
 
-# Cell cycle
+# Cell cycle primer
 
-Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
+With sc-RNA seq only capturing a snapshot of a cell at a certain point in time, it can often be useful to determine what sage of the cell-cycle a cell is based on that snapshot. With cell division happening in a cycle, growth in G1, replication of their DNA in S phase, preparation in G2 for the split during mitosis, we can estimate their stage based on the gene programs associated with the states. Each stage switches on a characteristic gene program, so measuring S-phase and G2M-phase program activity reveals which cells are cycling: information that matters twice over, because cycling cells can cluster together regardless of cell type (a confounder to check) and because proliferation itself is often the biology of interest.
 
-## Prerequisites
+SCARF infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, so technical level and dropout do not inflate the score. Built-in human and mouse S/G2M gene lists come inbuilt. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
 
-- Scarf installed with the `extra` optional dependencies
-- An RNA assay with a cell graph or embedding for visualization
+Here, we score the prepared pancreas store, map phases and scores onto its UMAP, and check the result against independently imported Scanpy scores.
 
-## What you will learn
+## Open the pre-analyzed store
 
-- Run cell-cycle scoring with Scarf's built-in gene sets
-- Inspect phase labels and phase-specific scores
-- Compare scores with values imported from another workflow
+To begin, we take the downloaded store [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors. We use its selected cells and UMAP so we can focus on cell-cycle scoring.
 
-## Setup
-
-```{code-cell} ipython3
+```{code-cell}
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -39,16 +33,7 @@ import pandas as pd
 import scarf
 
 scarf.configure_output(level="WARNING", progress=False)
-```
 
-## 1. Open the pre-analyzed store
-
-Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
-
-The store contains an analysis saved as `docs_default`. We use its selected cells and UMAP so
-we can focus on cell-cycle scoring.
-
-```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
@@ -61,27 +46,25 @@ ds = scarf.DataStore(
 analysis_run = ds.pipeline.open(label="docs_default")
 ```
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     run=analysis_run,
     color_by="clusters",
 )
 ```
 
-## 2. Run cell-cycle scoring
+## Run cell-cycle scoring
 
-Scarf's scorer follows the same general strategy as
-[Scanpy's cell-cycle scorer](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html):
+Scarf's scorer follows the same general strategy as [Scanpy&#39;s cell-cycle scorer](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html) which:
 
 - Match the supplied S and G2M markers, using Scarf's human-and-mouse lists by default.
-- Group genes into bins with similar mean log-normalized expression across the selected cells.
+- Groups genes into bins with similar mean log-normalized expression across the selected cells.
 - Sample control genes from the same expression bins as each phase's markers.
 - Subtract mean control expression from mean marker expression for each cell and phase.
 
-Cells with two negative scores are assigned G1. Otherwise, G2M wins when its score exceeds the S
-score, and the remaining cells are assigned S.
+As stated earlier, in SCARF, cells with two negative scores are assigned G1; Otherwise, the G2M phase is assigned when its score exceeds the S score, and the remaining cells are assigned S.
 
-```{code-cell} ipython3
+```{code-cell}
 cell_cycle_ref = ds.run_cell_cycle_scoring(analysis_run["analysis_cell_selection"])
 cell_cycle_values = ds.load_artifact(cell_cycle_ref)
 s_score = np.asarray(cell_cycle_values["s_score"][:])
@@ -99,7 +82,7 @@ later. Scoring requires a writable datastore.
 
 Pass the result directly to the embedding plot to color cells by phase:
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     layout=analysis_run["umap"],
     color_by=cell_cycle_ref,
@@ -112,7 +95,7 @@ or spread across several, depending on the tissue and experimental conditions.
 Phase composition for the pipeline's selected clustering shows which groups are enriched for S or
 G2M relative to G1:
 
-```{code-cell} ipython3
+```{code-cell}
 pd.crosstab(analysis_run.cells.fetch("clusters"), phase, normalize="index")
 ```
 
@@ -122,7 +105,7 @@ Rows are cluster-wise phase fractions among the cells captured by the run.
 
 The S and G2M score arrays are stored in the same artifact.
 
-```{code-cell} ipython3
+```{code-cell}
 umap = analysis_run.cells.to_pandas_dataframe(["umap_1", "umap_2"])
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
 for axis, values, title in (
@@ -141,7 +124,7 @@ figure
 The rebuilt dataset retains cell-cycle scores calculated with Scanpy in the `S_score` and
 `G2M_score` metadata columns. Plot both on the pipeline run's exact UMAP.
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(
     layout=analysis_run["umap"],
     color_by=["S_score", "G2M_score"],
@@ -152,7 +135,7 @@ ds.plots.embedding(
 The Scanpy scores look similar to Scarf's.
 Quantify the concordance:
 
-```{code-cell} ipython3
+```{code-cell}
 pd.Series(
     {
         "S": np.corrcoef(s_score, ds.cells.fetch("S_score"))[0, 1],

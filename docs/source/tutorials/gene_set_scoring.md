@@ -11,37 +11,19 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (gene_set_scoring)=
 
-# Gene-set activity scoring
+# Gene-set activity scoring primer
 
-Score pathway or cell-state signatures per cell with WAGGR or AUCell.
-Both methods stream RNA counts from the Zarr store and persist activity scores for later use.
-These methods do not calculate enrichment p-values.
+Single cell readouts on single genes can be sparse and heavily noisy. This is often driven by dropout, which can zero out a marker in cells that express it, and then one highly expressed gene can dominate expression. Gene-set scoring fixes this by collapsing a whole program; a pathway, a cell state, a lineage signature; into one number per cell that is more robust than any member gene alone.
 
-## Prerequisites
+Scarf offers two ways to compute that number. WAGGR (Weighted Aggregate) takes a weighted mean of normalized gene expression, so strongly expressed genes can pull harder and can push in opposite directions. AUCell ignores expression values entirely after ranking each cell's genes, then measures how early the signature's targets appear among the top ranks, with its scores falling between 0-1. WAGGR can be used to gain an idea of the magnitude of a program, whereas AUCell can tell you about rank recovery. Rank recovery can be conceptualized as how early the signature of interest appears among that cell's top-ranked genes.
 
-- Scarf installed with the `extra` optional dependencies
-- An RNA assay with feature names that match the identifiers in your gene sets
-- A basic understanding of cell metadata and embeddings
+## Load the prepared dataset
 
-## What you will learn
+We first begin by loading in the prepared dataset. For context, when we do our activity scoring, the data is streamed directly from the raw counts: AUCell ranks those raw counts, while WAGGR applies library-size normalization for its own scoring function.
 
-- Read gene sets from GMT and inspect feature overlap
-- Score weighted signatures with WAGGR
-- Score rank-based signatures with AUCell
-- Load selected score sources without materializing the full result
-
-## Dataset
-
-The 5K PBMC store contains a prepared analysis labeled `docs_default`.
-Open the downloaded store directly because scoring writes new immutable artifacts. The frozen run
-provides the exact analysis cells and UMAP used below.
-Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
-AUCell ranks those raw counts; WAGGR applies library-size normalization inside the scorer.
-
-```{code-cell} ipython3
+```{code-cell}
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -61,13 +43,11 @@ ds = scarf.DataStore(f'{dataset}/data.zarr', nthreads=4)
 run = ds.pipeline.open(label='docs_default')
 ```
 
-## 1. Read and inspect gene sets
+## Read and inspect gene-sets
 
-GMT stores one source per line.
-The first field is the source name, the second is a description, and the remaining fields are target genes.
-`read_gmt` returns one source-target row per gene.
+For reading and inspecting your gene-sets, you must use **your own Gene Matrix Transposed (GMT) files.** When reading the file, the matrix stores one gene program per line.
 
-```{code-cell} ipython3
+```{code-cell}
 input_directory = TemporaryDirectory()
 gmt_path = Path(input_directory.name) / 'pbmc_signatures.gmt'
 gmt_path.write_text(
@@ -80,13 +60,9 @@ gene_sets = scarf.read_gmt(gmt_path)
 gene_sets
 ```
 
-Targets are matched to active RNA feature names without case sensitivity.
-`tmin` is applied after matching, so a source is retained only when enough of its targets are present.
-Missing targets do not need to be removed from the input table first.
-A target that matches several active features, such as a gene symbol shared by two feature ids, is ambiguous.
-By default its edges are dropped with a warning and recorded in the result's `dropped_ambiguous_targets` attribute; pass `ambiguous_targets='error'` to reject such a network instead.
+Targets are matched to active RNA feature names without case sensitivity, meaning that any match regardless of capitalization will be selected. Missing targets do not need to be removed from the input table, as SCARF automatically handles this. A target that matches several active features, such as a gene symbol shared by two feature ids, is ambiguous (ignored).
 
-```{code-cell} ipython3
+```{code-cell}
 available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}
 (
     gene_sets.assign(
@@ -97,21 +73,22 @@ available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}
 )
 ```
 
-## 2. Start with equal-weight scores
+In our case, all 5 of our genes in the matrix are present inside of our dataset
+
+## Start with WAGGR
 
 WAGGR calculates a weighted mean of library-size-normalized expression by default.
 When the input has no weight column, every target gene has weight one.
-We use `tmin=3` for these short teaching signatures so that a signature can still be scored if
-one or two of its five genes are missing. The default requires five matched targets.
+`tmin` is the minimum number of matched genes a signature needs to be scored; anything below it is skipped. Our sample gene-sets have only five genes each, so `tmin=3` lets a signature survive one or two missing genes, where the default of five would drop it outright.
 
 This comparison uses the complete assay feature universe for both methods:
 
-```{code-cell} ipython3
+```{code-cell}
 cell_selection = run['analysis_cell_selection']
 all_features = ds.select_all_features(from_assay='RNA')
 ```
 
-```{code-cell} ipython3
+```{code-cell}
 waggr = ds.run_waggr(
     gene_sets,
     cell_selection,
@@ -127,20 +104,13 @@ waggr_scores = pd.DataFrame(
 waggr_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-Each column is one source.
-The ranges show that WAGGR tracks expression magnitude and is not confined to values between zero and one.
+The results from WAGGR are not confined from 0-1 like AUCell.
 
-## 3. Score rank recovery with AUCell
+## Score rank recovery with AUCell
 
-AUCell ranks the selected RNA features within each cell and measures how early a source's targets are recovered.
-Scores range from zero to one.
-Network weights are ignored.
+Since AUCell scores each cell by recovery among its top-ranked genes, it first needs to know what universe to rank. The required features argument sets that universe: here all_features ranks the complete gene list, but AUCell only uses the top 5% of genes to calculate its recovery.
 
-The required `features` argument defines the ranking universe.
-Here the `all_features` artifact ranks the complete RNA feature order.
-By default, AUCell evaluates the top 5% of that ranking universe.
-
-```{code-cell} ipython3
+```{code-cell}
 aucell = ds.run_aucell(
     gene_sets,
     cell_selection,
@@ -155,16 +125,13 @@ aucell_scores = pd.DataFrame(
 aucell_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-AUCell values stay between zero and one. The default seed keeps the ordering of tied expression
-values reproducible. Use `n_up` only when you want a different rank window, and keep it fixed when
-comparing scores from the same feature universe.
+An AUCell score of 0 means none of the signature's genes appear among the cell's top-ranked genes, while a score of 1 means the signature dominates the very top of that cell's ranking.
 
-## 4. Visualize the selected sources
+## Visualize the AUCell and WAGGR
 
-The tables above contain only the three requested signatures. Reuse them for plotting rather than
-loading the scores again. These values describe gene-set activity; they are not p-values.
+To visualize the results from AUCell, we can simply plot the recovery score on a UMAP of the cells.
 
-```{code-cell} ipython3
+```{code-cell}
 umap = run.cells.to_pandas_dataframe(['umap_1', 'umap_2'])
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, source in zip(axes, score_sources, strict=True):
@@ -184,10 +151,10 @@ plt.show()
 
 AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores peak in separate parts of the UMAP when those populations are present.
 
-Compare the two methods for the Myeloid signature. WAGGR follows expression magnitude, while
-AUCell measures recovery among the highest-ranked genes, so their numerical scales differ.
 
-```{code-cell} ipython3
+To compare both methods, take the Myeloid signature for example: we can create a table comparing the results; remember, their numerical scales differ.
+
+```{code-cell}
 myeloid_compare = pd.DataFrame(
     {
         'Myeloid_WAGGR': waggr_scores['Myeloid'],
@@ -197,7 +164,9 @@ myeloid_compare = pd.DataFrame(
 myeloid_compare.describe()
 ```
 
-```{code-cell} ipython3
+We can also individually plot the WAGGR for the Myeloid cells through a scatter plot.
+
+```{code-cell}
 figure, axis = plt.subplots(figsize=(4, 4))
 axis.scatter(
     myeloid_compare['Myeloid_WAGGR'],
@@ -211,34 +180,13 @@ plt.show()
 ```
 
 Look for cells with high scores under both methods and cells where the methods disagree.
-A change in score scale alone is not a biological difference.
 
 ## Optional: use a signature with weights
 
-Use weights when the source of a signature provides a reason for particular genes to contribute
-more, less, or in opposite directions. Add a `weight` column to the input table; without it, all
-weights are one. WAGGR's default `mode="wmean"` divides the weighted sum by the sum of absolute
-weights. `mode="wsum"` leaves it unscaled. AUCell ignores these weights.
+Add weights when the WAGGR source gives some genes more say than others: amplifying strong genes, silencing weak ones, or setting genes against each other in opposite directions. To adjust for this, add a `weight` column to the input table, as without one, every gene counts equally at weight one. WAGGR's default `mode="wmean"` divides the weighted sum by the sum of absolute weights, keeping scores comparable across signatures of different sizes, while `mode="wsum"` leaves the total unscaled, so comparability falls.
 
-WAGGR also accepts `log_transform=True` to apply `log1p` before aggregation. Changing weights or
-the expression transform changes the meaning of the score, so choose them before comparing cells
-or conditions.
+## Important caveats to consider regarding gene-set activity scoring
 
-## Choosing a method
-
-- Use WAGGR when edge weights or signed targets carry useful information and expression magnitude should affect the score.
-- Use AUCell when relative within-cell ranks are preferable to expression magnitude.
-- Treat both outputs as activity scores, not p-values.
-  Scores from different feature universes or AUCell `n_up` values are not directly interchangeable.
-
-## Common mistakes and limitations
-
-- Using identifiers that do not match the assay feature names
-- Setting `tmin` above the number of targets that remain after feature matching
-- Passing an HVG selection to AUCell without intending to restrict its ranking universe
-- Comparing WAGGR runs that use different normalization or log-transform settings
-- Editing the count matrix outside Scarf after a result has been cached
-
-Scarf persists each score matrix.
-Repeating an identical call reuses its completed result. `invalidate_cache=True` creates another
-immutable result without replacing the earlier one.
+- **Restricting AUCell's ranking universe (e.g., passing HVGs):** AUCell evaluates target recovery within the top 5% of whatever gene list is provided in features. Supplying a reduced subset like highly variable genes instead of the full feature universe distorts background gene ranks and artificially inflates or skews recovery scores, thus ensure you provide the universe of all genes.
+- **Unmatched gene identifiers and rigid tmin thresholds:** If gene symbols in the GMT file fail to match assay feature names or map ambiguously, target genes are dropped. When remaining valid targets fall below tmin, Scarf silently skips the entire signature rather than scoring the surviving subset.
+- **Comparing WAGGR scores across inconsistent transformations:** Unlike AUCell's bounded rank scores (0 to 1), WAGGR values are unbounded magnitude metrics sensitive to log_transform, weighting mode (wmean vs. wsum), and library normalization. Comparing WAGGR runs with different parameter settings or directly comparing WAGGR to AUCell confounds mathematical scaling with true biological differences.
