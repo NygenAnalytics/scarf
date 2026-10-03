@@ -14,9 +14,9 @@ kernelspec:
 
 # Clustering and cluster evidence
 
-Clustering is a model of graph structure, not a cell-type verdict. This page keeps one graph fixed,
-compares several Leiden resolutions with a Paris hierarchy, and reads every result through its
-exact immutable artifact ref.
+Clustering groups cells with similar neighbours. A cluster may represent a cell type, a cell
+state, or technical variation, so it needs biological interpretation. We first inspect a saved
+clustering, then change the resolution while keeping the graph fixed.
 
 ## 1. Open one graph
 
@@ -27,7 +27,6 @@ from itertools import combinations
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
 
@@ -42,12 +41,17 @@ ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 clustering_run = ds.pipeline.open(label="docs_default")
 graph = clustering_run["connectivity_map"]
 umap = clustering_run["umap"]
-umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 ```
 
-The rebuilt store carries one completed pipeline run under the immutable label `docs_default`.
-Its exact graph and UMAP refs are the baseline below. Only the additional clustering choices are
-created on this page, so feature, PCA, graph, and layout effects stay out of the comparison.
+The store carries an analysis saved as `docs_default`. Inspect its selected clusters first:
+
+```{code-cell} ipython3
+ds.plots.embedding(run=clustering_run, color_by="clusters")
+```
+
+This prepared example used Leiden resolution 0.5. The standalone method defaults to 1.0, and the
+standard pipeline can compare several resolutions. Cluster numbers are labels, not cell types.
+We use the same graph and UMAP below so only the clustering changes.
 
 ## 2. Sweep Leiden resolution
 
@@ -73,12 +77,12 @@ pd.DataFrame(
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, resolution in zip(axes, leiden_values, strict=True):
-    axis.scatter(
-        umap_values[:, 0],
-        umap_values[:, 1],
-        c=leiden_values[resolution],
-        s=3,
-        cmap="tab20",
+    ds.plots.embedding(
+        layout=umap,
+        color_by=leiden_refs[resolution],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     axis.set_title(f"Leiden {resolution}")
 figure.tight_layout()
@@ -88,48 +92,31 @@ figure
 Higher resolution usually produces more and smaller groups. Reject a split when it is driven by a
 technical covariate, has weak marker evidence, or disappears under a modest parameter change.
 
-ARI and NMI quantify agreement without selecting a winner:
+The adjusted Rand index (ARI) compares partitions without requiring the cluster numbers to
+match. A value of one means the partitions agree. It does not tell us which partition is better:
 
 ```{code-cell} ipython3
-agreement = []
-for first, second in combinations(leiden_values, 2):
-    agreement.append(
-        {
-            "comparison": f"{first} vs {second}",
-            "ARI": adjusted_rand_score(
-                leiden_values[first],
-                leiden_values[second],
-            ),
-            "NMI": normalized_mutual_info_score(
-                leiden_values[first],
-                leiden_values[second],
-            ),
-        }
-    )
-pd.DataFrame(agreement)
+pd.Series(
+    {
+        f"{first} vs {second}": ds.metric_label_concordance(
+            leiden_refs[first], leiden_refs[second]
+        )
+        for first, second in combinations(leiden_refs, 2)
+    },
+    name="ARI",
+)
 ```
 
 ## 3. Inspect membership strength
 
-Use the chosen cluster ref directly. The result is another axis-aligned artifact, not a metadata
-column. Resolution `0.5` is fixed here for the diagnostic walkthrough.
+Membership strength measures how strongly a cell connects to its assigned cluster.
+We use resolution 0.5 for this walkthrough.
 
 ```{code-cell} ipython3
 chosen = leiden_refs[0.5]
 chosen_values = leiden_values[0.5]
 membership = ds.calc_membership_strength(chosen, graph)
-membership_values = np.asarray(ds.load_artifact(membership)["values"][:])
-
-figure, axis = plt.subplots(figsize=(5, 4))
-points = axis.scatter(
-    umap_values[:, 0],
-    umap_values[:, 1],
-    c=membership_values,
-    s=3,
-)
-figure.colorbar(points, ax=axis, label="membership strength")
-figure.tight_layout()
-figure
+ds.plots.embedding(layout=umap, color_by=membership)
 ```
 
 ```{code-cell} ipython3
@@ -143,49 +130,7 @@ ds.plots.cluster_connectivity(
 Low values throughout one cluster suggest a weak boundary. A narrow band of low values between
 otherwise coherent groups may represent continuous biology.
 
-## 4. Compare Paris cuts
-
-`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when
-hierarchy diagnostics are needed.
-
-```{code-cell} ipython3
-paris_auto = ds.run_paris_clustering(graph)
-paris_result = ds.load_paris_clustering(paris_auto)
-pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
-    ["label", "size", "persistence", "decision_margin", "forced"]
-]
-```
-
-```{code-cell} ipython3
-ds.plots.cluster_tree(graph=graph, clusters=paris_auto)
-```
-
-Persistence measures how long a selected branch survives in the hierarchy. The decision margin
-measures the preference for retaining it. A forced group satisfies a structural constraint and is
-not, by itself, strong biological evidence.
-
-```{code-cell} ipython3
-paris_fixed = ds.run_paris_clustering(
-    graph,
-    n_clusters=paris_result.n_clusters,
-)
-paris_auto_values = np.asarray(ds.load_artifact(paris_auto)["labels"][:])
-paris_fixed_values = np.asarray(ds.load_artifact(paris_fixed)["labels"][:])
-pd.Series(
-    {
-        "auto vs fixed ARI": adjusted_rand_score(
-            paris_auto_values,
-            paris_fixed_values,
-        ),
-        "Leiden vs Paris ARI": adjusted_rand_score(
-            chosen_values,
-            paris_auto_values,
-        ),
-    }
-)
-```
-
-## 5. Review marker evidence
+## 4. Review marker evidence
 
 Marker search requires exact cluster and feature-selection refs and returns one immutable marker
 table artifact.
@@ -219,7 +164,7 @@ The p-values are cell-level one-versus-rest marker tests with within-group adjus
 replicate-aware differential expression. A defensible partition combines marker evidence, graph
 support, technical covariates, replicate coverage, and the study question.
 
-## 6. Pipeline cluster selection
+## 5. Pipeline cluster selection
 
 When a pipeline run includes multiple Leiden candidates, it scores them with one deterministic
 shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates. Paris can still
@@ -235,3 +180,43 @@ selected_cluster_ref = clustering_run["clusters"]
 This automatic choice is a reproducible baseline, not proof that the selected resolution is best
 for every biological question. Retain alternative refs when the decision needs domain-specific
 evidence.
+
+## Optional: compare Paris cuts
+
+`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when
+hierarchy diagnostics are needed.
+
+```{code-cell} ipython3
+paris_auto = ds.run_paris_clustering(graph)
+paris_result = ds.load_paris_clustering(paris_auto)
+pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
+    ["label", "size", "persistence", "decision_margin", "forced"]
+]
+```
+
+```{code-cell} ipython3
+ds.plots.cluster_tree(graph=graph, clusters=paris_auto)
+```
+
+Persistence measures how long a selected branch survives in the hierarchy. The decision margin
+measures the preference for retaining it. A forced group satisfies a structural constraint and is
+not, by itself, strong biological evidence.
+
+```{code-cell} ipython3
+paris_fixed = ds.run_paris_clustering(
+    graph,
+    n_clusters=paris_result.n_clusters,
+)
+pd.Series(
+    {
+        "auto vs fixed ARI": ds.metric_label_concordance(
+            paris_auto,
+            paris_fixed,
+        ),
+        "Leiden vs Paris ARI": ds.metric_label_concordance(
+            chosen,
+            paris_auto,
+        ),
+    }
+)
+```

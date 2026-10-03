@@ -21,21 +21,16 @@ whose corrected variance is high relative to genes with similar abundance.
 This is distinct from cell quality control.
 A gene can be measured correctly and still be excluded because it contributes broad technical or confounding variation to the graph.
 
-For a simple detection threshold, `select_detected_features(cell_selection, min_cells=...)` returns
-a selection from the same immutable feature summary.
-The threshold is inclusive and the method returns the selection reference.
-
 ## 1. Fit the mean-variance model
 
-The rebuilt PBMC store carries a completed `docs_default` run. Repeating its 500-gene selection
-with `show_plot=True` reuses the exact stored artifact and its diagnostics. Later sections create
-only the alternative feature selections they compare.
+The PBMC store carries an analysis saved as `docs_default`. It used 500 genes and 15 PCs to keep
+this teaching example small. The current API defaults are 1,000 genes and 21 PCs.
+We first repeat the saved 500-gene selection to inspect how those genes were chosen.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
 
@@ -52,7 +47,6 @@ cell_selection = baseline["analysis_cell_selection"]
 hvg_500 = ds.select_hvgs(
     cell_selection,
     top_n=500,
-    show_plot=True,
 )
 hvg_500_values = np.asarray(ds.load_artifact(hvg_500)["values"][:])
 {
@@ -145,11 +139,8 @@ ds.select_hvgs(cell_selection, blacklist=r"^MT-|^RPS|^RPL", top_n=2000)
 ds.select_hvgs(cell_selection, max_cells=np.inf, top_n=2000)
 ```
 
-HVG reuse is based on the resolved algorithm inputs: `min_cells`, effective `max_cells`, `top_n`, variance and mean bounds, `n_bins`, `lowess_frac`, the resolved blacklist, `keep_bounds`, and `bin_strategy`.
-When `max_cells` is omitted, Scarf applies `n_selected - 20` unless that would be at or below `min_cells`, in which case the upper limit is infinite.
-The effective value is stored, so an omitted value and an explicitly equivalent value reuse the same artifact.
-Plotting options, threads, and `invalidate_cache` are not part of scientific identity.
-On reuse, an HVG plot reads stored corrected-variance diagnostics rather than recomputing the selection.
+Repeating a selection with the same cells and settings reuses the saved result, including the
+diagnostics used for its plot. See {doc}`reuse_and_tracing` for details.
 
 ## 3. Compare feature-set size
 
@@ -183,23 +174,23 @@ figure, axes = plt.subplots(1, 2, figsize=(10, 4))
 cluster_values = {}
 for axis, top_n in zip(axes, feature_branches, strict=True):
     umap_ref, cluster_ref = feature_branches[top_n]
-    coordinates = np.asarray(ds.load_artifact(umap_ref)["values"][:])
     labels = np.asarray(ds.load_artifact(cluster_ref)["values"][:])
     cluster_values[top_n] = labels
-    axis.scatter(
-        coordinates[:, 0],
-        coordinates[:, 1],
-        c=labels,
-        s=3,
-        cmap="tab20",
+    ds.plots.embedding(
+        layout=umap_ref,
+        color_by=cluster_ref,
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     axis.set_title(f"{top_n:,} selected genes")
 figure.tight_layout()
 figure
 ```
 
-A cross-tabulation shows how partitions rematch when the feature set grows. The margins report
-cluster sizes; off-diagonal mass marks groups that split or merge.
+A cross-tabulation shows how partitions match when the feature set grows. Cluster numbers can
+change without changing the groups. A row spread across several columns suggests a split; a
+column collecting several rows suggests a merge. The margins report cluster sizes.
 
 ```{code-cell} ipython3
 cluster_500 = cluster_values[500]
@@ -214,10 +205,8 @@ pd.crosstab(
 ```{code-cell} ipython3
 pd.Series(
     {
-        "adjusted Rand index": adjusted_rand_score(cluster_500, cluster_1000),
-        "normalized mutual information": normalized_mutual_info_score(
-            cluster_500,
-            cluster_1000,
+        "adjusted Rand index": ds.metric_label_concordance(
+            feature_branches[500][1], feature_branches[1000][1]
         ),
     },
     name="500 vs 1,000 selected genes",
@@ -225,7 +214,8 @@ pd.Series(
 ```
 
 A larger set can recover weaker populations, but it can also restore unwanted programs.
-ARI and NMI quantify partition agreement but do not identify which feature set is more biologically useful.
+The adjusted Rand index (ARI) measures agreement between partitions without requiring their
+cluster numbers to match. It does not identify which feature set is more biologically useful.
 Compare marker specificity and known biology instead of choosing the layout that appears most separated.
 
 ## 4. Install an externally chosen feature set
@@ -265,13 +255,23 @@ all_features = ds.select_all_features(from_assay="RNA")
 
 `all_features` is an immutable all-true artifact for this exact assay axis.
 
-The standard pipeline exposes the common feature-count choice directly:
+In your own workflow, the standard pipeline uses 1,000 HVGs by default. Change the count when
+there is a reason to include more or fewer genes:
 
 ```python
 ds.pipeline.run(hvg_count=2000)
 ```
 
-Use `select_hvgs` plus the explicit stage methods when you need blacklist or mean-variance tuning.
+Other HVG settings are available through the pipeline's `params` mapping. For example, if a
+study needs genes that the default blacklist removes:
+
+```python
+ds.pipeline.run(params={"hvg": {"blacklist": ""}})
+```
+
+Use the explicit stage methods when you want to compare feature sets on the same frozen cells,
+as we did above. For a simple detection threshold instead of an HVG model, use
+`select_detected_features(cell_selection, min_cells=...)`.
 
 For scATAC-seq, prevalent peak selection is the analogous step.
 `select_prevalent_peaks` returns a feature-selection artifact whose scientific identity contains

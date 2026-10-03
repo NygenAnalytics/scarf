@@ -1,5 +1,5 @@
 ---
-description: Aggregate expression along an immutable pseudotime artifact and inspect feature modules.
+description: Follow gene expression along pseudotime and inspect groups with similar profiles.
 jupytext:
   text_representation:
     extension: .md
@@ -11,16 +11,18 @@ kernelspec:
   language: python
   name: python3
 ---
+# Follow gene expression along pseudotime
 
-# Expression dynamics along pseudotime
+Some genes increase or decrease steadily along a process. Others rise briefly and fall
+again, which a correlation score can miss. Here we smooth expression along the pancreas
+pseudotime ordering and group genes with similar profiles into **modules**.
 
-Pseudotime correlation captures monotonic change. Aggregation adds smoothed feature profiles and
-clusters them into early, intermediate, and late modules. Both operations persist immutable
-artifacts and leave feature metadata unchanged.
+Start with {doc}`pseudotime` for the endpoint choices and scoring method. This page uses
+the same ordering and focuses on how to read the expression heatmap.
 
-## 1. Open the prepared graph and orient it
+## Recreate the ordering
 
-```{code-cell} ipython3
+```{code-cell}
 import numpy as np
 import pandas as pd
 
@@ -33,14 +35,16 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
-    nthreads=4,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 analysis_run = ds.pipeline.open(label="docs_default")
 graph = analysis_run["connectivity_map"]
 all_features = analysis_run["feature_universe"]
+```
 
+Use the published cell-type annotations to orient the graph. As in the pseudotime
+example, the source and pooled sinks each receive a total mass of one, with opposite signs.
+
+```{code-cell}
 annotations = ds.cells.fetch("clusters", key="I")
 source = annotations == "Ductal"
 sink = np.isin(annotations, ["Alpha", "Beta", "Delta"])
@@ -52,90 +56,72 @@ source_sink_vector[sink] = 1.0 / sink.sum()
 pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 ```
 
-The rebuilt catalog store contains the completed `docs_default` pipeline run. This page reuses its
-exact graph and feature universe instead of rebuilding preprocessing. The literal `clusters`
-column contains the published cell-type annotations used only to orient the trajectory. The new
-pseudotime and module results remain exact artifacts.
+## Group changing expression profiles
 
-## 2. Aggregate and cluster feature profiles
+Start with the default aggregation settings. Scarf orders valid cells by pseudotime,
+smooths each retained gene over a 200-cell window, summarizes it in 50 bins, and groups
+similar profiles into 10 modules.
 
-```{code-cell} ipython3
+```{code-cell}
+modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_features)
+ds.plots.pseudotime_heatmap(aggregation=modules_ref)
+```
+
+Read from early to late pseudotime across the heatmap. Look for groups that peak early,
+late, or in the middle. By default, each gene is scaled relative to its own variation.
+Red indicates higher expression and blue lower expression for that gene; the colours do
+not show which gene has the greatest absolute expression.
+
+Module numbers are labels, not developmental stages. Ten modules is a starting choice,
+not a claim that the process has ten biological programs.
+
+## Inspect a module's genes
+
+Load the saved result to see how many genes each module contains:
+
+```{code-cell}
+modules = ds.load_pseudotime_aggregation(modules_ref)
+module_genes = pd.DataFrame(
+    {"gene": modules.feature_names, "module": modules.feature_clusters}
+)
+module_genes.groupby("module").size().rename("genes")
+```
+
+Choose a module from the heatmap, then list its genes. The example below selects the
+first module label only to show the lookup; the returned genes are not ranked markers.
+
+```{code-cell}
+module_id = module_genes["module"].min()
+module_genes.loc[module_genes["module"] == module_id, "gene"].head(20)
+```
+
+Check whether several genes support a shared process before naming the module. Follow
+up candidate genes with marker maps or other independent evidence.
+
+## Adjust smoothing only when needed
+
+A wide window can hide a brief expression peak; a narrow one can retain more noise.
+To explore a shorter window, repeat the call with one changed setting:
+
+```python
 modules_ref = ds.run_pseudotime_aggregation(
     pseudotime_ref,
     features=all_features,
-    n_clusters=15,
-    window_size=200,
-    chunk_size=100,
-)
-modules = ds.load_pseudotime_aggregation(modules_ref)
-{
-    "artifact": modules.ref,
-    "pseudotime": modules.pseudotime,
-    "feature selection": modules.feature_selection,
-    "assigned features": len(modules.feature_indices),
-}
-```
-
-The loader returns the valid feature rows only, their physical assay indexes, module labels, frozen
-feature names and IDs, and a lazy binned matrix. Use `modules.feature_names` or
-`modules.feature_ids` so later edits to live feature metadata cannot relabel the saved result.
-
-```{code-cell} ipython3
-feature_names = modules.feature_names
-module_frame = pd.DataFrame(
-    {
-        "feature_name": feature_names,
-        "module": modules.feature_clusters,
-    }
-)
-module_frame["module"].value_counts().sort_index()
-```
-
-```{code-cell} ipython3
-examples = (
-    module_frame.groupby("module", sort=True)["feature_name"]
-    .first()
-    .rename("example gene")
-)
-examples
-```
-
-The first feature is a compact example for each module, not a ranked representative.
-
-## 3. Inspect the ordered profiles
-
-```{code-cell} ipython3
-ds.plots.pseudotime_heatmap(
-    aggregation=modules_ref,
-    figsize=(8, 8),
+    window_size=100,
 )
 ```
 
-A useful result contains coherent early, intermediate, and late patterns rather than one block of
-uniformly expressed genes. Module numbers are labels, not developmental stages. Inspect example
-genes and module stability before assigning biological meaning.
+`n_clusters` controls the requested number of modules. `chunk_size` controls the number
+of displayed pseudotime bins, not a memory batch size. Change one choice at a time and
+compare the profiles before interpreting a split or merged module.
 
-## 4. Build a grouped assay when needed
+## Limits of these modules
 
-The aggregation ref can be consumed directly when a module-level assay is useful downstream:
+- Expression or variance checks exclude some features; the loaded result contains the
+  retained features only.
+- Genes with similar profiles are not necessarily regulated by the same mechanism.
+- A single pooled ordering can obscure changes specific to one branch.
+- Compare plausible endpoint and smoothing choices before treating a module as stable.
 
-```{code-cell} ipython3
-ds.add_grouped_assay(
-    modules_ref,
-    assay_label="TrajectoryModules",
-)
-ds.TrajectoryModules
-```
-
-This is an explicit new-assay construction step. It does not write the module labels into the
-RNA feature table. A feature metadata column can be passed instead of an artifact when the groups
-were deliberately authored as metadata.
-
-## Common mistakes and limitations
-
-- Treating module order as a causal sequence
-- Comparing modules built from different feature or pseudotime refs as if inputs matched
-- Ignoring invalid features removed by expression or variance checks
-- Using one trajectory orientation when plausible source and sink alternatives remain
-
-See {doc}`pseudotime` for scoring and {doc}`trajectory_validation` for broader checks.
+See {doc}`trajectory_validation` for broader checks and {doc}`fate_mapping` for multiple
+terminal outcomes.

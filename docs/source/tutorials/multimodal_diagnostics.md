@@ -14,9 +14,9 @@ kernelspec:
 
 # Diagnose multimodal integration
 
-Decide whether RNA and ADT support compatible biology, then compare equal-weight SNN with the
-recommended WNN path. This advanced page assumes the core {doc}`cite_seq` workflow. Its purpose is
-diagnosis: a clean integrated UMAP is not evidence by itself.
+After the core {doc}`cite_seq` workflow, check whether RNA and ADT support similar populations.
+Then inspect where each assay contributes to the default WNN integration. An optional comparison
+with SNN shows what changes when the two assay graphs have equal standing.
 
 ## Open the matched results
 
@@ -44,9 +44,13 @@ ds = scarf.DataStore(
 rna_run = ds.pipeline.open(label="docs_default")
 ```
 
-Use exact provenance predicates to reopen each alternative and its linked results. The API returns
-all matches; one-item destructuring makes ambiguity an error instead of silently selecting a
-current or latest graph.
+The prepared store already contains RNA, ADT, WNN, and SNN results. The setup below reopens those
+saved results. If you are continuing your own analysis, keep the references returned by its
+analysis steps instead.
+
+The searches specify which assay, method, and upstream graph each result belongs to.
+Each search expects one match in this prepared store. If you have added more analyses, narrow
+the search to the result you intend to compare.
 
 ```{code-cell} ipython3
 [adt_layout] = ds.list_artifacts(
@@ -133,7 +137,19 @@ Broad agreement supports a shared population structure. Local differences are no
 errors: protein can resolve a population whose transcript is sparse. Large contradictory regions
 should be investigated before integration.
 
-## 2. Compare SNN and WNN
+## 2. Inspect WNN modality weights
+
+Where does each assay contribute most strongly to the integrated graph?
+
+```{code-cell} ipython3
+ds.plots.modality_weights(graph=wnn_graph, layout=wnn_layout)
+```
+
+Spatial shifts show where RNA or ADT contributes more strongly. Check unexpected shifts
+against markers and assay quality; noisy features or retained control antibodies can also
+change the weights.
+
+## Optional: compare WNN with SNN
 
 SNN merges connectivity maps with equal standing. WNN consumes neighbour artifacts and learns a
 per-cell contribution for each modality. Both preserve their exact source references; neither
@@ -145,8 +161,8 @@ becomes an implicit active graph.
 cd16 = FeatureRef("CD16", assay="ADT", by="id", label="CD16")
 figure, axes = plt.subplots(2, 2, figsize=(9, 8))
 for row, layout, labels, method in (
-    (0, snn_layout, snn_clusters, "SNN"),
-    (1, wnn_layout, wnn_clusters, "WNN"),
+    (0, wnn_layout, wnn_clusters, "WNN"),
+    (1, snn_layout, snn_clusters, "SNN"),
 ):
     ds.plots.embedding(
         layout=layout,
@@ -200,22 +216,6 @@ pd.DataFrame(concordance)
 
 ARI and NMI describe agreement. Interpret them beside marker coherence and assay design rather than
 maximizing them mechanically.
-
-## 3. Inspect WNN modality weights
-
-### Question: where does each modality contribute most strongly?
-
-```{code-cell} ipython3
-ds.plots.modality_weights(
-    graph=wnn_graph,
-    layout=wnn_layout,
-)
-```
-
-The plot validates the stored WNN weights and aligns them to the exact layout selection before
-drawing one panel per assay. Spatial shifts can identify regions whose local structure is better
-resolved by RNA or ADT. They can also expose noisy features, retained control antibodies, or a
-modality-specific graph problem.
 
 ## Decision guide
 

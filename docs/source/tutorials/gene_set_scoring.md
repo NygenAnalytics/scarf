@@ -35,7 +35,7 @@ These methods do not calculate enrichment p-values.
 
 ## Dataset
 
-The rebuilt 5K PBMC store contains a completed standard analysis labeled `docs_default`.
+The 5K PBMC store contains a prepared analysis labeled `docs_default`.
 Open the downloaded store directly because scoring writes new immutable artifacts. The frozen run
 provides the exact analysis cells and UMAP used below.
 Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
@@ -97,11 +97,12 @@ available = {str(name).upper() for name in ds.RNA.feats.fetch_all('names')}
 )
 ```
 
-## 2. Score weighted signatures with WAGGR
+## 2. Start with equal-weight scores
 
-WAGGR applies edge weights to library-size-normalized expression.
-`wmean` divides each weighted sum by the sum of absolute weights, while `wsum` leaves the weighted sum unscaled.
-Signed weights are supported.
+WAGGR calculates a weighted mean of library-size-normalized expression by default.
+When the input has no weight column, every target gene has weight one.
+We use `tmin=3` for these short teaching signatures so that a signature can still be scored if
+one or two of its five genes are missing. The default requires five matched targets.
 
 This comparison uses the complete assay feature universe for both methods:
 
@@ -111,22 +112,10 @@ all_features = ds.select_all_features(from_assay='RNA')
 ```
 
 ```{code-cell} ipython3
-weighted_sets = gene_sets.assign(weight=1.0)
-weighted_sets.loc[
-    weighted_sets['target'].isin(['S100A8', 'S100A9']),
-    'weight',
-] = 1.5
-weighted_sets
-```
-
-S100A8 and S100A9 carry weight 1.5; every other edge stays at 1.0.
-
-```{code-cell} ipython3
 waggr = ds.run_waggr(
-    weighted_sets,
+    gene_sets,
     cell_selection,
     features=all_features,
-    mode='wmean',
     tmin=3,
 )
 score_sources = ['T_cell', 'B_cell', 'Myeloid']
@@ -140,36 +129,6 @@ waggr_scores.describe().loc[['min', '50%', 'max']]
 
 Each column is one source.
 The ranges show that WAGGR tracks expression magnitude and is not confined to values between zero and one.
-The loaded `EnrichmentResult.feature_selection` records the exact normalization universe.
-
-To see what the raised Myeloid weights change, run the same network with every weight at 1.0 and compare Myeloid summaries:
-
-```{code-cell} ipython3
-waggr_unweighted = ds.run_waggr(
-    gene_sets.assign(weight=1.0),
-    cell_selection,
-    features=all_features,
-    mode='wmean',
-    tmin=3,
-)
-waggr_unweighted_result = ds.get_enrichment(waggr_unweighted)
-unweighted_scores = pd.DataFrame(
-    waggr_unweighted_result.data.compute(),
-    columns=list(waggr_unweighted_result.source_names),
-)
-pd.DataFrame(
-    {
-        'weighted': waggr_scores['Myeloid'],
-        'unweighted': unweighted_scores['Myeloid'],
-    }
-).describe().loc[['min', '50%', 'max']]
-```
-
-Compare the Myeloid rows: any shift is the effect of raising S100A8 and S100A9.
-T_cell and B_cell edges were left at 1.0 in both runs.
-
-WAGGR uses Scarf's default RNA library-size normalization.
-Set `log_transform=True` to apply `log1p` before aggregation.
 
 ## 3. Score rank recovery with AUCell
 
@@ -179,7 +138,7 @@ Network weights are ignored.
 
 The required `features` argument defines the ranking universe.
 Here the `all_features` artifact ranks the complete RNA feature order.
-`n_up=500` evaluates recovery within the top 500 ranks.
+By default, AUCell evaluates the top 5% of that ranking universe.
 
 ```{code-cell} ipython3
 aucell = ds.run_aucell(
@@ -187,8 +146,6 @@ aucell = ds.run_aucell(
     cell_selection,
     features=all_features,
     tmin=3,
-    n_up=500,
-    tie_seed=0,
 )
 aucell_result = ds.get_enrichment(aucell, sources=score_sources)
 aucell_scores = pd.DataFrame(
@@ -198,51 +155,37 @@ aucell_scores = pd.DataFrame(
 aucell_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-AUCell values stay between zero and one.
-The same `tie_seed` gives a deterministic global ordering for equal expression values.
-Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different execution.
+AUCell values stay between zero and one. The default seed keeps the ordering of tied expression
+values reproducible. Use `n_up` only when you want a different rank window, and keep it fixed when
+comparing scores from the same feature universe.
 
 ## 4. Visualize the selected sources
 
-`get_enrichment` requires an exact enrichment ref and returns a lazy result.
-The calls above selected only the requested source columns before computing them. Reuse those
-loaded tables for every plot and comparison below. The values are activity scores, not p-values.
+The tables above contain only the three requested signatures. Reuse them for plotting rather than
+loading the scores again. These values describe gene-set activity; they are not p-values.
 
 ```{code-cell} ipython3
 umap = run.cells.to_pandas_dataframe(['umap_1', 'umap_2'])
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, source in zip(axes, score_sources, strict=True):
-    axis.scatter(
+    points = axis.scatter(
         umap['umap_1'],
         umap['umap_2'],
         c=aucell_scores[source],
         s=3,
+        vmin=0,
+        vmax=1,
     )
     axis.set_title(f'{source} AUCell')
+    figure.colorbar(points, ax=axis, label='AUCell score')
 figure.tight_layout()
-figure
+plt.show()
 ```
 
 AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores peak in separate parts of the UMAP when those populations are present.
 
-```{code-cell} ipython3
-figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-for axis, source in zip(axes, score_sources, strict=True):
-    axis.scatter(
-        umap['umap_1'],
-        umap['umap_2'],
-        c=waggr_scores[source],
-        s=3,
-    )
-    axis.set_title(f'{source} WAGGR')
-figure.tight_layout()
-figure
-```
-
-WAGGR marks the same lineage regions, but the color scale follows expression magnitude rather than rank recovery.
-
-WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because one aggregates weighted expression and the other measures within-cell rank recovery.
-Quantify that difference cell by cell:
+Compare the two methods for the Myeloid signature. WAGGR follows expression magnitude, while
+AUCell measures recovery among the highest-ranked genes, so their numerical scales differ.
 
 ```{code-cell} ipython3
 myeloid_compare = pd.DataFrame(
@@ -267,7 +210,19 @@ axis.set_ylabel('Myeloid AUCell')
 plt.show()
 ```
 
-Cells that rank high for Myeloid under AUCell also tend to score high under WAGGR, while the absolute values stay on different scales.
+Look for cells with high scores under both methods and cells where the methods disagree.
+A change in score scale alone is not a biological difference.
+
+## Optional: use a signature with weights
+
+Use weights when the source of a signature provides a reason for particular genes to contribute
+more, less, or in opposite directions. Add a `weight` column to the input table; without it, all
+weights are one. WAGGR's default `mode="wmean"` divides the weighted sum by the sum of absolute
+weights. `mode="wsum"` leaves it unscaled. AUCell ignores these weights.
+
+WAGGR also accepts `log_transform=True` to apply `log1p` before aggregation. Changing weights or
+the expression transform changes the meaning of the score, so choose them before comparing cells
+or conditions.
 
 ## Choosing a method
 

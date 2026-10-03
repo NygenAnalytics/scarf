@@ -17,15 +17,13 @@ kernelspec:
 
 # Automate an RNA analysis
 
-Scarf agents analyze one RNA assay in a prepared local Scarf store or Cytebase mount.
-Scarf measures the data and executes a fixed pipeline. A configured language model interprets
-study metadata, chooses among registered alternatives, selects measured finalists, and proposes
-provisional cluster identities. Results include clustering, descriptive markers, UMAP,
-annotations, and a report explaining the decisions and limitations.
+Scarf agents run an RNA analysis, compare a small set of analysis settings, and propose cell
+identities from the measured markers. The result includes clusters, UMAP, marker tables,
+provisional annotations, and a report explaining the choices.
 
-This tutorial runs a small synthetic example without downloading data or contacting a model
-provider. For a real Cytebase dataset with a configured provider, see
-{doc}`garrido_trigo_agents`. Annotation quality still requires biological review.
+Start with a prepared store and a model provider. The first sections show how to run the analysis
+and review its results; {doc}`garrido_trigo_agents` is a worked example on real data. An optional
+developer example at the end runs without a provider. Annotation still needs biological review.
 
 ## Prepare your input and model
 
@@ -56,7 +54,7 @@ In a notebook, await the asynchronous entry point. Here `model` is your configur
 model, and `study.zarr` must already be initialized.
 
 ```python
-from scarf.agent import AnalysisConfig, Study, analyze_rna_async
+from scarf.agent import Study, analyze_rna_async
 
 run = await analyze_rna_async(
     "study.zarr",
@@ -68,7 +66,6 @@ run = await analyze_rna_async(
         tissue="blood",
         excludedColumns=["author_annotation"],
     ),
-    config=AnalysisConfig(assay="RNA", scoreDoublets=False),
 )
 print(run.status)
 print(run.run_dir)
@@ -86,53 +83,56 @@ design. Repeated samples are not independent biological replicates. Hold evaluat
 with `excludedColumns`. Local UTF-8 excerpts in `referenceFiles` have a combined 16 KiB limit.
 Missing replication does not block descriptive population discovery.
 
-## What runs, and who decides?
+## Read and continue a run
 
-```{mermaid}
-flowchart TD
-    A[Inspect prepared store and freeze input identity] --> B[Model interprets metadata roles]
-    B --> C[Freeze cohort, exclusions, and correction eligibility]
-    C --> D[Execute baseline on every retained cell]
-    D --> E[Model chooses one feasible PC probe]
-    E --> F[Execute independent HVG, PC, and neighbor probes]
-    F --> G[Model shortlists measured partitions]
-    G --> H{Eligible optional Harmony comparison?}
-    H -->|Yes| I[Measure corrected partition and matched native control]
-    H -->|No| J[Compute markers for at most two finalists]
-    I --> J
-    J --> K[Validate correction gates and model selects finalist]
-    K --> L[Finalize pinned recipe with UMAP and reused markers]
-    L --> M[Model annotates every cluster in batches of at most eight]
-    M --> N[Save compact store result and external report]
+The returned status is `running`, `needsInput`, `completed`, `failed`, or `interrupted`.
+Inspect it before using finalized numerical results. Every persisted outcome supports a report,
+including questions and failures. A report error does not downgrade scientific status.
+
+```python
+from scarf.agent import open_analysis, resume_rna_async
+
+run = open_analysis(run.run_dir)
+print(run.status, run.pending_questions)
+print(run.exploration_coverage)
+print(run.decision_resolutions)
+run.report()  # Saved evidence only; no provider or numerical computation.
+
+# Explicitly resume unfinished work after reviewing its recorded outcome.
+run = await resume_rna_async(run.run_dir, model=model)
 ```
 
-The default baseline has 1,000 HVGs, 21 PCs, 11 neighbors, and Leiden resolutions
-`0.5`, `0.75`, `1.0`, and `1.25`. Four native representations are planned: the baseline,
-one HVG alternative, one PC alternative, and one neighbor alternative. Each probe changes one
-parameter from the same baseline. Alternatives come from HVGs `2,000/4,000`, PCs `10/30`, and
-neighbors `21/41`; registered fallback values handle explicitly changed baselines. The model
-cannot skip feasible native probes by accepting the baseline early.
+For a pending question, pass `answers={questionId: answer}` for every exact pending ID. Answers
+cannot replace fixed scientific settings. Resume requires matching scientific inputs and Scarf
+procedure/prompt identity. Operational settings or the provider may change for unfinished
+choices. A relocated source must match the fingerprint and saved pipeline/artifact history.
+Prototype histories cannot be resumed.
 
-Scarf checks dimensional rank, neighbor feasibility, actual selected genes, shared cohort,
-same-resolution comparisons, and artifact lineage. Identical HVG selections, infeasible probes,
-and failed trials remain visible in exploration coverage. An admitted failed trial consumes its
-slot. There is no grid search, combined-parameter search, or automatic scientific repair.
+Completed results expose `run.pipeline`, `run.artifacts`, `run.get_markers()`,
+`run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies
+the source and exact final artifacts. Annotations remain provisional and do not overwrite cell
+metadata. A named identity requires observed supporting markers, but this validation cannot
+establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
 
-Four native screens, two marker assessments, and finalization permit at most seven normal
-pipeline invocations. One eligible Harmony trial raises that limit to eight. Explicit recovery
-can add invocations; these counts do not bound elapsed time or provider spending.
+The external directory retains `run.json`, immutable events, evidence, visible model exchanges,
+annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the
+local Zarr store links to the exact final core pipeline and its workspace, selected configuration,
+rationale, and external audit location. Read it through `run.compact_result`. It does not duplicate the
+full history or make the external audit disposable. See {doc}`../reference/api/agent` for details.
 
-| Evidence or result | Cells used |
-| --- | --- |
-| PCA, graph, clustering, markers, final UMAP | The entire retained cohort |
-| PC/covariate and correction diagnostics | At most 10,000 cells |
-| Silhouette assessment | At most 2,000 cells |
-| Finalist cluster sizes and group/QC summaries | The entire retained cohort |
+## What the agent compares
 
-Diagnostic sampling never substitutes a smaller discovery cohort. Parameter comparisons include
-adjusted Rand index and directional overlap on aligned cells at the same resolution. Marker
-support is the fraction of clusters with at least one qualifying measured marker, not a measure
-of correct cell identity.
+The baseline uses 1,000 variable genes, 21 PCs, and 11 neighbors. Scarf then measures alternatives
+that change one of these settings at a time. It compares clusterings on the same retained cells,
+checks markers for up to two finalists, and makes a final UMAP.
+
+The model interprets those measurements and proposes labels. Scarf executes the numerical
+operations and checks the returned decisions. A clean UMAP or many marker genes does not, by
+itself, establish that the chosen identities are correct.
+
+The main analysis uses every retained cell. Some diagnostics use bounded samples: up to 10,000
+cells for covariate checks and 2,000 for silhouette assessment. See the
+{doc}`../reference/api/agent` reference for the full comparison rules and execution limits.
 
 ## QC, correction, and uncertainty
 
@@ -163,49 +163,14 @@ tie rule, not evidence of biological superiority. Strict mode keeps such questio
 Essential missing facts produce `needsInput` in either mode. Provider failures, invalid output
 after bounded repair, and unknown numerical failures still stop work.
 
-## Read and continue a run
+## Optional: a developer example without a provider
 
-The returned status is `running`, `needsInput`, `completed`, `failed`, or `interrupted`.
-Inspect it before using finalized numerical results. Every persisted outcome supports a report,
-including questions and failures. A report error does not downgrade scientific status.
+The user workflow above is complete. This optional section is for readers who want to inspect
+how structured model decisions enter the agent. It uses a scripted provider and synthetic data;
+it does not teach biological annotation or evaluate a live model.
 
-```python
-from scarf.agent import open_analysis, resume_rna_async
-
-run = open_analysis("analyses/my-study")
-print(run.status, run.pending_questions)
-print(run.exploration_coverage)
-print(run.decision_resolutions)
-run.report()  # Saved evidence only; no provider or numerical computation.
-
-# Explicitly resume unfinished work after reviewing its recorded outcome.
-run = await resume_rna_async(run.run_dir, model=model)
-```
-
-For a pending question, pass `answers={questionId: answer}` for every exact pending ID. Answers
-cannot replace fixed scientific settings. Resume requires matching scientific inputs and Scarf
-procedure/prompt identity. Operational settings or the provider may change for unfinished
-choices. A relocated source must match the fingerprint and saved pipeline/artifact history.
-Prototype histories cannot be resumed.
-
-Completed results expose `run.pipeline`, `run.artifacts`, `run.get_markers()`,
-`run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies
-the source and exact final artifacts. Annotations remain provisional and do not overwrite cell
-metadata. A named identity requires observed supporting markers, but this validation cannot
-establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
-
-The external directory retains `run.json`, immutable events, evidence, visible model exchanges,
-annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the
-local Zarr store links to the exact final core pipeline and its workspace, selected configuration,
-rationale, and external audit location. Read it through `run.compact_result`. It does not duplicate the
-full history or make the external audit disposable. See {doc}`../reference/api/agent` for details.
-
-## Worked example without network access
-
-This teaching fixture contains 120 synthetic cells and 2,102 features. Three planted expression
-patterns provide numerical structure without pretending they are real cell types. It is small
-enough to construct in memory; real analysis uses Scarf's bounded count access. No downloaded
-dataset or live provider is used.
+The fixture has 120 cells and 2,102 features, with three planted expression patterns. It is small
+enough to construct in memory and needs no dataset download or provider credentials.
 
 ```{code-cell} ipython3
 from pathlib import Path

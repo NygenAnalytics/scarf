@@ -14,15 +14,19 @@ kernelspec:
 (multimodal_integration)=
 (wnn_integration)=
 
-# scCITE-seq Primer
+# Read RNA and protein together with CITE-seq
 
-Cellular Indexing of Transcriptomes and Epitopes by Sequencing (CITE-seq) is a multimodal single-cell method that allows you to measure both **the transcriptome** (intracellular mRNA expression) and **epitopes** (cell-surface protein abundance) in the exact same single cell. Data in CITE-seq has 2 distinct features for each cell, with the first one being the measured **mRNA expression** of the genes; The secondary feature is measured **cell-surface protein abundance**. Cells are incubated with antibodies targeted against specific surface markers of interest, such as CD4, CD8, or CD19. Since each antibody is conjugated to a corresponding unique DNA barcode, by counting these sequenced barcodes, we can yield an Antibody-Derived Tag (ADT) count; The ADT count directly reflects the abundance of the protein on the cell's surface. Generally, CITE-seq is dominantly performed in immune/PBMC contexts, but it is not restricted to this realm.
+CITE-seq measures RNA and selected surface proteins in the same cells. Antibodies carry
+DNA barcodes, called antibody-derived tags (ADTs), that let us count their signal alongside
+RNA. The two measurements can help resolve cell types when one marker is hard to detect
+in RNA alone.
 
-# Integrate RNA and protein information with CITE-seq
+Here we use a prepared PBMC analysis to ask whether RNA and protein markers support the
+same cell identities. Scarf combines the measurements with weighted nearest neighbors
+(WNN): each cell receives an RNA weight and a protein weight based on their relative
+ability to predict its local neighborhood.
 
-To interpret matched RNA and ADT measurements from the same PBMCs in order to identify cell identities, we used a completed analysis. SCARF uses a weighted-nearest-neighbor (WNN) based approach, which builds a joint neighbor graph by letting each cell weigh RNA versus protein evidence according to how well each modality predicts its own neighbors, so the final graph is built off both modalities.
-
-## Open the prepared multimodal result
+## Open the prepared result
 
 ```{code-cell}
 import scarf
@@ -35,14 +39,11 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
-    default_assay="RNA",
-    nthreads=4,
-)
+ds = scarf.DataStore(f"{dataset}/data.zarr", default_assay="RNA", nthreads=4)
 ```
 
-The prepared result already contains all of the complete analysis, thus all we do is grab the WNN graph, the UMAP, and the Leiden clustering results.
+The store already contains a WNN graph, UMAP, and Leiden clusters. We select the UMAP
+and clusters made from that same graph. Each returned reference identifies one saved result.
 
 ```{code-cell}
 [wnn_graph] = ds.list_artifacts(
@@ -68,9 +69,7 @@ The prepared result already contains all of the complete analysis, thus all we d
 )
 ```
 
-### What unique populations does the joint RNA and protein graph identify?
-
-Before clustering, single-cell workflows construct a k-nearest-neighbors graph, connecting cells that share similar profiles. In CITE-seq, we have 2 different views, that when combined, provide more thorough pieces of information. The information from the RNA provides information of thousands of genes, but specific marker genes may often drop out, and not be sequenced. CITE-seq comes in here to provide a clean, and stable way to detect the protein expression of these genes on the surface of the cell, but you only get a minuscule portion of genes in comparison to the RNA. When combined, differentiating between cell identities becomes smoother, as we now possess protein evidence.
+## Find populations to investigate
 
 ```{code-cell}
 ds.plots.embedding(
@@ -80,11 +79,15 @@ ds.plots.embedding(
 )
 ```
 
-In this UMAP embedding, which is simply a 2D representation of the WNN graph, we can notice that certain groups of cells separate into distinct, well-defined clusters rather than one continuous smear. This separation once again indicates that the combined RNA and protein evidence suggest distinctly resolved cellular states. But to actually identify the different cell identities, we can visualize the RNA and protein expression.
+Each point is a cell. Nearby points tend to have similar RNA and protein profiles.
+The numbered groups give us populations to investigate; their separation alone does not
+tell us which cell types they contain.
 
-### Does the measured protein and RNA expression support the population structure?
+## Compare RNA and protein markers
 
-One important thing to consider before you visualize the protein expression is that the ADT counts rarely contain true zeros. Unbound antibodies stick nonspecifically to every droplet (background binding), so each cell carries low-level signal for every antibody. This is because the antibodies may get trapped in the droplet alongside cell debris, the antibodies sticking nonspecifically to the cell membranes, or antibodies binding to different receptors than intended. 
+We put each protein beside a related RNA marker on the same map. This dataset stores
+short antibody names as feature IDs, so `by="id"` selects the protein explicitly.
+`FeatureRef` also supplies the assay and a readable panel title.
 
 ```{code-cell}
 protein_panel = [
@@ -96,7 +99,7 @@ rna_panel = [
     for gene in ("CD3D", "CD4", "CD8A", "CD14", "CD19", "NCAM1")
 ]
 paired_panel = [
-    panel for pair in zip(protein_panel, rna_panel, strict=True) for panel in pair
+    marker for pair in zip(protein_panel, rna_panel, strict=True) for marker in pair
 ]
 ds.plots.embedding(
     layout=wnn_umap,
@@ -106,61 +109,40 @@ ds.plots.embedding(
 )
 ```
 
-To generally interpret the values on the graph, in our example, the panels with RNA expression are log1p library-size normalization expression; a standard approach for scRNA-seq data. For the protein (ADT) panels, we have centered-log-ratio normalized abundance. Higher expression on the protein panels means there is more surface protein expression relative to the background, in which the background is the extremely low values nearing zero, but never truly zero.
+Start with CD3 protein and CD3D RNA: their shared region supports a T-cell population.
+Within that region, CD4 and CD8a help distinguish T-cell subsets. CD14 supports monocytes,
+CD19 supports B cells, and CD56/NCAM1 supports NK-like cells. Use several markers together;
+{doc}`annotation` explains how to check an interpretation with additional markers.
 
-Here, our co-expression of CD3 on the RNA and protein indicates the cluster is likely T cells. Our co-expression of CD4 and CD8a helps in differentiating between subtypes of T cells. Genes and proteins like CD14 support regions of monocytes, while CD19 supports the regions of B cells, and CD56/NCAM1 highlights NK-like cells. The coherent localization on the same embedding provides further evidence of identifying cell states.
+The RNA panels show library-size-normalized expression. The ADT panels
+show centered-log-ratio (CLR) normalized values. Compare where each marker is high,
+rather than comparing RNA and protein colorbar numbers. CLR rescales ADT counts; it does
+not remove signal from ambient antibodies or nonspecific binding.
 
-For further information regarding the markers chosen for our cell identification purposes, refer to {doc}`annotation`.
+## Build a WNN result for your own data
 
-## Limits of this result
-
-- **Panel Pre-Selection & Biological Blind Spots:** Unlike RNA-seq, which measures the whole transcriptome (~20,000 genes) without bias, CITE-seq surface protein panels are strictly targeted to a set of proteins (typically 10 to 200 antibodies). If a novel cell type or activation state is driven by a surface marker not included in your selected panel, the protein modality is completely blind to it and integration must rely solely on RNA expression.
-- **Ambient Antibodies & Non-Specific Background Binding:** ADT counts do not equal zero even in cells that do not express the protein. High ambient antibody concentrations or unblocked Fc receptors can create false-positive protein signals. Advanced workflows often require isotype controls or ambient-subtraction algorithms to adjust for technical effects like this.
-- **Temporality of RNA expression vs. Protein expression:** CITE-seq is transcriptomics performed on dead cells, meaning we only capture a single snapshot of the cell's state. High mRNA abundance does not guarantee high surface protein levels. Differences in translation efficiency, post-transcriptional repression, and protein half-lives mean RNA and protein operate on different biological timelines, thus why we may see differences in our data. It's important to keep this idea in mind when interpreting results, and identify if this is a question that can answer the potential observations in your data.
-
-## Substitute your own input
-
-The workflow for CITE-seq can be described as the following:
-
-When processing your own CITE-seq dataset from scratch, the referenced workflow below can be used as a brief example:
+In your own open datastore, `ds`, build RNA and ADT neighbor results over the
+**same selected cells**, following
+{doc}`graph_construction`. Keep the returned `rna_neighbors` and `adt_neighbors` references
+and the RNA embedding initialization, `rna_initialization`. WNN is the default, so the
+joint analysis then needs only these calls:
 
 ```python
-# Firstly prepare the RNA Neighborhood Graph
-# Filter cells and select highly variable genes (HVGs)
-own_ds.auto_filter_cells()
-own_ds.mark_hvgs(from_assay="RNA", top_n=2000)
-
-# Perform dimensionality reduction with PCA and find k-nearest neighbors
-rna_pca = own_ds.run_pca(from_assay="RNA", dims=30)
-rna_ann = own_ds.build_ann_index(rna_pca)
-rna_neighbors = own_ds.query_neighbors(rna_ann, k=21)
-
-# Build a K-means starting layout from the RNA PCA to anchor the
-# global manifold
-rna_initialization = own_ds.build_embedding_initialization(rna_pca)
-
-# Secondly prepare the ADT (Protein) Neighborhood Graph
-# Normalize ADT counts (e.g., CLR) to account for background staining
-own_ds.run_normalization(from_assay="ADT")
-
-# For targeted antibody panels (typically < 100 markers), calculate neighbors 
-# directly on normalized protein features or after minor dimensionality reduction
-adt_ann = own_ds.build_ann_index(from_assay="ADT")
-adt_neighbors = own_ds.query_neighbors(adt_ann, k=21)
-
-
-# Thirdly, we perform multimodal integration with WNN
-# WNN computes cell-specific weights based on how reliably each modality 
-# predicts neighbors, producing a single consensus neighborhood graph.
-wnn_graph = own_ds.integrate_assays([rna_neighbors, adt_neighbors], method="wnn")
-
-
-# Finally, visualize the joint graph as a 2D UMAP and clustering
-# Project the joint graph into 2D space (using RNA initialization for global orientation)
-# Then perform Leiden clustering on the joint graph to identify potential cell types
-
-wnn_umap = own_ds.run_umap(wnn_graph, rna_initialization)
-wnn_clusters = own_ds.run_leiden_clustering(wnn_graph)
+wnn_graph = ds.integrate_assays([rna_neighbors, adt_neighbors])
+wnn_umap = ds.run_umap(wnn_graph, rna_initialization)
+wnn_clusters = ds.run_leiden_clustering(wnn_graph)
 ```
 
-Some references you can access for a deeper explanation of the graph building can be found at {doc}`graph_construction`. SCARF also has other integration methods for CITE-seq data, such as shared nearest-neighbor (SNN) integration, which gives RNA and protein equal weight instead of learning per-cell weights. To compare the best integration methods for your CITE-seq analysis, refer to {doc}`../reference/api/integration` and {doc}`multimodal_diagnostics` to compare integration predictions.
+Assay-specific preprocessing matters: RNA and a small antibody panel need different
+feature choices. Review those choices before integration. Continue to
+{doc}`multimodal_diagnostics` to inspect weights and compare integration methods, or
+{doc}`tea_seq` to add a third modality.
+
+## What this result can tell us
+
+- Agreement between RNA and protein supports a cell-type interpretation, but does not
+  establish every cluster's identity.
+- The antibody panel measures only its selected targets. Background binding can produce
+  signal even when the target protein is absent; review assay controls.
+- RNA and protein are measured at one time point. Their abundance can differ because of
+  translation, turnover, and technical effects.

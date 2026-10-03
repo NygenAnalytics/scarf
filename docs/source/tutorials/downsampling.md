@@ -14,13 +14,14 @@ kernelspec:
 
 # Cell downsampling
 
-TopACeDo selects representative cells from an explicit graph and Paris clustering. It returns one
-immutable artifact with the selected mask and diagnostics. Nothing is added to cell metadata.
+A smaller set of representative cells can make a large dataset easier to explore or pass to
+another tool. TopACeDo uses the neighbourhood graph and a Paris clustering to choose cells that
+cover its structure. It saves the selected cells as an artifact; it does not change the source data.
 
 ## 1. Open the required artifacts
 
 TopACeDo requires a Paris cut from the same graph. The rebuilt PBMC store contains a completed
-standard run labeled `docs_default` and a 15-cluster Paris cut built from its graph. Calling
+example run labeled `docs_default` and a 15-cluster Paris cut built from its graph. Calling
 `run_paris_clustering` with that graph and cut size reuses the exact stored result. A Leiden
 partition or a cut from another graph is rejected.
 
@@ -55,47 +56,25 @@ paris_result = ds.load_paris_clustering(paris)
 pd.Series(paris_result.labels).value_counts().sort_index()
 ```
 
-## 2. Sample and inspect the artifact
+## 2. Choose representative cells
 
 ```{code-cell} ipython3
 sampling = ds.run_topacedo_sampler(
     graph,
     paris,
-    max_sampling_rate=0.1,
 )
 sampling_data = ds.load_artifact(sampling)
 sampled = np.asarray(sampling_data["sampled"][:], dtype=bool)
-seeds = np.asarray(sampling_data["seeds"][:], dtype=bool)
-density = np.asarray(sampling_data["density"][:])
-mean_snn = np.asarray(sampling_data["mean_snn"][:])
 {
     "cells": int(sampled.size),
     "selected": int(sampled.sum()),
-    "seeds": int(seeds.sum()),
 }
 ```
 
-The payload also contains `edges`, the sampled Steiner-tree edges in graph row coordinates. All
-arrays use the captured cell-selection order.
-
-```{code-cell} ipython3
-summary = pd.DataFrame(
-    {
-        "cluster": paris_result.labels,
-        "sampled": sampled,
-        "seed": seeds,
-        "density": density,
-        "mean_snn": mean_snn,
-    }
-)
-summary.groupby("cluster", sort=True).agg(
-    cells=("sampled", "size"),
-    selected=("sampled", "sum"),
-    seeds=("seed", "sum"),
-    mean_density=("density", "mean"),
-    mean_snn=("mean_snn", "mean"),
-)
-```
+The default 5% rate controls seed selection within each cluster, with a minimum number of
+seeds per cluster. The sampler then adds cells that connect those seeds through the graph.
+The final sample can therefore exceed 5%. Check the selected count above; this is not a
+request for an exact sample size.
 
 ```{code-cell} ipython3
 coordinates = np.asarray(ds.load_artifact(umap)["values"][:])
@@ -136,6 +115,23 @@ subset.cells.N, subset.RNA.feats.N
 
 `SubsetZarr` retains every feature in the listed assays. Use `to_anndata` when you need an in-memory
 handoff with both axes constrained.
+
+## 4. Inspect coverage and adjust the sample
+
+Check how many cells were retained from each Paris cluster before choosing a different rate:
+
+```{code-cell} ipython3
+summary = pd.DataFrame({"cluster": paris_result.labels, "sampled": sampled})
+summary.groupby("cluster")["sampled"].agg(cells="size", selected="sum")
+```
+
+If you need a larger sample, pass `max_sampling_rate=0.1` to raise the maximum seed-selection
+rate to 10% per cluster. The minimum-per-cluster rule and added connecting cells still affect
+the final size. Compare coverage on the original layout after changing the rate.
+
+The artifact also contains seed cells, density estimates, shared-neighbour summaries, and the
+selected graph edges. These are available through `load_artifact` when you need to inspect how
+the sampler made its choices.
 
 ## Common mistakes
 

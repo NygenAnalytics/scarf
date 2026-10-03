@@ -24,6 +24,9 @@ The tutorial constructs equal cell counts for each sequencing-batch and disease 
 technical mixing can be assessed without making disease identical to batch. This sampling is not
 a donor-balanced biological design.
 
+We will first choose comparable cells, then run the same pipeline twice, adding
+`harmony_batch_columns=["batch"]` to the second run.
+
 The code downloads the
 [versioned H5AD file](https://datasets.cellxgene.cziscience.com/3b751975-34bb-409a-a9b7-98380f0450ea.h5ad)
 to local disk, converts it to a local Zarr store, and runs every analysis locally. Passing the
@@ -42,7 +45,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import urlretrieve
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -64,12 +66,23 @@ if not h5ad_path.exists():
     partial_path = h5ad_path.with_suffix(".h5ad.part")
     urlretrieve(download_url, partial_path)
     partial_path.replace(h5ad_path)
+```
 
+Check that the file contains the expected counts before converting it:
+
+```{code-cell} ipython3
 inspection = scarf.inspect_h5ad(str(h5ad_path))
 assert inspection.matrixKey == "raw/X"
 assert inspection.integerLike is True
 assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
+inspection
+```
 
+Convert once and keep the source store for later sessions. This dataset needs a 6 GB import
+budget for the default count layout. The temporary directory keeps an interrupted conversion
+separate from the finished store.
+
+```{code-cell} ipython3
 if not source_store.exists():
     with TemporaryDirectory(dir=dataset_directory) as conversion_directory:
         staged_store = Path(conversion_directory) / source_store.name
@@ -164,17 +177,15 @@ covariate, so only `batch` is supplied to Harmony below.
 
 ## 3. Run matched uncorrected and Harmony pipelines
 
-Both runs use the same cells, feature count, PCA dimensions, and neighbour count. The only analysis
-difference is `harmony_batch_columns=["batch"]` in the second run. Filtering and optional downstream
-stages that are not needed for this comparison are disabled.
+Both runs use the same cells and the default feature count, PCA dimensions, and neighbour count.
+The only analysis difference is `harmony_batch_columns=["batch"]` in the second run.
+We turn off filtering because we already chose the cells, and skip clustering, cell-cycle scores,
+doublet detection, and markers because this comparison only needs the graph and UMAP.
 
 ```{code-cell} ipython3
 pipeline_options = {
     "cell_key": "docs_ra_batch_demo",
     "filtering": False,
-    "hvg_count": 1_000,
-    "pca_dims": 20,
-    "neighbors_k": 21,
     "leiden": False,
     "cell_cycle": False,
     "paris": False,
@@ -200,30 +211,19 @@ for the comparison.
 
 ## 4. Compare the layouts
 
-Plot each run once by sequencing batch and once by the imported broad annotation. The 2 by 2 layout
-keeps technical mixing and broad cell-type structure visible together.
+Plot each run by sequencing batch and by the imported broad annotation. Look for better mixing
+of batches while the broad cell types remain distinct.
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(2, 2, figsize=(9, 7))
-for row, (run_name, run) in enumerate(
-    (("Uncorrected", uncorrected), ("Harmony", harmony))
-):
-    for column, (field, field_name) in enumerate(
-        (("batch", "Batch"), ("rough_annot", "Broad cell type"))
-    ):
-        ds.plots.embedding(
-            run=run,
-            layout="umap",
-            color_by=field,
-            target=axes[row, column],
-            legend_loc="right" if field == "batch" else "on_data",
-            point_alpha=0.8,
-            show=False,
-        )
-        axes[row, column].set_title(f"{run_name}: {field_name}")
+ds.plots.embedding(run=uncorrected, color_by="batch")
+ds.plots.embedding(run=uncorrected, color_by="rough_annot")
+```
 
-figure.tight_layout()
-figure
+The Harmony result:
+
+```{code-cell} ipython3
+ds.plots.embedding(run=harmony, color_by="batch")
+ds.plots.embedding(run=harmony, color_by="rough_annot")
 ```
 
 (lisi_metrics)=
@@ -234,7 +234,7 @@ figure
 iLISI measures local mixing of `batch`. cLISI measures local separation of `rough_annot`, and graph
 connectivity measures whether cells sharing that annotation remain connected. Scarf scales all
 three metrics so higher values are better. Use the exact neighbour and connectivity artifacts from
-each run, with perplexity 7 for both LISI metrics.
+each run. The LISI metrics choose their neighbourhood scale from the neighbour count by default.
 
 ```{code-cell} ipython3
 def integration_diagnostics(run):
@@ -242,12 +242,10 @@ def integration_diagnostics(run):
         "iLISI (batch)": ds.metric_ilisi(
             batch_colname="batch",
             neighbors=run["neighbors"],
-            perplexity=7,
         ),
         "cLISI (rough_annot)": ds.metric_clisi(
             annotation_column="rough_annot",
             neighbors=run["neighbors"],
-            perplexity=7,
         ),
         "graph connectivity (rough_annot)": ds.metric_graph_connectivity(
             annotation_column="rough_annot",
@@ -265,15 +263,8 @@ score_frame = pd.DataFrame(
 score_frame.round(3)
 ```
 
-The validated run produced:
-
-| Run | iLISI, batch | cLISI, rough annotation | Graph connectivity, rough annotation |
-| --- | ---: | ---: | ---: |
-| Uncorrected | 0.159 | 0.988 | 0.975 |
-| Harmony | 0.336 | 0.984 | 0.975 |
-
-The higher iLISI after Harmony, together with nearly unchanged cLISI and graph connectivity,
-supports improved technical mixing without obvious loss of broad cell-type structure. These metrics
+Read these scores together. Higher iLISI after Harmony, with similar cLISI and graph connectivity,
+would support improved technical mixing without obvious loss of broad cell-type structure. These metrics
 are diagnostics, not proof that correction is biologically valid or that every disease-associated
 signal was preserved. The subset equalizes cell counts, not biological replicates, and disease was
 not used as a correction covariate. Biological conclusions still require a donor-aware design and

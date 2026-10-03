@@ -16,8 +16,8 @@ kernelspec:
 
 # Provenance and reuse
 
-This is the focused guide to artifact mechanics. It shows how to reopen one exact result, branch a
-parameter, identify reused work, force recomputation, and compare lineage. Read
+Scarf saves analysis results so you can reuse earlier work and compare new settings.
+This guide shows how to reopen a result, change one parameter, and see which steps ran again. Read
 {doc}`../concepts/provenance` first for the short mental model.
 
 ## Prerequisites
@@ -33,9 +33,13 @@ parameter, identify reused work, force recomputation, and compare lineage. Read
 
 ## Dataset
 
-The rebuilt PBMC store carries a completed pipeline run labelled `docs_default`. Its exact
+The prepared PBMC store carries a completed example run labelled `docs_default`. Its exact
 selection, normalization, PCA, neighbour, and graph refs provide the baseline. This page creates
 only the parameter forks needed to demonstrate reuse.
+
+This example was prepared with 15 principal components and 11 neighbours. Those are the settings
+we match below to reuse its results; `docs_default` is a saved label, not a promise that every
+setting is the API default.
 
 ```{code-cell} ipython3
 import scarf
@@ -104,13 +108,14 @@ graph_k15 = ds.build_connectivity_map(neighbors_k15)
 }
 ```
 
-The graph-construction guide owns the scientific effect of changing `k`. Here the important result
-is where the immutable branch begins.
+See {doc}`graph_construction` for how changing `k` affects an analysis. Here, notice that only
+neighbours and the graph needed new results.
 
-## 3. Vary `dims`: invalidate downstream
+## 3. Vary `dims`: build a separate branch
 
 A new PCA dimensionality creates a new reduction.
 ANN, neighbors, and connectivity that depend on the old reduction are not reused for the new chain.
+The earlier results remain available.
 
 ```{code-cell} ipython3
 pca_dims20 = ds.run_pca(normalized, dims=20)
@@ -143,20 +148,7 @@ forced = ds.run_normalization(
     hvg_ref,
     invalidate_cache=True,
 )
-status = ds.inspect_artifact(forced)
-baseline_status = ds.inspect_artifact(normalized)
-baseline_inputs = baseline_status.inputs or {}
-forced_inputs = status.inputs or {}
-
-{
-    "new artifact": forced != normalized,
-    "complete": status.complete,
-    "operation": status.operation,
-    "path": status.path,
-    "baseline path": baseline_status.path,
-    "same parameters": status.parameters == baseline_status.parameters,
-    "same inputs": forced_inputs == baseline_inputs,
-}
+forced != normalized
 ```
 
 ## 5. Compare lineage

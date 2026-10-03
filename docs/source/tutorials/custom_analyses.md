@@ -22,25 +22,18 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 
 - Load a supported neighbourhood graph and calculate a cell statistic
 - Stream selected count blocks when the matrix cannot fit in memory
-- Write custom cell and feature selections
-- Use external feature loadings in a reduction branch
+- Save a custom cell selection
 - Choose an exit path for another analysis system
 
 ## 1. Prepare a store
 
-The rebuilt PBMC store supplies counts and a completed standard run labeled `docs_default`.
+The prepared PBMC store supplies counts and a saved example run labeled `docs_default`.
 Open the downloaded store directly because the examples write custom artifacts and metadata, then
 reuse the run's frozen selection, graph, feature selection, and UMAP. The prepared store's active
 `I` matches the run's analysis selection.
-Only the graph-statistic and `wellConnected` paths use `load_graph`.
-Streaming, `set_feature_selection`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
 See {doc}`graph_construction` to build a graph by hand.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-import matplotlib.pyplot as plt
 import numpy as np
 
 import scarf
@@ -55,7 +48,6 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 run = ds.pipeline.open(label="docs_default")
 graph_ref = run["connectivity_map"]
-layout = run.cells.to_pandas_dataframe(["umap_1", "umap_2"]).to_numpy()
 ```
 
 ## 2. Calculate from the graph
@@ -85,16 +77,13 @@ ds.cells.insert(
 ```
 
 The insert writes one value per active cell in graph row order.
-The summary confirms the CSR cover and that the new column is populated.
+The summary shows the graph size and the mean of the new column.
 
 ```{code-cell} ipython3
-plt.scatter(
-    layout[:, 0],
-    layout[:, 1],
-    c=graph_strength,
-    s=4,
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by="customGraphStrength",
 )
-plt.colorbar(label="weighted graph strength")
 ```
 
 The plot asks where cells have stronger or weaker weighted connectivity in this specific graph.
@@ -144,7 +133,9 @@ The summary checks that every streamed cell received a detection count.
 ## 4. Create custom selections
 
 A boolean cell column can become a `cell_key`.
-Use `fill_value=False` when the new key is defined only for currently active cells:
+Use `fill_value=False` when the new key is defined only for currently active cells.
+Here we keep cells above the lowest quarter of graph strength as an example of making a selection.
+This is an illustration of the API, not a recommended quality-control filter:
 
 ```{code-cell} ipython3
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
@@ -158,65 +149,23 @@ ds.cells.insert(
 ```
 
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-axes[0].scatter(layout[:, 0], layout[:, 1], c=detected_hvgs, s=4)
-axes[0].set_title("Detected selected features")
-axes[1].scatter(layout[:, 0], layout[:, 1], c=well_connected, s=4)
-axes[1].set_title("Well connected")
-figure.tight_layout()
+ds.plots.embedding(
+    layout=run["umap"],
+    color_by=["customDetectedHVGs", "wellConnected"],
+    n_columns=2,
+)
 ```
 
 The first panel checks where the streamed count statistic varies.
 The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
 
-Install a supplied RNA feature mask with `set_feature_selection`. This returns an immutable
-selection artifact. The cell population is chosen separately by the consuming operation:
+## 5. Pass a small selection to another tool
+
+`to_anndata` creates an in-memory AnnData object. Select the cells and genes you need before
+materializing it. Here we pass the custom cell selection and the six-gene panel:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
-feature_names = ds.RNA.feats.fetch_all("names").astype(str)
-panel_mask = np.isin(feature_names, panel_genes)
-custom_features = ds.set_feature_selection(
-    mask=panel_mask,
-)
-custom_features, int(panel_mask.sum())
-```
-
-The returned reference identifies this exact panel. Pass it directly to later computations instead
-of resolving it from feature metadata.
-
-## 5. Use external feature loadings
-
-`run_custom_reduction` accepts an external feature-by-dimension loading matrix.
-Its rows must match the selected normalized features in order.
-It projects Scarf's normalized cell blocks through those loadings and records a reusable reduction artifact.
-Here an identity matrix stands in for loadings from an external tool:
-
-```{code-cell} ipython3
-branch_normalized = ds.run_normalization(
-    ds.snapshot_cell_selection(cell_key="wellConnected"),
-    custom_features,
-)
-n_features = int(ds.load_artifact(branch_normalized)["data"].shape[1])
-external_loadings = np.eye(n_features, dtype=np.float64)
-
-custom_reduction = ds.run_custom_reduction(
-    external_loadings,
-    branch_normalized,
-)
-custom_ann = ds.build_ann_index(custom_reduction)
-ds.load_artifact(custom_reduction)["data"].shape, custom_ann
-```
-
-The returned references keep this experiment separate from the earlier graph.
-Pass them explicitly through later graph-construction steps, and retain only the branches you want to compare.
-Replace the identity matrix with real loadings when an external method supplies them; the row count must still match `n_features`.
-
-## 6. Choose an exit path
-
-Confirm a feature-selective in-memory handoff with `to_anndata`, then a cell-selective Scarf store with `SubsetZarr`:
-
-```{code-cell} ipython3
 adata = ds.to_anndata(
     cell_key="wellConnected",
     feature_names=panel_genes,
@@ -224,33 +173,13 @@ adata = ds.to_anndata(
 adata.shape, adata.var_names.tolist()
 ```
 
-```{code-cell} ipython3
-export_directory = TemporaryDirectory()
-subset_path = Path(export_directory.name) / "custom_analyses_subset.zarr"
-
-writer = scarf.SubsetZarr(
-    zarr_loc=str(subset_path),
-    assays=[ds.RNA],
-    cell_key="wellConnected",
-    reset_cell_filter=False,
-    overwrite_existing_file=True,
-)
-writer.dump()
-
-subset_ds = scarf.DataStore(str(subset_path))
-{
-    "source wellConnected cells": int(ds.cells.fetch_all("wellConnected").sum()),
-    "subset cells": subset_ds.cells.N,
-    "subset RNA features": subset_ds.RNA.feats.N,
-}
-```
-
 `to_anndata` drops unselected features.
 It indexes `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`.
 So `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols.
 Check `adata.var["names"]` when you need the symbols.
-`SubsetZarr` keeps every RNA feature and only the selected cells.
-For full-assay `to_h5ad` / `to_mtx` writers, see {doc}`import_and_export`.
+Use `SubsetZarr` to write selected cells to a Scarf store instead; it retains every feature in
+the chosen assays. See {doc}`downsampling` for an example and {doc}`import_and_export` for H5AD
+and Matrix Market export.
 Use {doc}`remote_stores` when the count source itself must remain remote.
 
 ## Extension boundary

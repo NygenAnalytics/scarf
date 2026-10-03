@@ -16,12 +16,13 @@ kernelspec:
 
 # Pseudobulk and differential expression
 
-The inferential unit in condition-level differential expression is the biological donor, not the
-cell. This tutorial sums raw counts from γδ T cells into one column per donor, keeps the matched
-study design, and exports the result for a replicate-aware method such as edgeR or DESeq2.
+To compare conditions, we need independent biological samples. Here each sample is a donor.
+This tutorial sums raw counts from γδ T cells into one column per donor, keeps the matched
+study design, and exports the result for a method such as edgeR or DESeq2.
 
 Scarf performs the aggregation and export. It does not fit the differential expression model on
-this page.
+this page. The main Scarf step is `ds.make_bulk("donor_id", aggr_type="sum", ...)`.
+The preparation below identifies which cells and donors belong in that comparison.
 
 ## Dataset and study design
 
@@ -37,7 +38,11 @@ This page downloads the
 converts it to a local Zarr store, and mounts that local store into a temporary local analysis
 target. It is a download workflow, not remote analysis.
 
-## 1. Download and inspect the raw-count matrix
+## 1. Prepare the study data
+
+This larger example starts from a published H5AD file. If you already have a count store with
+donor, condition, and cell-type metadata, the same workflow starts with selecting the cells in
+step 3. The download and import are needed only once.
 
 ```{code-cell} ipython3
 from os import environ
@@ -176,8 +181,9 @@ silently reassigned to that pair.
 
 ## 4. Sum raw counts by biological donor
 
-`aggr_type="sum"` streams raw assay counts and produces one column per `donor_id`. Empty features
-are removed by the default `remove_empty_features=True` behavior.
+`aggr_type="sum"` streams raw assay counts and produces one column per `donor_id`.
+This option is essential for count-based differential expression: the method's default is a
+mean of normalized values. Empty features are removed by default.
 
 ```{code-cell} ipython3
 bulk = ds.make_bulk(
@@ -190,8 +196,7 @@ assert bulk.shape == (13_547, 36)
 bulk.iloc[:5, :6]
 ```
 
-The validated local run produced 13,547 expressed features by 36 donors and took about 147 seconds.
-That duration is a local observation, not a hardware-independent benchmark.
+The result has 13,547 expressed features and 36 donor columns.
 
 ## 5. Build and verify the donor design
 
@@ -237,11 +242,36 @@ The 36 columns are 36 biological replicates, arranged as 18 RA-control pairs. `b
 the cells that actually contributed to each donor column. It does not reattach excluded technical
 repeats from elsewhere in the source H5AD.
 
-## 6. Explore a reported γδ T-cell panel
+## 6. Export raw counts and design metadata
+
+Write the two tables to a named directory so they remain available after the notebook closes.
+The donor metadata has already been aligned to the count columns.
+
+```{code-cell} ipython3
+export_directory = Path("pseudobulk_exports")
+export_directory.mkdir(exist_ok=True)
+counts_csv = export_directory / "yd_t_cell_raw_counts.csv"
+metadata_csv = export_directory / "yd_t_cell_donor_design.csv"
+
+bulk.to_csv(counts_csv)
+donor_metadata.index.name = "donor_id"
+donor_metadata.to_csv(metadata_csv)
+print(counts_csv, metadata_csv, sep="\n")
+```
+
+Use `bulk` as the raw feature-by-donor count matrix. The external model must use donor-level
+replication and account for the study design. The matched-pair identifier and processing batch
+are both exported, but should not be added blindly as fixed effects: the full model with an
+intercept, disease, pair, and batch is rank deficient for this cohort, so it cannot estimate all
+those effects separately. A paired contrast and the paper's batch-adjusted model answer related
+but distinct questions. The paper used DESeq2 with a likelihood-ratio test corrected for batch;
+reproducing it requires its exact sample definition, model, filtering, and multiple-testing choices.
+
+## Optional: explore a reported γδ T-cell panel
 
 Library-normalized values are useful for a compact descriptive view before modeling. The figure
-below converts the donor pseudobulks to log2 counts per million (CPM) only for visualization. Each
-grey segment connects one matched pair.
+below converts the donor pseudobulks to log2 counts per million (CPM) only for visualization.
+Start with one gene, IFNG, so each line can show one matched pair.
 
 ```{code-cell} ipython3
 panel_genes = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
@@ -253,38 +283,13 @@ assert library_sizes.gt(0).all()
 log2_cpm = np.log2(bulk.div(library_sizes, axis=1).mul(1_000_000) + 1)
 panel = log2_cpm.loc[panel_genes].T.join(donor_metadata)
 
-condition_order = ("normal", "rheumatoid arthritis")
-condition_colors = {
-    "normal": "#4C78A8",
-    "rheumatoid arthritis": "#E45756",
-}
-fig, axes = plt.subplots(2, 3, figsize=(10.5, 5.8), sharex=True)
-for gene, ax in zip(panel_genes, axes.flat, strict=True):
-    for _, paired in panel.groupby("pair_index_CW", sort=True):
-        ordered = paired.set_index("disease").reindex(condition_order)
-        ax.plot(
-            (0, 1),
-            ordered[gene],
-            color="0.78",
-            linewidth=0.8,
-            zorder=1,
-        )
-    for position, condition in enumerate(condition_order):
-        values = panel.loc[panel["disease"].eq(condition), gene]
-        ax.scatter(
-            np.full(len(values), position),
-            values,
-            color=condition_colors[condition],
-            s=20,
-            zorder=2,
-        )
-    ax.set_title(gene)
-    ax.set_xticks((0, 1), ("Control", "RA"))
-    ax.set_ylabel("log2(CPM + 1)")
-
-fig.suptitle("Matched-donor γδ T-cell pseudobulk expression", y=1.02)
-fig.tight_layout()
-fig
+paired_values = panel.pivot(index="pair_index_CW", columns="disease", values="IFNG")
+paired_values = paired_values[["normal", "rheumatoid arthritis"]]
+axis = paired_values.T.plot(marker="o", legend=False, color="0.6", alpha=0.6)
+axis.set_xticks([0, 1], ["Control", "RA"])
+axis.set_ylabel("log2(CPM + 1)")
+axis.set_title("IFNG in matched γδ T-cell pseudobulks")
+plt.show()
 ```
 
 This panel shows donor heterogeneity and paired direction, but it does not estimate dispersion,
@@ -293,32 +298,11 @@ differential expression result.
 
 The paper applied pseudobulk modeling across 18 PBMC subsets and reported 168 differentially
 expressed genes in total. Its γδ T-cell result included downregulation of IFNG, IFIT2, TNF, GZMA,
-ISG15, and S100A4 in RA. This page displays those genes for orientation but does not reproduce the
-paper's replicate-aware model or its significance claims.
+ISG15, and S100A4 in RA. Those genes are included in `panel`; change the `values` argument to
+inspect another one. These plots do not reproduce the paper's model or its significance claims.
 
-## 7. Export raw counts and design metadata
-
-```{code-cell} ipython3
-export_directory = TemporaryDirectory()
-counts_csv = Path(export_directory.name) / "yd_t_cell_raw_counts.csv"
-metadata_csv = Path(export_directory.name) / "yd_t_cell_donor_design.csv"
-
-bulk.to_csv(counts_csv)
-donor_metadata.index.name = "donor_id"
-donor_metadata.to_csv(metadata_csv)
-
-pd.read_csv(metadata_csv, index_col="donor_id").head()
-```
-
-Use `bulk` as the raw feature-by-donor count matrix. Do not give the log2 CPM panel to edgeR or
-DESeq2 as count input. The external model must use donor-level replication, estimate the disease
-contrast, and use a model whose terms are identifiable for the chosen design. Both the matched-pair
-identifier and the observed processing batch are exported, but they should not be added blindly as
-fixed effects: the full intercept-plus-disease-plus-pair-plus-batch design is rank deficient for
-this selected cohort. A paired contrast and the paper's batch-adjusted model answer related but
-distinct questions. The Binvignat paper used DESeq2 with a likelihood-ratio test corrected for
-batch; reproducing that analysis requires its exact sample definition, aggregation, model,
-filtering, and multiple-testing choices.
+Do not give these log2 CPM plotting values to edgeR or DESeq2 as count input. Use the raw-count
+file exported above.
 
 ## Pseudo-replicates are not biological replicates
 

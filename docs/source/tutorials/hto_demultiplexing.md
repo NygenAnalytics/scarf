@@ -13,15 +13,14 @@ This is separate from integrating RNA and ADT measurements: demultiplexing class
 ## 1. Run HTO demultiplexing
 
 Scarf expects an HTO assay, named `HTO` by default, in the same datastore as the biological assays.
+Open that datastore as `ds` before following the examples. The assay must be declared as type
+`HTO` when imported; naming an ordinary RNA or ADT assay `HTO` is not enough.
 `run_hto_demultiplexing` normalizes the hashtag counts, estimates background, and returns an immutable
 identity artifact without changing shared cell metadata.
 
 ```python
 cell_selection = ds.snapshot_cell_selection("I")
-identities = ds.run_hto_demultiplexing(
-    cell_selection,
-    from_assay="HTO",
-)
+identities = ds.run_hto_demultiplexing(cell_selection)
 ds.load_artifact(identities)["values"][:]
 ```
 

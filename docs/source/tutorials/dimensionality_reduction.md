@@ -34,7 +34,6 @@ from itertools import combinations
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 import scarf
 
@@ -51,9 +50,12 @@ normalized = baseline["normalized"]
 umap = baseline["umap"]
 ```
 
-The rebuilt store's `docs_default` run freezes the cell selection, feature selection, and
-normalization used here. Each dimensionality branch therefore changes only PCA and its downstream
-artifacts.
+The saved analysis used 15 PCs; Scarf's current default is 21. We keep the example's cells,
+genes, and normalization fixed so we can explore what changing the number of PCs does.
+
+```{code-cell} ipython3
+ds.plots.embedding(run=baseline, color_by="clusters")
+```
 
 ## 2. Compare PCA dimension counts
 
@@ -62,7 +64,6 @@ Retain the 15-component graph and initialization for the layout comparisons belo
 
 ```{code-cell} ipython3
 dimension_counts = (10, 15, 30)
-pca_refs = {15: baseline["pca"]}
 graph_15 = baseline["connectivity_map"]
 cluster_refs = {15: baseline["leiden_0.5"]}
 for dimensions in (10, 30):
@@ -71,7 +72,6 @@ for dimensions in (10, 30):
         dims=dimensions,
         show_elbow_plot=dimensions == 30,
     )
-    pca_refs[dimensions] = pca
     ann = ds.build_ann_index(pca)
     neighbors = ds.query_neighbors(ann, k=11)
     graph = ds.build_connectivity_map(neighbors)
@@ -88,39 +88,14 @@ cluster_values = {
 ```
 
 PCA axes represent decreasing amounts of variation in the selected genes.
-The elbow plot uses 31 explained-variance ratios from a dims+1 fit (`dims=30`), not a scree of only the 30 kept components.
-On artifact reuse the fit is unavailable, so Scarf may warn and skip the plot.
-An early bend means later axes add less variance each; it does not force a stop at the marked component, and it does not make 10, 15, and 30 interchangeable.
-The cumulative shares below place those cutoffs on the same 30 kept components.
+An early bend in the elbow plot means later axes each add less variance. It suggests a range to
+investigate, rather than a single correct cutoff. Scarf fits one extra component for this plot;
+when reusing a saved PCA result, it may warn that the plot is unavailable.
 Too few axes can merge distinct populations; too many can restore technical variation and noise.
 Compare graph connectivity, cluster stability, and marker coherence when the choice is uncertain.
 
-```{code-cell} ipython3
-scores_30 = np.asarray(ds.load_artifact(pca_refs[30])["data"])
-retained_share = scores_30.var(axis=0, ddof=1)
-retained_share = 100.0 * retained_share / retained_share.sum()
-cumulative_share = np.cumsum(retained_share)
-pd.Series(
-    {
-        dimensions: float(cumulative_share[dimensions - 1])
-        for dimensions in dimension_counts
-    },
-    name="cumulative_share_of_30pc_fit",
-).rename_axis("pca_dimensions")
-```
-
-```{code-cell} ipython3
-pd.Series(
-    {
-        dimensions: pd.Series(cluster_values[dimensions]).nunique()
-        for dimensions in dimension_counts
-    },
-    name="n_clusters",
-).rename_axis("pca_dimensions")
-```
-
-Similar cluster counts can still hide size flips.
-Per-cluster sizes show whether an extra group is a real split or a tiny fragment.
+Compare cluster sizes as well as the number of clusters. Cluster numbers can change between
+analyses, so matching row numbers do not necessarily identify the same cells.
 
 ```{code-cell} ipython3
 pd.DataFrame(
@@ -132,23 +107,20 @@ pd.DataFrame(
 ```
 
 ```{code-cell} ipython3
-agreement_rows = []
-for first, second in combinations(dimension_counts, 2):
-    agreement_rows.append(
-        {
-            "comparison": f"{first} vs {second} dimensions",
-            "ARI": adjusted_rand_score(cluster_values[first], cluster_values[second]),
-            "NMI": normalized_mutual_info_score(
-                cluster_values[first],
-                cluster_values[second],
-            ),
-        }
-    )
-pd.DataFrame(agreement_rows)
+pd.Series(
+    {
+        f"{first} vs {second} PCs": ds.metric_label_concordance(
+            cluster_refs[first], cluster_refs[second]
+        )
+        for first, second in combinations(dimension_counts, 2)
+    },
+    name="adjusted Rand index",
+)
 ```
 
-ARI and NMI measure agreement between partitions but do not identify the biologically correct dimension count.
-Investigate a low-agreement arm through markers, technical covariates, and graph diagnostics before choosing it or discarding it.
+The adjusted Rand index measures partition agreement without requiring matching cluster numbers.
+It does not identify the biologically correct dimension count. Inspect markers and QC metrics
+where the partitions disagree. See {doc}`clustering` for more on cluster evidence.
 
 ## 3. Compare UMAP packing
 
@@ -156,19 +128,18 @@ The layout below uses the explicit 15-component graph.
 Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
 
 ```{code-cell} ipython3
-umap_values = np.asarray(ds.load_artifact(umap)["values"][:])
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, dimensions in zip(
     axes,
     dimension_counts,
     strict=True,
 ):
-    axis.scatter(
-        umap_values[:, 0],
-        umap_values[:, 1],
-        c=cluster_values[dimensions],
-        s=3,
-        cmap="tab20",
+    ds.plots.embedding(
+        layout=umap,
+        color_by=cluster_refs[dimensions],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     axis.set_title(f"Leiden on {dimensions} PCs")
 figure.tight_layout()
@@ -184,52 +155,33 @@ umap_tight = ds.run_umap(graph_15, initialization_15, min_dist=0.1)
 ```
 
 ```{code-cell} ipython3
-umap_tight_values = np.asarray(ds.load_artifact(umap_tight)["values"][:])
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-for axis, coordinates, title in zip(
+for axis, layout, title in zip(
     axes,
-    (umap_values, umap_tight_values),
+    (umap, umap_tight),
     ("min_dist=1", "min_dist=0.1"),
     strict=True,
 ):
-    axis.scatter(
-        coordinates[:, 0],
-        coordinates[:, 1],
-        c=cluster_values[15],
-        s=3,
-        cmap="tab20",
+    ds.plots.embedding(
+        layout=layout,
+        color_by=cluster_refs[15],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     axis.set_title(title)
 figure.tight_layout()
 figure
 ```
 
-## 4. Preserve local density with densMAP
+## Optional: compare densMAP and t-SNE
 
 ```{code-cell} ipython3
 densmap = ds.run_umap(graph_15, initialization_15, use_density_map=True)
 ```
 
 densMAP adds a density-preservation objective.
-Contours below contrast local cell density on the same cells under UMAP and densMAP.
-Relative packing can differ; plot area is still not a direct estimate of cell frequency.
-
-```{code-cell} ipython3
-dense_values = np.asarray(ds.load_artifact(densmap)["values"][:])
-figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-for axis, coordinates, title in zip(
-    axes,
-    (umap_values, dense_values),
-    ("UMAP", "densMAP"),
-    strict=True,
-):
-    axis.hexbin(coordinates[:, 0], coordinates[:, 1], gridsize=50)
-    axis.set_title(title)
-figure.tight_layout()
-figure
-```
-
-## 5. Run graph-based t-SNE
+Relative packing can differ from UMAP; plot area is still not a direct estimate of cell frequency.
 
 Scarf's t-SNE consumes the same neighbourhood graph.
 Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (`darwin`) and Windows are unsupported.
@@ -238,27 +190,26 @@ Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (
 tsne = ds.run_tsne(graph_15, initialization_15, verbose=False)
 ```
 
-## 6. Compare layouts responsibly
+### Read the layouts cautiously
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-tsne_values = np.asarray(ds.load_artifact(tsne)["values"][:])
 layout_comparisons = (
-    ("UMAP", umap_values),
-    ("densMAP", dense_values),
-    ("t-SNE", tsne_values),
+    ("UMAP", umap),
+    ("densMAP", densmap),
+    ("t-SNE", tsne),
 )
-for axis, (title, coordinates) in zip(
+for axis, (title, layout) in zip(
     axes,
     layout_comparisons,
     strict=True,
 ):
-    axis.scatter(
-        coordinates[:, 0],
-        coordinates[:, 1],
-        c=cluster_values[15],
-        s=3,
-        cmap="tab20",
+    ds.plots.embedding(
+        layout=layout,
+        color_by=cluster_refs[15],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     axis.set_title(title)
 figure.tight_layout()
@@ -274,7 +225,7 @@ A layout that hides connected transitions or separates obvious technical covaria
 <span id="run-paris-clustering-and-inspect-the-tree"></span>
 ```
 
-## 7. Paris clustering and its tree
+## Next: clustering
 
 This material moved to {doc}`clustering`.
 That guide distinguishes graph connectivity between groups from the Paris hierarchy and covers both adaptive and fixed cuts.

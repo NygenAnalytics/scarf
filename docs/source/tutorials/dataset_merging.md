@@ -24,8 +24,8 @@ This guide builds that uncorrected baseline first.
 ## 1. Load compatible source stores
 
 The control and interferon beta stimulated Kang PBMC stores use the same RNA feature space.
-Their publication recipe physically removes cells without an imported cell-type label before running source-level quality control.
-The remaining `I` cell key records that quality-control selection.
+These prepared stores contain cells with author-provided cell-type labels.
+Their `I` columns mark the cells that passed quality control.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -106,12 +106,12 @@ merged.cells.to_pandas_dataframe(
 )
 ```
 
-## 3. Open the rebuilt uncorrected baseline
+## 3. Inspect a prepared joint analysis
 
-The catalog's merged store is rebuilt with the merge recipe above and a labelled standard RNA
-run. Open that frozen run instead of repeating PCA, graph construction, clustering, and UMAP in
-this merge tutorial. Its graph uses 21 neighbours so the correction methods on the next page can
-branch from the same baseline.
+The merge is complete. To see what these datasets look like together, open the catalog's prepared
+merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP.
+This is a separate store from `merged`, so the following plots do not run an analysis on the store
+you just created. The saved example run is named `docs_default`.
 
 ```{code-cell} ipython3
 prepared_path = repository.download_dataset(
@@ -138,7 +138,7 @@ ds.plots.embedding(
 )
 ```
 
-A proportional composition plot makes source dominance within the uncorrected Leiden clusters explicit.
+A table of proportions shows whether each Leiden cluster contains cells from both sources.
 
 ```{code-cell} ipython3
 pd.crosstab(
@@ -148,25 +148,9 @@ pd.crosstab(
 )
 ```
 
-iLISI summarizes local source mixing on a zero-to-one scale.
-Zero means the median neighbourhood effectively contains cells from only one source.
-One is the maximum mixing score across the observed sources.
-
-```{code-cell} ipython3
-uncorrected_ilisi = ds.metric_ilisi(
-    batch_colname="sample_id",
-    neighbors=baseline["neighbors"],
-    perplexity=7,
-)
-{"uncorrected iLISI": round(uncorrected_ilisi, 3)}
-```
-
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
 Source-associated structure can therefore include biological response as well as technical variation.
-An interferon-response gene such as `ISG15` makes that stim-enriched program visible on the same uncorrected layout.
 
-Inspect treatment-linked expression separately before interpreting the source mixing as purely
-technical.
-
-This page establishes the uncorrected observation; {doc}`batch_correction` compares how partial PCA and Harmony change it.
+The next page, {doc}`batch_correction`, uses a different dataset with measured sequencing batches
+to compare an uncorrected analysis with Harmony. It also introduces metrics for batch mixing.
 Keep uncorrected counts for condition-level differential expression.

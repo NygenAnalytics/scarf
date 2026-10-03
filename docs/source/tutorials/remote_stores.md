@@ -16,15 +16,12 @@ kernelspec:
 
 # Remote stores and mounted analysis targets
 
-Scarf supports Zarr stores on object storage, but this page does not execute against an
-object-store URI. Its executable section downloads a documentation dataset, then uses a local
-count source and a separate local analysis target to demonstrate mounted-store mechanics.
+A mounted datastore lets you save an analysis separately from its counts. This is useful when
+several people share a source or when counts live in object storage.
 
-Object-store snippets are explicitly non-executed templates. They show the supported API shape,
-not proof that a particular provider, URI, credential setup, or network path was exercised.
-Measured results from a separate fixed object-store workflow are in
-{doc}`../concepts/benchmarks`; resource controls are in
-{doc}`../concepts/memory_and_execution`.
+We will first try a mount with a downloaded dataset, then show how the same call accepts a remote
+source. Only the local example is executed on this page. For a worked example that reads a public
+remote store, see {doc}`cytebase`.
 
 ## Prerequisites
 
@@ -56,18 +53,14 @@ It is mounted with `counts` and is not rewritten into the target.
 Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
-The code below downloads the documentation archive to a temporary local directory. It then mounts
-that local count source into a different local target. This verifies source resolution, target
-writes, pipeline execution, and reopening. It does not verify direct object-store analysis,
-credentials, or network performance.
+Download the example to a temporary directory, then create a separate target for the analysis.
+For your own work, use persistent paths and keep the count source available.
 
 ```{code-cell} ipython3
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import numpy as np
 import scarf
-import zarr
 
 scarf.configure_output(level="ERROR", progress=False)
 repository = scarf.cytebase.connect("scarf_docs")
@@ -90,18 +83,10 @@ mounted = scarf.mount_datastore(
     default_assay='RNA',
     nthreads=4,
 )
-
-matrix_source = zarr.open_group(str(target_path), mode='r').attrs['matrixSource']
-print('Target path:', target_path)
-print('Target exists:', target_path.exists())
-print('Downloaded dataset:', staged_dataset)
-print('Mounted count source:', matrix_source['location'])
-print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
 Counts and RNA `countsT` stay in the downloaded count source.
 Cell and feature metadata are copied once, while new analysis artifacts are written to the target.
-The printed `matrixSource` record is what later reopen uses to resolve those counts.
 
 ```{mermaid}
 flowchart LR
@@ -112,55 +97,17 @@ flowchart LR
     staged -->|mount count blocks| target
 ```
 
-The target assay has no physical count array, while `rawData` exposes the complete mounted count matrix:
-
-```{code-cell} ipython3
-target_root = zarr.open_group(str(target_path), mode='r')
-
-print('Counts stored in target:', 'counts' in target_root['RNA'])
-print('Mounted shape:', mounted.RNA.rawData.shape)
-```
-
-Run the standard RNA pipeline through the local mount. Count blocks are read from the separate
+Run the RNA pipeline with its defaults through the local mount. Count blocks are read from the separate
 local source, while the run record and its normalized data, reductions, graph, UMAP, and
 clusters are written only to the local target. Because the target and its source are both local,
 `local_cache` staging is skipped here; Section 3 makes that policy explicit.
 
 ```{code-cell} ipython3
-mounted_run = mounted.pipeline.run(
-    filtering=False,
-    hvg_count=500,
-    pca_dims=15,
-    leiden={"partitions": [0.5]},
-    cell_cycle=False,
-    paris=False,
-    doublets=False,
-    markers=False,
-)
-normalized = mounted_run["normalized"]
-pca = mounted_run["pca"]
+mounted_run = mounted.pipeline.run(label="mounted_analysis")
 ```
 
 ```{code-cell} ipython3
 mounted.plots.embedding(run=mounted_run, color_by="clusters")
-```
-
-The populated embedding demonstrates that supported analysis can read counts from a separate
-mounted source. The size calculation compares only the writable target with the dense logical
-size of the counts. It excludes the downloaded source and is not a remote-storage benchmark.
-
-```{code-cell} ipython3
-target_bytes = sum(
-    path.stat().st_size
-    for path in target_path.rglob("*")
-    if path.is_file()
-)
-logical_count_bytes = int(
-    np.prod(mounted.RNA.rawData.shape)
-    * mounted.RNA.rawData.dtype.itemsize
-)
-print("Writable target bytes:", target_bytes)
-print("Dense logical count bytes:", logical_count_bytes)
 ```
 
 Opening the target later resolves the source automatically.
@@ -172,16 +119,7 @@ reopened = scarf.DataStore(
     nthreads=4,
 )
 reopened_run = reopened.pipeline.open(run_id=mounted_run.run_id)
-same_counts = np.array_equal(
-    reopened.RNA.rawData[:20, :20].compute(),
-    mounted.RNA.rawData[:20, :20].compute(),
-)
-print('Counts still resolve:', same_counts)
-print('Reopened pipeline status:', reopened_run.status)
-print(
-    'Normalization complete:',
-    reopened.inspect_artifact(reopened_run['normalized']).complete,
-)
+reopened_run.status
 ```
 
 The mount records matrix shape, dtype, and source identity. Reopening fails if the source no
@@ -197,10 +135,8 @@ as counts do; `python -m scarf.tools.repack_zarr` copies a mount into a self-con
 
 ## 2. Non-executed object-store templates
 
-Nothing in this section is executed by the documentation build. These snippets illustrate how to
-supply a URI and storage options after you have verified the provider, credentials, permissions,
-and store layout in your own environment. They provide no performance or compatibility result for
-the placeholder locations.
+These templates are not executed. Replace the example locations and storage options with those
+for your own bucket.
 
 ### Mount an object-store count source
 
@@ -217,8 +153,7 @@ mounted = scarf.mount_datastore(
 )
 ```
 
-The source must remain available at the recorded URI whenever the target is opened. For RNA, the
-source must contain its matching current-layout `countsT` array.
+The source must remain available at the recorded URI whenever the target is opened.
 
 ### Open a datastore directly
 
@@ -232,8 +167,6 @@ ds = scarf.DataStore(
     "s3://bucket/path/to/data.zarr",
     zarr_mode="r",
     storage_options={"skip_signature": True},
-    mem_budget="16G",
-    nthreads=8,
 )
 ```
 
@@ -254,8 +187,6 @@ remote_writable = scarf.DataStore(
         "secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
         # "endpoint": "https://...",  # S3-compatible endpoints
     },
-    mem_budget="32G",
-    nthreads=8,
 )
 ```
 
@@ -263,8 +194,7 @@ Google Cloud Storage uses a `gs://` URI.
 Pass the provider options your environment already uses for obstore or fsspec, such as
 application-default credentials on the VM or an explicit token in `storage_options`.
 
-After a successful open in your environment, the same analysis APIs are available as for a local
-store. This page does not execute that step.
+After opening a writable store, use the same analysis calls as for local data.
 
 ## 3. Local scratch for reductions
 
@@ -278,29 +208,13 @@ Harmony, ANN, and neighbor queries read persisted reduced coordinates and do not
 | Value | Behavior |
 |---|---|
 | `"auto"` (default) | Stage for remote stores; skip for local stores |
-| `True` | Temporary scratch directory, deleted when the stage ends |
+| `True` | Stage a remote artifact in temporary scratch, deleted when the stage ends |
 | `False` | No staging; every pass reads the store URI |
-| `"/path/to/scratch"` | Persistent scratch keyed by artifact ID |
+| `"/path/to/scratch"` | Stage a remote artifact in persistent scratch keyed by artifact ID |
 
-The mounted target and its source in this page are both local, so normalized artifacts already live on local disk and Scarf skips staging even when a scratch path is supplied.
-This executable checkpoint makes that distinction explicit:
-
-```{code-cell} ipython3
-scratch_directory = TemporaryDirectory()
-scratch_dir = Path(scratch_directory.name) / 'pca_scratch'
-pca_without_staging = mounted.run_pca(
-    normalized,
-    dims=15,
-    local_cache=str(scratch_dir),
-)
-staged_bytes = sum(
-    path.stat().st_size for path in scratch_dir.rglob('*') if path.is_file()
-)
-print('Local cache path:', scratch_dir)
-print('Staged normalized bytes:', staged_bytes)
-print('Local cache present after PCA:', scratch_dir.exists())
-print('Reduction reused:', pca_without_staging == pca)
-```
+The mounted target and its source in this page are both local, so their normalized artifacts
+need no extra staging. A repeated PCA call can also reuse an existing result before reading
+normalized blocks at all.
 
 For a writable remote store opened from the non-executed template above, the same path-string
 policy stages normalized blocks and keeps the cache for inspection or reuse. The following is

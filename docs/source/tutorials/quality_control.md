@@ -17,9 +17,9 @@ kernelspec:
 # Quality control across assays
 
 Quality control defines the cells and features that downstream analyses can use.
-Scarf keeps the source matrix intact and returns immutable selection artifacts from analytical
-filters. This guide covers manual, global automatic, and sample-aware filtering, followed by
-assay-specific checks.
+Scarf keeps the count matrix intact. Each filter returns a saved selection that you can pass to
+the next analysis step. This guide starts with inspecting the cells and applying the default
+automatic filter, then shows when to choose your own thresholds.
 
 ## Prerequisites
 
@@ -29,16 +29,20 @@ assay-specific checks.
 ## What you will learn
 
 - Inspect per-cell QC columns
-- Set manual thresholds with `filter_cells`
-- Compare pooled and per-sample MAD bounds with explicit Gaussian filtering
+- Apply the default automatic filter and inspect its result
+- Set manual thresholds or filter each sample separately
 - Compute doublet scores after an initial clustering
 - Recognize current RNA, ATAC, and ADT support boundaries
 
 ## Standalone setup
 
-Quality control has to see the population it is judging, so this page builds its store from raw counts rather than opening one that has already been filtered.
+Quality control needs the population before filtering, so this page imports raw counts into a
+separate `quality_control.zarr` store. Running the setup again replaces that tutorial store.
+We set `min_features_per_cell=10` to retain low-feature cells for inspection before choosing
+stricter thresholds.
 
 ```{code-cell} ipython3
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -51,7 +55,7 @@ counts = scarf.cytebase.connect("scarf_docs").download(
     destination="scarf_datasets",
 )[0]
 
-store = counts.with_name("data.zarr")
+store = counts.with_name("quality_control.zarr")
 reader = scarf.CrH5Reader(str(counts))
 scarf.CrToZarr(
     reader,
@@ -65,17 +69,13 @@ ds = scarf.DataStore(
 )
 ```
 
-The `I` {term}`cell key` is the initial live selection. Filtering snapshots that input and returns a
-new immutable selection artifact. It leaves all rows and the live key unchanged. Feature
-selections are immutable artifacts aligned to one assay.
+The `I` {term}`cell key` marks the cells retained when the store is opened. Filtering saves a new
+selection and leaves `I` and the counts unchanged.
 
 ## 1. Inspect QC distributions
 
-The first time a store is opened for writing, Scarf prepares each assay. It records per-cell
-columns such as `RNA_nCounts` and `RNA_nFeatures` from totals saved when the counts were written,
-computes mito/ribo percentages when gene names match the configured patterns, and records
-per-feature detection statistics used by explicit selection producers. Later opens validate this
-prepared data instead of recomputing it.
+Scarf prepares QC columns when a new store is first opened. These include total counts, detected
+features, and mitochondrial and ribosomal percentages when the gene names match their patterns.
 
 ```{code-cell} ipython3
 qc_cols = [
@@ -87,15 +87,30 @@ qc_cell_selection = ds.snapshot_cell_selection("I")
 ds.plots.distribution(
     keys=qc_cols,
     cell_selection=qc_cell_selection,
-    kind="violin",
-    max_points=2000,
 )
 ```
 
 Each violin uses an immutable snapshot of `I`, so cells already below `min_features_per_cell` from
 open are excluded. Use the tails to set further cutoffs.
 
-## 2. Manual thresholds
+## 2. Start with automatic thresholds
+
+`auto_filter_cells` uses the median absolute deviation (MAD), a measure of spread that is less
+affected by extreme values than the standard deviation. Its default bounds are three scaled
+MADs from the median. Counts and detected features use log1p values and two-sided bounds;
+mitochondrial and ribosomal percentages use upper bounds only.
+
+```{code-cell} ipython3
+automatic_selection = ds.auto_filter_cells(cell_selection=qc_cell_selection)
+automatic_mask = np.asarray(ds.load_artifact(automatic_selection)["values"][:], dtype=bool)
+print(f"Cells after automatic filtering: {int(automatic_mask.sum())}")
+ds.plots.distribution(keys=qc_cols, cell_selection=automatic_selection)
+```
+
+Compare these distributions with the input before accepting the result. Automatic bounds are a
+starting point; a rare population may have a different count-depth distribution.
+
+## 3. Choose manual thresholds when needed
 
 Thresholds are dataset-specific.
 The values below match the PBMC example in {doc}`scrna_seq`.
@@ -121,41 +136,9 @@ The filtered summary should lose the long low-count tail and high-mito shoulder.
 the barcodes drop out here, which is typical for this dataset and is the number worth
 sanity-checking against your own expectations before continuing.
 
-## 3. Automatic thresholds
-
-`auto_filter_cells` defaults to `method="mad"`, using the median plus or minus `n_mads`
-times the scaled median absolute deviation (`1.4826 * MAD`). Without a sample source, it
-estimates these bounds over the pooled input selection. Default columns are nCounts, nFeatures,
-percentMito, and percentRibo when present. Counts and feature counts use log1p values and
-two-sided bounds; percentages use their original scale and an upper bound only.
-The default `n_mads` is 3. Groups with fewer than `min_cells_per_sample=20` active cells
-are retained with a warning, including a pooled selection with fewer than 20 cells.
-Pass the previous selection explicitly to compose filters.
-
-```{code-cell} ipython3
-automatic_selection = ds.auto_filter_cells(method="mad", cell_selection=manual_selection)
-automatic_mask = np.asarray(
-    ds.load_artifact(automatic_selection)["values"][:],
-    dtype=bool,
-)
-print(f"Cells after automatic refinement: {int(automatic_mask.sum())}")
-```
-
-Inspect the selected values through the returned mask before accepting the thresholds.
-
-Earlier versions used pooled Gaussian filtering by default. To retain that policy, pass
-`method="gaussian"` explicitly. This fits a normal distribution with `loc=median` and
-`scale=std`, then takes quantiles at `min_p` and `max_p` (defaults 0.01 and 0.99).
-Setting either probability alone does not switch the method:
-
-```python
-gaussian_selection = ds.auto_filter_cells(
-    method="gaussian",
-    cell_selection=manual_selection,
-    min_p=0.05,
-    max_p=0.99,
-)
-```
+The automatic and manual selections are alternatives here. The doublet example below uses the
+manual thresholds so it follows the same cells as the core PBMC workflow. To combine filters in
+your own analysis, pass the previous result as `cell_selection=`.
 
 ## 4. Per-sample MAD filtering
 
@@ -168,34 +151,20 @@ same immutable-selection contract as the global filter:
 
 ```python
 sample_selection = ds.auto_filter_cells(
-    method="mad",
-    attrs=qc_cols,
-    cell_selection=manual_selection,
+    cell_selection=qc_cell_selection,
     sample_column="sample_id",
-    n_mads=3.0,
-    min_cells_per_sample=20,
 )
 ```
 
-The PBMC page does not execute this call because inventing sample assignments would produce a
-mechanics demo with no biological interpretation.
-
-Count-like metrics such as `nCounts` and `nFeatures` use log1p values and two-sided bounds.
-Percentage metrics such as `percentMito` and `percentRibo` use their original scale and an upper bound only.
-Samples with fewer than `min_cells_per_sample` active cells are retained with a warning because stable within-sample bounds cannot be estimated.
-`min_p` and `max_p` apply only to `method="gaussian"`, which does not accept a sample source.
-Changing either probability with pooled or per-sample MAD filtering raises an error.
+This example needs a real `sample_id` column, which the PBMC dataset does not have.
+Samples with fewer than 20 selected cells are retained with a warning because their bounds
+cannot be estimated reliably. The same rule applies to a pooled selection with fewer than 20 cells.
 
 The same options can be forwarded through the standard pipeline:
 
 ```python
 ds.pipeline.run(
-    filtering={
-        "method": "mad",
-        "sample_column": "sample_id",
-        "n_mads": 3.0,
-        "min_cells_per_sample": 20,
-    },
+    filtering={"sample_column": "sample_id"},
 )
 ```
 
@@ -205,7 +174,7 @@ Ingestion-owned mitochondrial and ribosomal percentage columns measure the fract
 counts matching configured gene-name patterns. High values can indicate damaged cells or
 study-specific biology. Inspect their distributions before applying upper thresholds.
 
-The default mitochondrial pattern is now case-insensitive `^MT-`, replacing `MT-|mt`.
+The default mitochondrial pattern is case-insensitive `^MT-`.
 It matches names such as `MT-CO1` and `mt-Co1` without including `MTOR` or metallothioneins.
 Percentage columns are fixed when a store is first prepared. That first open for writing discards
 any existing column with a percentage name, logs a warning, and computes the percentage from the
@@ -237,9 +206,10 @@ See {doc}`feature_selection` for the default HVG blacklist and supported overrid
 
 ## 6. Doublet scores
 
-`run_doublet_detection` is the atomic score producer. The standard pipeline supplies its exact
-clustering and graph refs, and returns the same per-cell doublet artifact. It does not remove cells
-automatically. Reusing the manual-filter mapping keeps this example's QC bounds in one place.
+The pipeline builds a graph and clusters before calculating doublet scores. It does not remove
+cells automatically. Here we reuse the manual QC thresholds and the prepared PBMC example's
+500 genes, 15 PCs, and Leiden resolution 0.5. These are teaching-dataset settings, not the API
+defaults. We skip cell-cycle scoring, Paris, and markers because they are not needed for this check.
 
 ```{code-cell} ipython3
 doublet_run = ds.pipeline.run(
@@ -266,6 +236,7 @@ Inspect the score distribution before applying a cutoff:
 
 ```{code-cell} ipython3
 pd.Series(scores, name="doublet_score").plot(kind="hist", bins=40)
+plt.show()
 ```
 
 The score distribution and embedding should be reviewed together.
@@ -316,7 +287,6 @@ Hashtag demultiplexing is covered separately in {doc}`hto_demultiplexing`.
 
 - Copying thresholds from another dataset without checking distributions
 - Pooling samples with different depth distributions and then applying one global bound
-- Changing `min_p` or `max_p` without selecting `method="gaussian"`
 - Expecting `run_doublet_detection` to drop cells (it only scores)
 - Running doublet detection before building the neighbourhood graph and clustering
 - Claiming FRiP or TSS enrichment from the ATAC metrics Scarf currently provides

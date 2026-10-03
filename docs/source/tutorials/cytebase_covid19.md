@@ -42,7 +42,7 @@ uv pip install --prerelease allow 'scarf[cytebase]' jupyterlab
 ## What you will learn
 
 - Read a study's design from cell metadata alone
-- Compare conditions on the published UMAP with facets, density overlays, and highlights
+- Compare conditions on the published UMAP
 - Compute cell-type composition per donor
 - Check published labels against canonical markers with a dot plot
 - Compare gene expression between donors rather than between cells
@@ -76,8 +76,6 @@ from scarf import cytebase
 from scarf.plotting import (
     CategoricalScale,
     CellField,
-    DensityOverlay,
-    Highlight,
     NormalizationSpec,
 )
 
@@ -99,9 +97,9 @@ rather than typing an ID by hand.
 matches = catalog.search("wilk sars cov 2", ready_only=True, max_cell_chars=None)
 display(matches)
 
-# Fall back to the known ID if the search wording ever stops matching.
-FALLBACK_ID = "wilk_2020_single_cell_atlas_peripheral_sars_cov_2_infection_456e8b9b"
-dataset_id = matches[0]["cytebase_id"] if matches else FALLBACK_ID
+if not matches:
+    raise RuntimeError("The Wilk COVID-19 dataset is not ready in this catalog")
+dataset_id = matches[0]["cytebase_id"]
 entry = catalog.dataset(dataset_id)
 entry
 ```
@@ -211,40 +209,9 @@ shifted: healthy monocytes sit on its left side, while most COVID-19 monocytes
 occupy the right side, so the same annotated cell type appears in a different
 transcriptional state.
 
-A density overlay makes this easier to see. Shaded contours mark the 60th, 80th,
-and 95th percentiles of each panel's smoothed cell density; they summarize the
-display and do not define clusters.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout=umap_ref,
-    color_by=None,
-    default_color="#cfcfcf",
-    point_alpha=0.5,
-    facet_by="disease",
-    density_overlay=DensityOverlay(
-        kind="filled", levels=(0.6, 0.8, 0.95), cmap="Reds", alpha=0.6
-    ),
-    figsize=(12, 6),
-);
-```
-
-In COVID-19 samples the densest regions are the right side of the monocyte island
-and the CD4 and CD8 T-cell areas. In healthy samples they are the NK cells, the
-left side of the monocyte island, and the CD16 monocytes. `Highlight` isolates one
-population while keeping the rest as context, here the plasmablasts:
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout=umap_ref,
-    color_by=None,
-    default_color="#bdbdbd",
-    point_alpha=0.4,
-    facet_by="disease",
-    highlight=Highlight(by="cell.type.coarse", groups=("PB",)),
-    figsize=(12, 6),
-);
-```
+These panels show where the cells lie, but donors contribute different numbers of cells.
+Next, compare proportions within each donor. For highlighting populations,
+see {doc}`plotting`.
 
 ## 4. Composition per donor
 
@@ -306,9 +273,9 @@ constraint and donor-level variation.
 
 ## 5. Do the published labels match canonical markers?
 
-Before using the annotations, check them against well-known PBMC markers. Gene
-symbols are resolved against the assay's feature names; the lookup ignores case
-and reports any symbol this dataset does not contain.
+Before using the annotations, check them against well-known PBMC markers. Scarf resolves gene
+symbols without regard to case and raises an error for missing or ambiguous names. This panel
+uses genes present in the published dataset.
 
 The dot plot then reads only these genes from the remote counts. Values are
 library-size normalized counts (the assay default) with `log1p`;
@@ -332,20 +299,6 @@ marker_sets = {
 }
 isg_genes = ["IFI27", "ISG15", "IFI44L", "IFI6"]
 
-feature_names = ds.RNA.feats.fetch_all("names")
-by_upper = {str(name).upper(): str(name) for name in feature_names}
-
-
-def resolve(genes):
-    return [by_upper[gene.upper()] for gene in genes if gene.upper() in by_upper]
-
-
-requested = [gene for genes in marker_sets.values() for gene in genes] + isg_genes
-missing = [gene for gene in requested if gene.upper() not in by_upper]
-marker_sets = {name: resolve(genes) for name, genes in marker_sets.items()}
-isg_genes = resolve(isg_genes)
-print(f"{len(feature_names):,} features in the assay")
-print(f"Requested {len(requested)} genes; missing: {missing or 'none'}")
 ```
 
 ```{code-cell} ipython3
@@ -461,8 +414,14 @@ mono_table = monocytes.groupby("donor_id").agg(
     monocytes=("disease", "size"),
     **{column: (column, "mean") for column in [*isg_genes, "ISG mean", "IFN1"]},
 )
-display(mono_table.round(3))
+mono_table.round(3)
+```
 
+This table gives one expression summary per donor. As an optional numerical check, compare the
+seven patient means with the six healthy means and compare the four-gene summary with the authors'
+`IFN1` score. These are exploratory checks, not a model of disease severity.
+
+```{code-cell} ipython3
 covid = mono_table.loc[mono_table["disease"] == "COVID-19", "ISG mean"]
 healthy = mono_table.loc[mono_table["disease"] == "normal", "ISG mean"]
 test = mannwhitneyu(covid, healthy, alternative="two-sided")

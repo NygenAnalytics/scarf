@@ -30,21 +30,8 @@ Export paths write Matrix Market or H5AD.
 Scarf does not write Seurat `.rds` or `.h5seurat` files.
 See {doc}`../scanpy` or {doc}`../seurat` for ecosystem-specific workflow mapping.
 
-RNA writers write both a cell-major `counts` array and a gene-major `countsT` copy.
-Every newly written assay starts with an all-true physical feature column `I`.
-Opening computes `nCells` and `dropOuts` but does not turn feature rows off; use a feature-selection producer for analysis filtering.
-That second copy is what later HVG and marker stages stream from.
-Non-RNA assays write `counts` only.
-See {doc}`../concepts/memory_and_execution` for why the two orientations exist.
-
-Every import stores counts in a dtype chosen from their values, with duplicate coordinates
-summed: integral non-negative counts use the narrowest unsigned dtype that holds them, and
-fractional or negative counts keep their source dtype. The same counts therefore import alike
-from every format and encoding, and no writer takes a count dtype argument. Each import reads
-its counts once before it creates the store, and rejects NaN and infinite values there. Every
-import writes the default count layout unless it is given a `policy`: when the default count
-shards do not fit `mem_budget`, it stops before it creates the store and names the smaller
-`policy` that fits. Neither choice changes the stored values or the store's identity.
+Start with the Matrix Market example below. The later sections cover other input formats and
+show how to keep supplied analysis results or handle a larger import.
 
 ## Prerequisites
 
@@ -80,59 +67,17 @@ output_dir = Path(outputs.name)
 Each download returns the directory it wrote, which the readers below use as their input path.
 
 ```{code-cell} ipython3
-tenx_h5 = datasets.download_dataset(
-    name="tenx_10K_pbmc-v1_atacseq",
-    destination=output_dir,
-)
 mtx_dir = datasets.download_dataset(
     name="xin_1K_pancreas_rnaseq",
     destination=output_dir,
 )
-h5ad_dir = datasets.download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
-    destination=output_dir,
-)
-
-tenx_h5, mtx_dir, h5ad_dir
+mtx_dir
 ```
 
 This tutorial writes downloads and converted stores below one temporary directory. Replace
 `output_dir` with a persistent project directory in your own workflow.
 
-## 2. Import 10x HDF5
-
-Scarf stores data as dense, compressed chunks in Zarr.
-`CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
-Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
-`mem_budget` bounds the memory the conversion plans for.
-The default count shards of this 89,796-peak assay do not fit `mem_budget="8G"`, so the import
-passes the smaller `policy` that its `MemoryError` names. Non-RNA assays write no `countsT`
-copy, so the smaller shards do not slow later `countsT` reads.
-Each assay gets the count dtype of its own counts over the selected barcodes, so an assay
-imports alike whichever other assays share the file.
-
-```{code-cell} ipython3
-from scarf.storage.count_matrix import CountMatrixPolicy
-
-atac_store = output_dir / "pbmc_atac.zarr"
-reader = scarf.CrH5Reader(str(tenx_h5 / "data.h5"))
-scarf.CrToZarr(
-    reader,
-    zarr_loc=str(atac_store),
-    mem_budget="8G",
-    policy=CountMatrixPolicy(unitBytes=500_000_000, chunkBytes=50_000_000),
-).dump()
-```
-
-Open the written store.
-The summary lists an ATAC assay, which confirms that inference from the H5 feature types survived the dump:
-
-```{code-cell} ipython3
-ds_atac = scarf.DataStore(str(atac_store))
-ds_atac
-```
-
-## 3. Import Matrix Market
+## 2. Import Matrix Market
 
 Inspect a Matrix Market source before selecting a triplet.
 A source can be an `.mtx` or `.mtx.gz` file, a directory, or a direct MEX ZIP.
@@ -144,10 +89,9 @@ candidates = scarf.inspect_mtx(str(mtx_dir))
 candidates
 ```
 
-Select one candidate explicitly when inspection reports more than one.
-`MtxReader` reads the matrix once when it opens, to validate the coordinates and find the largest
-counts of the kept cells. This example contains a count above the `uint32` range, so the reader
-and the store hold `uint64` counts:
+This directory contains one complete matrix. Open its reader, choose an output path, and call
+`dump()` to write the Scarf store. If your inspection finds several candidates, choose the one
+whose cells and counts you want to analyse:
 
 ```{code-cell} ipython3
 mtx_store = output_dir / "xin_1K.zarr"
@@ -158,21 +102,17 @@ scarf.MtxToZarr(
 ).dump()
 ```
 
-Reopen the store and check that the count matrix holds `uint64` counts and the candidate dimensions:
+Open the store and inspect its cells and features:
 
 ```{code-cell} ipython3
 ds_mtx = scarf.DataStore(str(mtx_store))
-ds_mtx.RNA.rawData.dtype, ds_mtx.RNA.rawData.shape
+ds_mtx
 ```
 
-Cell-major coordinates stream directly.
-Feature-major coordinates, including BD Rhapsody MEX output, are converted to a temporary disk-backed CSR matrix.
-The reader checks available capacity and reports the exact required bytes before creating those files.
-Pass `temp_dir` to `MtxReader` when the system temporary directory is too small.
-`MtxToZarr` parses 100,000 lines at a time, and its layout fit reserves that buffer; pass a
-smaller `lines_in_mem` to `MtxToZarr` when a small `mem_budget` cannot hold it.
+The store is ready for analysis. Continue with {doc}`scrna_seq` for an RNA workflow, or read on
+if you need another input format.
 
-### 3.1 Parse DGE directories
+### 2.1 Parse DGE directories
 
 Parse DGE matrices use cells by genes orientation and require `cell_metadata.csv`.
 Scarf imports its non-ID columns.
@@ -184,12 +124,16 @@ reader = scarf.MtxReader(candidate, cell_id_key="bc_index")
 scarf.MtxToZarr(reader, zarr_loc="parse.zarr").dump()
 ```
 
-## 4. Import H5AD
+## 3. Import H5AD
 
 H5AD files vary in where they store counts, feature names, metadata, and layers.
 Inspect the file before conversion rather than assuming `X`, `obs`, and `var` contain the intended values.
 
 ```{code-cell} ipython3
+h5ad_dir = datasets.download_dataset(
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination=output_dir,
+)
 h5ad_path = str(h5ad_dir / "data.h5ad")
 inspection = scarf.inspect_h5ad(h5ad_path)
 inspection
@@ -197,6 +141,9 @@ inspection
 
 `H5adReader.from_inspect` uses the discovered matrix and metadata keys.
 Override the inspection only after confirming that another layer contains the raw count matrix required by the analysis.
+This file also contains a UMAP and cell-type labels. Here we ask the reader to keep them with
+`embedding_roles` and `cluster_keys`, so we can plot and export them later. Omit these two
+arguments for a counts-and-metadata import.
 
 ```{code-cell} ipython3
 reader = scarf.H5adReader.from_inspect(
@@ -214,46 +161,50 @@ h5ad_import = scarf.H5adToZarr(
 h5ad_import.embeddingArtifacts, h5ad_import.clusterArtifacts
 ```
 
-Categorical columns are decoded from category codes.
-Missing categorical or object values become `None`; missing numeric nullable values become `NaN`.
-Unsupported group-encoded columns are skipped with a warning rather than treated as valid metadata.
-Columns are listed from the file's `column-order`, so a column that an old AnnData version
-nested because its name contains `/` is still imported. Scarf stores such names with `_` in
-place of `/` and `\`: `Baseline eGFR (ml/min/1.73m2) (Binned)` becomes the cell column
-`Baseline eGFR (ml_min_1.73m2) (Binned)`, and the import logs the rename.
-
 `embedding_roles` and `cluster_keys` select analytical values for artifact import.
 The result maps their source names to exact refs in `embeddingArtifacts` and `clusterArtifacts`.
 These values are not flattened into live cell metadata. Load them through the datastore or pass
 their refs directly to consumers. Sparse, non-numeric, or row-mismatched selected embeddings are
 rejected.
 
-Source read batches start from one destination row band, which the fitted count layout admits,
-and physical writes stay shard-aligned. An explicit positive `batch_size` remains available for
-controlled profiling and expert workflows; a batch holds at most one band.
+For a file with several assay types, pass `assay_split_key` to the writer to split them;
+`from_inspect` alone writes one assay. The {doc}`../reference/api/import_export` reference covers
+multi-assay imports and metadata handling.
 
-The import writes the default count layout unless it is given a `policy`. When the default count
-shards, the batches of one band that write them, or the gene-major `countsT` copy built from them,
-do not fit `mem_budget`, the import stops before it creates the store, and its error names the
-largest smaller policy that fits, such as
-`policy=CountMatrixPolicy(unitBytes=250_000_000, chunkBytes=25_000_000)` with `CountMatrixPolicy`
-from `scarf.storage.count_matrix`. Smaller shards make
-every later read of `countsT` slower, so prefer a larger `mem_budget` when the machine has the
-memory. The layout never changes the stored values or the store's identity.
+## 4. Import a larger 10x HDF5 dataset
 
-The stored count dtype follows the values, not the H5AD encoding, so raw counts saved as
-`float32`, `int32`, CSC, or dense arrays import alike, while fractional or negative values keep
-their source dtype. NaN and infinite values are rejected before the store is created.
+Scarf stores data as dense, compressed chunks in Zarr.
+`CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
+Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
+`mem_budget` bounds the memory the conversion plans for.
+The default count shards of this 89,796-peak assay do not fit `mem_budget="8G"`, so the import
+passes the smaller `policy` that its `MemoryError` names. Non-RNA assays write no `countsT`
+copy, so the smaller shards do not slow later `countsT` reads.
 
-10x feature types are retained in feature metadata when present.
-Stable multi-assay names (CRISPR guide, multiplexing, antigen, custom, RNA, antibody, and similar) require `assay_split_key` on `H5adToZarr` (for example `feature_types`).
-A plain `from_inspect` path without `assay_split_key` writes everything into one assay (default RNA).
-Inspection may set `assaySplitKey` and `suggestedAssays`, but `to_reader_kwargs` does not pass `assaySplitKey` through.
-Pass `assay_split_key` and optional `assay_name_map` on the writer to split.
-Each split assay gets the count dtype of its own counts.
-When selected analytical values accompany a multi-assay import, set `analysis_assay` to the assay
-that owns those artifacts.
-`reclassify_features` is a `CrReader` API (10x HDF5 / MEX), not `H5adReader`.
+```{code-cell} ipython3
+from scarf.storage.count_matrix import CountMatrixPolicy
+
+tenx_h5 = datasets.download_dataset(
+    name="tenx_10K_pbmc-v1_atacseq",
+    destination=output_dir,
+)
+atac_store = output_dir / "pbmc_atac.zarr"
+reader = scarf.CrH5Reader(str(tenx_h5 / "data.h5"))
+scarf.CrToZarr(
+    reader,
+    zarr_loc=str(atac_store),
+    mem_budget="8G",
+    policy=CountMatrixPolicy(unitBytes=500_000_000, chunkBytes=50_000_000),
+).dump()
+```
+
+Open the written store.
+The summary lists an ATAC assay, which confirms that inference from the H5 feature types survived the dump:
+
+```{code-cell} ipython3
+ds_atac = scarf.DataStore(str(atac_store))
+ds_atac
+```
 
 ## 5. Import Seurat RDS
 
@@ -324,7 +275,7 @@ Prefer original 10x HDF5 or Matrix Market counts when they are available and you
 
 ## 6. Export to Matrix Market
 
-Open the H5AD-derived store written in section 4 and load the selected analytical artifacts:
+Open the H5AD-derived store written in section 3 and load the selected analytical artifacts:
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(str(pancreas_store))
@@ -399,7 +350,7 @@ selected = ds.to_anndata(
 )
 {
     "shape": selected.shape,
-    "genes": selected.var_names.tolist(),
+    "genes": selected.var["names"].tolist(),
 }
 ```
 
@@ -442,16 +393,10 @@ ds_csv.cells.head()
 ```
 
 `quality` is cell metadata rather than a count column, which is what `cell_data_cols` is for.
-`CSVReader` finds the range of the counts in the pass that checks every row, so these counts,
-which pandas parses as `int64`, are stored as `uint8`. `CSVtoZarr` casts each batch to the
-stored dtype through a checked cast, so a count that changed after the reader's pass and no
-longer fits raises instead of wrapping.
 
 ## 9. Import sparse matrices
 
 `SparseToZarr` accepts a SciPy CSR matrix with matching cell and feature IDs.
-It scans the matrix, with duplicate coordinates summed, before it creates the store, so these
-`int64` counts are stored as `uint8`.
 
 ```{code-cell} ipython3
 from scipy.sparse import csr_matrix
@@ -491,6 +436,8 @@ Choose the `cloud` profile for an object-store destination and pass credentials 
 ```python
 import os
 
+inspection = scarf.inspect_h5ad("counts.h5ad")
+reader = scarf.H5adReader.from_inspect(inspection)
 writer = scarf.H5adToZarr(
     reader,
     zarr_loc="s3://my-bucket/project/data.zarr",
@@ -502,6 +449,22 @@ writer = scarf.H5adToZarr(
 )
 writer.dump()
 ```
+
+### 10.3 Count storage and memory
+
+Writers choose a count dtype from the values without changing them. Integral non-negative
+counts use an unsigned integer dtype that fits; fractional or negative values keep their source
+dtype. NaN and infinite counts are rejected before the store is created.
+
+RNA writers store both cell-major `counts` and gene-major `countsT` arrays. The latter supports
+feature selection and marker search; non-RNA assays store `counts` only. New stores start with
+all feature rows available, and analytical feature selections are saved separately.
+
+Start with the default storage layout. If it cannot fit the import's `mem_budget`, the error
+names a smaller `CountMatrixPolicy` that fits, as used in the ATAC example above. Prefer a larger
+memory budget when your machine allows it: smaller RNA shards slow later gene-major reads.
+See {doc}`../concepts/memory_and_execution` for memory planning and
+{doc}`../reference/api/import_export` for reader buffering and storage options.
 
 ## Common mistakes and limitations
 
