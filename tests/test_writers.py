@@ -2023,11 +2023,6 @@ def test_to_h5ad_skips_a_metadata_column_of_unsupported_dtype(
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: to_h5ad lists a skipped column in obs column-order, so AnnData "
-    "cannot read the file",
-)
 def test_to_h5ad_with_a_skipped_column_stays_readable_by_anndata(
     export_assay_store, tmp_path
 ):
@@ -2035,16 +2030,27 @@ def test_to_h5ad_with_a_skipped_column_stays_readable_by_anndata(
 
     from scarf.writers import to_h5ad
 
+    import h5py
+
+    pairs = [("a", "<i4"), ("b", "<f4")]
     assay = export_assay_store.RNA
-    assay.cells.insert(
-        "pairs", np.zeros(3, dtype=[("a", "<i4"), ("b", "<f4")]), overwrite=True
-    )
+    assay.cells.insert("pairs", np.zeros(3, dtype=pairs), overwrite=True)
+    assay.feats.insert("pairs", np.zeros(assay.feats.N, dtype=pairs), overwrite=True)
     path = tmp_path / "pairs.h5ad"
     to_h5ad(assay, str(path))
 
+    # column-order names exactly the columns written, which AnnData reads.
+    with h5py.File(path, mode="r") as h5:
+        for table in ("obs", "var"):
+            listed = list(h5[table].attrs["column-order"])
+            assert "pairs" not in listed and "pairs" not in h5[table]
+            assert set(listed) == set(h5[table]) - {"_index"}
     adata = anndata.read_h5ad(path)
-    assert "pairs" not in adata.obs.columns
+    assert "pairs" not in adata.obs.columns and "pairs" not in adata.var.columns
     assert list(adata.obs_names) == ["b1", "b2", "b3"]
+    np.testing.assert_array_equal(
+        adata.obs["RNA_nCounts"], assay.cells.fetch_all("RNA_nCounts")
+    )
 
 
 def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_path):

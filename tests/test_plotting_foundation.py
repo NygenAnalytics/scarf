@@ -2089,13 +2089,6 @@ def test_ungrouped_horizontal_distribution_hides_category_ticks_and_titles(
     result.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: ungrouped horizontal violin/box lets seaborn treat the numeric "
-        "values as categories, drawing one flat box per value and no violin"
-    ),
-)
 @pytest.mark.parametrize("kind", ["box", "violin"])
 def test_ungrouped_horizontal_distribution_draws_one_value_axis_shape(
     synthetic_plot_store,

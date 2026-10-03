@@ -131,6 +131,19 @@ def _priority_sample_update(
     return sample_values, sample_priorities, keep
 
 
+def _representable_window(low: float, high: float) -> tuple[float, float]:
+    """Widen a collapsed window by a few representable steps.
+
+    Far from zero, float64 absorbs the unit padding of a constant coordinate,
+    so the window can end up empty. Two steps at the window's magnitude on
+    each side keep it drawable; a window with any width is unchanged.
+    """
+    if high > low:
+        return low, high
+    step = float(np.spacing(max(abs(low), abs(high))))
+    return low - 2.0 * step, high + 2.0 * step
+
+
 def raster_from_metadata(
     cells: Any,
     *,
@@ -266,6 +279,8 @@ def raster_from_metadata(
         (xmin, xmax),
         (ymin, ymax),
     )
+    xmin, xmax = _representable_window(xmin, xmax)
+    ymin, ymax = _representable_window(ymin, ymax)
 
     sums = np.zeros((pixels, pixels), dtype=np.float64)
     counts = np.zeros((pixels, pixels), dtype=np.int64)

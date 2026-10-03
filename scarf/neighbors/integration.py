@@ -258,6 +258,13 @@ def _wnn_integration_many(
                     )
 
             finite_scores = scores[np.isfinite(scores)]
+            if finite_scores.size == 0:
+                # Every cross-modality prediction is non-finite, as when the
+                # distances of all modalities overflow, so the cell has no
+                # modality weights.
+                raise FloatingPointError(
+                    "WNN integration produced non-finite modality weights"
+                )
             max_score = float(finite_scores.max())
             pairwise_strengths = np.zeros(scores.shape, dtype=np.float64)
             finite = np.isfinite(scores)

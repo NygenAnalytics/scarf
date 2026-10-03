@@ -1788,18 +1788,14 @@ def test_wnn_integration_rejects_distances_that_overflow():
             )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: when every modality's distances overflow, WNN raises NumPy's "
-        "zero-size reduction ValueError instead of FloatingPointError"
-    ),
-)
 def test_wnn_integration_reports_overflow_in_every_modality():
     indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
 
     with np.errstate(over="ignore", invalid="ignore"):
-        with pytest.raises(FloatingPointError, match="non-finite"):
+        with pytest.raises(
+            FloatingPointError,
+            match="^WNN integration produced non-finite modality weights$",
+        ):
             _wnn_pair(
                 "RNA",
                 indices1,

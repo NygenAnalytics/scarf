@@ -1381,13 +1381,6 @@ def test_scratch_space_inspection_failure_is_reported_while_parsing(
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: prepare_payload reports scratch-space OSErrors while spooling a "
-        "compressed payload as an invalid compressed stream"
-    ),
-)
 def test_scratch_space_failure_while_spooling_is_not_reported_as_corrupt_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1398,8 +1391,29 @@ def test_scratch_space_failure_while_spooling_is_not_reported_as_corrupt_input(
     wire = Wire()
     payload = gzip.compress(wire.document(wire.integer_vector([1])))
     monkeypatch.setattr("scarf.readers._rds._storage.shutil.disk_usage", unavailable)
-    with pytest.raises(OSError, match="^Cannot inspect free scratch space for "):
+    with pytest.raises(
+        OSError, match="^Cannot inspect free scratch space for "
+    ) as caught:
         open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    assert str(caught.value.__cause__) == "statvfs failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_full_scratch_disk_while_spooling_is_not_reported_as_corrupt_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def disk_full(_storage: object, _data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    wire = Wire()
+    payload = gzip.compress(wire.document(wire.integer_vector([1])))
+    monkeypatch.setattr(RandomAccessStorage, "_append_unchecked", disk_full)
+    with pytest.raises(OSError, match="No space left on device") as caught:
+        open_rds(io.BytesIO(payload), temp_dir=tmp_path)
+    assert not isinstance(caught.value, RdsFormatError)
+    assert caught.value.errno == 28
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_bytes_like_inputs_are_parsed_without_a_stream() -> None:

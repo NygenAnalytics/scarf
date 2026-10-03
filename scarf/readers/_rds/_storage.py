@@ -480,19 +480,21 @@ def prepare_payload(
         payload_digest = hashlib.sha256()
         try:
             while True:
-                chunk = reader.read(1024 * 1024)
+                # Only the decoder judges the input. Spooling errors, such as
+                # a temp cap, missing scratch space, or a full disk, keep
+                # their own type instead of reading as corrupt input.
+                try:
+                    chunk = reader.read(1024 * 1024)
+                except Exception as error:
+                    raise RdsFormatError(
+                        f"invalid {compression.value} compressed stream",
+                        path="$source",
+                    ) from error
                 if not chunk:
                     break
                 manager.append(spool, chunk, path="$source")
                 payload_bytes += len(chunk)
                 payload_digest.update(chunk)
-        except RdsLimitError:
-            raise
-        except Exception as error:
-            raise RdsFormatError(
-                f"invalid {compression.value} compressed stream",
-                path="$source",
-            ) from error
         finally:
             reader.close()
         spool.flush()

@@ -165,19 +165,22 @@ def to_h5ad(
 
     import h5py
 
-    def save_attr(group: str, col: str, scarf_col: str, md: Any) -> None:
+    def save_attr(group: str, col: str, scarf_col: str, md: Any) -> bool:
+        """Write one metadata column and return whether it was written."""
         d = md.fetch_all(scarf_col)
         mask = metadata_missing_mask(md, scarf_col)
         missing = None if mask is None else np.asarray(mask[:], dtype=bool)
         if missing is not None and missing.any():
             _write_masked_column(h5[group], col, d, missing)
-            return
+            return True
         try:
             _write_array(h5[group], col, d)
         except TypeError:
             logger.warning(
                 f"Skipping metadata column {col!r} with unsupported dtype {d.dtype}"
             )
+            return False
+        return True
 
     with h5py.File(h5ad_filename, "w") as h5:
         _encoded(h5, "anndata", "0.1.0")
@@ -258,12 +261,13 @@ def to_h5ad(
         embedding_columns = {
             column for columns in embeddings.values() for column in columns
         }
+        # column-order lists only written columns: AnnData reads every
+        # column it names, so a skipped one would make the file unreadable.
         out_cols = []
         for i in assay.cells.columns:
             if i == "ids":
                 save_attr("obs", "_index", "ids", assay.cells)
-            elif i not in embedding_columns:
-                save_attr("obs", i, i, assay.cells)
+            elif i not in embedding_columns and save_attr("obs", i, i, assay.cells):
                 out_cols.append(i)
 
         # The index element is named by ``_index`` and is not a column.
@@ -281,10 +285,9 @@ def to_h5ad(
             if i == "ids":
                 save_attr("var", "_index", "ids", assay.feats)
             elif i == "names":
-                save_attr("var", "gene_short_name", "names", assay.feats)
-                out_cols.append("gene_short_name")
-            else:
-                save_attr("var", i, i, assay.feats)
+                if save_attr("var", "gene_short_name", "names", assay.feats):
+                    out_cols.append("gene_short_name")
+            elif save_attr("var", i, i, assay.feats):
                 out_cols.append(i)
 
         attrs = {

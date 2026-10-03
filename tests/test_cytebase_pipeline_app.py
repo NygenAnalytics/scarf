@@ -1807,9 +1807,9 @@ def test_process_run_stops_publishing_after_a_periodic_update_fails(
     assert result["error"] == "RuntimeError: catalog unavailable"
     assert result["catalog"] == {"status": "done", "updated": []}
     assert result["successes"] == [CYTEBASE_ID, OTHER_ID]
-    # Known issue: catalog errors end "blocked", never "failed"; see
-    # test_a_failed_catalog_publication_fails_the_run.
-    assert result["state"] in {"blocked", "failed"}
+    # A catalog worker that raised has an unknown outcome; see
+    # test_a_raising_catalog_worker_blocks_the_run_until_reset.
+    assert result["state"] == "blocked"
 
 
 @pytest.mark.parametrize(
@@ -1849,17 +1849,16 @@ def test_run_pipeline_reports_a_failed_catalog_publication(
     assert result["error"] == "RuntimeError: catalog unavailable"
     assert result["datasets"] == datasets
     assert result["failures"] == []
-    # Known issue: catalog errors end "blocked", never "failed"; see
-    # test_a_failed_catalog_publication_fails_the_run.
-    assert result["state"] in {"blocked", "failed"}
+    # A catalog worker that raised has an unknown outcome; see
+    # test_a_raising_catalog_worker_blocks_the_run_until_reset.
+    assert result["state"] == "blocked"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: a catalog worker that raised leaves the run blocked, not failed",
-)
-def test_a_failed_catalog_publication_fails_the_run(modal_harness, monkeypatch):
-    _register(modal_harness.hub)
+def test_a_raising_catalog_worker_blocks_the_run_until_reset(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
 
     def run_catalog(request, storage, check):
         check()
@@ -1868,12 +1867,52 @@ def test_a_failed_catalog_publication_fails_the_run(modal_harness, monkeypatch):
     monkeypatch.setattr(pipeline_catalog, "run_catalog", run_catalog)
     result = modal_harness.run("catalog", {}, run_id=RUN_ID)
 
-    assert result["error"] == "RuntimeError: catalog unavailable"
-    # The worker finished with an error, so its outcome is known: the run's
-    # final-state expression has a "failed" branch for exactly this case.
-    # Every worker exception marks the run uncertain, so it ends "blocked"
-    # and needs a drain-confirmed reset instead.
-    assert result["state"] == "failed"
+    # Modal re-raises a worker's own exception as it reports an unavailable
+    # result, so a raising worker's outcome is unknown and the run is blocked.
+    assert (result["state"], result["error"]) == (
+        "blocked",
+        "RuntimeError: catalog unavailable",
+    )
+    saved = hub.read_json(app.RUN_PATH)
+    assert saved["state"] == "blocked"
+    assert saved["children"]["catalog"] == _catalog_child()
+    with pytest.raises(RuntimeError, match=f"Run {RUN_ID} has unresolved workers"):
+        modal_harness.run("catalog", {}, run_id="fc-run-2")
+
+    calls = Calls({CATALOG_WORKER_ID: RuntimeError("catalog unavailable")})
+    monkeypatch.setattr(modal, "FunctionCall", calls)
+    reset = modal_harness.run("reset", RESET, run_id="fc-run-3")
+    assert reset == {"runId": RUN_ID, "state": "reset"}
+    assert calls.polled == [(RUN_ID, 0), (CATALOG_WORKER_ID, 0)]
+
+
+def test_an_orchestration_error_fails_the_run_without_blocking_new_work(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+
+    class Pacer:
+        def __init__(self, interval: float) -> None:
+            pass
+
+        async def wait(self) -> None:
+            raise RuntimeError("pacer unavailable")
+
+    monkeypatch.setattr(app, "_StartPacer", Pacer)
+    process = {"cytebaseIds": [CYTEBASE_ID]}
+    result = modal_harness.run("process", process, run_id=RUN_ID)
+
+    # The error came from the orchestrator before any dataset worker started,
+    # so no outcome is unknown: the run fails instead of blocking.
+    assert (result["state"], result["error"]) == (
+        "failed",
+        "RuntimeError: pacer unavailable",
+    )
+    assert modal_harness.process_dataset.spawned == []
+    assert hub.read_json(app.RUN_PATH)["state"] == "failed"
+    assert modal_harness.run("catalog", {}, run_id="fc-run-2")["state"] == "completed"
+    assert hub.read_json(app.RUN_PATH)["runId"] == "fc-run-2"
 
 
 def test_blocked_run_must_be_reset_before_new_work(modal_harness, monkeypatch):

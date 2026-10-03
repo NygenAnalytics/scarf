@@ -5768,13 +5768,6 @@ def test_serialized_slots_with_unsupported_forms_are_rejected(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: an ordinary R matrix nested as a DelayedArray seed is passed to the "
-        "matrix factory as a raw vector and rejected"
-    ),
-)
 def test_delayed_array_over_an_ordinary_matrix_imports(tmp_path: Path) -> None:
     wire = _Wire()
     # DelayedArray(matrix(c(1L, 0L, 0L, 2L, 3L, 0L), 2)) keeps the matrix as its seed.
@@ -5786,6 +5779,39 @@ def test_delayed_array_over_an_ordinary_matrix_imports(tmp_path: Path) -> None:
     )
     path = _write_document(
         tmp_path / "in-memory-seed.rds",
+        _seurat_document(wire, assays=[_single_layer_assay(wire, layer)]),
+    )
+    with SeuratReader(path, reductions=[]) as reader:
+        np.testing.assert_array_equal(
+            reader.get_assay("RNA").counts.read_cells(0, 3).toarray(),
+            [[1, 0], [0, 2], [3, 0]],
+        )
+
+
+def test_delayed_abind_of_ordinary_matrices_imports(tmp_path: Path) -> None:
+    wire = _Wire()
+    # cbind(DelayedArray(matrix(c(1L, 0L, 0L, 2L), 2)), matrix(c(3L, 0L), 2))
+    # keeps both ordinary matrices in the seeds list of a DelayedAbind.
+    bound = wire.s4(
+        [
+            (
+                "seeds",
+                wire.vector(
+                    [wire.matrix([1, 0, 0, 2], (2, 2)), wire.matrix([3, 0], (2, 1))]
+                ),
+            ),
+            ("along", wire.integer_vector([2])),
+            ("class", wire.string_vector(["DelayedAbind"])),
+        ]
+    )
+    layer = wire.s4(
+        [
+            ("seed", bound),
+            ("class", wire.string_vector(["DelayedMatrix", "DelayedArray"])),
+        ]
+    )
+    path = _write_document(
+        tmp_path / "bound-in-memory-seeds.rds",
         _seurat_document(wire, assays=[_single_layer_assay(wire, layer)]),
     )
     with SeuratReader(path, reductions=[]) as reader:

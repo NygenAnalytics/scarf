@@ -680,6 +680,10 @@ def _promote_dtypes(dtypes: list[np.dtype[Any]]) -> np.dtype[Any]:
         return np.result_type(*dtypes)
     if all(dtype.kind in "bif" for dtype in dtypes):
         return np.dtype(np.float64)
+    # Numbers mixed with complex values widen to complex128 like real mixes
+    # widen to float64, so no imaginary part is cast away.
+    if all(dtype.kind in "bifc" for dtype in dtypes):
+        return np.dtype(np.complex128)
     if any(dtype.kind in {"U", "S", "O"} for dtype in dtypes):
         return np.dtype("U1")
     return np.dtype(np.float64)
@@ -690,7 +694,7 @@ def _fill_value(dtype: np.dtype[Any]) -> Any:
         return False
     if dtype.kind in "iu":
         return 0
-    if dtype.kind == "f":
+    if dtype.kind in "fc":
         return np.nan
     return ""
 
@@ -711,22 +715,28 @@ def _merged_column_attributes(arrays: Iterable[Any], name: str) -> dict[str, Any
     return attributes
 
 
-def write_feature_metadata(
+@dataclass(frozen=True)
+class _FeatureColumnPlan:
+    """One merged feature column: its sources, dtype, and rows per write."""
+
+    name: str
+    sources: tuple[tuple[Any, np.ndarray], ...]
+    arrays: tuple[Any, ...]
+    dtype: np.dtype[Any]
+    blockRows: int
+
+
+def _plan_feature_columns(
     tables: list[Any],
     mappings: list[np.ndarray],
-    destination: zarr.Group,
     n_features: int,
     *,
     resources: ResourceBudget,
     resident_bytes: int,
-    profile: StorageProfile,
-) -> None:
-    """Merge feature annotations that agree across sources.
+) -> list[_FeatureColumnPlan]:
+    """Resolve every merged feature column and the rows it writes at once.
 
-    A column whose values or metadata differ for a shared feature describes
-    the source datasets rather than the features, so it is left out with a
-    warning. Per-dataset analysis outputs such as highly variable gene flags
-    usually fall in this group.
+    Raises MemoryError when a column cannot fit one row within the budget.
     """
     excluded = {"ids", "names", "I", *GENERATED_FEATURE_COLUMNS}
     table_columns = [set(table.columns) for table in tables]
@@ -738,7 +748,7 @@ def write_feature_metadata(
         resident_bytes=resident_bytes + mapping_bytes,
         preferred_rows=PROFILE_METADATA_CHUNK,
     )
-    skipped: list[str] = []
+    plans: list[_FeatureColumnPlan] = []
     for name in columns:
         sources = [
             (table, mapping)
@@ -781,6 +791,63 @@ def write_feature_metadata(
             raise MemoryError(
                 f"Merged feature column {name!r} cannot fit the memory budget"
             )
+        plans.append(
+            _FeatureColumnPlan(name, tuple(sources), tuple(arrays), dtype, block_rows)
+        )
+    return plans
+
+
+def admit_feature_metadata(
+    tables: list[Any],
+    mappings: list[np.ndarray],
+    n_features: int,
+    *,
+    resources: ResourceBudget,
+    resident_bytes: int,
+) -> None:
+    """Raise the MemoryError that merging feature annotations would raise.
+
+    Planning calls this so a merge whose feature columns cannot fit the
+    budget fails before it creates or changes the destination.
+    """
+    _plan_feature_columns(
+        tables,
+        mappings,
+        n_features,
+        resources=resources,
+        resident_bytes=resident_bytes,
+    )
+
+
+def write_feature_metadata(
+    tables: list[Any],
+    mappings: list[np.ndarray],
+    destination: zarr.Group,
+    n_features: int,
+    *,
+    resources: ResourceBudget,
+    resident_bytes: int,
+    profile: StorageProfile,
+) -> None:
+    """Merge feature annotations that agree across sources.
+
+    A column whose values or metadata differ for a shared feature describes
+    the source datasets rather than the features, so it is left out with a
+    warning. Per-dataset analysis outputs such as highly variable gene flags
+    usually fall in this group. Every column is planned before any is written.
+    """
+    skipped: list[str] = []
+    for column_plan in _plan_feature_columns(
+        tables,
+        mappings,
+        n_features,
+        resources=resources,
+        resident_bytes=resident_bytes,
+    ):
+        name = column_plan.name
+        sources = column_plan.sources
+        dtype = column_plan.dtype
+        block_rows = column_plan.blockRows
 
         def blocks() -> Iterator[MetadataBlock]:
             for start in range(0, n_features, block_rows):
@@ -797,7 +864,7 @@ def write_feature_metadata(
                     present = (
                         np.ones(len(rows), dtype=bool) if absent is None else ~absent
                     )
-                    if dtype.kind == "f":
+                    if dtype.kind in "fc":
                         present &= ~np.isnan(incoming)
                     conflict = (
                         present & ~missing[positions] & (values[positions] != incoming)
@@ -814,7 +881,7 @@ def write_feature_metadata(
                 yield MetadataBlock(start=start, values=values, missing=missing)
 
         try:
-            attributes = _merged_column_attributes(arrays, name)
+            attributes = _merged_column_attributes(column_plan.arrays, name)
             column = create_streamed_metadata_column(
                 destination,
                 name,

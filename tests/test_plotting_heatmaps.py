@@ -1714,41 +1714,32 @@ def test_annotation_legend_handles_name_values_and_skip_unresolved_scales():
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: pseudotime_heatmap maps feature_order through a name-to-row dict, "
-        "so repeated frozen feature names silently drop rows"
-    ),
-)
-def test_pseudotime_feature_order_keeps_rows_with_repeated_names():
+def test_pseudotime_feature_order_refuses_to_drop_rows_with_repeated_names():
     store = _pseudotime_store(feature_names=np.array(["g4", "g4", "g6"]))
 
-    try:
-        result = splt.pseudotime_heatmap(
+    # Without an explicit order every row is plotted, repeated names included.
+    result = splt.pseudotime_heatmap(store, aggregation=_AGGREGATION, show=False)
+    assert len(result.tables["matrix"]) == 3
+    result.close()
+    # An order by name cannot place the two g4 rows, so it is rejected rather
+    # than dropping one of them.
+    with pytest.raises(
+        ValueError,
+        match=r"^feature_order cannot order features whose names repeat: 'g4'$",
+    ):
+        splt.pseudotime_heatmap(
             store,
             aggregation=_AGGREGATION,
             feature_order=["g6", "g4"],
             show=False,
         )
-    except ValueError:
-        return  # Rejecting the ambiguous order would also be correct.
-    assert len(result.tables["matrix"]) == 3
-    result.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: marker_heatmap labels rows by feature name, so clustering rows "
-        "fails with a pandas reindex error when two markers share a name"
-    ),
-)
 def test_marker_heatmap_clusters_markers_that_share_a_feature_name(tmp_path):
     from tests.test_plotting_foundation import _imported_plot_store
 
     labels = np.arange(30) % 3
-    store, imported, _ = _imported_plot_store(
+    store, imported, counts = _imported_plot_store(
         tmp_path,
         coordinates=np.random.default_rng(2).normal(size=(30, 2)),
         clusters=labels,
@@ -1760,16 +1751,24 @@ def test_marker_heatmap_clusters_markers_that_share_a_feature_name(tmp_path):
 
     result = splt.marker_heatmap(store, marker=markers, topn=4, show=False)
 
-    assert len(result.tables["matrix"]) == 4
+    # A repeated name also shows its feature ID; other names are unchanged.
+    rows = ["CD3E (f0)", "LYZ", "CD3E (f2)", "NKG7"]
+    values = np.log1p(_library_normalized(counts.astype(np.float64)))
+    means = pd.DataFrame(values, columns=rows).groupby(labels).mean()
+    oracle = ((means - means.mean()) / means.std()).T
+    matrix = result.tables["matrix"]
+    assert sorted(matrix.index) == sorted(rows)
+    np.testing.assert_allclose(
+        matrix, oracle.loc[matrix.index, matrix.columns], rtol=_FLOAT32_RTOL
+    )
+    assert set(result.tables["markers"]["feature"]) == set(rows)
+    shown = [label.get_text() for label in result.axes["heatmap"].get_yticklabels()]
+    assert sorted(shown) == sorted(rows)
     result.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: marker_heatmap accepts a negative topn and drops each group's last marker",
-)
 def test_marker_heatmap_rejects_a_negative_topn(marker_store):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="^topn must be at least 0$"):
         splt.marker_heatmap(
             marker_store.store,
             marker=marker_store.markers,

@@ -29,6 +29,7 @@ from ._heatmap_utils import (
     normalize_annotations,
     order_heatmap,
 )
+from ..utils.arguments import integer_argument
 from ..utils.arrays import sort_categories
 from ._style import (
     apply_figure_chrome,
@@ -109,6 +110,32 @@ def _writable_float64(values: np.ndarray) -> np.ndarray:
     return np.array(values, dtype=np.float64, copy=True)
 
 
+def _marker_row_labels(
+    marker_slot: Any,
+    feature_names: np.ndarray,
+    feature_index: np.ndarray,
+) -> dict[int, str]:
+    """Label each selected feature by name, and a repeated name also by ID.
+
+    Feature names can repeat across features of one assay, but heatmap rows
+    must stay distinct, so every feature whose name repeats among the
+    selected ones is shown as ``name (ID)`` with the ID the marker search
+    recorded.
+    """
+    names = [str(feature_names[int(index)]) for index in feature_index]
+    counts = pd.Series(names).value_counts()
+    repeated = set(counts.index[counts > 1])
+    if not repeated:
+        return dict(zip((int(index) for index in feature_index), names, strict=True))
+    feature_ids = np.asarray(marker_slot["feature_ids"][:]).astype(str)
+    return {
+        int(index): (
+            f"{name} ({feature_ids[int(index)]})" if name in repeated else name
+        )
+        for index, name in zip(feature_index, names, strict=True)
+    }
+
+
 def _prepare_marker_heatmap(
     store: Any,
     *,
@@ -118,6 +145,9 @@ def _prepare_marker_heatmap(
 ) -> dict[str, Any]:
     if not isinstance(marker, ArtifactRef):
         raise TypeError("marker must be an ArtifactRef")
+    # A negative count would drop markers from the end of every group, as
+    # DataFrame.head does. Zero selects no markers and fails below.
+    topn = integer_argument(topn, "topn", minimum=0)
     assay, marker_slot = store._resolve_marker_group(marker)
     selection_ref = _artifact_input(store, marker, "cell_selection")
     clusters_ref = _artifact_input(store, marker, "clusters")
@@ -215,7 +245,8 @@ def _prepare_marker_heatmap(
         lambda values: (values - values.mean()) / values.std(),
         axis=0,
     )
-    group_means.columns = feature_names[feature_index]
+    row_labels = _marker_row_labels(marker_slot, feature_names, feature_index)
+    group_means.columns = [row_labels[int(index)] for index in feature_index]
     # Features become rows. Display limits clip colors only, so they cannot
     # change the clustering or the returned values.
     matrix = pd.DataFrame(
@@ -225,8 +256,9 @@ def _prepare_marker_heatmap(
     )
 
     marker_table = pd.DataFrame(marker_rows)
-    marker_table["feature"] = feature_names[
-        marker_table["feature_index"].to_numpy(dtype=int)
+    marker_table["feature"] = [
+        row_labels[int(index)]
+        for index in marker_table["feature_index"].to_numpy(dtype=int)
     ]
     return {
         "matrix": matrix,
@@ -730,6 +762,15 @@ def pseudotime_heatmap(
         observed_features = list(feature_labels)
         if set(requested_features) != set(observed_features):
             raise ValueError("feature_order must contain every plotted feature")
+        # An order by name cannot place two rows that share a name, and
+        # mapping names to rows would silently drop all but one of them.
+        label_counts = pd.Series(observed_features).value_counts()
+        repeated = sorted(map(str, label_counts.index[label_counts > 1]))
+        if repeated:
+            raise ValueError(
+                "feature_order cannot order features whose names repeat: "
+                + ", ".join(repr(label) for label in repeated)
+            )
         feature_index = {label: index for index, label in enumerate(feature_labels)}
         row_order = np.asarray(
             [feature_index[label] for label in requested_features],

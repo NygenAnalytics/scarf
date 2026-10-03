@@ -9,7 +9,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
-import pytest
 from matplotlib.colors import to_hex
 
 import scarf.plotting as splt
@@ -103,28 +102,30 @@ def test_cluster_tree_shows_owned_results_by_default(monkeypatch):
     assert not plt.fignum_exists(result.figure.number)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: a fill with one distinct observed value becomes all ones, so "
-        "clusters whose values are all missing are colored as if observed"
-    ),
-)
 def test_cluster_tree_keeps_missing_clusters_grey_under_a_uniform_fill():
-    result = splt.cluster_tree(
-        _tree_store(
-            [5.0, 5.0, 5.0, 0.0, 0.0, 0.0],
-            color_missing=[False, False, False, True, True, True],
-        ),
-        graph=_GRAPH,
-        clusters=_CLUSTERS,
-        fill_by_value="score",
-        force_ints_as_cats=False,
-        show_labels=False,
-        show=False,
+    def node_colors(values, missing):
+        result = splt.cluster_tree(
+            _tree_store(values, color_missing=missing),
+            graph=_GRAPH,
+            clusters=_CLUSTERS,
+            fill_by_value="score",
+            force_ints_as_cats=False,
+            show_labels=False,
+            show=False,
+        )
+        try:
+            return _node_colors(result)
+        finally:
+            result.close()
+
+    uniform = node_colors([5.0] * 6, [False] * 6)
+    partly_missing = node_colors(
+        [5.0, 5.0, 5.0, 0.0, 0.0, 0.0], [False, False, False, True, True, True]
     )
 
-    try:
-        assert _node_colors(result)[2] == splt.ColorScale().missing_color
-    finally:
-        result.close()
+    # Both clusters share the one observed value's color when nothing is
+    # missing; a cluster whose values are all missing shows as missing, and
+    # the observed cluster keeps its color.
+    assert uniform[1] == uniform[2] != splt.ColorScale().missing_color
+    assert partly_missing[1] == uniform[1]
+    assert partly_missing[2] == splt.ColorScale().missing_color

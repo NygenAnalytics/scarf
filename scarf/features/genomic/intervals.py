@@ -90,6 +90,10 @@ def get_feature_mappings(
     feats_ids: list[str] = []
     feats_names: list[str] = []
     id_counter: dict[str, int] = {}
+    # A repeated ID takes the next free numbered suffix. The IDs the BED names
+    # are reserved, so a suffix never takes an ID another feature carries.
+    reserved_ids = set(features_bed_df[3].tolist())
+    used_ids: set[str] = set()
     map_peak_rows: list[int] = []
     map_feat_cols: list[int] = []
     n_no_match = 0
@@ -107,7 +111,13 @@ def get_feature_mappings(
                 id_counter[feature_id] = 0
             id_counter[feature_id] += 1
             if id_counter[feature_id] > 1:
-                feature_id = feature_id + f"_{id_counter[feature_id]}"
+                suffix = id_counter[feature_id]
+                candidate = feature_id + f"_{suffix}"
+                while candidate in reserved_ids or candidate in used_ids:
+                    suffix += 1
+                    candidate = feature_id + f"_{suffix}"
+                feature_id = candidate
+            used_ids.add(feature_id)
             feats_ids.append(feature_id)
 
         if chrom not in peak_chroms:

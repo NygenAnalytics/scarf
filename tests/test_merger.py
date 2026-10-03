@@ -4553,10 +4553,6 @@ def test_dataset_merge_resume_needs_one_identity_row_within_its_budget(tmp_path)
         merger(mem_budget=4_000).plan()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: merging complex and real cell metadata discards the imaginary parts",
-)
 def test_dataset_merge_keeps_complex_cell_metadata_values():
     destination = MemoryStore()
     merger = _merge_two_rna(zarr_path=destination, overwrite=False)
@@ -4576,12 +4572,44 @@ def test_dataset_merge_keeps_complex_cell_metadata_values():
 
     merger.dump()
     root = zarr.open_group(destination, mode="r")
-    # complex64 holds every source value exactly, as their common type.
+    # Real and complex values widen to complex128, as real mixes widen to
+    # float64, so every source value is kept exactly.
+    assert root["cellData/score"].dtype == np.complex128
     assert _rows_by_id(root, "cellData/score") == {
         "left__c0": 1.5,
         "left__c1": 2.5,
         "right__c0": 1 + 2j,
         "right__c1": 3 - 1j,
+    }
+
+
+def test_dataset_merge_marks_cells_missing_from_a_complex_column():
+    destination = MemoryStore()
+    merger = _merge_two_rna(zarr_path=destination, overwrite=False)
+    for source, columns in zip(
+        merger.datasets,
+        ({}, {"phase": np.array([1j, 2 + 0j], dtype=np.complex64)}),
+        strict=True,
+    ):
+        metadata = _MergeMeta(
+            ids=["c0", "c1"], names=["c0", "c1"], I=np.ones(2, dtype=bool), **columns
+        )
+        source.cells = metadata
+        source.get_assay("RNA").cells = metadata
+
+    merger.dump()
+    root = zarr.open_group(destination, mode="r")
+    phase = root["cellData/phase"]
+    # Cells of the source without the column are filled and marked missing.
+    assert phase.dtype == np.complex64
+    values = _rows_by_id(root, "cellData/phase")
+    assert (values["right__c0"], values["right__c1"]) == (1j, 2 + 0j)
+    assert np.isnan(values["left__c0"]) and np.isnan(values["left__c1"])
+    assert _rows_by_id(root, f"cellData/{phase.attrs['missing_mask']}") == {
+        "left__c0": True,
+        "left__c1": True,
+        "right__c0": False,
+        "right__c1": False,
     }
 
 
@@ -4631,6 +4659,51 @@ def test_dataset_merge_keeps_float_feature_annotations_where_present(tmp_path):
     )
 
 
+def test_dataset_merge_keeps_complex_feature_annotations_where_present(tmp_path):
+    path = str(tmp_path / "complex_features.zarr")
+    DataStoreMerge(
+        datasets=_feature_annotated_sources(
+            {"phase": np.array([0.5, np.nan])},
+            {"phase": np.array([np.nan, 1 + 1j], dtype=np.complex128)},
+        ),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+    ).dump()
+
+    features = zarr.open_group(path, mode="r")["RNA/featureData"]
+    # Real and complex values widen to complex128, and NaN marks a missing
+    # value in either kind: b has no value, and c keeps its imaginary part.
+    assert features["phase"].dtype == np.complex128
+    phase = features["phase"][:]
+    assert (phase[0], phase[2]) == (0.5 + 0j, 1 + 1j)
+    assert np.isnan(phase[1])
+    np.testing.assert_array_equal(
+        features[features["phase"].attrs["missing_mask"]][:], [False, True, False]
+    )
+
+
+def test_dataset_merge_skips_feature_values_that_differ_only_in_imaginary_part(
+    tmp_path,
+):
+    path = str(tmp_path / "complex_conflict.zarr")
+    DataStoreMerge(
+        datasets=_feature_annotated_sources(
+            {"phase": np.array([0.5, 1.0])},
+            {"phase": np.array([1 + 1j, 2 + 0j], dtype=np.complex128)},
+        ),
+        zarr_path=path,
+        names=["left", "right"],
+        prepend_text="",
+        seed=0,
+    ).dump()
+
+    # Feature b is 1 in one source and 1+1j in the other, a conflict that
+    # casting to float64 used to hide.
+    assert "phase" not in zarr.open_group(path, mode="r")["RNA/featureData"]
+
+
 def test_dataset_merge_drops_feature_annotations_whose_attributes_differ(tmp_path):
     from scarf.utils.logging import logger
 
@@ -4665,13 +4738,6 @@ def test_dataset_merge_drops_feature_annotations_whose_attributes_differ(tmp_pat
     assert any("were not merged: biotype" in message for message in messages)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: DataStoreMerge.plan does not admit the feature-metadata merge, so "
-        "dump fails on its budget after creating the destination"
-    ),
-)
 def test_dataset_merge_below_one_feature_metadata_row_fails_before_the_destination_exists(
     tmp_path,
 ):
@@ -4687,7 +4753,12 @@ def test_dataset_merge_below_one_feature_metadata_row_fails_before_the_destinati
         mem_budget=150_000,
     )
     # One 5,000-character value needs about 240 KB to merge, more than the
-    # budget that admits the rest of the merge.
-    with pytest.raises(MemoryError, match="cannot fit"):
+    # budget that admits the rest of the merge. Planning refuses it, so the
+    # destination is never created.
+    message = "^Merged feature column 'description' cannot fit the memory budget$"
+    with pytest.raises(MemoryError, match=message):
+        merger.plan()
+    assert not path.exists()
+    with pytest.raises(MemoryError, match=message):
         merger.dump()
     assert not path.exists()

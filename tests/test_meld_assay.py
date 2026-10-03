@@ -337,10 +337,6 @@ def test_get_feature_mappings_uniquifies_duplicate_ids():
     assert list(feat_ids) == ["dup", "dup_2"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="bug: the suffix of a repeated id can equal another id, such as dup_2",
-)
 def test_get_feature_mappings_uniquifies_ids_that_collide_with_suffixes():
     peaks = create_bed_from_coord_ids(["chr1:100-200"])
     features = _features_bed(
@@ -351,13 +347,32 @@ def test_get_feature_mappings_uniquifies_ids_that_collide_with_suffixes():
         ]
     )
 
-    # Melding raises "Somehow the feature ids are not unique ... Please
-    # report this bug" instead of returning three distinct ids.
-    feat_ids, _, mapping = get_feature_mappings(peaks, features)
+    feat_ids, feat_names, mapping = get_feature_mappings(peaks, features)
 
-    assert len(set(feat_ids)) == 3
-    assert feat_ids[0] == "dup"
-    assert mapping.shape == (1, 3)
+    # The repeated "dup" skips "dup_2", which the BED gives to another
+    # feature, so every ID the BED names is kept.
+    assert list(feat_ids) == ["dup", "dup_3", "dup_2"]
+    assert list(feat_names) == ["A", "B", "C"]
+    np.testing.assert_array_equal(mapping.toarray(), [[1.0, 0.0, 0.0]])
+
+
+def test_get_feature_mappings_numbers_repeats_in_occurrence_order():
+    peaks = create_bed_from_coord_ids(["chr1:100-200", "chr2:100-200"])
+    features = _features_bed(
+        [
+            ("chr1", 120, 160, "x", "A", "+"),
+            ("chr2", 120, 160, "x", "B", "+"),
+            ("chr1", 500, 600, "x", "C", "+"),
+            ("chr2", 500, 600, "y", "D", "+"),
+        ]
+    )
+
+    feat_ids, feat_names, _ = get_feature_mappings(peaks, features)
+
+    # Features are grouped by chromosome in first-seen order, and the n-th
+    # occurrence of an ID takes the suffix _n, as stored melded IDs expect.
+    assert list(feat_ids) == ["x", "x_2", "x_3", "y"]
+    assert list(feat_names) == ["A", "C", "B", "D"]
 
 
 def test_get_feature_mappings_follows_feature_bed_order():

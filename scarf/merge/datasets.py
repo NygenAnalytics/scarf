@@ -38,6 +38,7 @@ from .metadata import (
     CellMetadataPlan,
     _cell_data_path,
     admit_cell_metadata_plan,
+    admit_feature_metadata,
     metadata_chunk_rows,
     plan_cell_metadata,
     resolve_metadata_schema_scan_rows,
@@ -913,6 +914,24 @@ class DataStoreMerge:
                         chunks=chunks,
                         shards=shards,
                         estimatedWriteTasks=tasks,
+                    )
+                    # Feature annotations are merged with the counts, so they
+                    # must fit the budget before the destination is created.
+                    present_sources = [
+                        (source, mapping)
+                        for source, mapping in zip(
+                            self._assaySources[assay_name],
+                            self._alignments[assay_name].featOrderMap,
+                            strict=True,
+                        )
+                        if source is not None
+                    ]
+                    admit_feature_metadata(
+                        [source.feats for source, _ in present_sources],
+                        [mapping for _, mapping in present_sources],
+                        self._alignments[assay_name].nFeats,
+                        resources=self.resources,
+                        resident_bytes=counts_t_resident,
                     )
                 else:
                     assert layout is not None

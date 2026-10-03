@@ -1381,13 +1381,6 @@ def test_raster_subset_by_reduces_cells():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: the degenerate-extent guard in raster_from_metadata adds 0.5 and 1.0, "
-        "which float64 absorbs at large coordinates, leaving a zero-width window"
-    ),
-)
 def test_raster_keeps_a_drawable_window_for_constant_large_coordinates():
     from scarf.plotting._raster import raster_from_metadata
 
@@ -1399,21 +1392,17 @@ def test_raster_keeps_a_drawable_window_for_constant_large_coordinates():
         }
     )
 
-    with np.errstate(invalid="ignore"):
-        canvas = raster_from_metadata(cells, x_key="x", y_key="y", pixels=8)
+    canvas = raster_from_metadata(cells, x_key="x", y_key="y", pixels=8)
 
+    # Float64 absorbs the unit padding at 1e17, so the window widens by
+    # representable steps instead, and every cell still lands in one bin.
     xmin, xmax, ymin, ymax = canvas.extent
-    assert xmax > xmin
-    assert ymax > ymin
+    assert xmin < 1e17 < xmax
+    assert ymin < -1e17 < ymax
+    assert int(canvas.counts.sum()) == 4
+    assert np.count_nonzero(canvas.counts) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bug: artifact raster views list their internal coordinate columns, so "
-        "embedding_raster accepts them as color_by and subset_by fields"
-    ),
-)
 def test_embedding_raster_hides_internal_artifact_coordinate_fields(monkeypatch):
     from scarf.storage import ArtifactRef
 
@@ -1437,11 +1426,26 @@ def test_embedding_raster_hides_internal_artifact_coordinate_fields(monkeypatch)
         artifact_id="f" * 64,
     )
 
-    with pytest.raises(KeyError, match="must be a cell-metadata column"):
+    store = SimpleNamespace(cells=view, zw=object(), _stored_display_metadata=None)
+    with pytest.raises(
+        KeyError,
+        match=f"color_by '{raster_module._ARTIFACT_X}' must be a cell-metadata column",
+    ):
         splt.embedding_raster(
-            SimpleNamespace(cells=view, zw=object(), _stored_display_metadata=None),
+            store,
             layout=layout,
             color_by=raster_module._ARTIFACT_X,
+            pixels=8,
+            show=False,
+        )
+    with pytest.raises(
+        KeyError,
+        match=f"subset_by '{raster_module._ARTIFACT_Y}' not found in cell metadata",
+    ):
+        splt.embedding_raster(
+            store,
+            layout=layout,
+            subset_by=raster_module._ARTIFACT_Y,
             pixels=8,
             show=False,
         )

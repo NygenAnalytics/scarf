@@ -51,6 +51,10 @@ _VECTOR_BLOCK_SIZE = 65_536
 _MATRIX_PARAMETER_SLOTS = frozenset(
     {"Rvalue", "active_transforms", "col_params", "row_params"}
 )
+# Slots whose values the matrix factory resolves as matrix sources.
+_MATRIX_INPUT_SLOTS = frozenset(
+    {"left", "mask", "mat", "matrix", "matrix_list", "right", "seed", "seeds"}
+)
 _SAFE_DELAYED_PRIMITIVES = frozenset(
     {
         "!",
@@ -1417,6 +1421,10 @@ def _matrix_slot_value(
             return values
         atomic_values = _unwrap_atomic(node, object_path=object_path)
         dimensions = get_attribute(node, "dim")
+        if name in _MATRIX_INPUT_SLOTS and dimensions is not None:
+            # An ordinary R matrix nested as an operation's input, such as the
+            # seed of DelayedArray(matrix(...)), is read like a top-level one.
+            return reader._matrix_source_from_node(node, object_path=object_path)
         if name in _MATRIX_PARAMETER_SLOTS and dimensions is not None:
             raw_shape = _unwrap_atomic(
                 dimensions,
