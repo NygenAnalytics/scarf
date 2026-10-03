@@ -79,7 +79,7 @@ Every writer follows reader then `*ToZarr(...).dump()`. Open each new store writ
 # 10x HDF5: assays inferred from feature types (RNA, ADT, ATAC)
 reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
 print(reader.assayFeats)                  # assays and feature ranges that will be written
-scarf.CrToZarr(reader, zarr_loc="pbmc.zarr", mem_budget="2G").dump()
+scarf.CrToZarr(reader, zarr_loc="pbmc.zarr").dump()    # budget from SCARF_MEM_BUDGET (Setup)
 ds = scarf.DataStore("pbmc.zarr", default_assay="RNA")   # required when there are 2+ assays
 
 # 10x directory (matrix.mtx, genes/features.tsv, barcodes.tsv; .gz accepted)
@@ -111,6 +111,23 @@ for path in ("dir.zarr", "mtx.zarr", "h5ad.zarr", "seurat.zarr"):
 ```
 
 `CSVReader`/`CSVtoZarr` (small dense CSV) and `SparseToZarr` (SciPy CSR plus IDs) also exist.
+
+Converters write Scarf's default count layout (releases after 1.0.0rc18; earlier ones shrink it
+to fit). When it does not fit `mem_budget`, the converter raises `CountLayoutMemoryError`, a
+`MemoryError`, before it creates the store, and the message names the largest smaller layout that
+fits. Rerun with a larger `mem_budget` when the host has the memory. Otherwise pass the named
+layout with the exact numbers from the message, and record that choice: smaller layouts make every
+later gene-major read slower.
+
+```python
+from scarf.storage.count_matrix import CountMatrixPolicy
+
+policy = CountMatrixPolicy(unitBytes=3906250, chunkBytes=390625)   # copied from the message
+scarf.CrToZarr(reader, zarr_loc="pbmc.zarr", mem_budget="128M", policy=policy).dump()
+```
+
+The need follows genes per cell relative to the gene count, not the number of cells. The 1K PBMC
+CITE-seq file refuses at `512M` and imports at `1G`.
 
 ### Find a Cytebase dataset
 

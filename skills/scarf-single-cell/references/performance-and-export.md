@@ -22,6 +22,9 @@ markers, and pipeline-run results. Docs: `docs/source/concepts/memory_and_execut
   `"512M"` (binary units, G = 1024^3 bytes), or a fraction of detected memory such as `"0.6"`.
   A bare `"8"` is rejected as ambiguous.
 - More workers mean more concurrent buffers and remote requests; pair them with a `mem_budget`.
+- Converters need a `mem_budget` that fits the default count layout and refuse before writing
+  when it does not (`references/data-access.md`). Prefer more memory over the smaller layout the
+  refusal names: smaller layouts slow every later gene-major read.
 - A `DataStore` is not thread-safe: call it from one thread at a time. Use separate stores or
   separate mount targets for independent parallel analyses.
 - Opt-in parallel UMAP, tSNE, and ANN builds record the resolved worker count in provenance.

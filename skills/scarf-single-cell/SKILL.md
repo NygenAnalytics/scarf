@@ -4,7 +4,7 @@ description: Analyze single-cell data with core Scarf, the out-of-core Zarr Data
 license: BSD-3-Clause
 compatibility: Requires Python 3.12+ and scarf 1.0.0rc17 or newer (pip install "scarf[extra]"; add the cytebase extra and network access for Cytebase datasets).
 metadata:
-  version: "0.2"
+  version: "0.3"
 ---
 
 # Scarf single-cell analysis
@@ -232,6 +232,7 @@ any changes you make after seeing the comparison as such.
 | Plot raises with `run=` and a gene or live column | run mode accepts one frozen field only | `layout=run["umap"], color_by=[...]` |
 | `TypeError` from `distribution(grouping="col")` | grouping needs a ref or `CellField` | `grouping=scarf.plotting.CellField("col")` |
 | Very slow steps on a mount | each count pass is a network read | fewer passes; repack locally (rule 8) |
+| `CountLayoutMemoryError` from a converter | default count layout does not fit `mem_budget` | larger `mem_budget`; else the `policy=` the message names (`references/data-access.md`) |
 | `ValueError` plotting after reopening the store | a `PipelineRun` is bound to the store object that opened it | reopen the run from the new `ds` |
 | `list_artifacts(kind="cell_selection")` is empty | cell selections are datastore-scoped | add `scope="datastore"` |
 | `KeyError: 'groups'` in a dot plot table | with `group_by=` the column is named after the grouping column | read `res.tables["aggregate"].columns` first |

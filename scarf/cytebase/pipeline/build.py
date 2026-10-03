@@ -1122,6 +1122,11 @@ def publish_store(
         "zarrUri": zarr_uri,
         "verifiedAt": completed.isoformat(),
         "verification": converted["verification"],
+        # The container that built the store; reprocessing this version
+        # starts in a tier at least this large.
+        "resources": None
+        if record.resources is None
+        else record.resources.model_dump(include={"cpu", "memoryMiB", "memBudget"}),
     }
     ready = record.model_copy(
         update={"status": "ready", "stageOutcome": "succeeded", "updatedAt": completed}

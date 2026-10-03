@@ -709,6 +709,24 @@ def test_prepare_registration_tolerates_missing_collection_metadata():
     assert (rows[0]["consortia"], rows[0]["journal"]) == ([], None)
 
 
+def test_prepare_registration_fills_mean_genes_per_cell_of_an_older_record():
+    # A record saved before the field existed reads as unknown until the
+    # dataset is registered again.
+    saved = dataset_record(status="ready", processedVersionId=VERSION_ID)
+    del saved["meanGenesPerCell"]
+    older = DatasetRecord.model_validate(saved)
+    assert older.meanGenesPerCell is None
+
+    collection = cellxgene_collection([cellxgene_dataset(mean_genes_per_cell=1_706.5)])
+    [record], _, _ = _prepare([collection], [older])
+
+    assert record.meanGenesPerCell == 1_706.5
+    assert (record.status, record.processedVersionId) == (
+        "ready",
+        older.processedVersionId,
+    )
+
+
 @pytest.mark.parametrize(
     ("previous", "version_id", "status"),
     [
@@ -963,6 +981,7 @@ def test_dataset_row_maps_record_fields_to_catalog_columns():
         "cell_count": 6,
         "primary_cell_count": 4,
         "n_genes": 5,
+        "mean_genes_per_cell": 3.5,
         "schema_version": "5.3.0",
         "status": "ready",
         "zarr_uri": "/published/lung/data.zarr",

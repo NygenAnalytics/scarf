@@ -22,8 +22,13 @@ from fastapi.responses import JSONResponse
 from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
 from .download import download_connections
-from .models import DatasetRecord, ProcessRequest, RegisterRequest
-from .resources import PROCESS_RESOURCES, ImportMemoryRefusal, ProcessResources
+from .models import AttemptResources, DatasetRecord, ProcessRequest, RegisterRequest
+from .resources import (
+    PROCESS_RESOURCES,
+    ImportMemoryRefusal,
+    ProcessResources,
+    initial_tier,
+)
 
 
 class _LogFormatter(logging.Formatter):
@@ -295,6 +300,89 @@ def _progress(record: DatasetRecord, stage: str) -> Iterator[Callable[..., None]
         thread.join()
 
 
+def _process_tree_bytes(root: int) -> int:
+    """Return the resident bytes of process ``root`` and its descendants."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    children: dict[int, list[int]] = {}
+    resident: dict[int, int] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = Path(entry.path, "stat").read_text()
+            pages = int(Path(entry.path, "statm").read_text().split()[1])
+        except (OSError, ValueError, IndexError):
+            # The process exited while it was read.
+            continue
+        pid = int(entry.name)
+        # The command name may contain spaces and ends at the last ")"; the
+        # parent ID is the second field after it.
+        parent = int(stat.rpartition(")")[2].split()[1])
+        children.setdefault(parent, []).append(pid)
+        resident[pid] = pages * page
+    total, pending = 0, [root]
+    while pending:
+        pid = pending.pop()
+        total += resident.get(pid, 0)
+        pending.extend(children.get(pid, ()))
+    return total
+
+
+@contextmanager
+def _peak_memory(interval: float = 1.0) -> Iterator[Callable[[], int | None]]:
+    """Sample the resident memory of this worker and its child processes.
+
+    The yielded callable returns the highest sample, or None where ``/proc``
+    cannot be read.
+    """
+    peak: int | None = None
+    stopped = Event()
+
+    def sample() -> None:
+        nonlocal peak
+        try:
+            current = _process_tree_bytes(os.getpid())
+        except OSError:
+            return
+        peak = current if peak is None else max(peak, current)
+
+    def run() -> None:
+        sample()
+        while not stopped.wait(interval):
+            sample()
+
+    thread = Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        yield lambda: peak
+    finally:
+        stopped.set()
+        thread.join()
+
+
+def _start_tier(storage: Bucket, cytebase_id: str) -> int:
+    """Return the resource tier of a dataset's first worker attempt.
+
+    An unregistered dataset starts at tier 0, where its worker reports it.
+    """
+    try:
+        record = load_record(storage, cytebase_id)
+    except FileNotFoundError:
+        return 0
+    tier = initial_tier(record)
+    logger.info(
+        "Resource tier selected: dataset=%s tier=%s cells=%s genes=%s "
+        "meanGenesPerCell=%s sourceBytes=%s",
+        cytebase_id,
+        tier,
+        record.cellCount,
+        record.nGenes,
+        record.meanGenesPerCell,
+        record.sourceBytes,
+    )
+    return tier
+
+
 def _cleanup_local(
     workspace: TemporaryDirectory,
     record: DatasetRecord,
@@ -425,12 +513,19 @@ def _execute(
             "outcome": "failed",
             "message": error_message(error),
         }
+    previous_status = record.status
     record.attempt += 1
     record.runId, record.callId, record.stage = run_id, call_id, "process"
     record.pipelineVersion = os.environ["CYTEBASE_PIPELINE_VERSION"]
     record.stageOutcome, record.error = "running", None
     record.startedAt = datetime.now(UTC)
     record.timings = {}
+    attempt = AttemptResources(
+        cpu=resources.cpu,
+        memoryMiB=resources.memoryMiB,
+        memBudget=resources.memBudget,
+    )
+    record.resources = attempt
     logger.info(
         "Dataset worker started: dataset=%s version=%s run=%s call=%s attempt=%s "
         "cpu=%s memoryMiB=%s memBudget=%s",
@@ -447,21 +542,29 @@ def _execute(
         f"{dataset_prefix(cytebase_id)}/dataset.json", record.model_dump(mode="json")
     )
     started = monotonic()
-    try:
-        with _progress(record, "process") as progress:
-            storage.progress = progress
-            result = _run_dataset(
-                record, request, storage, progress, check, resources=resources
+    with _peak_memory() as peak_memory:
+        try:
+            with _progress(record, "process") as progress:
+                storage.progress = progress
+                result = _run_dataset(
+                    record, request, storage, progress, check, resources=resources
+                )
+        except Exception as error:
+            message = error_message(error)
+            logger.exception(
+                "Dataset worker failed: dataset=%s %s", cytebase_id, message
             )
-    except Exception as error:
-        message = error_message(error)
-        logger.exception("Dataset worker failed: dataset=%s %s", cytebase_id, message)
-        result = {"outcome": "failed", "message": message}
-        if isinstance(error, ImportMemoryRefusal):
-            result["_retryableMemory"] = True
-        record.status = "failed"
-    finally:
-        storage.progress = None
+            result = {"outcome": "failed", "message": message}
+            refused = isinstance(error, ImportMemoryRefusal)
+            if refused:
+                result["_retryableMemory"] = True
+            # A refusal precedes the local store, so nothing published changed;
+            # below the largest tier the run retries the dataset in the next.
+            retried = refused and resource_tier < len(PROCESS_RESOURCES) - 1
+            record.status = previous_status if retried else "failed"
+        finally:
+            storage.progress = None
+    attempt.peakMemoryBytes = peak_memory()
     record.stageOutcome = result["outcome"]
     if result["outcome"] not in {"succeeded", "skipped"}:
         record.error = result.get("message")
@@ -472,11 +575,15 @@ def _execute(
         f"{dataset_prefix(cytebase_id)}/dataset.json", record.model_dump(mode="json")
     )
     logger.info(
-        "Dataset worker finished: dataset=%s outcome=%s status=%s timings=%s message=%s",
+        "Dataset worker finished: dataset=%s outcome=%s status=%s timings=%s "
+        "peakMemoryGiB=%s message=%s",
         cytebase_id,
         result["outcome"],
         record.status,
         {key: round(value, 2) for key, value in record.timings.items()},
+        None
+        if attempt.peakMemoryBytes is None
+        else round(attempt.peakMemoryBytes / 1024**3, 2),
         result.get("message", ""),
     )
     return result | {
@@ -727,7 +834,12 @@ async def run_pipeline(action: str, request: dict) -> dict:
                             if path.startswith(f"{dataset_prefix(key)}/")
                         ],
                     }
-                    for tier, resources in enumerate(PROCESS_RESOURCES):
+                    start = await asyncio.to_thread(_start_tier, storage, key)
+                    # Each resource variant runs in its own Modal container pool
+                    # with its own max_containers, so only ``slots`` bounds the
+                    # datasets that run at once across every tier.
+                    for tier in range(start, len(PROCESS_RESOURCES)):
+                        resources = PROCESS_RESOURCES[tier]
                         await pacer.wait()
                         result = await invoke(
                             process_dataset.with_options(

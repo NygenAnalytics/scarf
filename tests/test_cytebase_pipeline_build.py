@@ -17,7 +17,7 @@ from zarr.storage import LocalStore
 
 import scarf
 from scarf.cytebase.pipeline import build
-from scarf.cytebase.pipeline.models import DatasetRecord, Manifest
+from scarf.cytebase.pipeline.models import AttemptResources, DatasetRecord, Manifest
 from scarf.cytebase.pipeline.resources import PROCESS_RESOURCES, ImportMemoryRefusal
 from scarf.storage.sharding import CountLayoutMemoryError
 from scarf.utils.logging import logger
@@ -1075,6 +1075,28 @@ def test_publish_store_publishes_a_verified_ready_dataset(
     assert ingest["verification"] == receipt["verification"]
     assert ingest["completedAt"] == receipt["verifiedAt"]
     assert record.model_dump(mode="json") == ready
+
+
+@pytest.mark.parametrize("built_in", [None, PROCESS_RESOURCES[1]])
+def test_publish_store_receipt_names_the_container_that_built_it(
+    fake_hub, publish, cytebase_build, built_in
+):
+    record = cytebase_build.record()
+    if built_in is not None:
+        record.resources = AttemptResources(
+            cpu=built_in.cpu,
+            memoryMiB=built_in.memoryMiB,
+            memBudget=built_in.memBudget,
+            peakMemoryBytes=123,
+        )
+    assert publish(record) == {"outcome": "succeeded"}
+
+    receipt = fake_hub.read_json(RECORD_PATH)["buildReceipt"]
+    assert receipt["resources"] == (
+        None
+        if built_in is None
+        else {"cpu": 8, "memoryMiB": 32_768, "memBudget": "24G"}
+    )
 
 
 def test_publish_store_records_a_needs_input_result_without_uploading(

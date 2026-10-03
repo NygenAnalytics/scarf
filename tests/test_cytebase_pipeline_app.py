@@ -3,6 +3,8 @@
 import hashlib
 import json
 import logging
+import os
+import subprocess
 import sys
 import threading
 from contextlib import contextmanager
@@ -1017,6 +1019,85 @@ def test_process_dataset_records_the_attempt_before_and_after_work(
     ]
 
 
+@pytest.mark.parametrize("resource_tier", range(3))
+@pytest.mark.parametrize("status", ["registered", "ready"])
+def test_process_dataset_keeps_the_status_when_a_refusal_is_retried(
+    modal_harness, monkeypatch, resource_tier, status
+):
+    hub = modal_harness.hub
+    _register(hub, **(READY if status == "ready" else {}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
+
+    def run_dataset(record, *args, **kwargs):
+        # The worker commits processing before it downloads the source.
+        record.status = "processing"
+        raise ImportMemoryRefusal("count layout exceeds budget")
+
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = _process_worker(modal_harness, resource_tier=resource_tier)
+
+    saved = hub.read_json(RECORD_PATH)
+    retried = resource_tier < len(PROCESS_RESOURCES) - 1
+    assert (result["outcome"], result["_retryableMemory"]) == ("failed", True)
+    assert saved["status"] == result["status"] == (status if retried else "failed")
+    assert (saved["stageOutcome"], saved["error"]) == (
+        "failed",
+        "ImportMemoryRefusal: count layout exceeds budget",
+    )
+
+
+def test_process_dataset_records_its_container_and_peak_memory(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
+    seen = {}
+
+    @contextmanager
+    def peak_memory():
+        yield lambda: 3 * GIB
+
+    def run_dataset(record, request, storage, progress, check, *, resources):
+        seen["started"] = hub.read_json(RECORD_PATH)
+        return {"outcome": "succeeded"}
+
+    monkeypatch.setattr(app, "_peak_memory", peak_memory)
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = _process_worker(modal_harness, resource_tier=1)
+
+    container = {"cpu": 8, "memoryMiB": 32_768, "memBudget": "24G"}
+    assert seen["started"]["resources"] == container | {"peakMemoryBytes": None}
+    saved = hub.read_json(RECORD_PATH)
+    assert saved["resources"] == result["record"]["resources"]
+    assert saved["resources"] == container | {"peakMemoryBytes": 3 * GIB}
+
+
+@pytest.mark.skipif(not Path("/proc/self/statm").exists(), reason="needs /proc")
+def test_peak_memory_includes_child_processes():
+    size = 64 * MIB
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import sys, time; block = b'x' * {size}; print('ready', flush=True); "
+            "time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == "ready\n"
+        assert app._process_tree_bytes(child.pid) >= size
+        with app._peak_memory(interval=0.01) as peak:
+            assert app._process_tree_bytes(os.getpid()) >= size
+        assert peak() is not None and peak() >= size
+    finally:
+        child.kill()
+        child.wait()
+
+
 @pytest.mark.parametrize(
     ("outcome", "error"),
     [
@@ -1549,6 +1630,44 @@ def test_process_run_escalates_only_to_the_available_resource_tiers(
     assert [child["callId"] for child in children if child["state"] == "running"] == [
         f"fc-process-{attempt + 1}" for attempt in range(attempts)
     ]
+
+
+@pytest.mark.parametrize(
+    ("shape", "start"),
+    [
+        ({"meanGenesPerCell": None}, 0),
+        ({"cellCount": 100_000, "nGenes": 36_601, "meanGenesPerCell": 5_000.0}, 1),
+        ({"cellCount": 79_631, "nGenes": 18_736, "meanGenesPerCell": 5_519.0}, 2),
+    ],
+)
+@pytest.mark.parametrize("refusals", range(3))
+def test_process_run_starts_in_the_estimated_tier_and_escalates_from_it(
+    modal_harness, worker, shape, start, refusals
+):
+    _register(modal_harness.hub, **shape)
+    worker.build_errors = [
+        ImportMemoryRefusal("count layout exceeds budget")
+    ] * refusals
+
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    tiers = list(range(start, len(PROCESS_RESOURCES)))[: refusals + 1]
+    workers = modal_harness.process_dataset
+    assert [args[3] for args in workers.spawned] == tiers
+    assert workers.spawn_options == [
+        {
+            "cpu": PROCESS_RESOURCES[tier].cpu,
+            "memory": PROCESS_RESOURCES[tier].memoryMiB,
+        }
+        for tier in tiers
+    ]
+    builds = [event for event in worker.events if event.step == "build"]
+    assert [build.resources for build in builds] == [
+        PROCESS_RESOURCES[tier] for tier in tiers
+    ]
+    refused = refusals >= len(tiers)
+    assert result["state"] == "completed"
+    assert result["datasets"][0]["outcome"] == ("failed" if refused else "succeeded")
 
 
 @pytest.mark.parametrize("step", ["download", "build", "publish"])
