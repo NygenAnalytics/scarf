@@ -1770,6 +1770,35 @@ def test_process_run_does_not_publish_a_refusal_when_the_retry_result_is_unknown
     ]
 
 
+def test_a_pacing_error_before_a_retry_fails_the_run(
+    modal_harness, worker, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+    worker.build_errors = [ImportMemoryRefusal("count layout exceeds budget")]
+
+    class Pacer:
+        def __init__(self, interval: float) -> None:
+            self.waits = 0
+
+        async def wait(self) -> None:
+            self.waits += 1
+            if self.waits > 1:
+                raise RuntimeError("pacer unavailable")
+
+    monkeypatch.setattr(app, "_StartPacer", Pacer)
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    # The refused attempt finished, so no outcome is unknown when the
+    # orchestrator fails before the retry: the run fails instead of blocking.
+    assert [args[3] for args in modal_harness.process_dataset.spawned] == [0]
+    assert (result["state"], result["error"]) == (
+        "failed",
+        "RuntimeError: pacer unavailable",
+    )
+    assert hub.read_json(RECORD_PATH)["status"] == "registered"
+
+
 def test_process_run_reports_unregistered_datasets_without_stopping_others(
     modal_harness, monkeypatch
 ):

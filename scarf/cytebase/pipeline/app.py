@@ -825,6 +825,13 @@ async def run_pipeline(action: str, request: dict) -> dict:
                 async with slots:
                     return await dispatch(key, payload)
 
+            def failed(key: str, error: Exception) -> dict:
+                return {
+                    "cytebaseId": key,
+                    "outcome": "failed",
+                    "message": error_message(error),
+                }
+
             async def dispatch(key: str, payload: dict) -> dict:
                 try:
                     arguments = payload | {
@@ -835,12 +842,18 @@ async def run_pipeline(action: str, request: dict) -> dict:
                         ],
                     }
                     start = await asyncio.to_thread(_start_tier, storage, key)
-                    # Each resource variant runs in its own Modal container pool
-                    # with its own max_containers, so only ``slots`` bounds the
-                    # datasets that run at once across every tier.
-                    for tier in range(start, len(PROCESS_RESOURCES)):
-                        resources = PROCESS_RESOURCES[tier]
-                        await pacer.wait()
+                except Exception as error:
+                    return failed(key, error)
+                # Each resource variant runs in its own Modal container pool
+                # with its own max_containers, so only ``slots`` bounds the
+                # datasets that run at once across every tier.
+                for tier in range(start, len(PROCESS_RESOURCES)):
+                    resources = PROCESS_RESOURCES[tier]
+                    # A pacing error belongs to the orchestrator and comes before
+                    # this attempt's worker starts, so it fails the run rather
+                    # than the dataset.
+                    await pacer.wait()
+                    try:
                         result = await invoke(
                             process_dataset.with_options(
                                 cpu=resources.cpu, memory=resources.memoryMiB
@@ -849,32 +862,28 @@ async def run_pipeline(action: str, request: dict) -> dict:
                             (key, state["runId"], arguments, tier),
                             {"cytebaseId": key, "stage": "process"},
                         )
-                        retryable = result.pop("_retryableMemory", False)
-                        if (
-                            result["outcome"] != "failed"
-                            or not retryable
-                            or tier == len(PROCESS_RESOURCES) - 1
-                        ):
-                            break
-                        next_resources = PROCESS_RESOURCES[tier + 1]
-                        logger.info(
-                            "Retrying count-layout memory refusal: dataset=%s "
-                            "cpu=%s memoryMiB=%s memBudget=%s",
-                            key,
-                            next_resources.cpu,
-                            next_resources.memoryMiB,
-                            next_resources.memBudget,
-                        )
-                    record = result.pop("record", None)
-                    if record is not None:
-                        dirty[key] = record
-                    return result
-                except Exception as error:
-                    return {
-                        "cytebaseId": key,
-                        "outcome": "failed",
-                        "message": error_message(error),
-                    }
+                    except Exception as error:
+                        return failed(key, error)
+                    retryable = result.pop("_retryableMemory", False)
+                    if (
+                        result["outcome"] != "failed"
+                        or not retryable
+                        or tier == len(PROCESS_RESOURCES) - 1
+                    ):
+                        break
+                    next_resources = PROCESS_RESOURCES[tier + 1]
+                    logger.info(
+                        "Retrying count-layout memory refusal: dataset=%s "
+                        "cpu=%s memoryMiB=%s memBudget=%s",
+                        key,
+                        next_resources.cpu,
+                        next_resources.memoryMiB,
+                        next_resources.memBudget,
+                    )
+                record = result.pop("record", None)
+                if record is not None:
+                    dirty[key] = record
+                return result
 
             pending = {
                 asyncio.create_task(one(key, payload))
