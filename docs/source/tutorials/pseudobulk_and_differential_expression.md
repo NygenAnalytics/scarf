@@ -147,11 +147,11 @@ pd.Series(
 )
 ```
 
-This selection simply freezes out cells to ensure that the when we conduct the pseudobulking, the count data and the donor metadata is described on the same cells.  
+This selection simply freezes out cells to ensure that the when we conduct the pseudobulking, the count data and the donor metadata is described on the same cells.
 
 ## "Pseudobulk" (sum raw counts by biological donor)
 
-Pseudobulking is simply just the process of summing the raw counts by biological donor, thus, we use the `aggr_type="sum"` function to take the raw assay counts and produces one column of counts per `donor_id`.
+Pseudobulking is simply the process of summing the raw counts by biological donor, thus, we use the `aggr_type="sum"` function to take the raw assay counts and produce one column of counts per `donor_id`.
 
 ```{code-cell}
 bulk = ds.make_bulk(
@@ -225,7 +225,6 @@ print(counts_csv, metadata_csv, sep="\n")
 
 Use `bulk` as the raw feature-by-donor count matrix. The external model must use donor-level replication and account for the study design. The linked publication at the top of this notebook allows you find the exact parameters the authors used, and replicate the results yourself.
 
-
 ## Optional: explore a reported γδ T-cell panel
 
 Library-normalized values are useful for a compact descriptive view before modeling. These values show each donor's expression on a common per-million scale, so differences between conditions can be eyeballed before any model is fit. This also adjusts for differences in the amount of cells between groups, as the common scale used is counts per million. Doing this only describes the data, and doesn't test it for any changes.  The figure below converts the donor pseudobulks to log2 counts per million (CPM) only for visualization.
@@ -253,15 +252,12 @@ plt.show()
 
 This panel shows donor heterogeneity and paired direction, but it does not estimate dispersion, adjust for batch, fit the matched design, or test a hypothesis. It must not be reported as a differential expression result.
 
-
 ## Pseudo-replicates are not biological replicates
 
-`make_bulk(..., pseudo_reps=2)` randomly divides cells within a donor. Those partitions can support descriptive stability checks, but they come from the same person and do not increase the biologicalsample size. This tutorial leaves `pseudo_reps` at its default of one. Using `pseudo_reps` is usually a last case effort when you don't have enough biological donors, thus limit the use of this. 
+`make_bulk(..., pseudo_reps=2)` randomly divides cells within a donor. Those partitions can support descriptive stability checks, but they come from the same person and do not increase the biological sample size. This tutorial leaves `pseudo_reps` at its default of one. Using `pseudo_reps` is usually a last resort effort when you don't have enough biological donors, thus limit its use.
 
-## Common mistakes
+## Important caveats to consider regarding pseudobulk and differential expression
 
-- Aggregating all RA cells and all control cells into only two columns
-- Treating cells or random within-donor splits as independent biological replicates
-- Fitting a count model to the library-normalized plotting values
-- Ignoring the matched-pair or processing-batch metadata
-- Reporting the exploratory panel as a Scarf differential expression result
+- **Conflating pseudo-replicates with biological replicates:** Subsetting cells or splitting a donor into random partitions ( with pseudo_reps) does not increase the true biological sample size. Treating non-independent cells or partitions as distinct replicates artificially inflates degrees of freedom, leading to massive false-positive rates in downstream models.
+- **Feeding normalized values into count-based models:** Exploratory log2(CPM) values are strictly descriptive and intended for visualization. Differential expression frameworks like DESeq2 and edgeR require raw, unnormalized integer counts to accurately model negative binomial dispersion and compute internal library size factors. *NEVER* feed normalized counts into these models. 
+- **Omitting matched-pair and batch covariates:** Aggregating donors into two monolithic condition pools or excluding pair_index_CW and batch from the downstream design matrix throws away the statistical power of a matched study and risks confounding disease signatures with technical batch variation.
