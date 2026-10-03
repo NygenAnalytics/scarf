@@ -84,7 +84,9 @@ cluster_refs = {15: baseline["leiden_0.5"]}
 # Rebuild only the alternatives to the saved 15-PC analysis.
 for dimensions in (10, 30):
     # Fit PCA with the current dimension count.
-    pca = ds.run_pca(normalized, dims=dimensions, show_elbow_plot=dimensions == 30)
+    pca = ds.run_pca(
+        normalized, dims=dimensions, show_elbow_plot=dimensions == 30
+    )
     # Build an index over these PCA coordinates.
     ann = ds.build_ann_index(pca)
     # Query the same number of neighbors for every candidate.
@@ -98,7 +100,9 @@ for dimensions in (10, 30):
 initialization_15 = baseline["embedding_initialization"]
 # Load each candidate's labels in the common cell order.
 cluster_values = {
-    dimensions: np.asarray(ds.load_artifact(cluster_refs[dimensions])["values"][:])
+    dimensions: np.asarray(
+        ds.load_artifact(cluster_refs[dimensions])["values"][:]
+    )
     for dimensions in dimension_counts
 }
 ```
@@ -114,13 +118,15 @@ Compare cluster sizes as well as the number of clusters. Cluster numbers can cha
 analyses, so matching row numbers do not necessarily identify the same cells.
 
 ```{code-cell} ipython3
-# Compare cluster sizes across the three PCA dimension counts.
-pd.DataFrame(
+# Count cells per cluster for each PCA dimension count.
+cluster_sizes = pd.DataFrame(
     {
         dimensions: pd.Series(cluster_values[dimensions]).value_counts()
         for dimensions in dimension_counts
     }
 ).fillna(0).astype(int)
+# Label both comparison axes before displaying the cluster sizes.
+cluster_sizes.rename_axis(index="cluster", columns="PCs")
 ```
 
 ```{code-cell} ipython3
@@ -152,7 +158,11 @@ figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, dimensions in zip(axes, dimension_counts, strict=True):
     # Place each candidate clustering on the common baseline UMAP.
     ds.plots.embedding(
-        layout=umap, color_by=cluster_refs[dimensions], target=axis, show_titles=False, show=False
+        layout=umap,
+        color_by=cluster_refs[dimensions],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     # Label the panel with the quantity being compared.
     axis.set_title(f"Leiden on {dimensions} PCs")
@@ -180,7 +190,11 @@ for axis, layout, title in zip(
 ):
     # Compare UMAP packing with the same cluster colors.
     ds.plots.embedding(
-        layout=layout, color_by=cluster_refs[15], target=axis, show_titles=False, show=False
+        layout=layout,
+        color_by=cluster_refs[15],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     # Label the panel with the quantity being compared.
     axis.set_title(title)
@@ -219,7 +233,11 @@ layout_comparisons = (("UMAP", umap), ("densMAP", densmap), ("t-SNE", tsne))
 for axis, (title, layout) in zip(axes, layout_comparisons, strict=True):
     # Compare UMAP, densMAP, and t-SNE with the same cluster colors.
     ds.plots.embedding(
-        layout=layout, color_by=cluster_refs[15], target=axis, show_titles=False, show=False
+        layout=layout,
+        color_by=cluster_refs[15],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     # Label the panel with the quantity being compared.
     axis.set_title(title)

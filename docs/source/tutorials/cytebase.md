@@ -68,6 +68,8 @@ private bucket names out of notebook source and outputs.
 
 ```{code-cell} ipython3
 import logging
+from IPython.display import Markdown, display
+
 import scarf
 from scarf import cytebase
 
@@ -93,8 +95,12 @@ matches = catalog.search("wilson kidney cortex")
 # Stop if the expected kidney dataset is not available.
 if not matches:
     raise RuntimeError("The example kidney dataset is not ready in this bucket")
-# Inspect the matching datasets before selecting one.
-matches
+# Summarize dataset titles and sizes while keeping full IDs in the result rows.
+match_preview = matches.to_markdown(
+    columns=["cytebase_id", "title", "cell_count"], max_cell_chars=32
+)
+# Display the search summary before choosing a dataset.
+display(Markdown(match_preview))
 ```
 
 ```{code-cell} ipython3
@@ -158,8 +164,9 @@ wanted = ["cell_type", "tissue", "disease", "donor_id", "sex", "assay"]
 columns = [column for column in wanted if column in ds.cells.columns]
 # Read cell metadata and index it by cell ID.
 meta = ds.cells.to_pandas_dataframe(["ids", *columns], key="I").set_index("ids")
-# Preview the selected cell metadata.
-meta.head()
+# Preview cell types and donor groups without truncating annotation names.
+with pd.option_context("display.max_colwidth", None):
+    display(meta[["cell_type", "disease", "donor_id"]].head())
 ```
 
 This materializes the selected metadata columns as a pandas DataFrame, not the
@@ -190,7 +197,9 @@ labels is better viewed with selected groups or `legend_loc="none"`.
 
 ```{code-cell} ipython3
 # Plot the published cell types and retain the figure for export.
-cell_type_plot = ds.plots.embedding(layout=umap_ref, color_by="cell_type", figsize=(10, 7))
+cell_type_plot = ds.plots.embedding(
+    layout=umap_ref, color_by="cell_type", figsize=(10, 7)
+)
 ```
 
 Focus on the five most common cell types without changing the source dataset:
@@ -199,7 +208,12 @@ Focus on the five most common cell types without changing the source dataset:
 # Select the five most common cell types for a closer view.
 top_types = meta["cell_type"].value_counts().head(5).index.tolist()
 # Focus the UMAP on the five most abundant cell types.
-ds.plots.embedding(layout=umap_ref, color_by="cell_type", groups=top_types, figsize=(10, 6))
+ds.plots.embedding(
+    layout=umap_ref,
+    color_by="cell_type",
+    groups=top_types,
+    figsize=(10, 6),
+)
 ```
 
 ### Gene expression
@@ -243,7 +257,10 @@ from scarf.plotting import CellField
 
 # Compare distributions within the stated groups.
 ds.plots.distribution(
-    "RNA_nCounts", grouping=CellField("cell_type"), groups=top_types, figsize=(10, 5)
+    "RNA_nCounts",
+    grouping=CellField("cell_type"),
+    groups=top_types,
+    figsize=(10, 5),
 )
 ```
 
@@ -252,7 +269,12 @@ additional expression values:
 
 ```python
 # Compare distributions within the stated groups.
-ds.plots.distribution(genes[:2], grouping=CellField("cell_type"), groups=top_types, figsize=(12, 5))
+ds.plots.distribution(
+    genes[:2],
+    grouping=CellField("cell_type"),
+    groups=top_types,
+    figsize=(12, 5),
+)
 ```
 
 ## 6. Coordinates for custom plots
@@ -266,8 +288,9 @@ a separate metadata table:
 coords = cytebase.embedding_coordinates(ds, umap_ref)
 # Align metadata and coordinates by cell ID.
 frame = coords.join(meta)
-# Preview the coordinates joined to cell metadata by ID.
-frame.head()
+# Preview joined coordinates and full cell-type names in the same rows.
+with pd.option_context("display.max_colwidth", None):
+    display(frame[["umap_1", "umap_2", "cell_type"]].head())
 ```
 
 The joined table is ready for a custom figure or for export. For most views, the Scarf plotting
@@ -332,7 +355,10 @@ if atlases:
     atlas_umap_ref = cytebase.embedding(atlas_ds, "X_umap")
     # Plot atlas tissues without an oversized legend.
     atlas_ds.plots.embedding(
-        layout=atlas_umap_ref, color_by="tissue", legend_loc="none", figsize=(8, 8)
+        layout=atlas_umap_ref,
+        color_by="tissue",
+        legend_loc="none",
+        figsize=(8, 8),
     )
 ```
 
@@ -353,7 +379,13 @@ Take an exact tissue label from the selected dataset:
 # Use an exact tissue label supplied by the catalog.
 tissue = matches[0]["tissue_labels"][0]
 # Find datasets using the exact tissue and organism labels.
-catalog.find_datasets(tissue=tissue, organism="Homo sapiens")
+kidney_datasets = catalog.find_datasets(tissue=tissue, organism="Homo sapiens")
+# Summarize dataset sizes and disease labels with shortened display IDs.
+kidney_preview = kidney_datasets.to_markdown(
+    columns=["cytebase_id", "cell_count", "disease_labels"], max_cell_chars=32
+)
+# Display the exact-match search results.
+display(Markdown(kidney_preview))
 ```
 
 SQL queries run against the verified local catalog. Select just the columns you
@@ -361,7 +393,7 @@ need and bind values with `parameters`:
 
 ```{code-cell} ipython3
 # Run the parameterized catalog query on the local metadata copy.
-catalog.query(
+small_datasets = catalog.query(
     """
     SELECT cytebase_id, first_author, year, cell_count, n_genes,
            len(cell_type_labels) AS n_cell_types
@@ -373,6 +405,8 @@ catalog.query(
     """,
     parameters=["ready"],
 )
+# Keep all query columns while shortening only their displayed values.
+display(Markdown(small_datasets.to_markdown(max_cell_chars=24)))
 ```
 
 Pass `ready_only=False` to discover datasets that are still being prepared. For more SQL

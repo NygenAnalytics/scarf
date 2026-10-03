@@ -66,8 +66,10 @@ ds
 ```{code-cell} ipython3
 # Load the Paris labels and hierarchy diagnostics.
 paris_result = ds.load_paris_clustering(paris)
-# Check the sizes of the 15 Paris groups used for sampling.
-pd.Series(paris_result.labels).value_counts().sort_index()
+# Count cells in the 15 Paris groups used for sampling.
+cluster_counts = pd.Series(paris_result.labels, name="cluster").value_counts()
+# Inspect group sizes in cluster-label order.
+cluster_counts.sort_index().to_frame("cells")
 ```
 
 ## 2. Choose representative cells
@@ -144,7 +146,7 @@ writer.dump()
 # Reopen the exported store to check its dimensions.
 subset = scarf.DataStore(str(subset_path))
 # Check the exported cell and feature counts.
-subset.cells.N, subset.RNA.feats.N
+{"exported cells": subset.cells.N, "retained genes": subset.RNA.feats.N}
 ```
 
 `SubsetZarr` retains every feature in the listed assays. Use `to_anndata` when you need an in-memory

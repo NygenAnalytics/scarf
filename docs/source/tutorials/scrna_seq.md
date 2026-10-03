@@ -30,6 +30,9 @@ own counts. This page uses saved results so we can concentrate on interpreting t
 # Open count stores and run Scarf analyses.
 import scarf
 
+# Keep routine execution messages out of the results.
+scarf.configure_output(level="WARNING", progress=False)
+
 # Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -136,7 +139,7 @@ ds.cells.insert("pbmc_cell_type", cell_types, overwrite=True)
 # Count analyzed cells assigned to each cell type.
 labels, counts = np.unique(cell_types[analysis_cells], return_counts=True)
 # Show the number of analyzed cells assigned to each cell type.
-dict(zip(labels, counts, strict=True))
+{str(label): int(count) for label, count in zip(labels, counts, strict=True)}
 ```
 
 This writes our labels to `pbmc_cell_type`; rerunning the cell replaces that column. The saved

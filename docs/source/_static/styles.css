@@ -24,7 +24,29 @@ p {
     font-size: 1em
 }
 .dataframe {
-    font-size: 0.8em !important;
+    font-size: 1em !important;
+}
+.cell_output table.dataframe th,
+.cell_output table.dataframe td {
+    padding: 0.3rem 0.5rem;
+}
+.cell_output table:not(.dataframe) td {
+    overflow-wrap: anywhere;
+}
+.cell_output table .text-right {
+    white-space: nowrap;
+}
+.cell_output code.literal .pre {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.cell_output pre.mermaid {
+    overflow-x: auto;
+}
+.cell_output pre.mermaid > svg {
+    width: auto;
+    max-width: none !important;
+    height: 50rem;
 }
 
 /* Square Scarf mark: keep the sidebar brand compact. */

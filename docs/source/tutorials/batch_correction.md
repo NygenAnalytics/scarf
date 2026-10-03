@@ -63,7 +63,10 @@ dataset_directory = Path(environ.get("SCARF_DOCS_DATA_DIR", "scarf_datasets"))
 dataset_directory.mkdir(parents=True, exist_ok=True)
 
 # Use the versioned H5AD file from the published collection.
-download_url = "https://datasets.cellxgene.cziscience.com/3b751975-34bb-409a-a9b7-98380f0450ea.h5ad"
+download_url = (
+    "https://datasets.cellxgene.cziscience.com/"
+    "3b751975-34bb-409a-a9b7-98380f0450ea.h5ad"
+)
 # Name the local H5AD download.
 h5ad_path = dataset_directory / "binvignat_ra_pbmc.h5ad"
 # Name the reusable converted count store.
@@ -90,8 +93,13 @@ assert inspection.matrixKey == "raw/X"
 assert inspection.integerLike is True
 # Verify the published cell and gene counts.
 assert (inspection.nCells, inspection.nFeatures) == (108_717, 21_648)
-# Inspect the chosen count matrix and its dimensions.
-inspection
+# Show the count matrix and dimensions needed for conversion.
+{
+    "count matrix": inspection.matrixKey,
+    "cells": inspection.nCells,
+    "genes": inspection.nFeatures,
+    "integer counts": inspection.integerLike,
+}
 ```
 
 Convert once and keep the source store for later sessions. This dataset needs a 6 GB import
@@ -118,7 +126,7 @@ if not source_store.exists():
                 mem_budget="6G",
             ).dump()
         finally:
-            # Close the figure or reader after its final use.
+            # Close the H5AD reader after conversion.
             reader.h5.close()
         # Move the completed file or store to its reusable path.
         staged_store.replace(source_store)
@@ -132,8 +140,8 @@ while the tutorial defines its own exact selection.
 source = scarf.DataStore(
     str(source_store), default_assay="RNA", min_features_per_cell=0, nthreads=4
 )
-# Inspect the initialized source store.
-source
+# Check the initialized count matrix dimensions.
+{"cells": source.cells.N, "genes": source.RNA.feats.N}
 ```
 
 Mount the source into a temporary writable analysis store. Count matrices remain in the local
@@ -154,8 +162,11 @@ ds = scarf.mount_datastore(
     min_features_per_cell=0,
     nthreads=4,
 )
-# Inspect the store's assays and dimensions.
-ds
+# Check that mounting preserved the source dimensions.
+{
+    "same cell count": ds.cells.N == source.cells.N,
+    "same gene count": ds.RNA.feats.N == source.RNA.feats.N,
+}
 ```
 
 ## 2. Create a balanced 9,000-cell analysis
@@ -180,7 +191,7 @@ assert batch_values.size == 3
 assert disease_values.size == 2
 
 # Compare the cell counts or fractions across the selected groups.
-pd.crosstab(batch, disease)
+pd.crosstab(batch, disease, rownames=["batch"], colnames=["condition"])
 ```
 
 Draw the same number of cells from each batch and disease group.
@@ -210,7 +221,9 @@ assert selected.sum() == 9_000
 ds.cells.insert(column_name="docs_ra_batch_demo", values=selected, overwrite=True)
 
 # Compare the cell counts or fractions across the selected groups.
-pd.crosstab(batch[selected], disease[selected])
+pd.crosstab(
+    batch[selected], disease[selected], rownames=["batch"], colnames=["condition"]
+)
 ```
 
 The constructed subset has equal cell counts for every batch and disease combination, but donor
@@ -256,7 +269,9 @@ Repeat the analysis with batch correction.
 
 ```{code-cell} ipython3
 # Run the same analysis with sequencing batch supplied to Harmony.
-harmony = ds.pipeline.run(label="ra_harmony", harmony_batch_columns=["batch"], **pipeline_options)
+harmony = ds.pipeline.run(
+    label="ra_harmony", harmony_batch_columns=["batch"], **pipeline_options
+)
 # Check that the corrected run uses the same cell count.
 {"analysis cells": int(harmony.cells.fetch_all("I").sum())}
 ```
@@ -300,7 +315,9 @@ each run. The LISI metrics choose their neighbourhood scale from the neighbour c
 # Measure batch mixing and annotation preservation for one run.
 def integration_diagnostics(run):
     return {
-        "iLISI (batch)": ds.metric_ilisi(batch_colname="batch", neighbors=run["neighbors"]),
+        "iLISI (batch)": ds.metric_ilisi(
+            batch_colname="batch", neighbors=run["neighbors"]
+        ),
         "cLISI (rough_annot)": ds.metric_clisi(
             annotation_column="rough_annot", neighbors=run["neighbors"]
         ),

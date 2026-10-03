@@ -114,10 +114,14 @@ Columns imported from the sources keep the `orig_` prefix so their origin remain
 The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-# Count active cells and imported cell types from each source.
-merged.cells.to_pandas_dataframe(["sample_id", "orig_cluster_labels"], key="I").groupby(
-    "sample_id"
-)["orig_cluster_labels"].agg(cells="count", cell_types="nunique")
+# Read source labels and imported cell types for active cells.
+merged_labels = merged.cells.to_pandas_dataframe(
+    ["sample_id", "orig_cluster_labels"], key="I"
+)
+# Count active cells and distinct imported cell types from each source.
+merged_labels.groupby("sample_id")["orig_cluster_labels"].agg(
+    cells="count", cell_types="nunique"
+)
 ```
 
 ## 3. Inspect a prepared joint analysis
@@ -158,8 +162,14 @@ ds.plots.embedding(
 A table of proportions shows whether each Leiden cluster contains cells from both sources.
 
 ```{code-cell} ipython3
-# Compare the cell counts or fractions across the selected groups.
-pd.crosstab(baseline.cells.fetch("clusters"), baseline.cells.fetch("sample_id"), normalize="index")
+# Compare source proportions within each computed cluster.
+pd.crosstab(
+    baseline.cells.fetch("clusters"),
+    baseline.cells.fetch("sample_id"),
+    rownames=["cluster"],
+    colnames=["source"],
+    normalize="index",
+).round(3)
 ```
 
 The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.

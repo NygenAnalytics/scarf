@@ -87,8 +87,8 @@ source_sink_vector[sink] = 1.0 / sink.sum()
 {
     "source cells": int(source.sum()),
     "sink cells": int(sink.sum()),
-    "source weight": source_sink_vector[source].sum(),
-    "sink weight": source_sink_vector[sink].sum(),
+    "source weight": round(float(source_sink_vector[source].sum()), 6),
+    "sink weight": round(float(source_sink_vector[sink].sum()), 6),
 }
 ```
 
@@ -127,6 +127,10 @@ is a reason to revisit the graph or endpoint choice.
 
 ## Find genes associated with the ordering
 
+The full result includes untested features, which have missing p-values. The first few rows
+may therefore contain `NaN`. Multiple-testing correction covers only the tested features;
+we select those after previewing the table.
+
 ```{code-cell}
 # Test the selected genes for association with pseudotime.
 marker_ref = ds.run_pseudotime_marker_search(pseudotime_ref, features=all_features)
@@ -154,8 +158,7 @@ pd.concat({"increasing": increasing, "decreasing": decreasing})
 
 Positive correlations identify genes whose expression tends to increase along the
 chosen axis; negative correlations identify decreasing genes. These are candidates to
-inspect, not evidence that they drive development. Untested features have missing
-p-values, and multiple-testing correction covers only the tested features.
+inspect, not evidence that they drive development.
 
 ## Check the limits
 

@@ -210,10 +210,10 @@ rng = np.random.default_rng(39)
 counts = rng.poisson(1, size=(120, 2102)).astype(np.uint32)
 # Plant a different expression pattern in each synthetic group.
 for group in range(3):
-    # Add the planted expression pattern to this synthetic group.
-    counts[group * 40 : (group + 1) * 40, 2 + group * 40 : 42 + group * 40] += rng.poisson(
-        4, size=(40, 40)
-    ).astype(np.uint32)
+    # Generate counts for this group's planted expression pattern.
+    planted_counts = rng.poisson(4, size=(40, 40)).astype(np.uint32)
+    # Add that pattern to the group's cells and marker genes.
+    counts[group * 40 : (group + 1) * 40, 2 + group * 40 : 42 + group * 40] += planted_counts
 # Check the synthetic matrix dimensions before writing it.
 {"cells": counts.shape[0], "genes": counts.shape[1]}
 ```
@@ -241,12 +241,18 @@ Open the synthetic store and record its initial selection.
 ```{code-cell} ipython3
 # Open the synthetic count store without additional filtering.
 prepared = scarf.DataStore(
-    str(source), default_assay="RNA", min_features_per_cell=-1, nthreads=1, mem_budget="512M"
+    str(source),
+    default_assay="RNA",
+    min_features_per_cell=-1,
+    nthreads=1,
+    mem_budget="512M",
 )
 # Save the values in cell metadata using the stated selection.
 prepared.cells.insert("sample", np.tile(["sample_A", "sample_B"], 60))
 # Save the values in cell metadata using the stated selection.
-prepared.cells.insert("author_annotation", np.repeat(["planted_A", "planted_B", "planted_C"], 40))
+prepared.cells.insert(
+    "author_annotation", np.repeat(["planted_A", "planted_B", "planted_C"], 40)
+)
 # Record the input selection for the later preservation check.
 initial_selection = prepared.cells.fetch_all("I").copy()
 # Record the original metadata columns.
@@ -254,7 +260,10 @@ initial_columns = list(prepared.cells.columns)
 # Release objects that are no longer needed.
 del prepared, counts
 # Check the original selection and metadata size.
-{"selected cells": int(initial_selection.sum()), "metadata columns": len(initial_columns)}
+{
+    "selected cells": int(initial_selection.sum()),
+    "metadata columns": len(initial_columns),
+}
 ```
 
 The local `FunctionModel` receives the same schemas and measured evidence as a provider. It
@@ -294,7 +303,9 @@ async def teaching_decision(messages, info):
                 {
                     "clusterId": row["clusterId"],
                     "identity": "unassigned",
-                    "rationale": "Synthetic markers do not establish a biological cell identity.",
+                    "rationale": (
+                        "Synthetic markers do not establish a biological cell identity."
+                    ),
                 }
                 for row in evidence["clusters"]
             ]
@@ -303,7 +314,9 @@ async def teaching_decision(messages, info):
     elif evidence.get("decisionKind") == "pcProbe":
         # Find the option that measures 30 principal components.
         chosen = next(
-            key for key, value in evidence["experiments"].items() if value["pcaDims"] == 30
+            key
+            for key, value in evidence["experiments"].items()
+            if value["pcaDims"] == 30
         )
         # Link this experiment request to its baseline evidence.
         answer = {
@@ -327,13 +340,17 @@ async def teaching_decision(messages, info):
         # Require the expected shortlist decision before selecting candidates.
         assert evidence["decisionKind"] == "nativeShortlist"
         # Shortlist the first two measured baseline partitions.
-        chosen = [row["optionId"] for row in evidence["candidates"][0]["partitions"][:2]]
+        chosen = [
+            row["optionId"] for row in evidence["candidates"][0]["partitions"][:2]
+        ]
         # Request marker review for both shortlisted partitions.
         answer = {
             "action": "shortlist",
             "optionIds": chosen,
             "evidenceIds": chosen,
-            "rationale": "Compare two measured baseline resolutions after the independent probes.",
+            "rationale": (
+                "Compare two measured baseline resolutions after the independent probes."
+            ),
         }
     return ModelResponse(parts=[ToolCallPart("decision", answer)])
 ```
@@ -356,8 +373,13 @@ result = await analyze_rna_async(
     run_dir=Path(teaching_directory.name) / "analysis",
     model=teaching_model,
     study=Study(
-        context="Synthetic RNA with three planted expression patterns and two interleaved sample labels.",
-        objective="Demonstrate bounded population discovery without biological identity claims.",
+        context=(
+            "Synthetic RNA with three planted expression patterns "
+            "and two interleaved sample labels."
+        ),
+        objective=(
+            "Demonstrate bounded population discovery without biological identity claims."
+        ),
         sampleColumn="sample",
         excludedColumns=["author_annotation"],
     ),
@@ -367,7 +389,9 @@ result = await analyze_rna_async(
 # Require a completed analysis before inspecting final results.
 assert result.status == "completed", result.status
 # Inspect which parameter alternatives were measured.
-pd.DataFrame(result.exploration_coverage["slots"])[["candidateId", "axis", "status", "reason"]]
+pd.DataFrame(result.exploration_coverage["slots"])[
+    ["candidateId", "axis", "status", "reason"]
+]
 ```
 
 Inspect actual selected-feature counts. Requested HVG counts alone do not show that two trials
@@ -399,7 +423,7 @@ from IPython.display import display
 embedding = result.plot_embedding(show=False)
 # Display the final clustering on its saved UMAP.
 display(embedding.figure)
-# Close the figure or reader after its final use.
+# Close the displayed figure to release its resources.
 embedding.close()
 ```
 
@@ -410,7 +434,7 @@ Inspect the markers supporting the final clustering.
 marker_plot = result.plot_markers(show=False)
 # Display the marker evidence for the final clusters.
 display(marker_plot.figure)
-# Close the figure or reader after its final use.
+# Close the displayed figure to release its resources.
 marker_plot.close()
 ```
 
@@ -419,7 +443,12 @@ cluster record is present, not that every population received a named biological
 
 ```{code-cell} ipython3
 # Inspect the provisional identities and their supporting rationale.
-pd.DataFrame(result.annotations)[["clusterId", "identity", "confidence", "rationale"]]
+annotation_table = pd.DataFrame(result.annotations)[
+    ["clusterId", "identity", "confidence", "rationale"]
+]
+# Show each explanation in full rather than truncating it with an ellipsis.
+with pd.option_context("display.max_colwidth", None):
+    display(annotation_table)
 ```
 
 The compact result points to the exact final pipeline and executed configuration. The full audit
@@ -430,8 +459,20 @@ remains external; report regeneration and decision replay use those saved files.
 compact = result.compact_result
 # Check that the compact summary points to the final pipeline.
 assert compact["finalPipelineRunId"] == result.pipeline.run_id
-# Inspect the settings selected by the scripted workflow.
-compact["selectedParameters"]
+# Read the settings selected by the scripted workflow.
+selected = compact["selectedParameters"]
+# Summarize the choices that determine the final analysis.
+pd.Series(
+    {
+        "candidate": selected["candidateId"],
+        "HVGs": selected["actualHvgCount"],
+        "PCs": selected["pcaDims"],
+        "neighbors": selected["neighborsK"],
+        "resolution": selected["resolution"],
+        "Harmony": selected["useHarmony"],
+    },
+    name="selected settings",
+)
 ```
 
 ```{code-cell} ipython3

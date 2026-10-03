@@ -109,10 +109,14 @@ if not source_store.exists():
         try:
             # Write the prepared counts and metadata to the new store.
             scarf.H5adToZarr(
-                reader, zarr_loc=str(staged_store), assay_name="RNA", nthreads=4, mem_budget="6G"
+                reader,
+                zarr_loc=str(staged_store),
+                assay_name="RNA",
+                nthreads=4,
+                mem_budget="6G",
             ).dump()
         finally:
-            # Close the figure or reader after its final use.
+            # Close the H5AD reader after conversion.
             reader.h5.close()
         # Move the completed file or store to its reusable path.
         staged_store.replace(source_store)
@@ -130,8 +134,8 @@ source = scarf.DataStore(
 # Check that initialization retained all published cells.
 assert source.cells.N == 108_717
 
-# Inspect the initialized source store.
-source
+# Check the initialized count matrix dimensions.
+{"cells": source.cells.N, "genes": source.RNA.feats.N}
 ```
 
 Keep new selections and test results in a separate working store.
@@ -147,8 +151,11 @@ ds = scarf.mount_datastore(
     min_features_per_cell=0,
     nthreads=4,
 )
-# Inspect the store's assays and dimensions.
-ds
+# Check that mounting preserved the source dimensions.
+{
+    "same cell count": ds.cells.N == source.cells.N,
+    "same gene count": ds.RNA.feats.N == source.RNA.feats.N,
+}
 ```
 
 ## Select the matched cells
@@ -230,7 +237,9 @@ panel = ["IFNG", "IFIT2", "TNF", "GZMA", "ISG15", "S100A4"]
 # Use disease metadata to define the comparison groups.
 condition = CellField("disease")
 # Declare the donor, condition, and matched-pair columns.
-design = StudyDesign(sample_by="donor_id", condition_by="disease", pair_by="pair_index_CW")
+design = StudyDesign(
+    sample_by="donor_id", condition_by="disease", pair_by="pair_index_CW"
+)
 ```
 
 Run the paired comparison on donor means.
@@ -238,7 +247,12 @@ Run the paired comparison on donor means.
 ```{code-cell} ipython3
 # Compare paired donor means with the Wilcoxon signed-rank test.
 paired_result = ds.run_statistical_testing(
-    panel, condition, cell_selection=cells, groups=GROUPS, study_design=design, test="wilcoxon"
+    panel,
+    condition,
+    cell_selection=cells,
+    groups=GROUPS,
+    study_design=design,
+    test="wilcoxon",
 )
 ```
 

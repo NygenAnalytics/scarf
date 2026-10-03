@@ -92,7 +92,10 @@ from scarf.features.variability import DEFAULT_HVG_BLACKLIST
 
 # Count genes matching each default exclusion family.
 family_counts = pd.Series(
-    {name: len(ds.RNA.feats.grep(pattern)) for name, pattern in GENE_FAMILY_PATTERNS.items()},
+    {
+        name: len(ds.RNA.feats.grep(pattern))
+        for name, pattern in GENE_FAMILY_PATTERNS.items()
+    },
     name="genes matching pattern",
 )
 # Count all genes matched by the combined default blacklist.
@@ -112,15 +115,20 @@ Compare the same `top_n` with and without the default pattern:
 
 ```{code-cell} ipython3
 # Repeat selection with the same count and no name blacklist.
-hvg_no_blacklist = ds.select_hvgs(cell_selection, top_n=500, blacklist="", show_plot=False)
+hvg_no_blacklist = ds.select_hvgs(
+    cell_selection, top_n=500, blacklist="", show_plot=False
+)
+# Load the alternative selection on the same feature axis.
+unblocked_values = np.asarray(ds.load_artifact(hvg_no_blacklist)["values"][:])
 # Keep both feature masks for a direct comparison.
 selection_values = {
     "hvgs_default": hvg_500_values,
-    "hvgs_no_blacklist": np.asarray(ds.load_artifact(hvg_no_blacklist)["values"][:]),
+    "hvgs_no_blacklist": unblocked_values,
 }
 # Compare selected-gene counts with and without name exclusions.
 pd.Series(
-    {key: int(values.sum()) for key, values in selection_values.items()}, name="selected genes"
+    {key: int(values.sum()) for key, values in selection_values.items()},
+    name="selected genes",
 )
 ```
 
@@ -129,12 +137,12 @@ pd.Series(
 feature_names = ds.RNA.feats.fetch_all("names")
 # Keep the default selection mask.
 default_values = selection_values["hvgs_default"]
-# Keep the selection made without name exclusions.
-unblocked_values = selection_values["hvgs_no_blacklist"]
 # Find genes added only when the blacklist is cleared.
 only_without_blacklist = feature_names[unblocked_values & ~default_values]
 # Count genes added only when the blacklist is cleared.
-print("Genes selected only when blacklist is cleared:", len(only_without_blacklist))
+print(
+    "Genes selected only when blacklist is cleared:", len(only_without_blacklist)
+)
 # Inspect the newly included gene names.
 pd.Series(only_without_blacklist).head(15)
 ```
@@ -161,8 +169,10 @@ This comparison keeps all other graph choices fixed. The 500-gene branch comes d
 ```{code-cell} ipython3
 # Select 1,000 genes on the same frozen cell population.
 feature_1000 = ds.select_hvgs(cell_selection, top_n=1000, show_plot=False)
+# Read the selected-gene mask for the new branch.
+feature_1000_values = np.asarray(ds.load_artifact(feature_1000)["values"][:])
 # Check the number of genes retained for the new branch.
-int(np.asarray(ds.load_artifact(feature_1000)["values"][:]).sum())
+{"selected genes": int(feature_1000_values.sum())}
 ```
 
 Normalize the selected genes and construct the new graph.
@@ -180,8 +190,10 @@ ann_1000 = ds.build_ann_index(pca_1000)
 neighbors_1000 = ds.query_neighbors(ann_1000, k=11)
 # Build connectivity from the new neighbors.
 graph_1000 = ds.build_connectivity_map(neighbors_1000)
-# Inspect the PCA dimensions supplied to this graph.
-ds.load_artifact(pca_1000)["data"].shape
+# Read the PCA dimensions supplied to this graph without loading its values.
+pca_shape = ds.load_artifact(pca_1000)["data"].shape
+# Inspect the cell and principal-component counts.
+{"cells": pca_shape[0], "PCs": pca_shape[1]}
 ```
 
 Build the layout and clustering for the new graph.
@@ -201,7 +213,9 @@ layout_shapes = {
     for top_n, (layout_ref, _) in feature_branches.items()
 }
 # Check that both layouts contain the same cells and two embedding coordinates.
-pd.DataFrame(layout_shapes, index=["cells", "embedding dimensions"]).T
+pd.DataFrame(
+    layout_shapes, index=["cells", "embedding dimensions"]
+).T.rename_axis("selected genes")
 ```
 
 ```{code-cell} ipython3
@@ -219,7 +233,11 @@ for axis, top_n in zip(axes, feature_branches, strict=True):
     cluster_values[top_n] = labels
     # Plot this feature branch with its corresponding clustering.
     ds.plots.embedding(
-        layout=umap_ref, color_by=cluster_ref, target=axis, show_titles=False, show=False
+        layout=umap_ref,
+        color_by=cluster_ref,
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     # Label the panel with the quantity being compared.
     axis.set_title(f"{top_n:,} selected genes")

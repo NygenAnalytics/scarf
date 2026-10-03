@@ -82,7 +82,10 @@ leiden_values = {
 
 # Compare cluster sizes across the three Leiden resolutions.
 pd.DataFrame(
-    {resolution: pd.Series(values).value_counts() for resolution, values in leiden_values.items()}
+    {
+        resolution: pd.Series(values).value_counts()
+        for resolution, values in leiden_values.items()
+    }
 ).fillna(0).astype(int)
 ```
 
@@ -93,7 +96,11 @@ figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, resolution in zip(axes, leiden_values, strict=True):
     # Place this resolution on the common UMAP for comparison.
     ds.plots.embedding(
-        layout=umap, color_by=leiden_refs[resolution], target=axis, show_titles=False, show=False
+        layout=umap,
+        color_by=leiden_refs[resolution],
+        target=axis,
+        show_titles=False,
+        show=False,
     )
     # Label the panel with the quantity being compared.
     axis.set_title(f"Leiden {resolution}")
@@ -113,7 +120,9 @@ match. A value of one means the partitions agree. It does not tell us which part
 # Compare partition agreement for every resolution pair.
 pd.Series(
     {
-        f"{first} vs {second}": ds.metric_label_concordance(leiden_refs[first], leiden_refs[second])
+        f"{first} vs {second}": ds.metric_label_concordance(
+            leiden_refs[first], leiden_refs[second]
+        )
         for first, second in combinations(leiden_refs, 2)
     },
     name="ARI",
@@ -171,14 +180,16 @@ Markers for the largest cluster:
 
 ```{code-cell} ipython3
 # Inspect the leading markers for the largest cluster.
-largest_markers[["feature_name", "score", "auc", "p_value", "p_value_adjusted"]].head(10)
+marker_columns = ["feature_name", "score", "auc", "p_value", "p_value_adjusted"]
+# Preview these statistics for the ten leading markers.
+largest_markers[marker_columns].head(10)
 ```
 
 Markers for the smallest cluster:
 
 ```{code-cell} ipython3
 # Inspect the leading markers for the smallest cluster.
-smallest_markers[["feature_name", "score", "auc", "p_value", "p_value_adjusted"]].head(10)
+smallest_markers[marker_columns].head(10)
 ```
 
 The p-values are cell-level one-versus-rest marker tests with within-group adjustment. They are not

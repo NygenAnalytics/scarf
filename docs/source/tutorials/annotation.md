@@ -31,6 +31,9 @@ import pandas as pd
 
 import scarf
 
+# Keep routine execution diagnostics out of the marker figures.
+scarf.configure_output(level="WARNING", progress=False)
+
 # Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
@@ -65,7 +68,14 @@ Start with the default marker filters and inspect one cluster:
 # Load the marker evidence for cluster 1.
 group_markers = ds.get_markers(marker=markers, group_id="1")
 # Inspect the ten leading markers and their supporting statistics.
-marker_columns = ["feature_name", "score", "frac_exp", "fold_change", "auc", "p_value_adjusted"]
+marker_columns = [
+    "feature_name",
+    "score",
+    "frac_exp",
+    "fold_change",
+    "auc",
+    "p_value_adjusted",
+]
 # Preview the ten leading rows using those evidence columns.
 group_markers[marker_columns].head(10)
 ```
@@ -171,7 +181,8 @@ For finer T-cell labels, inspect a small panel rather than a long list of every 
 t_cell_genes = ["CD3D", "CD8A", "CD8B", "CCR7", "IL7R", "CD27", "GZMK"]
 # Select the marker rows for the two T-cell groups.
 t_cell_evidence = all_markers[
-    all_markers["group_id"].isin(["7", "8"]) & all_markers["feature_name"].isin(t_cell_genes)
+    all_markers["group_id"].isin(["7", "8"])
+    & all_markers["feature_name"].isin(t_cell_genes)
 ]
 # Inspect T-cell marker detection and specificity in clusters 7 and 8.
 t_cell_evidence[["group_id", "feature_name", "frac_exp", "score"]].round(2)
@@ -191,7 +202,8 @@ such as CD3D and CD3E. For a CD8 T-cell call, compare CD4 with CD8A and CD8B.
 comparison_genes = ["CD3D", "CD3E", "CD4", "NKG7", "GNLY", "CD8A", "CD8B"]
 # Keep evidence for the two populations under review.
 comparison = all_markers[
-    all_markers["group_id"].isin(["6", "8"]) & all_markers["feature_name"].isin(comparison_genes)
+    all_markers["group_id"].isin(["6", "8"])
+    & all_markers["feature_name"].isin(comparison_genes)
 ]
 # Compare marker detection inside and outside the competing populations.
 comparison[["group_id", "feature_name", "frac_exp", "frac_exp_rest", "auc"]].round(2)
@@ -250,7 +262,9 @@ pd.Series(reviewed_cell_type[analysis_cells]).value_counts().rename("cells")
 
 ```{code-cell} ipython3
 # Compare the original and reviewed annotations on the same UMAP.
-ds.plots.embedding(layout=run["umap"], color_by=["proposed_cell_type", "reviewed_cell_type"])
+ds.plots.embedding(
+    layout=run["umap"], color_by=["proposed_cell_type", "reviewed_cell_type"]
+)
 ```
 
 The saved `naive CD8 T cells` and `memory B cells` labels summarize the interpretations above.

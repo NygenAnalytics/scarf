@@ -51,60 +51,25 @@ from dotenv import load_dotenv
 from IPython.display import Image, display
 
 import scarf
-from scarf.agent import AnalysisConfig, RuntimeConfig, Study, analyze_rna_async, resume_rna_async
-```
+from scarf.agent import (
+    AnalysisConfig,
+    RuntimeConfig,
+    Study,
+    analyze_rna_async,
+    resume_rna_async,
+)
 
-Load provider settings and choose the notebook working folder.
-
-```{code-cell} ipython3
-# Read the optional local environment-file setting.
 env_file = os.environ.get("SCARF_AGENT_ENV_FILE")
-# Load provider credentials from the local environment file.
 _ = load_dotenv(env_file) if env_file else load_dotenv()
-# Choose the notebook's working folder.
 work_dir = Path(os.environ.get("SCARF_AGENT_NOTEBOOK_DIR", Path.cwd())).resolve()
-# Create the local folder if it does not already exist.
 work_dir.mkdir(parents=True, exist_ok=True)
-# Run subsequent relative paths from the chosen notebook folder.
 os.chdir(work_dir)
-# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
-# Keep request URLs out of shared notebook output.
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
-# Keep the dataset identifier returned by the catalog.
 dataset_id = "garridotrigo_2023_ibd_hc_10x_single_cell_transcriptomics_data_9bfecd44"
-# Keep the prepared local count store in the working folder.
 data_path = work_dir / "data.zarr"
-# Choose the directory for the saved agent analysis.
 run_dir = work_dir / "agent_runs" / "garrido-trigo"
-# Show whether an analysis already exists, without displaying private paths.
-{"prepared input exists": data_path.exists(), "saved analysis exists": run_dir.exists()}
-```
-
-Check provider access before spending time on input preparation. A saved completed run can be
-reopened without configuring a provider.
-
-```{code-cell} ipython3
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-
-# Read the provider key from the environment without displaying it.
-api_key = os.environ.get("BASETEN_API_KEY")
-# Configure the model used for new or resumed decisions.
-model = None
-# Configure a provider only when a key is available.
-if api_key:
-    # Configure the model used for new or resumed decisions.
-    model = OpenAIChatModel(
-        "deepseek-ai/DeepSeek-V4.1-Flash",
-        provider=OpenAIProvider(base_url="https://inference.baseten.co/v1", api_key=api_key),
-    )
-# Require provider access before downloading a fresh analysis input.
-if not run_dir.exists() and model is None:
-    raise RuntimeError("Configure BASETEN_API_KEY before starting a fresh analysis")
-# Show whether this session can start or resume an analysis.
-{"saved analysis exists": run_dir.exists(), "provider configured": model is not None}
 ```
 
 ## Prepare the input once
@@ -128,103 +93,45 @@ from huggingface_hub.utils import disable_progress_bars
 from scarf import cytebase
 from scarf.tools.repack_zarr import repack_store
 
-# Prepare counts only when there is no completed local input.
-prepare_input = not data_path.exists()
-if prepare_input:
-    # Connect to the public Cytebase catalog.
+if not data_path.exists():
     catalog = cytebase.Catalog()
-    # Read the dataset's scientific metadata and citation.
     entry = catalog.dataset(dataset_id)
-    # Resolve the published dataset's source location from its catalog entry.
     source_uri = entry.row["zarr_uri"]
-    # Require the Hugging Face bucket format expected by this copy recipe.
     if not source_uri.startswith("hf://buckets/"):
         raise ValueError("This copy recipe expects a Cytebase HF bucket source")
-    # Separate the bucket source into its path components.
     pieces = source_uri.removeprefix("hf://buckets/").split("/")
-    # Separate the bucket name from the dataset's object prefix.
     bucket, prefix = "/".join(pieces[:2]), "/".join(pieces[2:]).rstrip("/") + "/"
-    # Keep a local copy of the published input files.
     raw_path = work_dir / "scarf_datasets" / f"{dataset_id}.zarr"
-    # Create the local folder if it does not already exist.
     raw_path.mkdir(parents=True, exist_ok=True)
-    # Keep file-transfer progress out of the saved notebook.
     disable_progress_bars()
-    # Use existing credentials when available, otherwise read anonymously.
     token = get_token() or False
-    # List the downloadable files belonging to this dataset.
     objects = [
-        item
-        for item in list_bucket_tree(bucket, prefix=prefix, recursive=True, token=token)
+        item for item in list_bucket_tree(bucket, prefix=prefix, recursive=True, token=token)
         if isinstance(item, BucketFile)
     ]
-
-# Show whether the input needs to be copied and prepared.
-{"preparation required": prepare_input}
-```
-
-Validate the download destinations before transferring any files.
-
-```{code-cell} ipython3
-# Keep preparation steps conditional on the same initial input check.
-if prepare_input:
-    # Collect each source object and its local destination.
     transfers = []
-    # Validate every source path before choosing a local destination.
     for item in objects:
-        # Require every listed object to belong to this dataset.
         if not item.path.startswith(prefix):
             raise ValueError("A source object is outside the dataset prefix")
-        # Resolve the object path relative to the dataset prefix.
         relative = Path(item.path.removeprefix(prefix))
-        # Reject paths that could escape the local dataset folder.
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             raise ValueError("Invalid source object path")
-        # Pair the source object with its validated local destination.
         transfers.append((item, raw_path / relative))
-    # Reject an empty published source instead of creating an empty store.
     if not transfers:
         raise ValueError("The published source contains no downloadable files")
-    # Show the number of files in the validated transfer list.
-    print({"files to download": len(transfers)})
-```
-
-Download the source files and prepare the local counts.
-
-```{code-cell} ipython3
-# Recheck the destination so rerunning this cell retains the completed input.
-if not data_path.exists():
-    # Download the validated dataset files to their local paths.
     download_bucket_files(bucket, transfers, token=token, raise_on_missing_files=True)
-    # Prepare a local count-only store without prior numerical results.
     repack_store(
-        str(raw_path),
-        str(data_path),
-        data_only=True,
-        profile="fast_local",
-        nthreads=4,
-        mem_budget="4G",
+        str(raw_path), str(data_path), data_only=True,
+        profile="fast_local", nthreads=4, mem_budget="4G",
     )
-# Refresh the preparation flag for any later rerun of the validation cell.
-prepare_input = not data_path.exists()
-# Check that the local input is now available.
-{"prepared input exists": data_path.exists()}
-```
 
-Inspect the prepared local counts and record the original axes.
-
-```{code-cell} ipython3
-# Open the prepared input read-only for inspection.
 store = scarf.DataStore(
-    str(data_path), zarr_mode="r", min_features_per_cell=-1, nthreads=4, mem_budget="4G"
+    str(data_path), zarr_mode="r", min_features_per_cell=-1,
+    nthreads=4, mem_budget="4G",
 )
-# Record the original selected-cell mask.
 input_cells = store.cells.fetch_all("I").copy()
-# Record the original cell identifiers.
 input_ids = store.cells.fetch_all("ids").copy()
-# Record the original feature identifiers.
 input_features = store.RNA.feats.fetch_all("ids").copy()
-# Show the selected dataset and the prepared count dimensions.
 print({"dataset": dataset_id, "cells": int(input_cells.sum()), "genes": len(input_features)})
 ```
 
@@ -239,19 +146,12 @@ The default QC policy retains the supplied cells with advisory outlier flags.
 Doublet scoring is opt-in and is left disabled here.
 
 ```{code-cell} ipython3
-# Record the available metadata fields before building study context.
 columns = set(store.cells.columns)
-# Collect the public study metadata for the analysis context.
 metadata_facts = {}
-# Summarize each available field used to describe the study.
 for name in ("organism", "tissue", "disease", "donor_id", "sample_id"):
-    # Summarize this field only when the source provides it.
     if name in columns:
-        # Read this metadata field for the supplied cells.
         values = store.cells.to_pandas_dataframe([name])[name]
-        # Count the recorded levels of this metadata field.
         counts = values.dropna().astype(str).value_counts()
-        # Record distinct levels and missingness for this field.
         metadata_facts[name] = {
             "distinct": len(counts),
             "missing": int(values.isna().sum()),
@@ -260,14 +160,6 @@ for name in ("organism", "tissue", "disease", "donor_id", "sample_id"):
 
 import json
 
-# Inspect the available study metadata, missingness, and recorded levels.
-pd.DataFrame(metadata_facts).T
-```
-
-Describe the study using the metadata just inspected.
-
-```{code-cell} ipython3
-# Describe the cohort, permitted analysis, and held-out metadata.
 study = Study(
     context=(
         "Garrido-Trigo 2023 IBD and healthy-control intestinal RNA cohort from Cytebase. "
@@ -283,14 +175,7 @@ study = Study(
     protectedColumns=[name for name in ("disease", "tissue", "sex") if name in columns],
     excludedColumns=[name for name in columns if name.lower().startswith(("skill_", "agent_"))],
 )
-# Release objects that are no longer needed.
 del store
-# Inspect the metadata roles before sending the study to the model.
-{
-    "sample column": study.sampleColumn,
-    "protected columns": study.protectedColumns,
-    "held-out columns": study.excludedColumns,
-}
 ```
 
 ## Run the automated analysis
@@ -303,31 +188,29 @@ non-completed outcome rather than an invented answer.
 This example supplies a memorable `run_dir`. Omitting it creates
 `./agent_runs/<run-id>/` in the directory where the analysis call starts.
 
-Start a new analysis or resume the saved run.
-
 ```{code-cell} ipython3
-# Set the thread and memory limits for numerical work.
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+api_key = os.environ.get("BASETEN_API_KEY")
+model = None
+if api_key:
+    model = OpenAIChatModel(
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        provider=OpenAIProvider(base_url="https://inference.baseten.co/v1", api_key=api_key),
+    )
 runtime = RuntimeConfig(nthreads=4, memBudget="4G")
-# Reuse completed local work when it is already present.
 if run_dir.exists():
-    # Resume the saved analysis and reuse its completed numerical work.
     run = await resume_rna_async(run_dir, model=model, runtime=runtime)
 else:
-    # Start a fresh analysis of the prepared input with the configured provider.
+    if model is None:
+        raise RuntimeError("Configure BASETEN_API_KEY before starting a fresh analysis")
     run = await analyze_rna_async(
-        data_path,
-        run_dir=run_dir,
-        model=model,
-        study=study,
-        config=AnalysisConfig(assay="RNA"),
-        runtime=runtime,
+        data_path, run_dir=run_dir, model=model, study=study,
+        config=AnalysisConfig(assay="RNA"), runtime=runtime,
     )
-# Require a completed analysis before reading finalized results.
 if run.status != "completed":
-    raise RuntimeError(
-        f"Analysis returned {run.status}; inspect its saved report before continuing"
-    )
-# Show the completed status and numerical pipeline invocation count.
+    raise RuntimeError(f"Analysis returned {run.status}; inspect its saved report before continuing")
 print({"status": run.status, "pipelineInvocations": len(run.pipeline_runs)})
 ```
 
@@ -340,32 +223,12 @@ selected marker artifacts and adds UMAP. These are descriptive markers rather th
 replicated differential-expression tests.
 
 ```{code-cell} ipython3
-# Read the measured parameter alternatives.
-coverage = pd.DataFrame(run.exploration_coverage["slots"])
-# Inspect which parameter alternatives were measured.
-coverage[["axis", "candidateId", "status", "reason"]]
-```
-
-Read the proposed identities and their supporting rationale.
-
-```{code-cell} ipython3
-# Keep identities, confidence, and rationale together for review.
-annotations = pd.DataFrame(run.annotations)[["clusterId", "identity", "confidence", "rationale"]]
-# Show the complete annotation rationale without truncating table cells.
-with pd.option_context("display.max_colwidth", None):
-    # Review each provisional identity, confidence, and supporting rationale.
-    display(annotations)
+display(pd.DataFrame(run.exploration_coverage["slots"]))
+display(pd.DataFrame(run.annotations)[["clusterId", "identity", "confidence", "rationale"]])
 ```
 
 ```{code-cell} ipython3
-# Display the saved cluster UMAP from the completed analysis.
 display(Image(filename=str(run.run_dir / "umap_clusters.png")))
-```
-
-Compare the saved marker evidence with the cluster layout.
-
-```{code-cell} ipython3
-# Display the saved marker dot plot supporting the provisional identities.
 display(Image(filename=str(run.run_dir / "marker_dotplot.png")))
 ```
 
@@ -391,47 +254,26 @@ input cells and genes stayed unchanged.
 ```{code-cell} ipython3
 import numpy as np
 
-# Read the compact summary linked to the final pipeline.
 compact = run.compact_result
-# Require the compact result stored with the completed analysis.
 assert compact is not None
-# Check that the compact result points to the selected pipeline.
 assert compact["finalPipelineRunId"] == run.pipeline.run_id
-# Read the settings selected for the final analysis.
 selected = compact["selectedParameters"]
-# Choose the final settings relevant to this analysis.
-setting_names = [
-    "requestedHvgCount", "actualHvgCount", "pcaDims", "neighborsK", "resolution", "useHarmony"
-]
-# Show the settings as a compact table.
-pd.Series(selected, name="Final settings").loc[setting_names].to_frame()
-```
-
-Verify the stored input axes and replay the saved decisions.
-
-```{code-cell} ipython3
-# Reopen the input to check that its axes and selection were preserved.
+display(pd.Series({
+    key: selected[key]
+    for key in ("requestedHvgCount", "actualHvgCount", "pcaDims", "neighborsK", "resolution", "useHarmony")
+}, name="Final settings").to_frame())
 verification = scarf.DataStore(str(data_path), zarr_mode="r", min_features_per_cell=-1)
-# Check that the original selected-cell mask is unchanged.
 assert np.array_equal(verification.cells.fetch_all("I"), input_cells)
-# Check that the original cell identifiers are unchanged.
 assert np.array_equal(verification.cells.fetch_all("ids"), input_ids)
-# Check that the original feature identifiers are unchanged.
 assert np.array_equal(verification.RNA.feats.fetch_all("ids"), input_features)
-# Recheck recorded decisions against their saved evidence.
 replayed = run.replay_decisions()
-# Check that every saved decision passes offline replay.
 assert all(item["valid"] for item in replayed)
-# Summarize the completed consistency and replay checks.
-print(
-    {
-        "compactResultStored": True,
-        "pipelineReferenceVerified": True,
-        "inputCohortUnchanged": True,
-        "decisionsReplayed": len(replayed),
-    }
-)
-# Write the report and show its path relative to the notebook folder.
+print({
+    "compactResultStored": True,
+    "pipelineReferenceVerified": True,
+    "inputCohortUnchanged": True,
+    "decisionsReplayed": len(replayed),
+})
 print("Report:", run.report().relative_to(work_dir))
 ```
 

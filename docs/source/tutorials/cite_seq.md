@@ -120,7 +120,9 @@ for protein, gene in zip(protein_panel, rna_panel, strict=True):
     # Add the two matched markers in plotting order.
     paired_panel.extend([protein, gene])
 # Compare each protein with its RNA counterpart on the same map.
-ds.plots.embedding(layout=wnn_umap, color_by=paired_panel, n_columns=2, sort_values=True)
+ds.plots.embedding(
+    layout=wnn_umap, color_by=paired_panel, n_columns=2, sort_values=True
+)
 ```
 
 Start with CD3 protein and CD3D RNA: their shared region supports a T-cell population.

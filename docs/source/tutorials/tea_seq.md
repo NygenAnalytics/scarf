@@ -66,10 +66,11 @@ for assay in ("RNA", "ATAC", "ADT"):
         operation="run_umap",
         complete_only=True,
     )
-    # Label the modality shown in the next figure.
-    print(assay)
-    # Color this modality's UMAP by the publication cell types.
-    ds.plots.embedding(layout=layout, color_by="tea_cell_type")
+    # Name the modality on its UMAP and color cells by the publication labels.
+    ds.plots.embedding(
+        layout=layout,
+        color_by=CellField("tea_cell_type", label=f"{assay}: publication cell type"),
+    )
 ```
 
 Differences between these views may reflect complementary measurements or technical

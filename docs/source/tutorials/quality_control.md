@@ -265,7 +265,7 @@ Inspect the score distribution before applying a cutoff:
 
 ```{code-cell} ipython3
 # Plot the doublet-score distribution.
-scores_series.plot(kind="hist", bins=40)
+scores_series.plot(kind="hist", bins=40, xlabel="Doublet score")
 # Display the completed figure.
 plt.show()
 ```

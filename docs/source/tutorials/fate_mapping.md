@@ -40,7 +40,9 @@ scarf.configure_output(level="WARNING", progress=False)
 
 # Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq", destination="scarf_datasets", zarr=True
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
 )
 ```
 
@@ -102,7 +104,13 @@ sink_labels = analysis_run.cells.fetch("clusters")
 # Check that imported and computed labels cover the same cell count.
 assert len(annotations) == len(sink_labels)
 # Measure each published annotation's share within each cluster.
-shares = pd.crosstab(sink_labels, annotations, normalize="index")
+shares = pd.crosstab(
+    sink_labels,
+    annotations,
+    rownames=["cluster"],
+    colnames=["annotation"],
+    normalize="index",
+)
 # Show the majority annotation and its share for every cluster.
 sink_table = pd.DataFrame(
     {"annotation": shares.idxmax(axis=1), "majority share": shares.max(axis=1)}
@@ -120,8 +128,10 @@ an endpoint arbitrarily.
 candidate_fates = ["Alpha", "Beta", "Delta"]
 # Keep one cluster for each requested terminal identity.
 selected = sink_table.loc[sink_table["annotation"].isin(candidate_fates)]
+# Count the candidate fates before checking for missing or duplicated matches.
+n_fates = len(candidate_fates)
 # Check that each requested fate identifies exactly one cluster.
-valid_fates = len(selected) == len(candidate_fates) == selected["annotation"].nunique()
+valid_fates = len(selected) == n_fates == selected["annotation"].nunique()
 # Reject a missing or ambiguous terminal-cluster choice.
 if not valid_fates:
     raise ValueError("Each candidate fate must match exactly one cluster")
@@ -149,11 +159,13 @@ boundaries. See {doc}`annotation` for marker checks.
 
 ```{code-cell}
 # Calculate absorption probabilities for the chosen endpoints.
-fate_ref = ds.run_fate_mapping(pseudotime_ref, sink_labels_ref, sinks=terminal_labels)
+fate_ref = ds.run_fate_mapping(
+    pseudotime_ref, sink_labels_ref, sinks=terminal_labels
+)
 # Load the probabilities and their validity mask.
 fate = ds.load_fate_mapping(fate_ref)
 # Compare valid probability rows with the complete graph-cell count.
-int(fate.valid.sum()), len(fate.valid)
+{"valid probability rows": int(fate.valid.sum()), "graph cells": len(fate.valid)}
 ```
 
 The output reports how many graph cells have valid probabilities. Summarize only those
@@ -161,10 +173,10 @@ rows. Each probability column is one candidate fate, and the columns should sum 
 for each valid cell.
 
 ```{code-cell}
+# Match fate names to the saved probability-column order.
+fate_names = [sink_names[int(label)] for label in fate.sink_labels]
 # Keep valid rows and label each probability column by fate.
-probabilities = pd.DataFrame(
-    fate.values[fate.valid], columns=[sink_names[int(label)] for label in fate.sink_labels]
-)
+probabilities = pd.DataFrame(fate.values[fate.valid], columns=fate_names)
 # Measure each probability row's deviation from a total of one.
 probabilities["row-sum error"] = abs(probabilities.sum(axis=1) - 1.0)
 # Inspect probability ranges and the error in their row sums.
@@ -185,14 +197,19 @@ color scale. This uses the same UMAP as the preceding trajectory analysis.
 for index, label in enumerate(fate.sink_labels):
     # Save the values in cell metadata using the stated selection.
     ds.cells.insert(
-        f"fate_prob_{sink_names[int(label)]}", fate.values[:, index], key="I", overwrite=True
+        f"fate_prob_{sink_names[int(label)]}",
+        fate.values[:, index],
+        key="I",
+        overwrite=True,
     )
 
 # Compare the three fate probabilities on a shared zero-to-one scale.
 ds.plots.embedding(
     layout=analysis_run["umap"],
     color_by=[
-        CellField(f"fate_prob_{name}", kind="continuous", label=f"{name} probability")
+        CellField(
+            f"fate_prob_{name}", kind="continuous", label=f"{name} probability"
+        )
         for name in candidate_fates
     ],
     n_columns=3,

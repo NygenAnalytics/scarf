@@ -42,9 +42,13 @@ the query store must be writable so Scarf can save the mapping and transferred l
 ```{code-cell} ipython3
 # Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize the query populations in a labeled table.
+import pandas as pd
 
 # Open count stores and run Scarf analyses.
 import scarf
+# Give the reference and query plots descriptive labels.
+from scarf.plotting import CellField
 
 # Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
@@ -89,9 +93,15 @@ First, look at the author labels in both datasets.
 
 ```{code-cell} ipython3
 # Inspect the published labels in the control reference.
-ds_ctrl.plots.embedding(layout_key='RNA_UMAP', color_by='cluster_labels')
+ds_ctrl.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=CellField("cluster_labels", label="Control reference"),
+)
 # Inspect the published labels in the stimulated query.
-ds_stim.plots.embedding(layout_key='RNA_UMAP', color_by='cluster_labels')
+ds_stim.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=CellField("cluster_labels", label="Stimulated query"),
+)
 ```
 
 These UMAP layouts were fitted independently, so their coordinates are not comparable.
@@ -181,7 +191,7 @@ score_groups = np.array(
     dtype=object,
 )
 # Count cells in each mapping-score group.
-np.unique(score_groups, return_counts=True)
+pd.Series(score_groups, name="query population").value_counts().to_frame("cells")
 ```
 
 Show where each query population contributes weight on the reference map:
@@ -292,8 +302,8 @@ ds_stim.plots.mapping_confusion(
 )
 ```
 
-The diagonal is recall within each known query label.
-Off-diagonal blocks are systematic swaps.
+Cells where the known and predicted labels match show recall within each known query label.
+Blocks between different labels show systematic swaps.
 The `Abstained` column holds the cells that did not receive a transferred label.
 Pay particular attention to the monocyte rows. Stimulation can change expression enough that a
 query population maps to another reference label. Inspect such swaps before accepting the labels.

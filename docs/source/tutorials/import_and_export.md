@@ -57,6 +57,8 @@ from tempfile import TemporaryDirectory
 
 # Work with numeric arrays and cell masks.
 import numpy as np
+# Summarize inspected files and matrices in tables.
+import pandas as pd
 # Open count stores and run Scarf analyses.
 import scarf
 
@@ -99,8 +101,21 @@ It returns every complete candidate instead of choosing between alternatives suc
 ```{code-cell} ipython3
 # Find complete matrix, feature, and cell-file triplets.
 candidates = scarf.inspect_mtx(str(mtx_dir))
-# Review the detected Matrix Market candidates.
-candidates
+# Compare the candidate files and dimensions without repeating the download path.
+pd.DataFrame(
+    {
+        index: {
+            "matrix file": str(Path(candidate.matrixPath).relative_to(mtx_dir)),
+            "feature file": str(Path(candidate.featurePath).relative_to(mtx_dir)),
+            "cell file": str(Path(candidate.cellPath).relative_to(mtx_dir)),
+            "orientation": candidate.matrixOrientation,
+            "cells": candidate.nCells,
+            "features": candidate.nFeatures,
+            "stored entries": candidate.nEntries,
+        }
+        for index, candidate in enumerate(candidates)
+    }
+).rename_axis(columns="candidate")
 ```
 
 This directory contains one complete matrix. Open its reader, choose an output path, and call
@@ -161,7 +176,20 @@ h5ad_path = str(h5ad_dir / "data.h5ad")
 # Inspect the available count matrices and metadata.
 inspection = scarf.inspect_h5ad(h5ad_path)
 # Review the source matrices, dimensions, and metadata.
-inspection
+pd.Series(
+    {
+        "selected matrix": inspection.matrixKey,
+        "available matrices": ", ".join(inspection.matrixCandidates),
+        "encoding": inspection.matrixEncoding,
+        "integer-like counts": inspection.integerLike,
+        "cells": inspection.nCells,
+        "features": inspection.nFeatures,
+        "cell metadata": inspection.cellAttrsKey,
+        "feature metadata": inspection.featureAttrsKey,
+        "feature names": inspection.featureNameKey,
+    },
+    name="value",
+).to_frame()
 ```
 
 `H5adReader.from_inspect` uses the discovered matrix and metadata keys.
@@ -187,7 +215,10 @@ h5ad_import = scarf.H5adToZarr(
     analysis_assay="RNA",
 ).dump()
 # Inspect the imported UMAP and cluster references.
-h5ad_import.embeddingArtifacts, h5ad_import.clusterArtifacts
+{
+    "embeddings": dict(h5ad_import.embeddingArtifacts),
+    "clusters": dict(h5ad_import.clusterArtifacts),
+}
 ```
 
 `embedding_roles` and `cluster_keys` select analytical values for artifact import.

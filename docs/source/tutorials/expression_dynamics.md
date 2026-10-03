@@ -33,7 +33,9 @@ scarf.configure_output(level="WARNING", progress=False)
 
 # Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    name="bastidas-ponce_4K_pancreas-d15_rnaseq", destination="scarf_datasets", zarr=True
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
 )
 ```
 
@@ -106,7 +108,10 @@ Load the saved result to see how many genes each module contains:
 # Load the saved gene-module assignments.
 modules = ds.load_pseudotime_aggregation(modules_ref)
 # Pair each retained gene with its module label.
-module_genes = pd.DataFrame({"gene": modules.feature_names, "module": modules.feature_clusters})
+module_genes = pd.DataFrame({
+    "gene": modules.feature_names,
+    "module": modules.feature_clusters,
+})
 # Count the genes assigned to each expression module.
 module_genes.groupby("module").size().rename("genes")
 ```
@@ -131,7 +136,9 @@ To explore a shorter window, repeat the call with one changed setting:
 
 ```python
 # Group genes with similar expression profiles along pseudotime.
-modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_features, window_size=100)
+modules_ref = ds.run_pseudotime_aggregation(
+    pseudotime_ref, features=all_features, window_size=100
+)
 ```
 
 `n_clusters` controls the requested number of modules. `chunk_size` controls the number

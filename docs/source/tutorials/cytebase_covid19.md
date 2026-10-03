@@ -68,7 +68,7 @@ import logging
 
 import numpy as np
 import pandas as pd
-from IPython.display import display
+from IPython.display import Markdown, display
 from scipy.stats import mannwhitneyu, spearmanr
 
 import scarf
@@ -95,8 +95,12 @@ rather than typing an ID by hand.
 ```{code-cell} ipython3
 # Search the catalog for the dataset used in this example.
 matches = catalog.search("wilk sars cov 2", ready_only=True, max_cell_chars=None)
-# Inspect the matching COVID-19 datasets before choosing the cohort.
-display(matches)
+# Summarize matching cohorts without letting full IDs dominate the table.
+match_preview = matches.to_markdown(
+    columns=["cytebase_id", "title", "cell_count"], max_cell_chars=32
+)
+# Display the cohort preview; result rows retain their complete identifiers.
+display(Markdown(match_preview))
 
 # Stop if the published COVID-19 cohort is unavailable.
 if not matches:
@@ -196,8 +200,10 @@ exactly one coarse label:
 ```{code-cell} ipython3
 # Count cells of each published type in each condition.
 by_type = pd.crosstab(meta["cell_type"], meta["disease"])
-# Save the values in cell metadata using the stated selection.
-by_type.insert(0, "coarse label", meta.groupby("cell_type")["cell.type.coarse"].first())
+# Match each detailed cell type to the authors' coarse label.
+coarse_labels = meta.groupby("cell_type")["cell.type.coarse"].first()
+# Place each coarse label beside its detailed cell-type counts.
+by_type.insert(0, "coarse label", coarse_labels)
 # Compare condition counts with the authors' shorter cell-type labels.
 by_type.sort_values(["coarse label", "COVID-19"], ascending=[True, False])
 ```
@@ -213,7 +219,12 @@ coordinates. First, the full Cell Ontology annotation:
 
 ```{code-cell} ipython3
 # Show the published Cell Ontology labels on the imported UMAP.
-ds.plots.embedding(layout=umap_ref, color_by="cell_type", legend_loc="right", figsize=(12, 7))
+ds.plots.embedding(
+    layout=umap_ref,
+    color_by="cell_type",
+    legend_loc="right",
+    figsize=(12, 7),
+)
 ```
 
 Splitting the same layout by condition with `facet_by` shows where each group's
@@ -222,7 +233,10 @@ cells fall. Labels are the authors' coarse types.
 ```{code-cell} ipython3
 # Compare the two conditions on matching UMAP panels.
 ds.plots.embedding(
-    layout=umap_ref, color_by="cell.type.coarse", facet_by="disease", figsize=(12, 6)
+    layout=umap_ref,
+    color_by="cell.type.coarse",
+    facet_by="disease",
+    figsize=(12, 6),
 )
 ```
 
@@ -282,14 +296,16 @@ ds.plots.composition(
     condition_by="disease",
     kind="per_sample",
     categorical_scale=coarse_scale,
-    figsize=(13, 4.5),
+    figsize=(10, 7),
     max_figure_width=None,
 )
 ```
 
 ```{code-cell} ipython3
 # Calculate cell-type proportions separately within each donor.
-fractions = pd.crosstab(meta["donor_id"], meta["cell.type.coarse"], normalize="index")
+fractions = pd.crosstab(
+    meta["donor_id"], meta["cell.type.coarse"], normalize="index"
+)
 # Choose the cell types highlighted in the comparison.
 shown = ["PB", "CD16 Monocyte", "gd T", "pDC", "NK", "RBC"]
 # Attach each donor's condition to the composition summary.
@@ -501,7 +517,10 @@ print(
     f"U = {test.statistic:.0f}, two-sided p = {test.pvalue:.4f}"
 )
 # Report concordance with the authors' interferon-response score.
-print(f"Spearman correlation of donor ISG mean with the authors' IFN1 score: {rho:.2f}")
+print(
+    "Spearman correlation of donor ISG mean with the authors' IFN1 score:",
+    f"{rho:.2f}",
+)
 ```
 
 In CD14 monocytes, **six of the seven patients have a higher ISG mean than any

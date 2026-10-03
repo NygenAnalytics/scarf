@@ -71,7 +71,11 @@ smoothed = ds.get_imputed(feature_name="CD4", diffusion=diffusion)
 # Save the calculated values in the cell table.
 ds.cells.insert("CD4_imputed_t2", smoothed, key="I", overwrite=True)
 # Check the number of smoothed cells and their expression range.
-{"cells": len(smoothed), "minimum": smoothed.min(), "maximum": smoothed.max()}
+{
+    "cells": len(smoothed),
+    "minimum": round(float(smoothed.min()), 4),
+    "maximum": round(float(smoothed.max()), 4),
+}
 ```
 
 The inserted column lets us plot the smoothed values beside observed, normalized CD4

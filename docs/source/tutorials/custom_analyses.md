@@ -72,7 +72,9 @@ graph = ds.load_graph(graph=graph_ref, symmetric=True, upper_only=False)
 # Sum the edge weights connected to each cell.
 graph_strength = np.asarray(graph.sum(axis=1)).ravel()
 # Save the values in cell metadata using the stated selection.
-ds.cells.insert(column_name="customGraphStrength", values=graph_strength, key="I", overwrite=True)
+ds.cells.insert(
+    column_name="customGraphStrength", values=graph_strength, key="I", overwrite=True
+)
 # Summarize the graph size and the new per-cell connectivity statistic.
 {
     "cells": int(graph.shape[0]),
@@ -134,7 +136,9 @@ Collect the per-cell results and save them in metadata.
 # Join the block results in their original cell order.
 detected_hvgs = np.concatenate(detected_blocks)
 # Save the values in cell metadata using the stated selection.
-ds.cells.insert(column_name="customDetectedHVGs", values=detected_hvgs, key="I", overwrite=True)
+ds.cells.insert(
+    column_name="customDetectedHVGs", values=detected_hvgs, key="I", overwrite=True
+)
 # Summarize the per-cell detected-gene counts.
 {
     "cells": int(detected_hvgs.size),
@@ -159,7 +163,11 @@ This is an illustration of the API, not a recommended quality-control filter:
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
 # Save the values in cell metadata using the stated selection.
 ds.cells.insert(
-    column_name="wellConnected", values=well_connected, fill_value=False, key="I", overwrite=True
+    column_name="wellConnected",
+    values=well_connected,
+    fill_value=False,
+    key="I",
+    overwrite=True,
 )
 # Check how many active cells pass the custom selection.
 {"selected cells": int(well_connected.sum()), "active cells": len(well_connected)}
