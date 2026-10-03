@@ -13,7 +13,7 @@ kernelspec:
 ---
 (pseudobulk_and_differential_expression)=
 
-# Pseudobulk and Differential Expression (DE) Primer
+# Pseudobulk and differential expression (DE) primer
 
 To compare gene expression changes across conditions, we need independent biological samples in each group. Pseudobulking works for single-cell RNA sequencing data because summing raw counts within each donor produces donor-level count data that mirrors bulk RNA-seq count data. Testing for differential expression tells us which genes change between conditions, pointing to the programs driving disease or response. Without it, we can describe what genes are present and potentially driving an effect, but not what is different about them across the conditions.
 
@@ -259,5 +259,5 @@ This panel shows donor heterogeneity and paired direction, but it does not estim
 ## Important caveats to consider regarding pseudobulk and differential expression
 
 - **Conflating pseudo-replicates with biological replicates:** Subsetting cells or splitting a donor into random partitions ( with pseudo_reps) does not increase the true biological sample size. Treating non-independent cells or partitions as distinct replicates artificially inflates degrees of freedom, leading to massive false-positive rates in downstream models.
-- **Feeding normalized values into count-based models:** Exploratory log2(CPM) values are strictly descriptive and intended for visualization. Differential expression frameworks like DESeq2 and edgeR require raw, unnormalized integer counts to accurately model negative binomial dispersion and compute internal library size factors. *NEVER* feed normalized counts into these models. 
+- **Feeding normalized values into count-based models:** Exploratory log2(CPM) values are strictly descriptive and intended for visualization. Differential expression frameworks like DESeq2 and edgeR require raw, unnormalized integer counts to accurately model negative binomial dispersion and compute internal library size factors. *NEVER* feed normalized counts into these models.
 - **Omitting matched-pair and batch covariates:** Aggregating donors into two monolithic condition pools or excluding pair_index_CW and batch from the downstream design matrix throws away the statistical power of a matched study and risks confounding disease signatures with technical batch variation.

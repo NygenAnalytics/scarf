@@ -110,11 +110,8 @@ figure.tight_layout()
 figure
 ```
 
-## Common mistakes and limitations
+## Important caveats to consider regarding cell cycle
 
-- Applying a human or mouse gene set to data with incompatible feature names
-- Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
-- Comparing scores across workflows with different gene sets or normalization
-
-`run_cell_cycle_scoring` stores phase and both scores in one immutable artifact. Retain its exact ref
-for loading and downstream analysis.
+- **Incompatible gene identifiers and silent marker dropout:** Scarf's bundled S and G2M signatures rely on standard human and mouse gene nomenclature. Supplying datasets with non-conforming identifiers (e.g., Ensembl IDs, discordant case-sensitivity, or unmapped orthologs) causes the gene markers to drop silently, compromising expression binning and distorting background control subtraction, misrepresenting the final scores.
+- **Conflating negative scores with active G1 (the G0 vs. G1 blindspot):** Cells are assigned to G1 by default whenever both S and G2M scores are negative. This heuristic cannot distinguish actively cycling G1 cells from quiescent (G0), senescent, or post-mitotic differentiated states, and severe technical dropout can artificially depress scores into negative values.
+- **Treating relative scores as definitive proof of proliferation:** Cell-cycle scores measure the relative enrichment of phase-associated transcripts against expression-matched background bins, not absolute mitotic rates. Without confirming key driver genes (e.g., MKI67, TOP2A, PCNA) and checking whether cell-cycle signatures are confounding unsupervised clustering, stress programs or lineage-specific transcripts can easily be misinterpreted as active proliferation.
