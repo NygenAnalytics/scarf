@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+
+import scarf.features.identity as identity
 from scarf.features.identity import (
     audit_feature_identity,
     backfill_symbols,
@@ -262,3 +265,167 @@ def test_mouse_cell_cycle_lists_are_title_case() -> None:
     assert "Top2a" in g2m_phase_genes_mouse
     assert len(s_phase_genes_mouse) == len(s_phase_genes)
     assert len(g2m_phase_genes_mouse) == len(g2m_phase_genes)
+
+
+def test_audit_feature_identity_requires_aligned_ids_and_names() -> None:
+    with pytest.raises(ValueError, match="ids and names must have the same length"):
+        audit_feature_identity(["ENSG00000075624", "ENSG00000111640"], ["ACTB"])
+
+
+def test_resolve_species_reports_unsupported_directions() -> None:
+    assert resolve_species(["g1"], ["foo"], directed="felis_catus") == {
+        "species": "unknown",
+        "method": "directions",
+        "reason": "unsupported species 'felis_catus'",
+    }
+    assert resolve_species(["g1"], ["foo"], directed="unknown") == {
+        "species": "unknown",
+        "method": "directions",
+        "reason": "caller override",
+    }
+
+
+_HUMAN_SYMBOLS = ["ACTB", "GAPDH", "BRCA1", "RPL31", "XIST"]
+_UNPREFIXED_IDS = ["g1", "g2", "g3", "g4", "g5"]
+
+
+def test_resolve_species_settles_on_symbols_of_a_cached_reference(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def no_download(*_args, **_kwargs):
+        raise AssertionError("a cached reference must not be downloaded")
+
+    monkeypatch.setattr(identity, "ensure_reference", no_download)
+    # An earlier download left the human table in the cache.
+    _human_reference(tmp_path)
+
+    result = resolve_species(_UNPREFIXED_IDS, _HUMAN_SYMBOLS, cacheDir=tmp_path)
+
+    assert result["species"] == "homo_sapiens"
+    assert result["method"] == "symbolOverlap"
+    assert result["reason"] == "clear symbol overlap for homo_sapiens (5 hits)"
+    assert result["overlap"]["scores"] == {
+        "homo_sapiens": {"hits": 5, "share": 1.0, "nQuery": 5, "nReferenceSymbols": 10}
+    }
+    assert "downloadErrors" not in result
+
+
+def test_resolve_species_downloads_missing_references_when_allowed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    human = _human_reference(tmp_path / "fixtures")
+    mouse = _mouse_reference(tmp_path / "fixtures")
+    requested: list[str] = []
+
+    def download(species: str, *, cacheDir=None):
+        requested.append(species)
+        return {"homo_sapiens": human, "mus_musculus": mouse}[species]
+
+    monkeypatch.setattr(identity, "ensure_reference", download)
+
+    result = resolve_species(
+        _UNPREFIXED_IDS, _HUMAN_SYMBOLS, cacheDir=tmp_path / "empty", allowDownload=True
+    )
+
+    assert requested == ["homo_sapiens", "mus_musculus"]
+    assert result["species"] == "homo_sapiens"
+    assert result["overlap"]["second"] == "mus_musculus"
+    assert "downloadErrors" not in result
+
+
+def test_resolve_species_reports_failed_downloads_and_keeps_cached_references(
+    tmp_path: Path, monkeypatch
+) -> None:
+    requested: list[str] = []
+
+    def offline(species: str, *, cacheDir=None):
+        requested.append(species)
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(identity, "ensure_reference", offline)
+    _human_reference(tmp_path / "cache")
+
+    settled = resolve_species(
+        _UNPREFIXED_IDS, _HUMAN_SYMBOLS, cacheDir=tmp_path / "cache", allowDownload=True
+    )
+    unsettled = resolve_species(
+        ["g1", "g2"], ["foo", "bar"], cacheDir=tmp_path / "empty", allowDownload=True
+    )
+
+    # Only the reference that is not cached is requested.
+    assert requested == ["mus_musculus", "homo_sapiens", "mus_musculus"]
+    assert (settled["species"], settled["method"]) == ("homo_sapiens", "symbolOverlap")
+    assert settled["downloadErrors"] == ["mus_musculus: network unreachable"]
+    assert (unsettled["species"], unsettled["method"]) == ("unknown", "inconclusive")
+    assert unsettled["candidates"] == []
+    assert unsettled["downloadErrors"] == [
+        "homo_sapiens: network unreachable",
+        "mus_musculus: network unreachable",
+    ]
+
+
+def test_backfill_symbols_keeps_names_that_are_not_ids(tmp_path: Path) -> None:
+    reference = _human_reference(tmp_path)
+
+    result = backfill_symbols(
+        ["ENSG00000075624", "ENSG00000111640"], ["MyActb", ""], reference
+    )
+
+    assert result == {
+        "symbols": ["MyActb", "GAPDH"],
+        "nRecovered": 1,
+        "nFeatures": 2,
+        "joinRate": 0.5,
+        "idsEqualNames": False,
+    }
+
+
+def test_observe_families_skips_families_that_cannot_be_observed() -> None:
+    unknown = observe_families(
+        species="unknown", ids=["g1"], symbols=["MT-CO1"], reference=None
+    )
+    assert [
+        (item["family"], item["method"], item["skipped"], item["defaultExclude"])
+        for item in unknown
+    ] == [
+        ("mitochondrial", "skipped", "speciesUnknown", True),
+        ("ribosomal", "skipped", "speciesUnknown", True),
+        ("cellCycle", "skipped", "speciesUnknown", False),
+        ("sex", "skipped", "speciesUnknown", False),
+        ("histone", "skipped", "speciesUnknown", True),
+    ]
+    assert all(item["count"] == 0 for item in unknown)
+
+    # Chromosome families need a reference, and blank symbols match nothing
+    # without making an empty match suspect.
+    blank = {
+        item["family"]: item
+        for item in observe_families(
+            species="homo_sapiens", ids=["g1", "g2"], symbols=["", ""], reference=None
+        )
+    }
+    assert blank["mitochondrial"]["skipped"] == "referenceUnavailable"
+    assert blank["sex"]["skipped"] == "referenceUnavailable"
+    assert blank["cellCycle"]["skipped"] == "catalogUnavailable"
+    for family in ("ribosomal", "histone"):
+        assert blank[family]["count"] == 0
+        assert "skipped" not in blank[family]
+        assert "catalogSuspect" not in blank[family]
+
+    # Zebrafish has no histone prefixes to match.
+    zebrafish = {
+        item["family"]: item
+        for item in observe_families(
+            species="danio_rerio", ids=["g1"], symbols=["rpl3"], reference=None
+        )
+    }
+    assert zebrafish["histone"]["skipped"] == "catalogUnavailable"
+    assert zebrafish["histone"]["defaultExclude"] is True
+    assert zebrafish["ribosomal"]["examples"] == ["rpl3"]
+
+
+def test_exogenous_candidates_skip_features_without_a_label() -> None:
+    ranked = exogenous_candidates(["", "GFP"], ["", ""], reference=None)
+
+    # GFP scores for its token and for having no name.
+    assert ranked == [{"id": "GFP", "name": "", "score": 4}]

@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.optimize import curve_fit
 from scipy.sparse import coo_matrix
+from scipy.stats import norm
 
 from scarf.embeddings.initialization import initial_embedding
 from scarf.embeddings.umap import (
@@ -124,15 +126,21 @@ def test_fit_transform_runs_short_embedding():
 
     assert embedding.shape == (n_cells, 2)
     assert np.all(np.isfinite(embedding))
-    assert np.all(np.ptp(embedding, axis=0) > 0)
     assert not np.array_equal(embedding, ini_embed)
     np.testing.assert_array_equal(embedding, repeated_embedding)
-    np.testing.assert_allclose(
-        [a, b],
-        [0.58303002, 1.33416699],
-        rtol=1e-6,
-        atol=1e-6,
+    # The random start has no ring structure; the layout pulls ring neighbors
+    # well inside the typical pairwise distance.
+    distances = np.linalg.norm(embedding[:, None] - embedding[None], axis=2)
+    ring_neighbors = distances[np.arange(n_cells), (np.arange(n_cells) + 1) % n_cells]
+    assert ring_neighbors.mean() < 0.5 * distances[np.triu_indices(n_cells, 1)].mean()
+    # UMAP fits 1 / (1 + a * d ** (2 * b)) to the target membership curve.
+    spread, min_dist = 1.0, 0.5
+    grid = np.linspace(0, spread * 3, 300)
+    target = np.where(grid < min_dist, 1.0, np.exp(-(grid - min_dist) / spread))
+    (expected_a, expected_b), _ = curve_fit(
+        lambda d, a, b: 1.0 / (1.0 + a * d ** (2 * b)), grid, target
     )
+    np.testing.assert_allclose([a, b], [expected_a, expected_b], rtol=1e-6)
     np.testing.assert_allclose([a, b], [repeated_a, repeated_b], rtol=0, atol=0)
 
 
@@ -161,6 +169,21 @@ def test_initial_embedding_matches_regression_values():
         rtol=1e-6,
         atol=1e-6,
     )
+    # Independently: principal-component scores of the centers, each clipped
+    # to the 10th and 90th percentiles of a normal fitted around its median,
+    # then read for each cell's label. Component signs are arbitrary.
+    centered = centers - centers.mean(axis=0)
+    _, _, components = np.linalg.svd(centered, full_matrices=False)
+    for component in range(2):
+        scores = centered @ components[component]
+        center, scale = np.median(scores), np.std(scores)
+        clipped = np.clip(
+            scores,
+            norm.ppf(0.1, center, scale),
+            norm.ppf(0.9, center, scale),
+        )[labels]
+        sign = np.sign(actual[0, component] * clipped[0])
+        np.testing.assert_allclose(actual[:, component], sign * clipped, atol=1e-6)
 
 
 def test_initial_embedding_is_repeatable_when_pca_uses_the_randomized_solver():
@@ -178,33 +201,68 @@ def test_initial_embedding_is_repeatable_when_pca_uses_the_randomized_solver():
 def test_initial_embedding_accepts_integral_float_labels_and_rejects_invalid():
     centers = np.eye(3)
     integral = initial_embedding(centers, np.array([0.0, 1.0, 2.0]), 2)
-    assert integral.shape == (3, 2)
+    np.testing.assert_array_equal(
+        integral, initial_embedding(centers, np.array([0, 1, 2]), 2)
+    )
 
-    for labels in (
-        np.array([0.0, 1.5]),
-        np.array([0.0, -1.0]),
-        np.array([0.0, np.nan]),
-        np.array([0, 3]),
+    for labels, message in (
+        (np.array([0.0, 1.5]), "must be finite integers"),
+        (np.array([0.0, np.nan]), "must be finite integers"),
+        (np.array([0.0, -1.0]), "outside the center range"),
+        (np.array([0, 3]), "outside the center range"),
+        (np.array([[0, 1], [1, 2]]), "must be one-dimensional"),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             initial_embedding(centers, labels, 2)
+    with pytest.raises(TypeError, match="must contain numeric integers"):
+        initial_embedding(centers, np.array(["0", "1"]), 2)
+    # Three centers in three dimensions support at most three components.
+    for n_components in (0, 4):
+        with pytest.raises(ValueError, match="cannot exceed the center count"):
+            initial_embedding(centers, np.array([0, 1]), n_components)
+
+
+def _same_label_neighbor_fraction(values: np.ndarray, labels: np.ndarray) -> float:
+    """Fraction of each cell's ten nearest neighbors that share its label."""
+    distances = np.linalg.norm(values.T[:, None] - values.T[None], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    nearest = np.argsort(distances, axis=1)[:, :10]
+    return float(np.mean(labels[nearest] == labels[:, None]))
 
 
 def test_fit_harmony_corrects_batch_structure():
     rng = np.random.default_rng(0)
-    n_cells = 180
-    n_dims = 12
-    batch = rng.integers(0, 3, n_cells)
-    batch_effect = rng.normal(scale=2.0, size=(3, n_dims))
-    data = rng.normal(size=(n_dims, n_cells))
-    for cell_idx, batch_id in enumerate(batch):
-        data[:, cell_idx] += batch_effect[batch_id]
+    # Two cell types present in every one of three shifted batches.
+    batch = np.repeat(np.arange(3), 60)
+    cell_type = np.tile(np.repeat(np.arange(2), 30), 3)
+    type_centers = np.zeros((2, 6))
+    type_centers[0, 0] = type_centers[1, 1] = 5.0
+    batch_shift = rng.normal(scale=1.5, size=(3, 6))
+    data = (
+        rng.normal(scale=0.5, size=(180, 6))
+        + type_centers[cell_type]
+        + batch_shift[batch]
+    ).T
 
-    meta = pd.DataFrame({"batch": [f"batch_{x}" for x in batch]})
+    def batch_spread(values: np.ndarray) -> float:
+        """Mean distance of batch centroids from their mean, within cell types."""
+        spreads = []
+        for kind in range(2):
+            centroids = np.stack(
+                [
+                    values[:, (batch == level) & (cell_type == kind)].mean(axis=1)
+                    for level in range(3)
+                ]
+            )
+            spreads.append(
+                np.linalg.norm(centroids - centroids.mean(axis=0), axis=1).mean()
+            )
+        return float(np.mean(spreads))
+
     corrected = fit_harmony(
         data,
-        meta,
-        nclust=15,
+        pd.DataFrame({"batch": [f"batch_{x}" for x in batch]}),
+        nclust=4,
         max_iter_harmony=4,
         max_iter_kmeans=5,
         random_state=0,
@@ -212,8 +270,21 @@ def test_fit_harmony_corrects_batch_structure():
 
     assert corrected.shape == data.shape
     assert np.all(np.isfinite(corrected))
-    batch_means_before = [data[:, batch == b].mean(axis=1) for b in range(3)]
-    batch_means_after = [corrected[:, batch == b].mean(axis=1) for b in range(3)]
-    spread_before = np.std([m.mean() for m in batch_means_before])
-    spread_after = np.std([m.mean() for m in batch_means_after])
-    assert spread_after <= spread_before
+    assert batch_spread(corrected) < 0.2 * batch_spread(data)
+    # Batches separate the raw neighborhoods; after correction a cell's
+    # neighbors come from all three batches, about one third from its own.
+    assert _same_label_neighbor_fraction(data, batch) > 0.9
+    assert _same_label_neighbor_fraction(corrected, batch) < 0.45
+    # Cell types stay apart. Every batch holds both types equally, so removing
+    # batch deviations around each cluster keeps the gap between type centroids.
+    assert _same_label_neighbor_fraction(corrected, cell_type) == 1.0
+
+    def type_gap(values: np.ndarray) -> float:
+        return float(
+            np.linalg.norm(
+                values[:, cell_type == 0].mean(axis=1)
+                - values[:, cell_type == 1].mean(axis=1)
+            )
+        )
+
+    np.testing.assert_allclose(type_gap(corrected), type_gap(data), rtol=1e-3)

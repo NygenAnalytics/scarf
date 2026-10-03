@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
+from threadpoolctl import threadpool_limits
 
 from scarf.quality_control.hto import hto_demux
 
@@ -73,7 +74,10 @@ def test_hto_demux_matches_seurat_5_5_1_golden_calls() -> None:
         dtype=np.int64,
     )
 
-    assignments = hto_demux(counts, random_seed=provenance["randomSeed"])
+    # The 100 k-means restarts over 1,000 cells are too small to gain from
+    # OpenMP threads, and threads contend with other workers of a parallel run.
+    with threadpool_limits(limits=1):
+        assignments = hto_demux(counts, random_seed=provenance["randomSeed"])
 
     np.testing.assert_array_equal(
         assignments.to_numpy(),

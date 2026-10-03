@@ -313,9 +313,28 @@ def test_teaseq_recipe_is_explicit_but_excluded_from_all():
     assert parameters["neighborhood"]["selfFreeNeighbors"] == 20
 
 
-def test_all_cannot_silently_ignore_named_external_dataset():
-    with pytest.raises(SystemExit):
+def test_all_cannot_silently_ignore_named_external_dataset(capsys):
+    with pytest.raises(SystemExit) as exited:
         generator.main(["--all", generator.TEASEQ_DATASET])
+
+    assert exited.value.code == 2
+    assert (
+        capsys.readouterr()
+        .err.rstrip()
+        .endswith("error: --all cannot be combined with named datasets")
+    )
+
+
+def test_a_run_needs_named_datasets_or_all(capsys):
+    with pytest.raises(SystemExit) as exited:
+        generator.main([])
+
+    assert exited.value.code == 2
+    assert (
+        capsys.readouterr()
+        .err.rstrip()
+        .endswith("error: name at least one dataset or pass --all")
+    )
 
 
 def test_teaseq_annotations_map_original_barcodes_through_well_suffix(tmp_path):

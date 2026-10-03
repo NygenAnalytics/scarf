@@ -481,3 +481,110 @@ def test_run_umap_rejects_non_artifact_graph_before_resolution() -> None:
             "RNA",
             np.zeros((2, 2)),
         )
+
+
+def _neighbors_payload(
+    store: _BareGraphStore,
+    *,
+    indices: np.ndarray | None = None,
+    distances: np.ndarray | None = None,
+    attrs: dict[str, object] | None = None,
+) -> ArtifactRef:
+    """Store a neighbors artifact over four cells with two neighbors each."""
+    ref = _complete_artifact(
+        store,
+        "neighbors",
+        arrays={
+            "indices": (
+                np.array([[1, 2], [0, 2], [0, 1], [0, 1]], dtype=np.uint32)
+                if indices is None
+                else indices
+            ),
+            "distances": (
+                np.full((4, 2), 0.5, dtype=np.float32)
+                if distances is None
+                else distances
+            ),
+        },
+    )
+    group = store.zw[artifact_path(ref)]
+    group.attrs.update({"n_cells": 4, "n_neighbors": 2, "self_hit_rate": 100.0})
+    group.attrs.update(attrs or {})
+    for name, value in (attrs or {}).items():
+        if value is None:
+            del group.attrs[name]
+    return ref
+
+
+def test_neighbor_payload_validation_requires_a_neighbors_artifact() -> None:
+    from scarf.graph.distances import (
+        validate_distance_provenance,
+        validate_neighbors_payload,
+    )
+
+    store = _bare_store()
+    connectivity = _ref("connectivity_map", "a")
+
+    with pytest.raises(ValueError, match="Distance provenance requires a neighbors"):
+        validate_distance_provenance(store.zw, connectivity)
+    with pytest.raises(ValueError, match="validation requires a neighbors artifact"):
+        validate_neighbors_payload(store.zw, connectivity)
+
+
+def test_neighbor_payload_validation_returns_the_validated_dimensions() -> None:
+    from scarf.graph.distances import validate_neighbors_payload
+
+    store = _bare_store()
+    for rate in (0, 37.5, 100):
+        payload = validate_neighbors_payload(
+            store.zw, _neighbors_payload(store, attrs={"self_hit_rate": rate})
+        )
+        assert (payload.n_cells, payload.n_neighbors) == (4, 2)
+        np.testing.assert_array_equal(payload.indices[:, 0], [1, 0, 0, 0])
+
+
+@pytest.mark.parametrize("rate", [None, True, "100", float("nan"), -1.0, 100.5])
+def test_neighbor_payload_validation_rejects_an_invalid_self_hit_rate(rate) -> None:
+    from scarf.graph.distances import validate_neighbors_payload
+
+    store = _bare_store()
+    neighbors = _neighbors_payload(store, attrs={"self_hit_rate": rate})
+
+    with pytest.raises(
+        ArtifactResolutionError, match="invalid self_hit_rate"
+    ) as caught:
+        validate_neighbors_payload(store.zw, neighbors)
+    assert caught.value.code == "corrupt_payload"
+    assert caught.value.context["artifact_id"] == neighbors.artifact_id
+
+
+@pytest.mark.parametrize(
+    ("indices", "distances"),
+    [
+        (np.array([[1, 2], [0, 2], [0, 1], [0, 4]], dtype=np.uint32), None),
+        (np.array([[1, 2], [0, 2], [2, 1], [0, 1]], dtype=np.uint32), None),
+        (None, np.array([[0.5, 0.5]] * 3 + [[0.5, np.inf]], dtype=np.float32)),
+        (None, np.array([[0.5, 0.5]] * 3 + [[0.5, np.nan]], dtype=np.float32)),
+        (None, np.array([[0.5, 0.5]] * 3 + [[0.5, -0.5]], dtype=np.float32)),
+    ],
+    ids=[
+        "index_past_last_cell",
+        "self_neighbor",
+        "infinite_distance",
+        "nan_distance",
+        "negative_distance",
+    ],
+)
+def test_neighbor_payload_validation_rejects_invalid_indices_or_distances(
+    indices, distances
+) -> None:
+    from scarf.graph.distances import validate_neighbors_payload
+
+    store = _bare_store()
+    neighbors = _neighbors_payload(store, indices=indices, distances=distances)
+
+    with pytest.raises(
+        ArtifactResolutionError, match="contain invalid indices or distances"
+    ) as caught:
+        validate_neighbors_payload(store.zw, neighbors)
+    assert caught.value.code == "corrupt_payload"

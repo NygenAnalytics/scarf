@@ -148,6 +148,11 @@ def test_writer_static_method_contracts_are_stable():
     }.items():
         for name in names:
             assert isinstance(inspect.getattr_static(cls, name), staticmethod)
+    # Called on the class, the offsets move each source feature range of an
+    # assay to the next free columns of that assay.
+    assert CrToZarr._prep_feat_index_offset(
+        {"RNA": ((0, 2), (5, 8)), "ADT": ((2, 5),)}
+    ) == {"RNA": [0, -3], "ADT": [-2]}
 
 
 def test_writer_storage_wrappers_remain_distinct_objects(

@@ -24,7 +24,9 @@ from scarf.storage.feature_selection import (
     _write_feature_selection,
 )
 from scarf.storage.selections import read_stored_selection_mask
+from scarf.utils.logging import logger
 from tests.test_graph_operation_paths import N_CELLS, open_store, write_graph_template
+from tests.qc_helpers import reference_mad_keep
 
 # A cell-selection input that names no artifact.
 MALFORMED_SELECTION = {
@@ -360,6 +362,13 @@ def test_auto_filter_cells_defaults_to_the_qc_metrics_the_store_has(qc_store) ->
 
     parameters = store.inspect_artifact(retained).parameters
     assert parameters["attrs"] == ["RNA_nCounts", "RNA_nFeatures"]
+    metrics = {
+        attr: np.asarray(store.cells.fetch_all(attr), dtype=float)
+        for attr in parameters["attrs"]
+    }
+    np.testing.assert_array_equal(
+        _selected(store, retained), reference_mad_keep(metrics, min_cells=20)
+    )
 
 
 @pytest.mark.parametrize(
@@ -510,6 +519,58 @@ def test_cell_cycle_scoring_requires_an_rna_assay_and_an_artifact_ref(
         store.run_cell_cycle_scoring(refs["cells"], from_assay="ADT")
     with pytest.raises(TypeError, match="cell_selection must be an ArtifactRef"):
         store.run_cell_cycle_scoring("I")
+
+
+def test_cell_cycle_scoring_matches_gene_names_and_validates_gene_lists(
+    qc_store,
+) -> None:
+    store, refs = qc_store
+    cells = refs["cells"]
+    for options, error, message in (
+        ({"s_genes": "RNA0"}, TypeError, "^s_genes must be a sequence of gene names$"),
+        (
+            {"s_genes": ["RNA0"], "g2m_genes": ["RNA1", 2]},
+            TypeError,
+            "^g2m_genes must be a sequence of gene names$",
+        ),
+        (
+            {"s_genes": ["RNA0"], "g2m_genes": ["RNA1"], "log_transform": 1},
+            TypeError,
+            "^log_transform must be a bool$",
+        ),
+        (
+            {"s_genes": ["absent"], "g2m_genes": ["RNA1"]},
+            ValueError,
+            "^None of the s_genes match the assay feature names$",
+        ),
+    ):
+        with pytest.raises(error, match=message):
+            store.run_cell_cycle_scoring(cells, **options)
+    assert store.list_artifacts(kind="cell_cycle", from_assay="RNA") == []
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        ref = store.run_cell_cycle_scoring(
+            cells,
+            s_genes=["rna0", "RNA2", "absent"],
+            g2m_genes=["Rna1", "RNA3"],
+            n_bins=3,
+        )
+    finally:
+        logger.remove(sink)
+
+    # Names match without case; the control size defaults to the shorter list.
+    parameters = store.inspect_artifact(ref).parameters
+    assert parameters["s_gene_indices"] == [0, 2]
+    assert parameters["g2m_gene_indices"] == [1, 3]
+    assert parameters["control_size"] == 2
+    assert messages == ["1 of 3 s_genes were not found in the assay feature names"]
+    phase = store.load_artifact(ref)["phase"][:]
+    assert phase.shape == (N_CELLS,)
+    assert set(phase) <= {"G1", "S", "G2M"}
 
 
 def test_prevalent_peak_selection_requires_an_artifact_ref(qc_store) -> None:

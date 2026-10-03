@@ -672,8 +672,21 @@ def test_metric_silhouette(datastore, connectivity_graph, leiden_clustering):
     )
 
     assert scores is not None
-    assert np.isfinite(scores).any()
-    assert np.all(np.abs(scores[np.isfinite(scores)]) <= 1)
+    n_clusters = np.unique(datastore.load_artifact(leiden_clustering)["values"][:]).size
+    # One score per Leiden cluster; each has at least two cells.
+    assert scores.shape == (n_clusters,)
+    assert np.isfinite(scores).all()
+    assert np.all(np.abs(scores) <= 1)
+    # Graph clusters are on average closer within than to their nearest cluster.
+    assert scores.mean() > 0
+    np.testing.assert_array_equal(
+        datastore.metric_graph_silhouette(
+            neighbors,
+            leiden_clustering,
+            random_seed=42,
+        ),
+        scores,
+    )
 
 
 def test_small_cluster_does_not_invalidate_other_silhouette_scores():
@@ -718,7 +731,9 @@ def test_small_cluster_does_not_invalidate_other_silhouette_scores():
 
     assert scores is not None
     assert np.isnan(scores[0])
-    assert np.isfinite(scores[1:]).all()
+    # Tight squares about 14 apart: within distances near 0.1 give scores
+    # of about 1 - 0.1 / 14.
+    assert np.all(scores[1:] > 0.98)
 
 
 @pytest.mark.parametrize("metric", ["ari", "nmi"])
@@ -1115,3 +1130,357 @@ def test_silhouette_scoring_missing_cluster_labels(datastore):
         distance_metric="l2",
     )
     assert result is None
+
+
+class _LabelledCells:
+    """Cell metadata holding one cluster column for silhouette scoring."""
+
+    def __init__(self, labels: np.ndarray) -> None:
+        self.labels = np.asarray(labels)
+        self.columns = ["RNA_cluster"]
+
+    def fetch(self, column, key="I"):
+        assert (column, key) == ("RNA_cluster", "I")
+        return self.labels
+
+
+def _silhouette(labels, data, *, graph=None, **options):
+    from types import SimpleNamespace
+
+    labels = np.asarray(labels)
+    if graph is None and "neighbor_indices" not in options:
+        graph = csr_matrix(np.ones((len(labels), len(labels))) - np.eye(len(labels)))
+    return silhouette_scoring(
+        SimpleNamespace(cells=_LabelledCells(labels)),
+        graph,
+        np.asarray(data, dtype=np.float64),
+        "RNA",
+        "cluster",
+        **({"distance_metric": "l2", "random_seed": 3} | options),
+    )
+
+
+def test_silhouette_scores_follow_cluster_separation():
+    rng = np.random.default_rng(8)
+    labels = np.repeat([0, 1], 12)
+    # Two clusters of unit spread, far apart and then overlapping.
+    separated = rng.normal(size=(24, 3)) + np.repeat([[0.0] * 3, [50.0] * 3], 12, 0)
+    overlapping = rng.normal(size=(24, 3))
+
+    far = _silhouette(labels, separated, sample_size=4)
+    near = _silhouette(labels, overlapping, sample_size=4)
+
+    assert far.shape == near.shape == (2,)
+    assert np.all(far > 0.9)
+    assert np.all(np.abs(near) < 0.5)
+    # Identical cells have zero distance to both clusters, which scores zero.
+    np.testing.assert_array_equal(
+        _silhouette(labels, np.zeros((24, 3)), sample_size=4), [0.0, 0.0]
+    )
+
+
+def test_silhouette_accepts_streamed_neighbors_instead_of_a_graph():
+    labels = np.repeat([0, 1], 6)
+    data = (
+        np.vstack([np.zeros((6, 2)), np.full((6, 2), 10.0)])
+        + np.arange(12)[:, None] * 0.01
+    )
+    indices = np.array([[(cell + 1) % 12, (cell + 2) % 12] for cell in range(12)])
+
+    streamed = _silhouette(
+        labels,
+        data,
+        neighbor_indices=indices,
+        neighbor_distances=np.ones(indices.shape),
+        sample_size=3,
+    )
+
+    assert streamed.shape == (2,)
+    assert np.all(streamed > 0.9)
+
+
+def test_silhouette_scoring_validates_inputs():
+    labels = np.repeat([0, 1], 4)
+    data = np.arange(16, dtype=np.float64).reshape(8, 2)
+
+    with pytest.raises(ValueError, match="sample_size must be greater than zero"):
+        _silhouette(labels, data, sample_size=0)
+    with pytest.raises(ValueError, match="Embedding data and cluster labels"):
+        _silhouette(labels, data[:-1])
+    with pytest.raises(ValueError, match="KNN graph and cluster labels"):
+        _silhouette(labels, data, graph=csr_matrix((7, 7)))
+    with pytest.raises(ValueError, match="Provide a KNN graph or neighbor indices"):
+        _silhouette(labels, data, neighbor_indices=np.zeros((8, 2), dtype=int))
+    with pytest.raises(ValueError, match="Unsupported neighbor metric: manhattan"):
+        _silhouette(labels, data, distance_metric="manhattan")
+
+
+def test_silhouette_needs_two_clusters():
+    from scarf.utils import logger
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        scores = _silhouette(
+            np.zeros(6, dtype=int), np.random.default_rng(1).random((6, 2))
+        )
+    finally:
+        logger.remove(sink)
+
+    assert scores.shape == (1,)
+    assert np.isnan(scores).all()
+    assert messages == ["Silhouette scoring requires at least two clusters"]
+
+
+def test_cluster_sampling_draws_disjoint_seeded_groups():
+    from scarf.metrics.silhouette import _sample_cluster_rows, process_cluster
+
+    data = np.arange(20, dtype=np.float64).reshape(10, 2)
+    cells = np.array([1, 3, 4, 6, 8, 9])
+
+    first, second = process_cluster(cells, data, 3)
+    repeated = process_cluster(cells, data, 3, rng=np.random.default_rng(4444))
+
+    # Row i of data is [2i, 2i + 1], so each sampled row names its cell. The
+    # groups are read in row order and split the cluster between them.
+    first_cells = (first[:, 0] // 2).astype(int).tolist()
+    second_cells = (second[:, 0] // 2).astype(int).tolist()
+    assert first_cells == sorted(first_cells)
+    assert second_cells == sorted(second_cells)
+    assert sorted(first_cells + second_cells) == cells.tolist()
+    np.testing.assert_array_equal(first, repeated[0])
+    np.testing.assert_array_equal(second, repeated[1])
+    for k in (0, 4):
+        with pytest.raises(ValueError, match="at least 2 \\* k cells"):
+            process_cluster(cells, data, k)
+    for count in (0, 7):
+        with pytest.raises(ValueError, match="Sample count must fit"):
+            _sample_cluster_rows(cells, data, count, np.random.default_rng(0))
+
+
+def test_read_matrix_rows_reads_numpy_zarr_and_chunked_rows():
+    from scarf.matrix import ChunkedArray
+    from scarf.metrics._rows import read_matrix_rows
+
+    values = np.arange(20.0).reshape(5, 4)
+    stored = zarr.open_group(store=MemoryStore(), mode="w").create_array(
+        "values", data=values, chunks=(2, 4)
+    )
+    rows = np.array([3, 0, 4])
+
+    for source in (
+        values,
+        stored,
+        ChunkedArray.from_numpy(values, block_size=2, nthreads=1),
+    ):
+        np.testing.assert_array_equal(read_matrix_rows(source, rows), values[rows])
+
+
+@pytest.fixture(scope="module")
+def metric_store_template(tmp_path_factory):
+    """Forty cells in two expression groups with a PCA graph and clusterings."""
+    from scarf import DataStore
+    from tests.storage_helpers import write_count_store
+
+    rng = np.random.default_rng(17)
+    rates = np.ones((2, 30))
+    rates[0, :10] = rates[1, 10:20] = 8.0
+    counts = np.vstack([rng.poisson(rates[group], size=(20, 30)) for group in (0, 1)])
+    zarr_loc = tmp_path_factory.mktemp("metric_store") / "store.zarr"
+    write_count_store(str(zarr_loc), {"RNA": counts + 1}, "uint16")
+    store = DataStore(
+        str(zarr_loc), default_assay="RNA", min_features_per_cell=0, nthreads=1
+    )
+    cells = store.snapshot_cell_selection()
+    normalized = store.run_normalization(
+        cells, store.select_all_features(from_assay="RNA")
+    )
+    pca = store.run_pca(normalized, dims=3)
+    neighbors = store.query_neighbors(store.build_ann_index(pca), k=5)
+    graph = store.build_connectivity_map(neighbors)
+    store.cells.insert("batch", np.arange(40) % 2)
+    store.cells.insert("first_half", np.arange(40) < 20)
+    groups = np.repeat([0, 1], 20)
+    refs = {
+        "cells": cells,
+        "normalized": normalized,
+        "pca": pca,
+        "lsi": store.run_lsi(normalized, dims=2),
+        "neighbors": neighbors,
+        "graph": graph,
+        "clusters": _clustering_artifact(store, groups, selection=cells),
+        "subset_clusters": _clustering_artifact(
+            store,
+            groups[:20] + np.arange(20) % 2,
+            selection=store.snapshot_cell_selection("first_half"),
+        ),
+        "datastore_clusters": _clustering_artifact(
+            store, groups, selection=cells, scope="datastore"
+        ),
+    }
+    return zarr_loc, refs
+
+
+@pytest.fixture
+def metric_store(metric_store_template, tmp_path):
+    """A writable copy of the metric template."""
+    import shutil
+
+    from scarf import DataStore
+
+    zarr_loc, refs = metric_store_template
+    target = tmp_path / "store.zarr"
+    shutil.copytree(zarr_loc, target)
+    return (
+        DataStore(
+            str(target), default_assay="RNA", min_features_per_cell=0, nthreads=1
+        ),
+        refs,
+    )
+
+
+def _datastore_neighbors() -> ArtifactRef:
+    from scarf.storage.artifacts import new_artifact_id
+
+    return ArtifactRef(
+        scope="datastore", kind="neighbors", artifact_id=new_artifact_id()
+    )
+
+
+def test_neighbor_metrics_require_an_assay_neighbors_reference(metric_store):
+    from scarf.storage.errors import ArtifactResolutionError
+
+    store, refs = metric_store
+
+    for metric in (store.metric_ilisi, store.metric_clisi):
+        with pytest.raises(TypeError, match="neighbors must be an artifact reference"):
+            metric("batch", "neighbors")
+        with pytest.raises(ArtifactResolutionError, match="neighbors artifact") as kind:
+            metric("batch", refs["graph"])
+        assert kind.value.code == "wrong_kind"
+        with pytest.raises(ArtifactResolutionError, match="assay-scoped") as scope:
+            metric("batch", _datastore_neighbors())
+        assert scope.value.code == "wrong_scope"
+
+
+def test_graph_connectivity_metric_checks_the_graph_reference_and_rows(metric_store):
+    store, refs = metric_store
+    payload = store.load_artifact(refs["graph"])
+    weights = payload["weights"][:]
+    # The stored labels are read for the graph's cells; zero weights are no edge.
+    assert store.metric_graph_connectivity("batch", refs["graph"]) == pytest.approx(
+        _materialized_graph_connectivity(
+            payload["edges"][:][weights > 0], np.arange(40) % 2
+        )
+    )
+
+    with pytest.raises(TypeError, match="graph must be an ArtifactRef"):
+        store.metric_graph_connectivity("batch", "graph")
+    store.zw[store.inspect_artifact(refs["graph"]).path].attrs["n_cells"] = 39
+    with pytest.raises(ValueError, match="Graph labels must match the number of cells"):
+        store.metric_graph_connectivity("batch", refs["graph"])
+
+
+def test_graph_silhouette_requires_clusters_over_the_neighbor_cells(metric_store):
+    store, refs = metric_store
+    scores = store.metric_graph_silhouette(refs["neighbors"], refs["clusters"])
+    # The two expression groups are the clusters, so both score positively.
+    assert scores.shape == (2,)
+    assert np.all(scores > 0)
+
+    with pytest.raises(ValueError, match="use different cell selections"):
+        store.metric_graph_silhouette(refs["neighbors"], refs["subset_clusters"])
+
+
+def test_cluster_separability_metric_validates_its_arguments(metric_store):
+    store, refs = metric_store
+    pca, clusters = refs["pca"], refs["clusters"]
+
+    for invalid, message in (
+        ([clusters], "non-empty mapping of names to refs"),
+        ({}, "non-empty mapping of names to refs"),
+        ({"": clusters}, "cluster names must be non-empty strings"),
+        ({"groups": "clusters"}, "cluster values must be ArtifactRefs"),
+    ):
+        with pytest.raises(TypeError, match=message):
+            store.metric_cluster_separability(pca, invalid)
+    with pytest.raises(ValueError, match="must reference a PCA reduction artifact"):
+        store.metric_cluster_separability(refs["lsi"], {"groups": clusters})
+    with pytest.raises(
+        ValueError, match="assay-scoped clustering artifact for the PCA"
+    ):
+        store.metric_cluster_separability(pca, {"groups": refs["datastore_clusters"]})
+    with pytest.raises(ValueError, match="does not use the PCA cell selection"):
+        store.metric_cluster_separability(pca, {"groups": refs["subset_clusters"]})
+
+
+def _replace_provenance_input(store, ref: ArtifactRef, name: str, value) -> None:
+    group = store.zw[store.inspect_artifact(ref).path]
+    provenance = dict(group.attrs["provenance"])
+    inputs = dict(provenance["inputs"])
+    if value is None:
+        del inputs[name]
+    else:
+        inputs[name] = value
+    provenance["inputs"] = inputs
+    group.attrs["provenance"] = provenance
+
+
+def _datastore_scoped_normalized(store, normalized: ArtifactRef) -> ArtifactRef:
+    """Copy a normalized record's selection inputs into a datastore-scoped record."""
+    from scarf.storage.artifact_writer import artifact_transaction, plan_artifact
+
+    inputs = store.inspect_artifact(normalized).inputs
+    planned = plan_artifact(
+        store.zw,
+        scope="datastore",
+        kind="normalized",
+        operation="run_normalization",
+        parameters={},
+        inputs={
+            "cell_selection": ArtifactRef.from_dict(inputs["cell_selection"]),
+            "feature_selection": ArtifactRef.from_dict(inputs["feature_selection"]),
+        },
+        execution_options={},
+    )
+    with artifact_transaction(store.zw, planned):
+        pass
+    return planned.ref
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "no_coordinates",
+        "short_coordinates",
+        "no_feature_selection",
+        "datastore_normalized",
+    ],
+)
+def test_cluster_separability_metric_rejects_damaged_pca_records(metric_store, damage):
+    from scarf.storage.errors import ArtifactResolutionError
+
+    store, refs = metric_store
+    pca_group = store.zw[store.inspect_artifact(refs["pca"]).path]
+    error, message = ValueError, "PCA reduction coordinates are missing"
+    if damage == "no_coordinates":
+        del pca_group["data"]
+    elif damage == "short_coordinates":
+        pca_group.create_array(
+            "data", data=np.ones((39, 3), np.float32), overwrite=True
+        )
+        message = "does not align with PCA rows"
+    elif damage == "no_feature_selection":
+        _replace_provenance_input(store, refs["normalized"], "feature_selection", None)
+        error, message = ArtifactResolutionError, "missing its feature_selection input"
+    else:
+        # A normalized input outside every assay has no feature space.
+        detached = _datastore_scoped_normalized(store, refs["normalized"])
+        _replace_provenance_input(store, refs["pca"], "normalized", detached.to_dict())
+        error, message = ArtifactResolutionError, "Normalized feature selection has no"
+
+    with pytest.raises(error, match=message):
+        store.metric_cluster_separability(refs["pca"], {"groups": refs["clusters"]})

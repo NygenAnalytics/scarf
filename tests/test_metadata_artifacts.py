@@ -1,3 +1,6 @@
+import shutil
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,6 +10,7 @@ from zarr.storage import MemoryStore
 import scarf.metadata.artifacts as metadata_artifacts_module
 import scarf.metadata.selection as metadata_selection_module
 from scarf.datastore.datastore import DataStore
+from scarf.graph.feature_projection import graph_cell_selection
 from scarf.metadata.artifacts import (
     artifact_values,
     categorical_display,
@@ -16,6 +20,7 @@ from scarf.metadata.artifacts import (
     write_cell_data_artifact,
 )
 from scarf.metadata.selection import resolve_cell_aligned_artifact
+from scarf.quality_control.cell_cycle_genes import g2m_phase_genes, s_phase_genes
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_group,
@@ -23,7 +28,10 @@ from scarf.storage.artifacts import (
     inspect_artifact,
 )
 from scarf.storage.errors import ArtifactResolutionError
-from scarf.storage.selections import resolve_generated_selection_artifact
+from scarf.storage.selections import (
+    read_stored_selection_indices,
+    resolve_generated_selection_artifact,
+)
 from tests.fixtures_datastore import build_neighbourhood_graph
 
 
@@ -48,6 +56,38 @@ def _ensure_graph(datastore) -> ArtifactRef:
         n_centroids=10,
         local_cache=False,
     )
+
+
+@pytest.fixture(scope="module")
+def graph_template(datastore_zarr_root, tmp_path_factory) -> tuple[Path, ArtifactRef]:
+    """Build the small-k graph of the 1K PBMC store once for this module."""
+    path = tmp_path_factory.mktemp("metadata_graph") / "store.zarr"
+    shutil.copytree(datastore_zarr_root, path)
+    return path, _ensure_graph(DataStore(str(path), default_assay="RNA"))
+
+
+@pytest.fixture
+def graph_store(graph_template, tmp_path) -> tuple[DataStore, ArtifactRef]:
+    """A private copy of the graph store, which a test may change freely."""
+    template, graph = graph_template
+    target = tmp_path / "store.zarr"
+    shutil.copytree(template, target)
+    return DataStore(str(target), default_assay="RNA"), graph
+
+
+def _selected_cells(datastore, selection: ArtifactRef) -> np.ndarray:
+    return read_stored_selection_indices(
+        datastore.zw,
+        selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )
+
+
+def _input(datastore, ref: ArtifactRef, name: str) -> ArtifactRef:
+    return ArtifactRef.from_dict(datastore.inspect_artifact(ref).inputs[name])
 
 
 def _graph_neighbors(datastore, graph: ArtifactRef) -> ArtifactRef:
@@ -335,9 +375,8 @@ def test_datastore_rejects_corrupt_imported_metadata(datastore_ephemeral) -> Non
         DataStore(datastore.zarr_loc, default_assay="RNA")
 
 
-def test_embedding_and_clustering_are_artifact_only(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_embedding_and_clustering_are_artifact_only(graph_store) -> None:
+    datastore, graph = graph_store
     before = _metadata_snapshot(datastore)
 
     embedding = datastore.run_umap(
@@ -353,14 +392,23 @@ def test_embedding_and_clustering_are_artifact_only(datastore_ephemeral) -> None
     assert embedding.kind == "embedding"
     assert leiden.kind == "cluster_labels"
     assert paris.kind == "cluster_cut"
-    assert datastore.load_artifact(embedding)["values"].shape[1] == 2
+    n_cells = datastore.load_graph(graph).shape[0]
+    coordinates = datastore.load_artifact(embedding)["values"][:]
+    assert coordinates.shape == (n_cells, 2)
+    assert np.isfinite(coordinates).all()
     assert datastore.inspect_artifact(leiden).parameters["backend"] == "igraph"
+    assert len(artifact_values(artifact_group(datastore.zw, leiden), "values")) == (
+        n_cells
+    )
+    # One requested cluster puts every graph cell in the same cluster.
+    cut = artifact_values(artifact_group(datastore.zw, paris), "labels")
+    assert len(cut) == n_cells
+    assert len(np.unique(cut)) == 1
     _assert_metadata_unchanged(datastore, before)
 
 
-def test_leiden_backend_is_part_of_artifact_identity(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_leiden_backend_is_part_of_artifact_identity(graph_store) -> None:
+    datastore, graph = graph_store
 
     native = datastore.run_leiden_clustering(graph)
     legacy = datastore.run_leiden_clustering(graph, backend="leidenalg")
@@ -376,11 +424,10 @@ def test_leiden_backend_is_part_of_artifact_identity(datastore_ephemeral) -> Non
 
 
 def test_leiden_graph_flags_reach_the_graph_loader_as_booleans(
-    datastore_ephemeral,
+    graph_store,
     monkeypatch,
 ):
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+    datastore, graph = graph_store
     loads: list[tuple[object, object]] = []
     original = datastore._load_graph_artifact
 
@@ -408,9 +455,8 @@ def test_leiden_graph_flags_reach_the_graph_loader_as_booleans(
             datastore.run_leiden_clustering(graph, **{flag: 1})
 
 
-def test_leiden_does_not_reuse_artifacts_without_edge_weighting(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_leiden_does_not_reuse_artifacts_without_edge_weighting(graph_store):
+    datastore, graph = graph_store
     prepared = datastore._prepare_leiden_clustering(graph)
     provenance = prepared.planned.provenance
     parameters = dict(provenance["parameters"])
@@ -441,11 +487,8 @@ def test_leiden_does_not_reuse_artifacts_without_edge_weighting(datastore_epheme
     assert datastore.run_leiden_clustering(graph) == actual
 
 
-def test_membership_and_smart_labels_are_artifact_only(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_membership_and_smart_labels_are_artifact_only(graph_store) -> None:
+    datastore, graph = graph_store
     clusters = datastore.run_leiden_clustering(graph)
     columns_before = set(datastore.cells.columns)
 
@@ -464,21 +507,29 @@ def test_hto_identity_is_artifact_backed(
     monkeypatch,
 ) -> None:
     datastore = datastore_ephemeral
-    selection = datastore.snapshot_cell_selection()
-    n_active = len(datastore.cells.active_index("I"))
+    keep = np.asarray(datastore.cells.fetch_all("I"), dtype=bool).copy()
+    keep[np.flatnonzero(keep)[::4]] = False
+    datastore.cells.insert("hto_cells", keep)
+    selection = datastore.snapshot_cell_selection("hto_cells")
     columns_before = set(datastore.cells.columns)
-    expected = np.asarray(
-        ["negative" if index % 2 else "tag" for index in range(n_active)]
-    )
+    calls: list[tuple[pd.DataFrame, dict]] = []
+
+    def demultiplex(counts: pd.DataFrame, **kwargs) -> pd.Series:
+        # The stand-in names each cell's largest HTO, so the stored values
+        # reveal which rows it received and in which order.
+        calls.append((counts.copy(), kwargs))
+        return counts.idxmax(axis=1)
+
     monkeypatch.setattr(
-        "scarf.datastore._operations.quality_control.hto_demux",
-        lambda counts, **kwargs: pd.Series(expected[: len(counts)]),
+        "scarf.datastore._operations.quality_control.hto_demux", demultiplex
     )
     assay_types = dict(datastore.zw.attrs["assayTypes"])
     assay_types["assay2"] = "HTO"
     datastore.zw.attrs["assayTypes"] = assay_types
 
-    ref = datastore.run_hto_demultiplexing(selection, from_assay="assay2")
+    ref = datastore.run_hto_demultiplexing(
+        selection, from_assay="assay2", random_seed=5
+    )
 
     assert ref.kind == "hto_identity"
     status = datastore.inspect_artifact(ref)
@@ -486,19 +537,29 @@ def test_hto_identity_is_artifact_backed(
     parameters = status.parameters
     assert parameters is not None
     assert parameters["method"]["normalization"] == "clr_per_hto"
+    assert parameters["random_seed"] == 5
     assert "algorithm_version" not in parameters
+    cells = np.flatnonzero(keep)
+    raw = np.asarray(datastore.assay2.rawData[cells].compute())
+    feature_ids = np.asarray(datastore.assay2.feats.fetch_all("ids"))
+    ((counts, kwargs),) = calls
+    assert kwargs == {"random_seed": 5}
+    assert counts.columns.tolist() == feature_ids.tolist()
+    np.testing.assert_array_equal(counts.to_numpy(), raw)
     np.testing.assert_array_equal(
         artifact_values(artifact_group(datastore.zw, ref), "values"),
-        expected,
+        feature_ids[raw.argmax(axis=1)],
     )
     datastore.memoryBytes = 1
     assert (
         datastore.run_hto_demultiplexing(
             selection,
             from_assay="assay2",
+            random_seed=5,
         )
         == ref
     )
+    assert len(calls) == 1
     assert set(datastore.cells.columns) == columns_before
 
 
@@ -506,8 +567,15 @@ def test_hto_demultiplexing_rejects_non_hto_assay(datastore_ephemeral) -> None:
     datastore = datastore_ephemeral
     selection = datastore.snapshot_cell_selection()
 
-    with pytest.raises(TypeError, match="declared with type 'HTO'"):
+    with pytest.raises(
+        TypeError,
+        match="^HTO demultiplexing requires an assay declared with type 'HTO'; "
+        "'assay2' is declared as 'Assay'$",
+    ):
         datastore.run_hto_demultiplexing(selection, from_assay="assay2")
+    with pytest.raises(TypeError, match="'HTO' is declared as None"):
+        datastore.run_hto_demultiplexing(selection)
+    assert datastore.list_artifacts(kind="hto_identity") == []
 
 
 def test_hto_demultiplexing_respects_datastore_memory_budget(
@@ -536,20 +604,40 @@ def test_cell_cycle_scoring_returns_one_artifact_without_writing_columns(
     assert ref.kind == "cell_cycle"
     group = artifact_group(datastore.zw, ref)
     assert set(group.array_keys()) == {"s_score", "g2m_score", "phase"}
-    assert len(artifact_values(group, "phase")) == int(
-        artifact_values(artifact_group(datastore.zw, selection), "values").sum()
+    n_cells = len(_selected_cells(datastore, selection))
+    s_score = artifact_values(group, "s_score")
+    g2m_score = artifact_values(group, "g2m_score")
+    phase = artifact_values(group, "phase")
+    assert s_score.shape == g2m_score.shape == phase.shape == (n_cells,)
+    assert np.isfinite(s_score).all() and np.isfinite(g2m_score).all()
+    # G1 when both scores are negative, else G2M when it outscores S.
+    expected_phase = np.where(
+        (s_score < 0) & (g2m_score < 0),
+        "G1",
+        np.where(g2m_score > s_score, "G2M", "S"),
     )
+    np.testing.assert_array_equal(phase, expected_phase)
+    assert set(phase) == {"G1", "G2M", "S"}
+    # Genes match the default lists by case-insensitive feature name.
+    names = np.char.upper(datastore.RNA.feats.fetch_all("names").astype(str))
+    status = datastore.inspect_artifact(ref)
+    for key, genes in (
+        ("s_gene_indices", s_phase_genes),
+        ("g2m_gene_indices", g2m_phase_genes),
+    ):
+        expected = [int(i) for gene in genes for i in np.flatnonzero(names == gene)]
+        assert status.parameters[key] == expected
+        assert expected
+    assert status.parameters["control_size"] == 43
+    assert _input(datastore, ref, "cell_selection") == selection
     assert set(datastore.cells.columns) == columns_before
 
 
 def test_imputation_batches_preserve_requested_columns_and_stream_rows(
-    datastore_ephemeral,
+    graph_store,
     monkeypatch,
 ) -> None:
-    from scarf.storage.selections import read_stored_selection_indices
-
-    store = datastore_ephemeral
-    graph = _ensure_graph(store)
+    store, graph = graph_store
     diffusion = store.run_diffusion_operator(graph)
     operator, _graph, selection = store._load_diffusion_operator_with_lineage(diffusion)
     rows = read_stored_selection_indices(
@@ -643,10 +731,9 @@ def test_get_imputed_accepts_array_like_feature_names(
 
 
 def test_explicit_graph_consumers_ignore_later_live_selection_changes(
-    datastore_ephemeral,
+    graph_store,
 ) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+    datastore, graph = graph_store
     graph_n = datastore.load_graph(graph).shape[0]
     initialization = _graph_initialization(datastore, graph)
     mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
@@ -665,13 +752,23 @@ def test_explicit_graph_consumers_ignore_later_live_selection_changes(
     assert clusters.kind == "cluster_labels"
     assert embedding.kind == "embedding"
     assert diffusion.kind == "diffusion_operator"
+    # Every consumer keeps the graph's frozen cells, including the one that
+    # the live selection dropped.
+    graph_selection = graph_cell_selection(datastore.zw, graph)
+    graph_cells = _selected_cells(datastore, graph_selection)
+    assert len(graph_cells) == graph_n
+    assert selected[0] in graph_cells
+    assert _input(datastore, clusters, "cell_selection") == graph_selection
+    assert len(artifact_values(artifact_group(datastore.zw, clusters), "values")) == (
+        graph_n
+    )
+    assert datastore.load_artifact(embedding)["values"].shape == (graph_n, 2)
     assert operator.shape == (graph_n, graph_n)
     assert imputed.shape == (graph_n,)
 
 
-def test_graph_consumers_require_explicit_artifact_refs(datastore_ephemeral) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_graph_consumers_require_explicit_artifact_refs(graph_store) -> None:
+    datastore, graph = graph_store
     coordinates = _graph_coordinates(datastore, graph)
     initialization = _graph_initialization(datastore, graph)
 
@@ -697,11 +794,8 @@ def test_graph_consumers_require_explicit_artifact_refs(datastore_ephemeral) -> 
         datastore.run_umap(coordinates, initialization, n_epochs=10)
 
 
-def test_neighbor_metrics_reject_incomplete_ann_dependency(
-    datastore_ephemeral,
-) -> None:
-    datastore = datastore_ephemeral
-    graph = _ensure_graph(datastore)
+def test_neighbor_metrics_reject_incomplete_ann_dependency(graph_store) -> None:
+    datastore, graph = graph_store
     neighbors = _graph_neighbors(datastore, graph)
     ann = ArtifactRef.from_dict(
         datastore.inspect_artifact(neighbors).inputs["ann_index"]

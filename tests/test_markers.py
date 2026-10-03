@@ -1,5 +1,5 @@
 import inspect
-import textwrap
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -141,6 +141,8 @@ def test_batch_stats_matches_pandas_reference():
     # Zero-inflated counts exercise the tie correction path.
     data = rng.poisson(0.6, size=(n_cells, n_genes)).astype(np.float64)
     groups = rng.integers(1, 4, size=n_cells)
+    # Group 1 expresses four genes more, so some p-values are small.
+    data[groups == 1, :4] += rng.poisson(1.5, size=((groups == 1).sum(), 4))
     group_set = np.array(sorted(set(groups)))
     idx_map = {v: i for i, v in enumerate(group_set)}
     int_indices = np.array([idx_map[x] for x in groups])
@@ -150,12 +152,13 @@ def test_batch_stats_matches_pandas_reference():
     got = _batch_stats(data, int_indices, group_counts, n_cells)
 
     # score, mean, mean_rest, frac_exp, frac_exp_rest
-    assert np.allclose(got[:, :, :5], ref[:, :, :5], atol=1e-6)
+    np.testing.assert_allclose(got[:, :, :5], ref[:, :, :5], rtol=1e-12, atol=1e-15)
     # fold_change agrees where the reference is finite
     finite = np.isfinite(ref[:, :, 5])
-    assert np.allclose(got[:, :, 5][finite], ref[:, :, 5][finite], atol=1e-6)
-    # two-sided p-values
-    assert np.allclose(_p_values(got), ref[:, :, 6], atol=1e-6)
+    np.testing.assert_allclose(got[:, :, 5][finite], ref[:, :, 5][finite], rtol=1e-12)
+    # two-sided p-values, small ones included
+    assert ref[:, :, 6].min() < 1e-3
+    np.testing.assert_allclose(_p_values(got), ref[:, :, 6], rtol=1e-9)
 
 
 def test_batch_stats_preserves_float64_near_ties_against_scipy():
@@ -233,18 +236,25 @@ def test_rank_paths_match_scipy_continuity_correction():
     np.testing.assert_allclose(gene_major, expected, rtol=1e-12, atol=1e-12)
 
 
-@pytest.mark.parametrize("method_name", ["norm_lib_size", "norm_dummy"])
-def test_complementary_groups_get_the_exact_mann_whitney_p_value(
-    tmp_path, method_name
-) -> None:
-    import scarf.assay.normalization as normalization
-
+@pytest.fixture(scope="module")
+def complementary_groups(tmp_path_factory) -> tuple[DataStore, np.ndarray, np.ndarray]:
+    """Return a store of two groups, their labels, and the stored counts."""
     # The product of these group sizes exceeds 2**24, which float32 rounds.
     labels = np.repeat(np.array(["a", "b"]), [4_097, 4_099])
     counts = np.random.default_rng(7).poisson(1.5, size=(labels.size, 3))
     values = counts.astype(np.float64)
-    store = _count_store(tmp_path, values, "uint16")
-    store.RNA.normMethod = getattr(normalization, method_name)
+    store = _count_store(tmp_path_factory.mktemp("complementary"), values, "uint16")
+    return store, labels, values
+
+
+@pytest.mark.parametrize("method_name", ["norm_lib_size", "norm_dummy"])
+def test_complementary_groups_get_the_exact_mann_whitney_p_value(
+    complementary_groups, monkeypatch, method_name
+) -> None:
+    import scarf.assay.normalization as normalization
+
+    store, labels, values = complementary_groups
+    monkeypatch.setattr(store.RNA, "normMethod", getattr(normalization, method_name))
     result = find_markers_by_rank(
         store.RNA, labels, np.arange(labels.size), np.arange(3)
     )
@@ -644,65 +654,26 @@ def test_saved_marker_refs_keep_feature_specific_results_addressable(
 _COUNT_DTYPES = ("uint8", "uint16", "uint32", "int32", "int64", "float32", "float64")
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        np.array(
-            [
-                [1, 2, 3],
-                [3, 2, 1],
-                [2, 1, 4],
-                [4, 3, 2],
-            ],
-            dtype=np.uint32,
-        ),
-        np.zeros((4, 3), dtype=np.uint32),
-        np.full((4, 3), 2, dtype=np.uint32),
-        np.array(
-            [
-                [0, 0, 0],
-                [0, 0, 5],
-                [0, 0, 0],
-                [0, 0, 0],
-            ],
-            dtype=np.uint32,
-        ),
-        np.array(
-            [
-                [0, 2, 1],
-                [0, 2, 1],
-                [3, 2, 0],
-                [3, 2, 0],
-            ],
-            dtype=np.uint32,
-        ),
-        np.array([[0, 2, 2]], dtype=np.uint32),
-    ],
-    ids=[
-        "no-zeros",
-        "all-zero",
-        "constant",
-        "single-nonzero",
-        "heavy-ties",
-        "single-cell",
-    ],
-)
-@pytest.mark.parametrize("dtype", _COUNT_DTYPES)
-@pytest.mark.parametrize("log_transform", [False, True])
-def test_gene_major_zero_aware_kernel_is_bit_identical(
-    raw: np.ndarray,
-    dtype: str,
-    log_transform: bool,
+# Four cells by three features each; every pattern reaches other branches of
+# the zero-aware kernel's ranks.
+_GENE_MAJOR_PATTERNS = {
+    "no-zeros": [[1, 2, 3], [3, 2, 1], [2, 1, 4], [4, 3, 2]],
+    "all-zero": [[0, 0, 0]] * 4,
+    "constant": [[2, 2, 2]] * 4,
+    "single-nonzero": [[0, 0, 0], [0, 0, 5], [0, 0, 0], [0, 0, 0]],
+    "heavy-ties": [[0, 2, 1], [0, 2, 1], [3, 2, 0], [3, 2, 0]],
+}
+
+
+def _assert_gene_major_matches_dense_kernel(
+    counts: np.ndarray, log_transform: bool
 ) -> None:
+    """Compare the zero-aware kernel with the dense kernel on the same values."""
     from scarf.assay.normalization import library_size_values
 
-    counts = raw.astype(dtype)
     n_cells = counts.shape[0]
     groups = np.arange(n_cells, dtype=np.int64) % max(1, min(3, n_cells))
-    group_counts = np.bincount(
-        groups,
-        minlength=int(groups.max()) + 1,
-    )
+    group_counts = np.bincount(groups, minlength=int(groups.max()) + 1)
     totals = counts.sum(axis=1, dtype=np.float64)
     totals[totals == 0] = 1
     # The dense kernel ranks the float32 rounding of the float64 values.
@@ -710,23 +681,38 @@ def test_gene_major_zero_aware_kernel_is_bit_identical(
         counts, totals, 1000.0, dtype=np.float64, log_transform=log_transform
     ).astype(np.float32)
 
-    expected = _batch_stats(
-        normalized,
-        groups,
-        group_counts,
-        n_cells,
-    )
+    expected = _batch_stats(normalized, groups, group_counts, n_cells)
     observed = _gene_major_stats(
-        counts.T,
-        totals,
-        1000.0,
-        log_transform,
-        groups,
-        group_counts,
-        n_cells,
+        counts.T, totals, 1000.0, log_transform, groups, group_counts, n_cells
     )
 
     np.testing.assert_array_equal(observed, expected)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [*_GENE_MAJOR_PATTERNS.values(), [[0, 2, 2]]],
+    ids=[*_GENE_MAJOR_PATTERNS, "single-cell"],
+)
+@pytest.mark.parametrize("log_transform", [False, True])
+def test_gene_major_zero_aware_kernel_is_bit_identical(
+    raw: list[list[int]], log_transform: bool
+) -> None:
+    _assert_gene_major_matches_dense_kernel(
+        np.array(raw, dtype=np.uint32), log_transform
+    )
+
+
+@pytest.mark.parametrize("dtype", _COUNT_DTYPES)
+@pytest.mark.parametrize("log_transform", [False, True])
+def test_gene_major_zero_aware_kernel_is_bit_identical_in_every_count_dtype(
+    dtype: str, log_transform: bool
+) -> None:
+    # Every four-cell pattern side by side, so each dtype's kernel meets each
+    # rank branch in one call.
+    raw = np.hstack([np.array(pattern) for pattern in _GENE_MAJOR_PATTERNS.values()])
+
+    _assert_gene_major_matches_dense_kernel(raw.astype(dtype), log_transform)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
@@ -1029,7 +1015,20 @@ def test_find_markers_by_regression_handles_expression_threshold():
 
     assert result.loc["correlated", "r_value"] == pytest.approx(1.0)
     assert result.loc["correlated", "p_value"] < 1e-10
-    assert result.loc["at_threshold", "r_value"] != 0.0
+    # Two expressing cells meet min_cells=2, so that feature is tested.
+    expected = linregress(np.arange(4.0), [0.0, 1.0, 2.0, 0.0])
+    assert result.loc["at_threshold", "r_value"] == pytest.approx(
+        expected.rvalue, rel=1e-12
+    )
+    assert result.loc["at_threshold", "p_value"] == pytest.approx(
+        expected.pvalue, rel=1e-8
+    )
+    # Benjamini-Hochberg over the two tested features.
+    smaller, larger = sorted(result.loc[["correlated", "at_threshold"], "p_value"])
+    assert result.loc["at_threshold", "p_value_adjusted"] == pytest.approx(larger)
+    assert result.loc["correlated", "p_value_adjusted"] == pytest.approx(
+        min(2 * smaller, larger)
+    )
     assert result.loc["too_sparse", "r_value"] == 0.0
     assert np.isnan(result.loc["too_sparse", "p_value"])
     assert np.isnan(result.loc["too_sparse", "p_value_adjusted"])
@@ -1322,12 +1321,28 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
     assert group_a.loc[13, "fold_change"] == pytest.approx(1.0)
     assert group_b.loc[12, "fold_change"] == pytest.approx(100.1)
     assert group_b.loc[10, "fold_change"] == pytest.approx(0.0)
-    assert np.isfinite(group_a["p_value"]).all()
-    assert np.isfinite(group_b["p_value"]).all()
-    assert "auc" in group_a.columns
-    assert "p_value_adjusted" in group_a.columns
-    assert np.isfinite(group_a["auc"]).all()
-    assert np.isfinite(group_a["p_value_adjusted"]).all()
+    in_a = np.array([True, True, False, False])
+    for feature, column in ((10, 0), (12, 2)):
+        expected = mannwhitneyu(
+            data[in_a, column],
+            data[~in_a, column],
+            alternative="two-sided",
+            method="asymptotic",
+            use_continuity=True,
+        ).pvalue
+        assert group_a.loc[feature, "p_value"] == pytest.approx(expected, rel=1e-12)
+    # A feature tied in every cell has no rank variance, so nothing to test.
+    assert group_a.loc[[11, 13], "p_value"].tolist() == [1.0, 1.0]
+    # Two complementary groups run the same test, mirrored.
+    pd.testing.assert_series_equal(
+        group_b["p_value"].sort_index(), group_a["p_value"].sort_index()
+    )
+    assert group_a["auc"].sort_index().tolist() == [1.0, 0.5, 0.0, 0.5]
+    assert group_b["auc"].sort_index().tolist() == [0.0, 0.5, 1.0, 0.5]
+    np.testing.assert_allclose(
+        group_a["p_value_adjusted"].sort_index(),
+        adjust_pvalues(group_a["p_value"].sort_index().to_numpy(), "fdr_bh"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1500,11 +1515,15 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
 
     np.testing.assert_array_equal(results.group_ids, ["a", "b"])
     np.testing.assert_array_equal(results.feature_index, [0, 2, 3])
-    assert results.statistics.shape == (3, 2, 8)
-    for group_id in results.group_ids:
-        stored = results.stored_statistics(group_id)
-        assert stored.shape == (3, 9)
-        assert np.isfinite(stored).all()
+    # The dense kernel over the float32 rounding of the library-size values.
+    normalized = 1_000.0 * data / data.sum(axis=1)[:, None]
+    codes = np.array([0, 0, 1, 1])
+    np.testing.assert_array_equal(
+        results.statistics,
+        _batch_stats(
+            normalized[:, [0, 2, 3]].astype(np.float32), codes, np.bincount(codes), 4
+        ),
+    )
     # Feature 0 is expressed only in group a, feature 3 only in group b.
     assert results.statistics[0, :, 3].tolist() == [1.0, 0.0]
     assert results.statistics[2, :, 3].tolist() == [0.0, 1.0]
@@ -1996,6 +2015,40 @@ def test_marker_slot_validation_checks_every_group_against_its_counts():
         _validate_marker_slot(slot, names)
 
 
+@pytest.fixture(scope="module")
+def pbmc_marker_table(datastore_zarr_root, tmp_path_factory):
+    """Return a PBMC store with a two-group marker table over eight features."""
+    location = tmp_path_factory.mktemp("pbmc_markers") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, location)
+    store = DataStore(str(location), default_assay="RNA")
+    clusters = _cluster_labels(store, np.arange(len(store.cells.active_index("I"))) % 2)
+    feature_mask = np.zeros(store.RNA.feats.N, dtype=bool)
+    feature_mask[:8] = True
+    arguments = {
+        "clusters": clusters,
+        "from_assay": "RNA",
+        "features": store.set_feature_selection(from_assay="RNA", mask=feature_mask),
+        "nthreads": 1,
+    }
+    return location, arguments, store.run_marker_search(**arguments)
+
+
+def test_marker_cache_reuses_an_intact_payload(
+    pbmc_marker_table, tmp_path, monkeypatch
+) -> None:
+    import scarf.features.markers as marker_algorithms
+
+    location, arguments, saved = pbmc_marker_table
+    shutil.copytree(location, tmp_path / "data.zarr")
+    store = DataStore(str(tmp_path / "data.zarr"), default_assay="RNA")
+    monkeypatch.setattr(
+        marker_algorithms, "find_markers_by_rank", _refuse_marker_search
+    )
+
+    # The corruptions below are recomputed only because this copy is reused.
+    assert store.run_marker_search(**arguments) == saved
+
+
 @pytest.mark.parametrize(
     "corruption",
     [
@@ -2010,7 +2063,8 @@ def test_marker_slot_validation_checks_every_group_against_its_counts():
     ],
 )
 def test_marker_cache_reuse_revalidates_canonical_payload(
-    datastore_ephemeral,
+    pbmc_marker_table,
+    tmp_path,
     monkeypatch,
     corruption,
 ):
@@ -2018,25 +2072,10 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
     from scarf.features.markers.table import MARKER_STAT_COLUMNS
     from scarf.storage.artifacts import artifact_path
 
-    assay = datastore_ephemeral.RNA
-    clusters = _cluster_labels(
-        datastore_ephemeral,
-        np.arange(len(datastore_ephemeral.cells.active_index("I"))) % 2,
-    )
-    feature_mask = np.zeros(assay.feats.N, dtype=bool)
-    feature_mask[:8] = True
-    feature_selection = datastore_ephemeral.set_feature_selection(
-        from_assay="RNA",
-        mask=feature_mask,
-    )
-    arguments = {
-        "clusters": clusters,
-        "from_assay": "RNA",
-        "features": feature_selection,
-        "nthreads": 1,
-    }
-    old_ref = datastore_ephemeral.run_marker_search(**arguments)
-    old_artifact = datastore_ephemeral.zw[artifact_path(old_ref)]
+    location, arguments, old_ref = pbmc_marker_table
+    shutil.copytree(location, tmp_path / "data.zarr")
+    store = DataStore(str(tmp_path / "data.zarr"), default_assay="RNA")
+    old_artifact = store.zw[artifact_path(old_ref)]
     first_group_name = sorted(old_artifact.group_keys())[0]
     first_group = old_artifact[first_group_name]
     if corruption == "incomplete_provenance":
@@ -2089,8 +2128,8 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
         "find_markers_by_rank",
         tracked_marker_search,
     )
-    new_ref = datastore_ephemeral.run_marker_search(**arguments)
-    status = datastore_ephemeral.inspect_artifact(new_ref)
+    new_ref = store.run_marker_search(**arguments)
+    status = store.inspect_artifact(new_ref)
     assert calls == 1
     assert new_ref != old_ref
     assert status.parameters["method"] == "mannwhitneyu"
@@ -2206,15 +2245,14 @@ def test_canonical_marker_reader_rejects_negative_feature_index():
         )
 
 
-def test_bh_adjusted_pvalues_match_statsmodels_and_preserve_order():
-    from statsmodels.stats.multitest import multipletests
-
+def test_bh_adjusted_pvalues_match_the_step_up_procedure_and_preserve_order():
     p_values = np.array([0.04, 0.01, 0.2, np.nan, 0.03])
     adjusted = adjust_pvalues(p_values, "fdr_bh")
-    mask = np.isfinite(p_values)
-    _, expected, _, _ = multipletests(p_values[mask], method="fdr_bh")
-    assert adjusted[mask].tolist() == pytest.approx(list(expected))
-    assert np.isnan(adjusted[3])
+    # Four tested p-values ranked 0.01, 0.03, 0.04, 0.2 scale by 4 / rank to
+    # 0.04, 0.06, 0.16 / 3, and 0.2; each takes the smallest from its rank up.
+    np.testing.assert_allclose(
+        adjusted, [0.16 / 3, 0.04, 0.2, np.nan, 0.16 / 3], rtol=1e-12
+    )
     reordered = p_values[[1, 0, 4, 3, 2]]
     adjusted_reordered = adjust_pvalues(reordered, "fdr_bh")
     restore = np.empty_like(adjusted_reordered)
@@ -2250,7 +2288,7 @@ def test_marker_auc_matches_scipy_mannwhitneyu():
                 use_continuity=True,
             ).statistic
             expected_auc = u / (len(sample) * len(rest))
-            assert got[gene, group, 7] == pytest.approx(expected_auc, abs=1e-6)
+            assert got[gene, group, 7] == pytest.approx(expected_auc, rel=1e-12)
 
 
 def test_find_markers_by_rank_rejects_invalid_group_sizes():
@@ -2465,19 +2503,68 @@ def _dtype_counts(seed: int = 3) -> tuple[np.ndarray, np.ndarray]:
     return counts, np.array([f"g{group}" for group in groups])
 
 
-def _count_store(tmp_path, counts: np.ndarray, dtype: str) -> DataStore:
-    from tests.storage_helpers import write_count_store
-
-    path = str(tmp_path / f"{dtype}.zarr")
-    write_count_store(path, {"RNA": counts}, dtype)
+def _open_count_store(path) -> DataStore:
     return DataStore(
-        path,
+        str(path),
         default_assay="RNA",
         min_features_per_cell=0,
         mito_pattern="",
         ribo_pattern="",
         nthreads=2,
     )
+
+
+def _count_store(tmp_path, counts: np.ndarray, dtype: str) -> DataStore:
+    from tests.storage_helpers import write_count_store
+
+    path = str(tmp_path / f"{dtype}.zarr")
+    write_count_store(path, {"RNA": counts}, dtype)
+    return _open_count_store(path)
+
+
+@pytest.fixture(scope="module")
+def count_store(tmp_path_factory):
+    """Open the edge-case counts stored in a dtype, written once per module.
+
+    Each store comes with its cluster labels and every feature. Tests that
+    write to a store only add marker tables, which other tests do not read.
+    """
+    counts, labels = _dtype_counts()
+    directory = tmp_path_factory.mktemp("count_stores")
+    stores: dict[str, tuple[DataStore, ArtifactRef, ArtifactRef]] = {}
+
+    def open_store(dtype: str) -> tuple[DataStore, ArtifactRef, ArtifactRef]:
+        if dtype not in stores:
+            store = _count_store(directory, counts, dtype)
+            stores[dtype] = (
+                store,
+                _cluster_labels(store, labels),
+                store.select_all_features(from_assay="RNA"),
+            )
+        return stores[dtype]
+
+    return open_store
+
+
+@pytest.fixture(scope="module")
+def marker_table(tmp_path_factory) -> tuple[str, ArtifactRef, ArtifactRef, ArtifactRef]:
+    """Return a uint16 store, its clusters and features, and their marker table."""
+    counts, labels = _dtype_counts()
+    store = _count_store(tmp_path_factory.mktemp("marker_table"), counts, "uint16")
+    clusters = _cluster_labels(store, labels)
+    features = store.select_all_features(from_assay="RNA")
+    marker = store.run_marker_search(clusters, features=features)
+    return str(store.zarr_loc), clusters, features, marker
+
+
+def _saved_marker_table(
+    marker_table, tmp_path
+) -> tuple[DataStore, ArtifactRef, ArtifactRef, ArtifactRef]:
+    """Return a private copy of the marker-table store and its references."""
+    location, clusters, features, marker = marker_table
+    copy = tmp_path / "markers.zarr"
+    shutil.copytree(location, copy)
+    return _open_count_store(copy), clusters, features, marker
 
 
 def _stored_marker_stats(store: DataStore, ref: ArtifactRef) -> dict[str, np.ndarray]:
@@ -2491,18 +2578,15 @@ def _refuse_dense_kernel(*_args, **_kwargs):
 
 @pytest.mark.parametrize("log_transform", [False, True])
 def test_library_size_markers_match_across_count_dtypes(
-    tmp_path, monkeypatch, log_transform
+    count_store, monkeypatch, log_transform
 ) -> None:
     monkeypatch.setattr(marker_search_module, "_batch_stats", _refuse_dense_kernel)
-    counts, labels = _dtype_counts()
     tables = {}
     for dtype in _COUNT_DTYPES:
-        store = _count_store(tmp_path, counts, dtype)
+        store, clusters, features = count_store(dtype)
         assert store.RNA.rawDataT.dtype == np.dtype(dtype)
         ref = store.run_marker_search(
-            _cluster_labels(store, labels),
-            features=store.select_all_features(from_assay="RNA"),
-            log_transform=log_transform,
+            clusters, features=features, log_transform=log_transform
         )
         tables[dtype] = _stored_marker_stats(store, ref)
 
@@ -2577,13 +2661,13 @@ def test_subset_renormalized_markers_reject_invalid_counts_and_totals(
 @pytest.mark.parametrize("method_name", ["norm_lib_size", "norm_clr", "norm_dummy"])
 @pytest.mark.parametrize("axis", ["cell", "feat"])
 def test_rank_markers_refuse_indices_past_the_end_of_counts_t(
-    tmp_path, method_name, axis
+    count_store, monkeypatch, method_name, axis
 ) -> None:
     import scarf.assay.normalization as normalization
 
     counts, labels = _dtype_counts()
-    store = _count_store(tmp_path, counts, "uint16")
-    store.RNA.normMethod = getattr(normalization, method_name)
+    store, _, _ = count_store("uint16")
+    monkeypatch.setattr(store.RNA, "normMethod", getattr(normalization, method_name))
     indices = {"cell": np.arange(counts.shape[0]), "feat": np.arange(counts.shape[1])}
     # The last index is one past the end of its axis.
     indices[axis][-1] += 1
@@ -2592,24 +2676,10 @@ def test_rank_markers_refuse_indices_past_the_end_of_counts_t(
         find_markers_by_rank(store.RNA, labels, indices["cell"], indices["feat"])
 
 
-def _saved_marker_table(
-    tmp_path,
-) -> tuple[DataStore, ArtifactRef, ArtifactRef, ArtifactRef]:
-    """Return a small store, its clusters and features, and their marker table."""
-    counts, labels = _dtype_counts()
-    store = _count_store(tmp_path, counts, "uint16")
-    clusters = _cluster_labels(store, labels)
-    features = store.select_all_features(from_assay="RNA")
-    return (
-        store,
-        clusters,
-        features,
-        store.run_marker_search(clusters, features=features),
-    )
-
-
-def test_marker_search_and_reader_refuse_references_of_other_kinds(tmp_path) -> None:
-    store, clusters, features, _ = _saved_marker_table(tmp_path)
+def test_marker_search_and_reader_refuse_references_of_other_kinds(
+    marker_table, tmp_path
+) -> None:
+    store, clusters, features, _ = _saved_marker_table(marker_table, tmp_path)
 
     with pytest.raises(TypeError, match="clusters must be an ArtifactRef"):
         store.run_marker_search("clusters", features=features)
@@ -2628,11 +2698,13 @@ def test_marker_search_and_reader_refuse_references_of_other_kinds(tmp_path) -> 
         store.get_markers(missing)
 
 
-def test_marker_search_refuses_clusters_of_an_empty_cell_selection(tmp_path) -> None:
-    counts, labels = _dtype_counts()
-    store = _count_store(tmp_path, counts, "uint16")
+def test_marker_search_refuses_clusters_of_an_empty_cell_selection(
+    marker_table, tmp_path
+) -> None:
+    store, *_ = _saved_marker_table(marker_table, tmp_path)
+    saved = set(store.list_artifacts(kind="marker_table", from_assay="RNA"))
     store.cells.insert("none", np.zeros(store.cells.N, dtype=bool), overwrite=True)
-    store.cells.insert("labels", labels, overwrite=True)
+    store.cells.insert("labels", _dtype_counts()[1], overwrite=True)
     clusters = store.snapshot_cluster_labels(
         "labels", cell_selection=store.snapshot_cell_selection("none")
     )
@@ -2641,7 +2713,7 @@ def test_marker_search_refuses_clusters_of_an_empty_cell_selection(tmp_path) -> 
         store.run_marker_search(
             clusters, features=store.select_all_features(from_assay="RNA")
         )
-    assert store.list_artifacts(kind="marker_table", from_assay="RNA") == []
+    assert set(store.list_artifacts(kind="marker_table", from_assay="RNA")) == saved
 
 
 @pytest.mark.parametrize(
@@ -2661,11 +2733,11 @@ def test_marker_search_refuses_clusters_of_an_empty_cell_selection(tmp_path) -> 
     ],
 )
 def test_get_markers_rejects_a_marker_table_it_cannot_trace(
-    tmp_path, corruption, message
+    marker_table, tmp_path, corruption, message
 ) -> None:
     from scarf.storage.artifacts import artifact_path
 
-    store, _, features, ref = _saved_marker_table(tmp_path)
+    store, _, features, ref = _saved_marker_table(marker_table, tmp_path)
     group = store.zw[artifact_path(ref)]
     if corruption == "incomplete":
         group.attrs["complete"] = False
@@ -2688,10 +2760,12 @@ def test_get_markers_rejects_a_marker_table_it_cannot_trace(
         store.get_markers(ref)
 
 
-def test_marker_search_refuses_labels_and_names_that_do_not_align(tmp_path) -> None:
+def test_marker_search_refuses_labels_and_names_that_do_not_align(
+    marker_table, tmp_path
+) -> None:
     from scarf.metadata.selection import resolve_complete_labels
 
-    store, clusters, features, _ = _saved_marker_table(tmp_path)
+    store, clusters, features, _ = _saved_marker_table(marker_table, tmp_path)
     labels = resolve_complete_labels(store.zw, clusters, name="clusters")
     inputs = {
         "assay": store.RNA,
@@ -2709,11 +2783,11 @@ def test_marker_search_refuses_labels_and_names_that_do_not_align(tmp_path) -> N
 
 
 def test_marker_search_recomputes_a_table_whose_feature_names_changed(
-    tmp_path,
+    marker_table, tmp_path
 ) -> None:
     from scarf.storage.artifacts import artifact_path
 
-    store, clusters, features, ref = _saved_marker_table(tmp_path)
+    store, clusters, features, ref = _saved_marker_table(marker_table, tmp_path)
     names = store.zw[artifact_path(ref)]["feature_names"]
     names[0] = "renamed"
 
@@ -2723,11 +2797,11 @@ def test_marker_search_recomputes_a_table_whose_feature_names_changed(
 @pytest.mark.parametrize("renormalize_subset", [False, True])
 @pytest.mark.parametrize("log_transform", [False, True])
 def test_library_size_marker_means_are_float32_rounded_float64_values(
-    tmp_path, monkeypatch, log_transform, renormalize_subset
+    count_store, monkeypatch, log_transform, renormalize_subset
 ) -> None:
     monkeypatch.setattr(marker_search_module, "_batch_stats", _refuse_dense_kernel)
     counts, labels = _dtype_counts()
-    store = _count_store(tmp_path, counts, "uint32")
+    store, _, _ = count_store("uint32")
     tested = np.arange(2, 20)
     result = find_markers_by_rank(
         store.RNA,
@@ -2766,17 +2840,14 @@ def _reference_stored_stats(statistics: np.ndarray) -> np.ndarray:
 
 @pytest.mark.parametrize("method_name", ["norm_lib_size", "norm_clr", "norm_dummy"])
 def test_stored_marker_tables_are_the_reference_statistics(
-    tmp_path, method_name
+    marker_table, tmp_path, method_name
 ) -> None:
     import scarf.assay.normalization as normalization
 
     counts, labels = _dtype_counts()
-    store = _count_store(tmp_path, counts, "uint16")
+    store, clusters, features, _ = _saved_marker_table(marker_table, tmp_path)
     store.RNA.normMethod = getattr(normalization, method_name)
-    ref = store.run_marker_search(
-        _cluster_labels(store, labels),
-        features=store.select_all_features(from_assay="RNA"),
-    )
+    ref = store.run_marker_search(clusters, features=features)
 
     if method_name == "norm_lib_size":
         totals = counts.sum(axis=1)
@@ -2789,354 +2860,8 @@ def test_stored_marker_tables_are_the_reference_statistics(
     group_ids, codes = np.unique(labels, return_inverse=True)
     reference = _batch_stats(values, codes, np.bincount(codes), len(labels))
     stored = _stored_marker_stats(store, ref)
+    assert sorted(stored) == group_ids.tolist()
     for position, group_id in enumerate(group_ids):
         np.testing.assert_array_equal(
             stored[group_id], _reference_stored_stats(reference[:, position])
         )
-
-
-def _rebuild_interned_strings() -> None:
-    """Make CPython rebuild its interned-string table before a trace starts.
-
-    Pathlib interns every path part it parses, and those strings soon die;
-    their slots fill the table until an insertion rebuilds it. A rebuild
-    inside a trace adds a block the size of the table, because the table it
-    replaces predates the trace. A rebuilt table holds far more insertions
-    than a marker search and its writes make.
-    """
-    import sys
-    import tracemalloc
-
-    chunk = 1 << 12
-    for start in range(0, 1 << 21, chunk):
-        # Strings made before the trace leave a rebuilt table as the only
-        # sizeable block that the trace sees.
-        names = [
-            f"scarf-test-interned-{index}" for index in range(start, start + chunk)
-        ]
-        tracemalloc.start()
-        try:
-            for name in names:
-                sys.intern(name)
-            current, _ = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-        if current > 1 << 16:
-            return
-
-
-def _layout_store(tmp_path, values: np.ndarray, **datastore_options) -> DataStore:
-    """Write uint16 RNA counts in small read groups and open them."""
-    import zarr
-
-    from scarf.storage.count_matrix import CountMatrixPolicy
-    from scarf.storage.schema import create_cell_data, create_zarr_count_assay
-    from scarf.writers.counts_t import finalize_writer_counts_t
-    from tests.storage_helpers import finalize_test_counts
-
-    path = str(tmp_path / "layout.zarr")
-    root = zarr.open_group(path, mode="w")
-    n_cells, n_features = values.shape
-    cell_ids = np.array([f"c{index}" for index in range(n_cells)])
-    feature_ids = np.array([f"f{index}" for index in range(n_features)])
-    create_cell_data(root, None, ids=cell_ids, names=cell_ids)
-    # Read groups of 32 features over sharded bands of 2,500 cells.
-    counts = create_zarr_count_assay(
-        root,
-        "RNA",
-        None,
-        n_cells,
-        feature_ids,
-        feature_ids,
-        dtype="uint16",
-        policy=CountMatrixPolicy(unitBytes=n_cells * 32 * 2, chunkBytes=32 * 2_500 * 2),
-    )
-    counts[:] = values
-    finalize_test_counts(counts)
-    finalize_writer_counts_t(root, "RNA", None)
-    return DataStore(
-        path,
-        default_assay="RNA",
-        min_features_per_cell=0,
-        mito_pattern="",
-        ribo_pattern="",
-        **datastore_options,
-    )
-
-
-@pytest.mark.parametrize("method_name", ["norm_lib_size", "norm_dummy"])
-@pytest.mark.parametrize("n_groups", [20, 400])
-def test_marker_search_and_write_fit_the_bytes_the_search_reserves(
-    tmp_path, method_name, n_groups
-) -> None:
-    import tracemalloc
-
-    import zarr
-
-    import scarf.assay.normalization as normalization
-    from scarf.storage.execution import execution_report_scope
-
-    rng = np.random.default_rng(0)
-    values = rng.poisson(0.15, size=(20_000, 256)).astype(np.uint16)
-    store = _layout_store(tmp_path, values, nthreads=4, mem_budget="24M")
-    store.RNA.normMethod = getattr(normalization, method_name)
-    labels = rng.integers(0, n_groups, size=len(values))
-    cells = np.arange(len(values))
-    features = np.arange(values.shape[1])
-    names = np.asarray(store.RNA.feats.fetch_all("names"))
-    # Load the kernels, codecs, and pools, and import what finishes a table,
-    # so that the trace holds only what the search and its writes allocate.
-    DataStore._write_marker_slot(
-        zarr.open_group(str(tmp_path / "warm.zarr"), mode="w"),
-        find_markers_by_rank(store.RNA, labels, cells, features[:4], writers=2),
-        workers=2,
-        feature_names=names,
-        feature_ids=names,
-    )
-    slot = zarr.open_group(str(tmp_path / "markers.zarr"), mode="w")
-    _rebuild_interned_strings()
-
-    with execution_report_scope() as reports:
-        tracemalloc.start()
-        try:
-            base, _ = tracemalloc.get_traced_memory()
-            result = find_markers_by_rank(store.RNA, labels, cells, features, writers=2)
-            DataStore._write_marker_slot(
-                slot, result, workers=2, feature_names=names, feature_ids=names
-            )
-            _, peak = tracemalloc.get_traced_memory()
-        finally:
-            tracemalloc.stop()
-
-    (plan,) = [
-        report.as_metrics()
-        for report in reports
-        if report.unitKind == "countsTReadGroup"
-    ]
-    # NumPy, Zarr, and Numba buffers are traced. The search and the writes
-    # that follow it hold no more than the search reserved.
-    assert peak - base <= int(plan["reservedBytes"]) <= 24 * 1024**2
-    assert sorted(slot.group_keys()) == sorted(str(group) for group in result.group_ids)
-
-
-def test_marker_search_fits_its_threads_to_the_memory_budget(
-    tmp_path, monkeypatch
-) -> None:
-    import re
-
-    from scarf.features.markers import search
-    from scarf.features.markers.rank import gene_major_rank_scratch_bytes
-    from scarf.storage.budget import ResourceBudget
-
-    rng = np.random.default_rng(3)
-    values = rng.poisson(0.3, size=(20_000, 64)).astype(np.uint16)
-    store = _layout_store(tmp_path, values, nthreads=8)
-    labels = rng.integers(0, 6, size=len(values))
-    cells = np.arange(len(values))
-    features = np.arange(values.shape[1])
-    roomy = store.RNA.resources
-    expected = find_markers_by_rank(store.RNA, labels, cells, features).statistics
-    schedules: list[tuple[int, int]] = []
-    schedule = search._gene_major_schedule
-
-    def recorded(*args, **kwargs):
-        schedules.append(schedule(*args, **kwargs))
-        return schedules[-1]
-
-    monkeypatch.setattr(search, "_gene_major_schedule", recorded)
-
-    def rank(memory_bytes: int, nthreads: int = 8) -> np.ndarray:
-        store.RNA.resources = ResourceBudget(memory_bytes, roomy.workers)
-        return find_markers_by_rank(
-            store.RNA, labels, cells, features, nthreads=nthreads
-        ).statistics
-
-    with pytest.raises(MemoryError, match="needs at least") as refused:
-        rank(1)
-    (minimum,) = re.findall(r"needs at least (\d+) bytes", str(refused.value))
-    minimum = int(minimum)
-    with pytest.raises(MemoryError, match="needs at least"):
-        rank(minimum - 1)
-    # One thread fits exactly at the minimum, and a few more just above it.
-    np.testing.assert_array_equal(rank(minimum), expected)
-    assert schedules[-1] == (1, 1)
-    per_thread = gene_major_rank_scratch_bytes(
-        n_cells=len(cells), n_groups=6, n_features=0, nthreads=2
-    ) - gene_major_rank_scratch_bytes(
-        n_cells=len(cells), n_groups=6, n_features=0, nthreads=1
-    )
-    np.testing.assert_array_equal(rank(minimum + 2 * per_thread), expected)
-    threads, calls = schedules[-1]
-    assert 1 < threads * calls < roomy.workers
-    # nthreads caps the threads that a roomy budget would allow.
-    np.testing.assert_array_equal(rank(roomy.memoryBytes, nthreads=2), expected)
-    threads, calls = schedules[-1]
-    assert threads * calls == 2
-
-
-def test_marker_search_ranks_narrow_read_groups_at_once(tmp_path, monkeypatch) -> None:
-    from scarf.features.markers import search
-    from scarf.storage.feature_stream import persisted_read_group, read_group_rows
-
-    rng = np.random.default_rng(4)
-    values = rng.poisson(0.3, size=(20_000, 64)).astype(np.uint16)
-    store = _layout_store(tmp_path, values, nthreads=8)
-    labels = rng.integers(0, 6, size=len(values))
-    cells = np.arange(len(values))
-    counts_t = store.RNA.rawDataT
-    # One feature of each read group leaves one row per kernel call, so whole
-    # groups run at once, one serial kernel each.
-    features = np.arange(0, values.shape[1], persisted_read_group(counts_t)[0])
-    groups = len(read_group_rows(counts_t, features))
-    assert groups > 1
-    schedules: list[tuple[int, int]] = []
-    schedule = search._gene_major_schedule
-
-    def recorded(*args, **kwargs):
-        schedules.append(schedule(*args, **kwargs))
-        return schedules[-1]
-
-    monkeypatch.setattr(search, "_gene_major_schedule", recorded)
-    expected = find_markers_by_rank(store.RNA, labels, cells, features).statistics
-    observed = find_markers_by_rank(
-        store.RNA, labels, cells, features, nthreads=8
-    ).statistics
-
-    assert schedules == [(1, 1), (1, groups)]
-    np.testing.assert_array_equal(observed, expected)
-
-
-_SCRATCH_CHILD = textwrap.dedent(
-    """
-    import json
-    import sys
-    import threading
-    from pathlib import Path
-
-    import numba
-    import numpy as np
-
-    from scarf.features.markers import search
-    from scarf.features.markers.rank import gene_major_rank_scratch_bytes
-    from scarf.storage import feature_stream
-    from tests.test_markers import _layout_store
-
-    directory = Path(sys.argv[1])
-    values = np.load(directory / "values.npy")
-    n_cells, n_features = values.shape
-    store = _layout_store(directory, values, nthreads=8)
-    lock = threading.Lock()
-    active = 0
-    calls = []
-    charged = []
-    original_kernel = search._marker_stats_gene_major
-    original_map = feature_stream.map_feature_read_groups
-
-    def kernel(*args):
-        global active
-        with lock:
-            active += 1
-            calls.append((args[8], numba.get_num_threads(), active))
-        try:
-            return original_kernel(*args)
-        finally:
-            with lock:
-                active -= 1
-
-    def stream(*args, **kwargs):
-        charged.append(kwargs["scratchBytes"])
-        return original_map(*args, **kwargs)
-
-    original_schedule = search._gene_major_schedule
-    schedules = []
-
-    def schedule(*args, **kwargs):
-        planned = original_schedule(*args, **kwargs)
-        schedules.append(planned)
-        return planned
-
-    search._marker_stats_gene_major = kernel
-    search._gene_major_schedule = schedule
-    feature_stream.map_feature_read_groups = stream
-    counts_t = store.RNA.rawDataT
-    group_width = feature_stream.persisted_read_group(counts_t)[0]
-    # The features of one read group, then every feature.
-    for features in (np.arange(group_width), np.arange(n_features)):
-        calls.clear()
-        charged.clear()
-        schedules.clear()
-        result = search.find_markers_by_rank(
-            store.RNA,
-            np.arange(n_cells) % 5,
-            np.arange(n_cells),
-            features,
-            nthreads=8,
-        )
-        ((slots, planned_calls),) = schedules
-        print("SCRATCH:" + json.dumps({
-            "features": len(features),
-            "readGroups": len(feature_stream.read_group_rows(counts_t, features)),
-            "workers": store.RNA.resources.workers,
-            "slots": slots,
-            "plannedCalls": planned_calls,
-            "threads": sorted({call[0] for call in calls}),
-            "numbaThreads": sorted({call[1] for call in calls}),
-            "concurrentCalls": max(call[2] for call in calls),
-            "charged": charged[0] - result.statistics.nbytes,
-            "kernelScratch": planned_calls * gene_major_rank_scratch_bytes(
-                n_cells=n_cells,
-                n_groups=5,
-                n_features=group_width,
-                nthreads=slots,
-            ),
-        }))
-    """
-)
-
-
-def test_marker_kernel_scratch_covers_the_kernel_threads_that_run(tmp_path) -> None:
-    import json
-    import os
-    import subprocess
-    import sys
-
-    values = np.random.default_rng(1).poisson(0.3, size=(12_000, 128))
-    np.save(tmp_path / "values.npy", values.astype(np.uint16))
-    env = {**os.environ, "NUMBA_NUM_THREADS": "2", "SCARF_WORKERS": "8"}
-
-    completed = subprocess.run(
-        [sys.executable, "-c", _SCRATCH_CHILD, str(tmp_path)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    observed = {
-        entry["features"]: entry
-        for entry in (
-            json.loads(line.removeprefix("SCRATCH:"))
-            for line in completed.stdout.splitlines()
-            if line.startswith("SCRATCH:")
-        )
-    }
-    one_group, every_group = observed[min(observed)], observed[max(observed)]
-    # Eight workers split one read group over the two Numba threads of one
-    # kernel call at a time.
-    assert one_group["workers"] == 8
-    assert one_group["readGroups"] == 1
-    assert (one_group["slots"], one_group["plannedCalls"]) == (2, 1)
-    assert one_group["threads"] == one_group["numbaThreads"] == [2]
-    assert one_group["concurrentCalls"] == 1
-    # Narrow read groups run at once with one slot each, on no more compute
-    # workers than were planned for them.
-    groups = every_group["readGroups"]
-    assert 1 < groups <= 8
-    assert (every_group["slots"], every_group["plannedCalls"]) == (1, groups)
-    assert every_group["threads"] == [1]
-    assert every_group["concurrentCalls"] <= groups
-    # The search charges the scratch of every kernel call that can run.
-    for entry in (one_group, every_group):
-        assert entry["charged"] >= entry["kernelScratch"]

@@ -94,8 +94,6 @@ def test_prepare_local_datasets_uses_in_memory_path(tmp_path: Path) -> None:
         spec=spec,
     )
     assert [item.targetRows for item in prepared.artifacts] == [10, 25]
-    assert (tmp_path / "subsets" / "10.h5ad").is_file()
-    assert (tmp_path / "subsets" / "25.h5ad").is_file()
 
     selections = select_nested_rows(
         80,
@@ -104,6 +102,19 @@ def test_prepare_local_datasets_uses_in_memory_path(tmp_path: Path) -> None:
         sourceVersion=spec.versionId,
     )
     assert set(selections[10].tolist()).issubset(set(selections[25].tolist()))
+    with h5py.File(source, "r") as h5:
+        source_ids = h5["obs/_index"][:]
+    for artifact in prepared.artifacts:
+        rows = selections[artifact.targetRows]
+        assert (
+            artifact.localPath == tmp_path / "subsets" / f"{artifact.targetRows}.h5ad"
+        )
+        assert artifact.sourceRowsSha256 == ordered_source_row_digest(rows)
+        assert artifact.finalSourceRow == int(rows[-1])
+        # Each sample holds exactly its selected source rows, in order.
+        with h5py.File(artifact.localPath, "r") as h5:
+            np.testing.assert_array_equal(h5["obs/_index"][:], source_ids[rows])
+            assert h5["X"].attrs["shape"].tolist() == [artifact.targetRows, 30]
 
 
 def test_example_config_loads_prepare_resources() -> None:

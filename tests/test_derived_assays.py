@@ -556,7 +556,11 @@ def test_grouped_assay_from_aggregation_ignores_unclustered_features(
     datastore, pseudotime_aggregation, tmp_path
 ):
     source = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
-    aggregation = datastore.run_pseudotime_aggregation(
+    # A copy keeps the shared session store free of this test's results.
+    copy = tmp_path / "copy.zarr"
+    shutil.copytree(datastore.zarr_loc, copy)
+    store = DataStore(str(copy), default_assay="RNA")
+    aggregation = store.run_pseudotime_aggregation(
         source.pseudotime,
         features=source.feature_selection,
         n_clusters=15,
@@ -564,9 +568,6 @@ def test_grouped_assay_from_aggregation_ignores_unclustered_features(
         chunk_size=10,
         nan_cluster_value=0,
     )
-    copy = tmp_path / "copy.zarr"
-    shutil.copytree(datastore.zarr_loc, copy)
-    store = DataStore(str(copy), default_assay="RNA")
     loaded = store.load_pseudotime_aggregation(aggregation)
     clusters = sorted(set(loaded.feature_clusters.tolist()))
     assert 0 not in clusters

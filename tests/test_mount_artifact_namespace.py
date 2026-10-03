@@ -164,6 +164,21 @@ def published(tmp_path_factory):
     )
 
 
+@pytest.fixture(scope="module")
+def branched(published, tmp_path_factory):
+    """A mount of a copy of the published source that ran a branch recipe."""
+    root = tmp_path_factory.mktemp("branched")
+    source = root / "source.zarr"
+    shutil.copytree(published.location, source)
+    before = _files(source)
+    target = root / "target.zarr"
+    mounted = _mount(str(source), target)
+    run = mounted.pipeline.run(label="branch", leiden={"partitions": [0.5]}, **RECIPE)
+    return SimpleNamespace(
+        source=source, before=before, target=target, mounted=mounted, run=run
+    )
+
+
 def test_mount_lists_inspects_loads_and_traces_source_artifacts(published, tmp_path):
     before = _files(published.location)
     mounted = _mount(published.location, tmp_path / "target.zarr")
@@ -250,21 +265,15 @@ def test_identical_recipe_on_a_mount_reuses_every_source_artifact(published, tmp
     assert _files(published.location) == before
 
 
-def test_branch_recipe_writes_only_its_new_artifacts_to_the_target(published, tmp_path):
-    before = _files(published.location)
-    target = tmp_path / "target.zarr"
-    mounted = _mount(published.location, target)
-
-    run = mounted.pipeline.run(label="branch", leiden={"partitions": [0.5]}, **RECIPE)
-
-    summary = run.report()["summary"]
+def test_branch_recipe_writes_only_its_new_artifacts_to_the_target(published, branched):
+    summary = branched.run.report()["summary"]
     created = sorted(item["kind"] for item in summary["createdArtifacts"])
     assert created == ["cluster_labels", "cluster_selection", "marker_table"]
     assert len(summary["reusedArtifacts"]) == published.planned - len(created)
-    assert _artifact_kinds(target / "RNA" / "artifacts") == created
-    assert not (target / "artifacts").exists()
-    _complete_lineage(mounted, run["markers"])
-    assert _files(published.location) == before
+    assert _artifact_kinds(branched.target / "RNA" / "artifacts") == created
+    assert not (branched.target / "artifacts").exists()
+    _complete_lineage(branched.mounted, branched.run["markers"])
+    assert _files(branched.source) == branched.before
 
 
 def test_store_writes_inside_source_groups_are_refused(published, tmp_path):
@@ -367,19 +376,16 @@ def test_namespace_never_reads_source_tables_counts_or_runs(published, tmp_path)
     assert not sync(reopened.z.store.exists("RNA/artifacts/missing/zarr.json"))
 
 
-def test_read_only_reopen_resolves_source_artifacts(published, tmp_path):
-    target = tmp_path / "target.zarr"
-    mounted = _mount(published.location, target)
-    branch = mounted.pipeline.run(
-        label="branch", leiden={"partitions": [0.5]}, **RECIPE
-    )
-
+def test_read_only_reopen_resolves_source_artifacts(published, branched):
     reopened = DataStore(
-        str(target), zarr_mode="r", default_assay="RNA", min_features_per_cell=-1
+        str(branched.target),
+        zarr_mode="r",
+        default_assay="RNA",
+        min_features_per_cell=-1,
     )
 
     assert reopened.z.store.read_only
-    assert reopened.list_artifacts(from_assay="RNA") == mounted.list_artifacts(
+    assert reopened.list_artifacts(from_assay="RNA") == branched.mounted.list_artifacts(
         from_assay="RNA"
     )
     pd.testing.assert_frame_equal(
@@ -387,7 +393,7 @@ def test_read_only_reopen_resolves_source_artifacts(published, tmp_path):
     )
     pd.testing.assert_frame_equal(
         reopened.get_markers(reopened.pipeline.open(label="branch")["markers"]),
-        mounted.get_markers(branch["markers"]),
+        branched.mounted.get_markers(branched.run["markers"]),
     )
     with pytest.raises(PermissionError):
         reopened.run_marker_search(
@@ -396,32 +402,32 @@ def test_read_only_reopen_resolves_source_artifacts(published, tmp_path):
         )
 
 
-def test_repacked_mount_is_self_contained_after_its_source_moves(published, tmp_path):
-    source = tmp_path / "source.zarr"
-    shutil.copytree(published.location, source)
-    target = tmp_path / "target.zarr"
-    mounted = _mount(str(source), target)
-    branch = mounted.pipeline.run(
-        label="branch", leiden={"partitions": [0.5]}, **RECIPE
-    )
+def test_repacked_mount_is_self_contained_after_its_source_moves(
+    published, branched, tmp_path
+):
+    mounted = branched.mounted
     assay_artifacts = mounted.list_artifacts(from_assay="RNA")
     datastore_artifacts = mounted.list_artifacts(scope="datastore")
-    markers = mounted.get_markers(branch["markers"])
-    lineage = _complete_lineage(mounted, branch["markers"])
+    markers = mounted.get_markers(branched.run["markers"])
+    lineage = _complete_lineage(mounted, branched.run["markers"])
     assert len(assay_artifacts) == len(published.assay_artifacts) + 3
 
     output = tmp_path / "repacked.zarr"
-    repack_store(str(target), str(output), nthreads=1)
-    source.rename(tmp_path / "moved.zarr")
-
-    assert MATRIX_SOURCE_ATTR not in zarr.open_group(str(output), mode="r").attrs
-    repacked = DataStore(str(output), default_assay="RNA", min_features_per_cell=-1)
-    assert not isinstance(repacked.z.store, MountedArtifactStore)
-    assert repacked.list_artifacts(from_assay="RNA") == assay_artifacts
-    assert repacked.list_artifacts(scope="datastore") == datastore_artifacts
-    run = repacked.pipeline.open(label="branch")
-    assert _complete_lineage(repacked, run["markers"]) == lineage
-    pd.testing.assert_frame_equal(repacked.get_markers(run["markers"]), markers)
+    repack_store(str(branched.target), str(output), nthreads=1)
+    moved = branched.source.with_name("moved.zarr")
+    branched.source.rename(moved)
+    try:
+        assert MATRIX_SOURCE_ATTR not in zarr.open_group(str(output), mode="r").attrs
+        repacked = DataStore(str(output), default_assay="RNA", min_features_per_cell=-1)
+        assert not isinstance(repacked.z.store, MountedArtifactStore)
+        assert repacked.list_artifacts(from_assay="RNA") == assay_artifacts
+        assert repacked.list_artifacts(scope="datastore") == datastore_artifacts
+        run = repacked.pipeline.open(label="branch")
+        assert _complete_lineage(repacked, run["markers"]) == lineage
+        pd.testing.assert_frame_equal(repacked.get_markers(run["markers"]), markers)
+    finally:
+        # The other tests of this module share the mounted source.
+        moved.rename(branched.source)
 
 
 def test_workspace_mount_resolves_both_artifact_roots(tmp_path):

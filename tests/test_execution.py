@@ -24,11 +24,9 @@ def test_plan_operation_reserves_inner_reads() -> None:
             writes=True,
         ),
     )
-    assert plan.innerReads >= 1
-    assert plan.reservedBytes >= (
-        plan.readWorkers * plan.unitBytes
-        + plan.readWorkers * 64 * 1024 * plan.innerReads
-    )
+    # Eight units read at once, each with one inner read per chunk of its shard.
+    assert (plan.readWorkers, plan.innerReads, plan.writeWorkers) == (8, 4, 8)
+    assert plan.reservedBytes == 8 * 256 * 1024 + 8 * 4 * 64 * 1024
     assert plan.reservedBytes <= resources.memoryBytes
 
 
@@ -158,12 +156,12 @@ def test_plan_operation_respects_ceilings() -> None:
         WorkShape(nUnits=16, unitBytes=1024 * 1024, writes=True),
         policy=StorageIoPolicy(readWorkers=3, computeWorkers=2, writeWorkers=2),
     )
-    assert plan.readWorkers <= 3
-    assert plan.computeWorkers <= 2
-    assert plan.writeWorkers <= 2
-    assert plan.computeWorkers * plan.threadsPerComputeWorker <= 8
-    assert plan.writeWorkers * plan.threadsPerComputeWorker <= 8
-    assert plan.reservedBytes <= resources.memoryBytes
+    # Memory admits all 16 units, so the requested widths bind, and the eight
+    # workers split their threads between two compute workers.
+    assert (plan.readWorkers, plan.computeWorkers, plan.writeWorkers) == (3, 2, 2)
+    assert plan.threadsPerComputeWorker == 4
+    assert plan.reservedBytes == 3 * 1024 * 1024
+    assert plan.reductionReason is None
 
 
 def test_plan_operation_reduces_when_memory_is_tight() -> None:
@@ -174,12 +172,19 @@ def test_plan_operation_reduces_when_memory_is_tight() -> None:
         policy=StorageIoPolicy(readWorkers=8),
     )
     assert plan.readWorkers == 2
-    assert plan.reductionReason is not None
-    assert "3" in plan.reductionReason or "bytes" in plan.reductionReason
+    assert plan.reservedBytes == 2 * 3 * 1024 * 1024
+    assert plan.reductionReason == (
+        "2 readers used because each unit needs 3145728 bytes; "
+        "2 compute workers used because each unit needs 3145728 bytes"
+    )
 
 
 def test_plan_operation_rejects_one_unit_over_budget() -> None:
-    with pytest.raises(MemoryError):
+    with pytest.raises(
+        MemoryError,
+        match="One unit needs about 2048 bytes in addition to 100 reserved bytes, "
+        "but the operation limit is 1024 bytes",
+    ):
         plan_operation(
             ResourceBudget(1024, 2),
             WorkShape(nUnits=4, unitBytes=2048, residentBytes=100),
@@ -239,15 +244,13 @@ def test_map_feature_process_is_not_on_event_loop_thread() -> None:
                 io=StorageIoPolicy(readWorkers=2),
             )
         )
-    assert starts
-    assert on_loop
-    assert not any(on_loop)
-    assert reports
+    # One read group per chunk of features, each processed off the loop.
+    feature_chunk = int(counts_t.chunks[0])
+    assert starts == list(range(0, 80, feature_chunk))
+    assert on_loop == [False] * len(starts)
     report = reports[-1]
     assert report.unitKind == "countsTReadGroup"
     assert report.unitsCompleted == len(starts)
-    assert report.fetchSeconds >= 0.0
-    assert report.readerWaitSeconds >= 0.0
 
 
 def test_plan_operation_write_workers_fit_memory() -> None:
@@ -257,8 +260,11 @@ def test_plan_operation_write_workers_fit_memory() -> None:
         WorkShape(nUnits=16, unitBytes=3 * 1024 * 1024, writes=True),
     )
     assert plan.writeWorkers == 2
-    assert plan.reservedBytes <= resources.memoryBytes
-    assert plan.reductionReason is not None
+    assert plan.reservedBytes == 2 * 3 * 1024 * 1024
+    assert plan.reductionReason == (
+        "2 compute workers used because each unit needs 3145728 bytes; "
+        "2 writers used because each unit needs 3145728 bytes"
+    )
 
 
 def test_plan_operation_reports_reason_for_few_units() -> None:
@@ -268,8 +274,7 @@ def test_plan_operation_reports_reason_for_few_units() -> None:
     )
     assert plan.readWorkers == 2
     assert plan.computeWorkers == 2
-    assert plan.reductionReason is not None
-    assert "2" in plan.reductionReason
+    assert plan.reductionReason == "2 compute workers used because there are 2 units"
 
 
 def test_plan_operation_is_independent_of_call_order() -> None:
@@ -354,12 +359,10 @@ def test_plan_active_work_never_exceeds_requested_workers() -> None:
         WorkShape(nUnits=32, unitBytes=256 * 1024, writes=True),
         policy=StorageIoPolicy(readWorkers=5, computeWorkers=4, writeWorkers=4),
     )
-    assert plan.readWorkers <= 6
-    assert plan.computeWorkers <= 6
-    assert plan.writeWorkers <= 6
-    assert plan.computeWorkers * plan.threadsPerComputeWorker <= 6
-    assert plan.writeWorkers * plan.threadsPerComputeWorker <= 6
-    assert plan.reservedBytes <= resources.memoryBytes
+    # Every requested width fits six workers, so each worker gets one thread.
+    assert (plan.readWorkers, plan.computeWorkers, plan.writeWorkers) == (5, 4, 4)
+    assert plan.threadsPerComputeWorker == 1
+    assert plan.reservedBytes == 5 * 256 * 1024
     assert plan.requestedReadWorkers == 5
     assert plan.requestedComputeWorkers == 4
     assert plan.requestedWriteWorkers == 4
@@ -484,10 +487,33 @@ def test_chunked_row_stream_uses_shared_plan() -> None:
     assert report.plan.reservedBytes <= 4 * 1024 * 1024
 
 
+def _write_h5ad(path, values: np.ndarray):  # type: ignore[no-untyped-def]
+    """Write a minimal CSR AnnData file with ``feature_name`` names."""
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    matrix = csr_matrix(values)
+    with h5py.File(path, "w") as h5:
+        group = h5.create_group("X")
+        group.attrs["encoding-type"] = "csr_matrix"
+        group.attrs["shape"] = values.shape
+        group.create_dataset("data", data=matrix.data)
+        group.create_dataset("indices", data=matrix.indices)
+        group.create_dataset("indptr", data=matrix.indptr)
+        h5.create_group("obs").create_dataset(
+            "_index", data=np.array([f"c{i}".encode() for i in range(values.shape[0])])
+        )
+        names = np.array([f"g{i}".encode() for i in range(values.shape[1])])
+        var = h5.create_group("var")
+        var.create_dataset("_index", data=names)
+        var.create_dataset("feature_name", data=names)
+        h5.create_group("obsm")
+    return path
+
+
 def test_h5ad_import_records_execution_report(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from scarf.readers import H5adReader
     from scarf.writers import H5adToZarr
-    from tests.test_writers import _write_h5ad
 
     values = np.arange(1, 25, dtype=np.uint16).reshape(8, 3)
     path = _write_h5ad(tmp_path / "execution.h5ad", values)
@@ -504,11 +530,14 @@ def test_h5ad_import_records_execution_report(tmp_path) -> None:  # type: ignore
             writer.dump()
     finally:
         reader.h5.close()
-    assert reports
-    report = reports[-1]
-    assert report.unitKind in {"countsImportBand", "countsRowShard"}
-    assert report.plan.writeWorkers <= 2
-    assert report.actualWriteWorkers <= 2
+    # The band import and the countsT transpose each honor the one writer.
+    assert [report.unitKind for report in reports] == [
+        "countsImportBand",
+        "countsRowShard",
+    ]
+    for report in reports:
+        assert report.plan.writeWorkers == report.actualWriteWorkers == 1
+        assert report.unitsCompleted == 1
 
 
 def _dummy_report(unitKind: str) -> ExecutionReport:
@@ -568,17 +597,21 @@ def test_feature_consume_details_uses_matching_kind_after_later_reports() -> Non
 def test_pairwise_merge_tree_is_independent_of_completion_order() -> None:
     from scarf.utils.compute import add_stat_arrays, pairwise_merge_tree
 
+    # A merge that records its association shows the fixed tree: neighbours
+    # first, then neighbouring pairs, with an odd leftover promoted unchanged.
+    def merge(left: str, right: str) -> str:
+        return f"({left}+{right})"
+
+    assert pairwise_merge_tree(list("abcde"), merge) == "(((a+b)+(c+d))+e)"
+    assert pairwise_merge_tree(list("abcdef"), merge) == "(((a+b)+(c+d))+(e+f))"
+    assert pairwise_merge_tree(["a"], merge) == "a"
+
     left = (np.array([1.0, 2.0]), np.array([3.0, 4.0]))
     right = (np.array([5.0, 6.0]), np.array([7.0, 8.0]))
     third = (np.array([9.0, 10.0]), np.array([11.0, 12.0]))
-    first = pairwise_merge_tree([left, right, third], add_stat_arrays)
-    second = pairwise_merge_tree([left, right, third], add_stat_arrays)
-    for observed, expected in zip(first, second, strict=True):
-        np.testing.assert_array_equal(observed, expected)
-    paired = add_stat_arrays(left, right)
-    expected = add_stat_arrays(paired, third)
-    for observed, value in zip(first, expected, strict=True):
-        np.testing.assert_array_equal(observed, value)
+    merged = pairwise_merge_tree([left, right, third], add_stat_arrays)
+    np.testing.assert_array_equal(merged[0], [15.0, 18.0])
+    np.testing.assert_array_equal(merged[1], [21.0, 24.0])
 
 
 def test_pairwise_merge_tree_rejects_empty_and_mismatched_stats() -> None:
@@ -608,7 +641,11 @@ def test_plan_operation_error_and_reason_branches() -> None:
                 readWorkers=0, computeWorkers=None, writeWorkers=None
             ),
         )
-    with pytest.raises(MemoryError):
+    with pytest.raises(
+        MemoryError,
+        match="One live unit plus one inner read needs about 32 bytes, "
+        "but only 20 bytes are available",
+    ):
         plan_operation(
             ResourceBudget(20, 2),
             WorkShape(
@@ -623,8 +660,11 @@ def test_plan_operation_error_and_reason_branches() -> None:
         WorkShape(nUnits=2, unitBytes=32, writes=False),
         policy=StorageIoPolicy(readWorkers=8, computeWorkers=8),
     )
-    assert plan.readWorkers <= 2
-    assert plan.reductionReason is not None
+    assert (plan.readWorkers, plan.computeWorkers) == (2, 2)
+    assert plan.reductionReason == (
+        "2 readers used because there are 2 units; "
+        "2 compute workers used because there are 2 units"
+    )
     with pytest.raises(MemoryError, match="Resident data"):
         plan_operation(
             ResourceBudget(8, 2),

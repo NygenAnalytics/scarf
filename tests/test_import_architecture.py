@@ -1,9 +1,13 @@
 import ast
+import json
+import os
 import subprocess
 import sys
 from functools import cache
 from importlib.util import find_spec
 from pathlib import Path
+
+import pytest
 
 
 _SCARF_ROOT = Path(__file__).resolve().parents[1] / "scarf"
@@ -44,17 +48,37 @@ _MOVED_SYMBOLS = {
 }
 
 
+@cache
+def _tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(), filename=str(path))
+
+
+@cache
+def _nodes(path: Path) -> tuple[ast.AST, ...]:
+    return tuple(ast.walk(_tree(path)))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_parsed_sources():
+    """Parse each source once for this module, then free the ~170 MiB of trees."""
+    yield
+    _nodes.cache_clear()
+    _tree.cache_clear()
+    _root_imports_by_path.cache_clear()
+
+
 def _upward_imports(
     package_name: str,
     forbidden_packages: set[str],
     allowed_modules: frozenset[str] = frozenset(),
 ) -> set[tuple[str, str]]:
     package_root = _SCARF_ROOT / package_name
+    # A renamed or removed package must fail here instead of passing vacuously.
+    assert (package_root / "__init__.py").is_file(), package_root
     violations: set[tuple[str, str]] = set()
 
     for path in package_root.rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+        for node in _nodes(path):
             targets: set[str] = set()
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -88,9 +112,8 @@ def _root_imports(path: Path) -> set[str]:
     if parent_parts == ["."]:
         parent_parts = []
     imports: set[str] = set()
-    tree = ast.parse(path.read_text(), filename=str(path))
 
-    for node in ast.walk(tree):
+    for node in _nodes(path):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 parts = alias.name.split(".")
@@ -196,7 +219,7 @@ def _runtime_import_modules(
                     self.modules.add(module_name)
 
     visitor = RuntimeImportVisitor()
-    visitor.visit(ast.parse(path.read_text(), filename=str(path)))
+    visitor.visit(_tree(path))
     return visitor.modules
 
 
@@ -213,10 +236,9 @@ def _attribute_parts(node: ast.AST) -> list[str] | None:
 def _moved_symbol_imports() -> set[tuple[str, str, str]]:
     violations: set[tuple[str, str, str]] = set()
     for path in _SCARF_ROOT.rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
         aliases: dict[str, str] = {}
 
-        for node in ast.walk(tree):
+        for node in _nodes(path):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if not alias.name.startswith("scarf."):
@@ -247,7 +269,7 @@ def _moved_symbol_imports() -> set[tuple[str, str, str]]:
                 if imported_module in _MOVED_SYMBOLS:
                     aliases[alias.asname or alias.name] = imported_module
 
-        for node in ast.walk(tree):
+        for node in _nodes(path):
             if not isinstance(node, ast.Attribute):
                 continue
             parts = _attribute_parts(node)
@@ -270,6 +292,130 @@ def _moved_symbol_imports() -> set[tuple[str, str, str]]:
     return violations
 
 
+# Scripts that must see ``sys.modules`` as a fresh interpreter would. Each one
+# is registered beside the test that asserts its outcome.
+_FRESH_IMPORT_CHECKS: dict[str, str] = {}
+_LOADED_HELPER = """
+import sys
+
+
+def loaded(*prefixes):
+    return sorted(
+        name
+        for name in sys.modules
+        for prefix in prefixes
+        if name == prefix or name.startswith(prefix + ".")
+    )
+"""
+# Third-party packages the checked facades load eagerly. The probe imports them
+# once, confirms that no Scarf module or package a check forbids came with
+# them, and forks one child per check. Every check therefore starts from the
+# same state, and none pays for these imports again. Off Linux, where forking a
+# process with native libraries loaded is less safe, each check runs in its own
+# fresh interpreter instead.
+_FRESH_IMPORT_BASE = (
+    "h5py",
+    "numba",
+    "numpy",
+    "pandas",
+    "scipy.sparse",
+    "scipy.stats",
+    "sklearn.cluster",
+    "zarr",
+)
+_FRESH_IMPORT_FORBIDDEN_IN_BASE = ("scarf", "matplotlib", "seaborn", "pydantic_ai")
+_FRESH_IMPORT_PROBE = """
+import importlib
+import json
+import os
+import subprocess
+import sys
+import traceback
+
+request = json.load(sys.stdin)
+for name in request["base"]:
+    importlib.import_module(name)
+preloaded = sorted(
+    name for name in sys.modules if name.split(".")[0] in request["forbidden"]
+)
+if preloaded:
+    raise SystemExit(f"The shared imports loaded {preloaded}")
+
+
+def run_forked(name, script):
+    read_end, write_end = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_end)
+        error = ""
+        try:
+            exec(compile(script, name, "exec"), {"__name__": "__main__"})
+        except BaseException:
+            error = traceback.format_exc()
+        with os.fdopen(write_end, "w") as pipe:
+            pipe.write(error)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1 if error else 0)
+    os.close(write_end)
+    with os.fdopen(read_end) as pipe:
+        error = pipe.read()
+    _, status = os.waitpid(pid, 0)
+    exit_code = os.waitstatus_to_exitcode(status)
+    return error or ("" if exit_code == 0 else f"exited with status {exit_code}")
+
+
+def run_fresh(name, script):
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    if completed.returncode == 0:
+        return ""
+    return completed.stderr or f"exited with status {completed.returncode}"
+
+
+run = run_forked if sys.platform == "linux" else run_fresh
+results = {name: run(name, script) for name, script in request["checks"].items()}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(results, handle)
+"""
+
+
+@pytest.fixture(scope="module")
+def fresh_import_errors(tmp_path_factory) -> dict[str, str]:
+    """Run every registered fresh-interpreter check once and map it to its error."""
+    output = tmp_path_factory.mktemp("fresh_imports") / "errors.json"
+    request = {
+        "base": _FRESH_IMPORT_BASE,
+        "forbidden": _FRESH_IMPORT_FORBIDDEN_IN_BASE,
+        "checks": {
+            name: _LOADED_HELPER + script
+            for name, script in _FRESH_IMPORT_CHECKS.items()
+        },
+    }
+    # One BLAS thread keeps the probe single-threaded, so forking it is safe.
+    single_threaded = dict.fromkeys(
+        ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"), "1"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", _FRESH_IMPORT_PROBE, str(output)],
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+        env=os.environ | single_threaded,
+        timeout=600,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(output.read_text(encoding="utf-8"))
+
+
+def _assert_fresh_import_check(errors: dict[str, str], name: str) -> None:
+    assert errors[name] == "", f"Fresh import check {name!r} failed:\n{errors[name]}"
+
+
 def test_storage_has_no_upward_dependencies():
     assert (
         _upward_imports(
@@ -283,7 +429,7 @@ def test_storage_has_no_upward_dependencies():
 def test_storage_functions_do_not_hide_assays_behind_unrestricted_arguments():
     violations = []
     for path in (_SCARF_ROOT / "storage").glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in _nodes(path):
             if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
             for argument in (
@@ -303,7 +449,7 @@ def test_storage_functions_do_not_hide_assays_behind_unrestricted_arguments():
     for path in (_SCARF_ROOT / "storage").glob("*.py"):
         assert not any(
             isinstance(node, ast.Attribute) and node.attr in forbidden_attributes
-            for node in ast.walk(ast.parse(path.read_text()))
+            for node in _nodes(path)
         ), str(path)
 
 
@@ -317,16 +463,15 @@ def test_execution_uses_one_resolved_contract_and_normalization_has_one_owner():
         is OperationPlan
     )
     for path in (_SCARF_ROOT / "storage").glob("*.py"):
-        tree = ast.parse(path.read_text())
         assert not any(
             isinstance(node, ast.ClassDef)
             and node.name in {"ExecutionPlan", "StreamAdmission"}
-            for node in ast.walk(tree)
+            for node in _nodes(path)
         )
         assert not any(
             isinstance(node, ast.FunctionDef)
             and node.name == "write_renorm_subset_to_zarr"
-            for node in ast.walk(tree)
+            for node in _nodes(path)
         )
 
 
@@ -360,22 +505,11 @@ def test_plotting_does_not_import_datastore():
     assert _upward_imports("plotting", {"datastore"}) == set()
 
 
-def test_datastore_plot_namespace_defers_plotting_imports():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import sys
-
+_FRESH_IMPORT_CHECKS["datastore_plot_namespace"] = """
 from scarf.datastore.datastore import DataStore
 
 optional = ("matplotlib", "seaborn")
-assert not any(
-    name == prefix or name.startswith(f"{prefix}.")
-    for name in sys.modules
-    for prefix in ("scarf.plotting", *optional)
-)
+assert not loaded("scarf.plotting", *optional), loaded("scarf.plotting", *optional)
 
 store = object.__new__(DataStore)
 accessor = store.plots
@@ -390,26 +524,19 @@ concrete_modules = {
     "scarf.plotting.heatmaps",
     "scarf.plotting.summary",
 }
-assert concrete_modules.isdisjoint(sys.modules)
-assert not any(
-    name == prefix or name.startswith(f"{prefix}.")
-    for name in sys.modules
-    for prefix in optional
-)
+assert concrete_modules.isdisjoint(sys.modules), concrete_modules & set(sys.modules)
+assert not loaded(*optional), loaded(*optional)
 
 import scarf.plotting as plotting
 
 _ = plotting.embedding
 assert "scarf.plotting.embedding" in sys.modules
-assert not any(
-    name == prefix or name.startswith(f"{prefix}.")
-    for name in sys.modules
-    for prefix in optional
-)
-""",
-        ],
-        check=True,
-    )
+assert not loaded(*optional), loaded(*optional)
+"""
+
+
+def test_datastore_plot_namespace_defers_plotting_imports(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "datastore_plot_namespace")
 
 
 def test_algorithm_domains_do_not_import_orchestration_or_io():
@@ -424,18 +551,14 @@ def test_algorithm_domains_do_not_import_orchestration_or_io():
         "embeddings": {"imported_storage.py"},
         "trajectory": {"artifacts.py"},
     }
-    for package_name in ("clustering", "embeddings", "trajectory"):
-        package_root = _SCARF_ROOT / package_name
-        if package_root.is_dir():
-            assert _upward_imports(package_name, forbidden) == set()
-            storage_edges = _upward_imports(
-                package_name,
-                {"storage"},
-                frozenset({"storage.refs"}),
-            )
-            assert {path for path, _target in storage_edges} == storage_exceptions[
-                package_name
-            ]
+    for package_name, allowed_storage_importers in storage_exceptions.items():
+        assert _upward_imports(package_name, forbidden) == set()
+        storage_edges = _upward_imports(
+            package_name,
+            {"storage"},
+            frozenset({"storage.refs"}),
+        )
+        assert {path for path, _target in storage_edges} == allowed_storage_importers
     assert {path for path, _target in _upward_imports("clustering", {"storage"})} == {
         "paris_multiscale.py"
     }
@@ -443,15 +566,14 @@ def test_algorithm_domains_do_not_import_orchestration_or_io():
 
 def test_artifact_reference_module_has_no_storage_dependencies():
     path = _SCARF_ROOT / "storage" / "refs.py"
-    tree = ast.parse(path.read_text(), filename=str(path))
     imported = {
         alias.name.split(".")[0]
-        for node in ast.walk(tree)
+        for node in _nodes(path)
         if isinstance(node, ast.Import)
         for alias in node.names
     } | {
         node.module.split(".")[0]
-        for node in ast.walk(tree)
+        for node in _nodes(path)
         if isinstance(node, ast.ImportFrom) and node.module
     }
     assert imported <= {"re", "collections", "dataclasses", "typing"}
@@ -466,11 +588,10 @@ def test_metrics_and_embedding_harmony_avoid_runtime_orchestration_and_io_import
         "storage",
         "writers",
     }
-    paths = [
-        *_SCARF_ROOT.joinpath("metrics").glob("*.py"),
-        *_SCARF_ROOT.joinpath("embeddings", "harmony").glob("*.py"),
-    ]
-    for path in paths:
+    metrics_paths = list(_SCARF_ROOT.joinpath("metrics").glob("*.py"))
+    harmony_paths = list(_SCARF_ROOT.joinpath("embeddings", "harmony").glob("*.py"))
+    assert metrics_paths and harmony_paths
+    for path in [*metrics_paths, *harmony_paths]:
         runtime_imports = _runtime_import_modules(path)
         assert not {
             module_name
@@ -541,7 +662,7 @@ def test_read_paths_take_chunk_geometry_only_from_the_storage_geometry_module():
     offenders = set()
     for relative_path in read_path_modules:
         path = _SCARF_ROOT / relative_path
-        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        for node in _nodes(path):
             reads_subscript = (
                 isinstance(node, ast.Subscript)
                 and isinstance(node.value, ast.Attribute)
@@ -611,21 +732,11 @@ def test_internal_modules_do_not_use_moved_symbols_from_hybrid_facades():
     assert _moved_symbol_imports() == set()
 
 
-def test_agent_facade_defers_numerical_and_provider_imports():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import sys
-
+_FRESH_IMPORT_CHECKS["agent_facade"] = """
 import scarf
 
 assert "scarf.agent" not in sys.modules
-assert not any(
-    name == "pydantic_ai" or name.startswith("pydantic_ai.")
-    for name in sys.modules
-)
+assert not loaded("pydantic_ai"), loaded("pydantic_ai")
 
 import scarf.agent as agent
 
@@ -640,15 +751,12 @@ runtime_modules = (
 for public_name in (None, "Study", "analyze_rna", "AnalysisRun"):
     if public_name is not None:
         getattr(agent, public_name)
-    assert not any(
-        name == prefix or name.startswith(f"{prefix}.")
-        for name in sys.modules
-        for prefix in runtime_modules
-    )
-""",
-        ],
-        check=True,
-    )
+    assert not loaded(*runtime_modules), (public_name, loaded(*runtime_modules))
+"""
+
+
+def test_agent_facade_defers_numerical_and_provider_imports(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "agent_facade")
 
 
 def test_agent_support_modules_keep_narrow_dependencies():
@@ -799,41 +907,22 @@ def test_utility_modules_use_domain_names():
     )
 
 
-def test_data_model_defers_domain_algorithms_until_method_calls():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import sys
-
+_FRESH_IMPORT_CHECKS["data_model"] = """
 import scarf.metadata
 
-assert not any(
-    name == "scarf.features" or name.startswith("scarf.features.")
-    for name in sys.modules
-)
+assert not loaded("scarf.features"), loaded("scarf.features")
 
 import scarf.assay
 
-assert not any(
-    name == "scarf.trajectory" or name.startswith("scarf.trajectory.")
-    for name in sys.modules
-)
-""",
-        ],
-        check=True,
-    )
+assert not loaded("scarf.trajectory"), loaded("scarf.trajectory")
+"""
 
 
-def test_features_facades_defer_nested_implementations():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import sys
+def test_data_model_defers_domain_algorithms_until_method_calls(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "data_model")
 
+
+_FRESH_IMPORT_CHECKS["features_facades"] = """
 import scarf
 import scarf.features as features
 
@@ -870,25 +959,26 @@ assert "scarf.features.markers.search" in sys.modules
 _ = features.get_feature_mappings
 assert "scarf.features.genomic.intervals" in sys.modules
 assert "scarf.features.genomic.melding" not in sys.modules
-""",
-        ],
-        check=True,
-    )
+"""
 
 
-def test_metrics_and_merge_do_not_import_datastore_at_runtime():
-    for module_name in ("scarf.metrics", "scarf.merge"):
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    f"import {module_name}; import sys; "
-                    "assert 'scarf.datastore.datastore' not in sys.modules"
-                ),
-            ],
-            check=True,
-        )
+def test_features_facades_defer_nested_implementations(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "features_facades")
+
+
+_FRESH_IMPORT_CHECKS |= {
+    f"{facade}_runtime_imports": f"""
+import scarf.{facade}
+
+assert "scarf.datastore.datastore" not in sys.modules, loaded("scarf.datastore")
+"""
+    for facade in ("metrics", "merge", "mapping")
+}
+
+
+def test_metrics_and_merge_do_not_import_datastore_at_runtime(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "metrics_runtime_imports")
+    _assert_fresh_import_check(fresh_import_errors, "merge_runtime_imports")
 
 
 def test_merge_implementations_are_runtime_isolated():
@@ -922,18 +1012,8 @@ def test_merge_implementations_are_runtime_isolated():
         }
 
 
-def test_mapping_does_not_import_datastore_at_runtime():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import scarf.mapping; import sys; "
-                "assert 'scarf.datastore.datastore' not in sys.modules"
-            ),
-        ],
-        check=True,
-    )
+def test_mapping_does_not_import_datastore_at_runtime(fresh_import_errors):
+    _assert_fresh_import_check(fresh_import_errors, "mapping_runtime_imports")
 
 
 def test_reader_implementations_are_runtime_isolated():
@@ -989,10 +1069,9 @@ def test_reader_implementations_are_runtime_isolated():
         readers_root / name for name in sorted(required_files - {"__init__.py"})
     ]
     for path in implementation_paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
         relative_sibling_imports = {
             alias.name
-            for node in ast.walk(tree)
+            for node in _nodes(path)
             if isinstance(node, ast.ImportFrom)
             and node.level == 1
             and node.module is None
@@ -1079,10 +1158,9 @@ def test_writer_implementations_are_runtime_isolated():
     for path in writers_root.glob("*.py"):
         if path.name == "__init__.py":
             continue
-        tree = ast.parse(path.read_text(), filename=str(path))
         relative_sibling_imports = {
             node.module
-            for node in ast.walk(tree)
+            for node in _nodes(path)
             if isinstance(node, ast.ImportFrom)
             and node.level == 1
             and node.module in format_names
@@ -1105,7 +1183,7 @@ def test_writer_implementations_are_runtime_isolated():
 
         reader_imports = {
             node
-            for node in ast.walk(tree)
+            for node in _nodes(path)
             if isinstance(node, ast.ImportFrom)
             and _resolved_module(path, node) == "readers"
         }
@@ -1132,10 +1210,9 @@ def test_assay_implementations_are_runtime_isolated():
     for path in assay_root.glob("*.py"):
         if path.name == "__init__.py":
             continue
-        tree = ast.parse(path.read_text(), filename=str(path))
         relative_sibling_imports = {
             alias.name
-            for node in ast.walk(tree)
+            for node in _nodes(path)
             if isinstance(node, ast.ImportFrom)
             and node.level == 1
             and node.module is None
@@ -1251,8 +1328,7 @@ def test_analytical_producers_do_not_mutate_live_metadata():
     violations: list[tuple[str, int, str]] = []
 
     for path in producer_paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+        for node in _nodes(path):
             if not isinstance(node, ast.Call):
                 continue
             parts = _attribute_parts(node.func)
@@ -1286,8 +1362,7 @@ def test_graph_latest_pointer_reads_are_absent():
     violations: list[tuple[str, int, str]] = []
 
     for path in _SCARF_ROOT.rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
+        for node in _nodes(path):
             if (
                 isinstance(node, ast.Subscript)
                 and isinstance(node.ctx, ast.Load)
@@ -1360,7 +1435,7 @@ def test_missing_mask_links_are_resolved_by_the_canonical_reader():
         relative = path.relative_to(_SCARF_ROOT)
         if relative.parts[0] in allowed_packages:
             continue
-        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        for node in _nodes(path):
             if _reads_missing_mask_link(node):
                 offenders.add((relative.as_posix(), node.lineno))
 

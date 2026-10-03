@@ -1,6 +1,5 @@
 import os
 import select
-import shutil
 import signal
 import subprocess
 import sys
@@ -15,6 +14,7 @@ from scarf.storage.pipeline_runs import (
     list_pipeline_run_records,
     load_pipeline_stage_records,
 )
+from tests.test_pipeline_run_record_paths import _write_graph_store
 
 
 _CHILD = textwrap.dedent(
@@ -39,9 +39,9 @@ _CHILD = textwrap.dedent(
     store.pipeline.run(
         filtering=False,
         cell_cycle=False,
-        hvg_count=50,
+        hvg_count=20,
         pca_dims=3,
-        neighbors_k=3,
+        neighbors_k=5,
         umap=False,
         leiden=False,
         paris=False,
@@ -156,9 +156,9 @@ _SIGNAL_RACE_CHILD = textwrap.dedent(
     store.pipeline.run(
         filtering=False,
         cell_cycle=False,
-        hvg_count=50,
+        hvg_count=20,
         pca_dims=3,
-        neighbors_k=3,
+        neighbors_k=5,
         umap=False,
         leiden=False,
         paris=False,
@@ -167,6 +167,17 @@ _SIGNAL_RACE_CHILD = textwrap.dedent(
     )
     """
 )
+
+
+def _prepared_store(path: Path) -> Path:
+    """Write a small RNA store and prepare it as every child opens it.
+
+    The signal contract does not depend on data size, so each child reaches
+    its paused PCA stage after only a few quick stages.
+    """
+    _write_graph_store(path)
+    DataStore(str(path), default_assay="RNA")
+    return path
 
 
 def _child_environment() -> dict[str, str]:
@@ -247,11 +258,9 @@ def _paused_pipeline(path: Path, *, cooperative: bool) -> subprocess.Popen[str]:
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal contract")
 def test_sigterm_commits_interrupted_pipeline_before_propagation(
-    datastore_zarr_root: str,
     tmp_path: Path,
 ) -> None:
-    location = tmp_path / "sigterm.zarr"
-    shutil.copytree(datastore_zarr_root, location)
+    location = _prepared_store(tmp_path / "sigterm.zarr")
     process = _paused_pipeline(location, cooperative=True)
 
     process.send_signal(signal.SIGTERM)
@@ -261,20 +270,34 @@ def test_sigterm_commits_interrupted_pipeline_before_propagation(
     assert len(runs) == 1
     assert runs[0].status == "interrupted"
     assert runs[0].complete
-    assert runs[0].interruption is not None
+    interruption = runs[0].interruption
+    assert interruption is not None
+    assert (
+        interruption.kind,
+        interruption.signal_number,
+        interruption.signal_name,
+    ) == (
+        "signal",
+        signal.SIGTERM,
+        "SIGTERM",
+    )
     stages = load_pipeline_stage_records(root, runs[0].run_id)
-    assert stages[-1].stage == "pca"
-    assert stages[-1].status == "interrupted"
-    assert stages[-1].complete
+    assert [(stage.stage, stage.status) for stage in stages] == [
+        ("input_snapshot", "completed"),
+        ("filtering", "skipped"),
+        ("cell_cycle", "skipped"),
+        ("highly_variable_features", "completed"),
+        ("normalization", "completed"),
+        ("pca", "interrupted"),
+    ]
+    assert all(stage.complete for stage in stages)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal contract")
 def test_pending_sigterm_propagates_after_operation_failure(
-    datastore_zarr_root: str,
     tmp_path: Path,
 ) -> None:
-    location = tmp_path / "sigterm-operation-failure.zarr"
-    shutil.copytree(datastore_zarr_root, location)
+    location = _prepared_store(tmp_path / "sigterm-operation-failure.zarr")
     process = _start_child(location, _SIGNAL_RACE_CHILD, "operation_failure")
     _wait_for_stdout(process, "READY")
 
@@ -288,23 +311,25 @@ def test_pending_sigterm_propagates_after_operation_failure(
     assert runs[0].status == "failed"
     assert runs[0].complete
     assert runs[0].error is not None
-    assert runs[0].error.type == "RuntimeError"
+    assert (runs[0].error.type, runs[0].error.message) == (
+        "RuntimeError",
+        "PCA failed after SIGTERM",
+    )
     stages = load_pipeline_stage_records(root, runs[0].run_id)
-    assert stages[-1].stage == "pca"
-    assert stages[-1].status == "failed"
+    assert [(stage.stage, stage.status) for stage in stages] == [("pca", "failed")]
     assert stages[-1].complete
     assert stages[-1].error is not None
     assert stages[-1].error.type == "RuntimeError"
+    # The operation failure is recorded first; the pending signal then ends
+    # the process.
     assert returncode == -signal.SIGTERM, stderr
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal contract")
 def test_pending_sigterm_propagates_after_completed_run_handoff(
-    datastore_zarr_root: str,
     tmp_path: Path,
 ) -> None:
-    location = tmp_path / "sigterm-completed-handoff.zarr"
-    shutil.copytree(datastore_zarr_root, location)
+    location = _prepared_store(tmp_path / "sigterm-completed-handoff.zarr")
     process = _start_child(location, _SIGNAL_RACE_CHILD, "completed_handoff")
 
     _stdout, stderr = _communicate(process, timeout=60)
@@ -316,18 +341,16 @@ def test_pending_sigterm_propagates_after_completed_run_handoff(
     assert runs[0].status == "completed"
     assert runs[0].complete
     stages = load_pipeline_stage_records(root, runs[0].run_id)
-    assert stages
+    assert [(stage.stage, stage.status) for stage in stages] == [("handoff", "skipped")]
     assert all(stage.complete for stage in stages)
     assert returncode == -signal.SIGTERM, stderr
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal contract")
 def test_sigkill_leaves_incomplete_run_and_a_new_run_reuses_only_complete_outputs(
-    datastore_zarr_root: str,
     tmp_path: Path,
 ) -> None:
-    location = tmp_path / "sigkill.zarr"
-    shutil.copytree(datastore_zarr_root, location)
+    location = _prepared_store(tmp_path / "sigkill.zarr")
     process = _paused_pipeline(location, cooperative=False)
 
     process.send_signal(signal.SIGKILL)
@@ -344,9 +367,9 @@ def test_sigkill_leaves_incomplete_run_and_a_new_run_reuses_only_complete_output
     recovered = store.pipeline.run(
         filtering=False,
         cell_cycle=False,
-        hvg_count=50,
+        hvg_count=20,
         pca_dims=3,
-        neighbors_k=3,
+        neighbors_k=5,
         umap=False,
         leiden=False,
         paris=False,
@@ -355,8 +378,21 @@ def test_sigkill_leaves_incomplete_run_and_a_new_run_reuses_only_complete_output
     )
     assert recovered.status == "completed"
     report = recovered.report()
-    receipts = [plan for stage in report["stages"] for plan in stage["plans"]]
-    assert any(plan["disposition"] == "reused" for plan in receipts)
+    # Stages the killed run completed are reused; PCA onward is created.
+    dispositions = {
+        stage["stage"]: {plan["disposition"] for plan in stage["plans"]}
+        for stage in report["stages"]
+        if stage["plans"]
+    }
+    assert dispositions == {
+        "input_snapshot": {"reused"},
+        "highly_variable_features": {"reused"},
+        "normalization": {"reused"},
+        "pca": {"created"},
+        "ann_index": {"created"},
+        "neighbors": {"created"},
+        "connectivity": {"created"},
+    }
     assert all(
         store.inspect_artifact(plan_ref).complete for plan_ref in recovered.values()
     )

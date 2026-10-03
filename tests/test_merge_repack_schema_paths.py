@@ -115,6 +115,25 @@ def _merged_counts(location: str, path: str = "RNA/counts") -> np.ndarray:
     return np.asarray(zarr.open_group(location, mode="r")[path][:])
 
 
+def _rows_by_cell(location: str, path: str = "RNA/counts") -> dict[str, list]:
+    """Return merged rows keyed by merged cell ID."""
+    root = zarr.open_group(location, mode="r")
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    return {
+        cell: row.tolist()
+        for cell, row in zip(ids, np.asarray(root[path][:]), strict=True)
+    }
+
+
+def _source_rows(values_by_name: Mapping[str, np.ndarray]) -> dict[str, list]:
+    """Return the expected merged rows of sources whose cells are c0, c1, ..."""
+    return {
+        f"{name}__c{index}": row.tolist()
+        for name, values in values_by_name.items()
+        for index, row in enumerate(values)
+    }
+
+
 @contextmanager
 def _captured_warnings() -> Iterator[list[str]]:
     messages: list[str] = []
@@ -340,6 +359,16 @@ def test_only_cell_and_feature_tables_protect_prepared_columns(tmp_path, prepare
 # Merge planning and writing
 
 
+def test_module_merges_hold_the_rows_of_both_sources(merged, merged_in_workspace):
+    # Later tests compare resumed and rebuilt merges with these two.
+    expected = _source_rows({"left": _COUNTS, "right": _COUNTS + 1})
+    assert _rows_by_cell(merged) == expected
+    workspace = zarr.open_group(merged_in_workspace, mode="r")
+    ids = np.asarray(workspace["ws/cellData/ids"][:]).astype(str)
+    counts = np.asarray(workspace["matrices/RNA/counts"][:])
+    assert dict(zip(ids, counts.tolist(), strict=True)) == expected
+
+
 def test_merge_keeps_the_assay_class_of_each_source_assay(tmp_path):
     counts = {"RNA": _COUNTS, "ADT": _COUNTS[:, :2] * 3, "ATAC": _COUNTS % 2}
     sources = [_open(_write_source(MemoryStore(), counts)) for _ in _NAMES]
@@ -348,6 +377,10 @@ def test_merge_keeps_the_assay_class_of_each_source_assay(tmp_path):
     _merge(sources, destination).dump()
     root = zarr.open_group(destination, mode="r")
     assert root.attrs["assayTypes"] == {"RNA": "RNA", "ADT": "ADT", "ATAC": "ATAC"}
+    for name, values in counts.items():
+        assert _rows_by_cell(destination, f"{name}/counts") == _source_rows(
+            {"left": values, "right": values}
+        )
     assert {name for name in counts if "countsT" in root[name]} == {"RNA"}
     merged = _open(destination)
     # ADT keeps CLR and ATAC keeps TF-IDF normalization.
@@ -367,9 +400,8 @@ def test_merge_reads_sources_that_live_in_memory(tmp_path):
     # An in-memory source has no filesystem path that could overlap.
     assert merger.plan().canDump is True
     merger.dump()
-    np.testing.assert_array_equal(
-        np.sort(_merged_counts(destination).sum(axis=1)),
-        np.sort(np.concatenate([_COUNTS.sum(axis=1), (_COUNTS + 1).sum(axis=1)])),
+    assert _rows_by_cell(destination) == _source_rows(
+        {"left": _COUNTS, "right": _COUNTS + 1}
     )
 
 
@@ -725,15 +757,13 @@ def test_merge_by_name_sums_signed_counts_in_a_wider_dtype(tmp_path):
     merger.dump()
     root = zarr.open_group(destination, mode="r")
     assert root["RNA/counts"].dtype == np.int32
-    by_cell = dict(
-        zip(
-            np.asarray(root["cellData/ids"][:]).astype(str),
-            np.asarray(root["RNA/counts"][:]).tolist(),
-            strict=True,
-        )
-    )
-    assert by_cell["left__c0"] == [1, 1]
-    assert by_cell["right__c1"] == [0, 6]
+    # The left source sums features 0 and 1 into A, the right 1 and 2 into B.
+    assert _rows_by_cell(destination) == {
+        "left__c0": [1, 1],
+        "left__c1": [4, 2],
+        "right__c0": [3, -1],
+        "right__c1": [0, 6],
+    }
 
 
 def test_merge_by_name_keeps_uint64_counts_it_cannot_widen(tmp_path):

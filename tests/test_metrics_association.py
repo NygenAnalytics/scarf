@@ -40,8 +40,11 @@ def test_cramers_v_matches_hand_computed_chi_square() -> None:
     )
     result = cramers_v(left, right)
     assert result["valueUncorrected"] == pytest.approx(0.2)
-    # The bias correction shrinks the estimate toward zero.
-    assert result["value"] < result["valueUncorrected"]
+    # Bergsma's correction subtracts (r - 1)(k - 1) / (n - 1) from phi^2 = 0.04
+    # and shrinks each table dimension by (levels - 1)^2 / (n - 1).
+    assert result["value"] == pytest.approx(np.sqrt((0.04 - 1 / 99) / (1 - 1 / 99)))
+    assert (result["nLevelsLeft"], result["nLevelsRight"]) == (2, 2)
+    assert (result["rowsUsed"], result["rowsMissing"]) == (100, 0)
 
 
 def test_cramers_v_is_degenerate_when_levels_reach_rows() -> None:
@@ -144,33 +147,32 @@ def test_spearman_rho_rejects_non_numeric_values() -> None:
 def test_association_pair_dispatches_kinds() -> None:
     categorical = np.array(["a", "a", "b", "b"])
     continuous = np.array([1.0, 1.2, 8.0, 8.5])
-    assert (
-        association_pair(
-            continuous,
-            categorical,
-            leftKind="continuous",
-            rightKind="categorical",
-        )["measure"]
-        == "etaSquared"
+    forward = association_pair(
+        continuous,
+        categorical,
+        leftKind="continuous",
+        rightKind="categorical",
     )
-    assert (
-        association_pair(
-            categorical,
-            continuous,
-            leftKind="categorical",
-            rightKind="continuous",
-        )["measure"]
-        == "etaSquared"
+    backward = association_pair(
+        categorical,
+        continuous,
+        leftKind="categorical",
+        rightKind="continuous",
     )
-    assert (
-        association_pair(
-            continuous,
-            continuous,
-            leftKind="continuous",
-            rightKind="continuous",
-        )["measure"]
-        == "spearmanRho"
-    )
+    assert forward == backward == eta_squared(continuous, categorical)
+    assert forward["measure"] == "etaSquared"
+    assert association_pair(
+        continuous,
+        continuous[::-1],
+        leftKind="continuous",
+        rightKind="continuous",
+    ) == spearman_rho(continuous, continuous[::-1])
+    assert association_pair(
+        categorical,
+        categorical,
+        leftKind="categorical",
+        rightKind="categorical",
+    ) == cramers_v(categorical, categorical)
 
 
 def test_coefficient_estimability_detects_alias() -> None:
@@ -372,17 +374,128 @@ def test_coefficient_estimability_saturated_but_full_is_not_computed() -> None:
 
 def test_report_confounding_requires_present_columns() -> None:
     design = pd.DataFrame({"disease": ["case", "ctrl"]})
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="coefficient column 'missing' missing"):
         report_confounding(
             design,
             coefficient="missing",
             technicalColumns=[],
             columnKinds={"missing": "categorical"},
         )
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match=r"technical columns missing .*'batch'"):
         report_confounding(
             design,
             coefficient="disease",
             technicalColumns=["batch"],
             columnKinds={"disease": "categorical", "batch": "categorical"},
         )
+
+
+@pytest.mark.parametrize(
+    "measure", [directional_mapping, cramers_v, eta_squared, spearman_rho]
+)
+def test_paired_measures_require_aligned_vectors(measure) -> None:
+    with pytest.raises(ValueError, match="values must be one-dimensional"):
+        measure(np.ones((2, 2)), np.ones(4))
+    with pytest.raises(ValueError, match="paired arrays must have the same length"):
+        measure(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0]))
+
+
+def test_measures_report_too_few_complete_rows() -> None:
+    missing = np.array([np.nan, np.nan, np.nan], dtype=object)
+    labels = np.array(["a", "b", "c"], dtype=object)
+
+    assert directional_mapping(missing, labels) == {
+        "leftMapsToRight": False,
+        "rightMapsToLeft": False,
+        "nesting": "none",
+        "rowsUsed": 0,
+        "rowsMissing": 3,
+    }
+    one_row = np.array([1.0, np.nan, np.nan])
+    expected = {
+        "status": "notComputed",
+        "reason": "insufficientRows",
+        "rowsUsed": 1,
+        "rowsMissing": 2,
+    }
+    assert cramers_v(np.array(["a", None, None], dtype=object), labels) == expected
+    assert eta_squared(one_row, labels) == expected
+    # Spearman needs three rows.
+    assert spearman_rho(np.array([1.0, 2.0, np.nan]), np.array([3.0, 4.0, 5.0])) == {
+        **expected,
+        "rowsUsed": 2,
+        "rowsMissing": 1,
+    }
+
+
+def test_eta_squared_needs_two_groups() -> None:
+    assert eta_squared(np.array([1.0, 2.0, 3.0]), np.array(["a", "a", "a"])) == {
+        "status": "notComputed",
+        "reason": "constantOrSingleLevel",
+        "rowsUsed": 3,
+        "rowsMissing": 0,
+    }
+
+
+def test_coefficient_estimability_reports_unusable_inputs() -> None:
+    def estimability(coefficient, kind, technicals=None, kinds=None):
+        return coefficient_estimability(
+            coefficient,
+            coefficientKind=kind,
+            technicals=technicals or {},
+            technicalKinds=kinds or {},
+        )
+
+    assert estimability(np.array([]), "categorical") == {
+        "status": "notComputed",
+        "reason": "emptyInput",
+        "rowsUsed": 0,
+        "rowsMissing": 0,
+    }
+    assert estimability(np.array(["low", "high"]), "continuous")["reason"] == (
+        "nonNumeric"
+    )
+    sparse = estimability(
+        np.array(["a", "b", "a"]),
+        "categorical",
+        {"batch": np.array(["x", None, None], dtype=object)},
+        {"batch": "categorical"},
+    )
+    assert (sparse["reason"], sparse["rowsUsed"], sparse["rowsMissing"]) == (
+        "insufficientRows",
+        1,
+        2,
+    )
+    # A constant categorical coefficient has no contrast to estimate.
+    constant = estimability(np.array(["a", "a", "a"]), "categorical")
+    assert (constant["reason"], constant["rowsUsed"]) == ("constantCoefficient", 3)
+
+
+def test_coefficient_estimability_ignores_constant_technicals() -> None:
+    disease = np.array(["case", "ctrl", "case", "ctrl", "case", "ctrl"])
+    baseline = coefficient_estimability(
+        disease,
+        coefficientKind="categorical",
+        technicals={},
+        technicalKinds={},
+    )
+
+    # Constant technicals add nothing beyond the intercept, so they are dropped.
+    result = coefficient_estimability(
+        disease,
+        coefficientKind="categorical",
+        technicals={
+            "site": np.array(["s1"] * 6),
+            "depth": np.full(6, 2.5),
+            "label": np.array(["x"] * 6),
+        },
+        technicalKinds={
+            "site": "categorical",
+            "depth": "continuous",
+            "label": "continuous",
+        },
+    )
+
+    assert result == baseline
+    assert result["encodedColumns"] == 2
+    assert result["coefficientEstimable"] is True

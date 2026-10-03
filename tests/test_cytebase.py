@@ -1,27 +1,48 @@
 import io
+import os
 import tarfile
+from pathlib import Path
 
-from huggingface_hub import BucketFile, BucketFolder
 import pytest
 
-
-def bucket_file(path: str, size: int) -> BucketFile:
-    return BucketFile(
-        type="file",
-        path=path,
-        size=size,
-        xetHash="test-hash",
-        mtime=None,
-        uploadedAt=None,
-    )
+from tests.fixtures_cytebase import bucket_file, bucket_folder
 
 
-def bucket_folder(path: str) -> BucketFolder:
-    return BucketFolder(
-        type="directory",
-        path=path,
-        uploadedAt=None,
-    )
+@pytest.fixture(autouse=True)
+def _offline_unless_live(request):
+    """Keep every test except the explicit live checks off the network."""
+    if request.node.get_closest_marker("integration") is None:
+        request.getfixturevalue("cytebase_offline")
+
+
+def _write_tar(path: Path, members: list[tuple[str, str, bytes | str | None]]) -> Path:
+    """Write a gzip tar archive from ``(name, kind, payload)`` member specs.
+
+    ``kind`` is ``file`` (payload is the content), ``symlink`` or ``hardlink``
+    (payload is the link name), ``fifo``, or ``chardev``.
+    """
+    with tarfile.open(path, "w:gz") as archive:
+        for name, kind, payload in members:
+            member = tarfile.TarInfo(name)
+            if kind == "file":
+                assert isinstance(payload, bytes)
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+                continue
+            member.type = {
+                "symlink": tarfile.SYMTYPE,
+                "hardlink": tarfile.LNKTYPE,
+                "fifo": tarfile.FIFOTYPE,
+                "chardev": tarfile.CHRTYPE,
+            }[kind]
+            if payload is not None:
+                member.linkname = str(payload)
+            archive.addfile(member)
+    return path
+
+
+def _tree(root: Path) -> list[str]:
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
 
 
 @pytest.mark.parametrize("member_name", ["notes.txt", "other.zarr/zarr.json"])
@@ -118,19 +139,29 @@ def test_connect_returns_repository(monkeypatch):
 def test_connect_rejects_unknown_repository(monkeypatch):
     from scarf import cytebase
 
-    monkeypatch.setattr(cytebase, "list_repositories", lambda: ["scarf_docs"])
+    monkeypatch.setattr(cytebase, "list_repositories", lambda: ["cellxgene", "docs"])
 
-    with pytest.raises(KeyError, match="Available repositories"):
+    with pytest.raises(KeyError) as raised:
         cytebase.connect("missing")
+    assert raised.value.args[0] == (
+        "'missing' is not a Cytebase repository. Available repositories:\n"
+        "cellxgene\ndocs"
+    )
 
 
 @pytest.mark.parametrize(
     "name",
-    ["", ".", "..", "../outside", "/outside", r"..\outside"],
+    ["", ".", "..", "../outside", "/outside", r"..\outside", "a/b"],
 )
-def test_connect_rejects_invalid_repository_name(name):
+def test_connect_rejects_invalid_repository_name(monkeypatch, name):
     from scarf import cytebase
 
+    def unexpected_listing():
+        raise AssertionError("an invalid name must be rejected before listing")
+
+    monkeypatch.setattr(cytebase, "list_repositories", unexpected_listing)
+    with pytest.raises(ValueError, match="Invalid repository name"):
+        cytebase.connect(name)
     with pytest.raises(ValueError, match="Invalid repository name"):
         cytebase.Repository(name)
 
@@ -146,6 +177,11 @@ def test_repository_lists_datasets(monkeypatch):
             bucket_folder("scarf_docs/zeta"),
             bucket_file("scarf_docs/index.json", 2),
             bucket_folder("scarf_docs/alpha"),
+            # Object stores match prefixes as strings, so a sibling repository
+            # and deeper folders can appear in a non-recursive listing.
+            bucket_folder("scarf_docs_v2"),
+            bucket_folder("scarf_docs_v2/beta"),
+            bucket_folder("scarf_docs/alpha/raw"),
         ]
 
     monkeypatch.setattr(cytebase, "list_bucket_tree", fake_list_bucket_tree)
@@ -195,20 +231,20 @@ def test_repository_downloads_file_anonymously(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cytebase, "download_bucket_files", fake_download)
 
+    downloads = tmp_path / "downloads"
     downloaded = cytebase.Repository("scarf_docs").download(
         "alpha/data.bin",
-        tmp_path,
+        downloads,
     )
 
-    destination = tmp_path / "alpha" / "data.bin"
+    destination = downloads / "alpha" / "data.bin"
     assert downloaded == [destination]
     assert destination.read_bytes() == b"payload"
     assert calls[0][0] == "Nygen/cytebase"
     assert calls[0][1][0][0] is file
     assert calls[0][2:] == (False, False)
-    assert not any(
-        path.name.startswith(".cytebase-download-") for path in tmp_path.iterdir()
-    )
+    # The staging directory is gone and nothing else was written.
+    assert _tree(downloads) == ["alpha", "alpha/data.bin"]
 
 
 def test_download_dataset_excludes_zarr_archive_by_default(monkeypatch, tmp_path):
@@ -347,12 +383,15 @@ def test_download_dataset_reports_missing_zarr(monkeypatch, tmp_path):
         ],
     )
 
-    with pytest.raises(FileNotFoundError, match="No Zarr archive"):
+    with pytest.raises(
+        FileNotFoundError, match="^No Zarr archive is available for 'alpha'$"
+    ):
         cytebase.Repository("scarf_docs").download_dataset(
             "alpha",
-            tmp_path,
+            tmp_path / "downloads",
             zarr=True,
         )
+    assert not (tmp_path / "downloads").exists()
 
 
 def test_download_dataset_reports_unknown_name(monkeypatch, tmp_path):
@@ -365,8 +404,11 @@ def test_download_dataset_reports_unknown_name(monkeypatch, tmp_path):
         lambda self: ["alpha", "beta"],
     )
 
-    with pytest.raises(KeyError, match="Available datasets"):
+    with pytest.raises(KeyError) as raised:
         cytebase.Repository("scarf_docs").download_dataset("missing", tmp_path)
+    assert raised.value.args[0] == (
+        "'missing' is not in repository 'scarf_docs'. Available datasets:\nalpha\nbeta"
+    )
 
 
 @pytest.mark.parametrize(
@@ -389,8 +431,9 @@ def test_download_preserves_existing_file_when_transfer_fails(monkeypatch, tmp_p
         "_bucket_files",
         lambda repository, path, recursive: [file],
     )
-    destination = tmp_path / "alpha" / "data.bin"
-    destination.parent.mkdir()
+    downloads = tmp_path / "downloads"
+    destination = downloads / "alpha" / "data.bin"
+    destination.parent.mkdir(parents=True)
     destination.write_bytes(b"existing")
 
     def fail_download(bucket_id, files, *, raise_on_missing_files=False, token=None):
@@ -400,10 +443,10 @@ def test_download_preserves_existing_file_when_transfer_fails(monkeypatch, tmp_p
     monkeypatch.setattr(cytebase, "download_bucket_files", fail_download)
 
     with pytest.raises(RuntimeError, match="transfer failed"):
-        cytebase.Repository("scarf_docs").download("alpha/data.bin", tmp_path)
+        cytebase.Repository("scarf_docs").download("alpha/data.bin", downloads)
 
     assert destination.read_bytes() == b"existing"
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["alpha"]
+    assert _tree(downloads) == ["alpha", "alpha/data.bin"]
 
 
 def test_download_rejects_size_mismatch_and_preserves_existing(
@@ -418,8 +461,9 @@ def test_download_rejects_size_mismatch_and_preserves_existing(
         "_bucket_files",
         lambda repository, path, recursive: [file],
     )
-    destination = tmp_path / "alpha" / "data.bin"
-    destination.parent.mkdir()
+    downloads = tmp_path / "downloads"
+    destination = downloads / "alpha" / "data.bin"
+    destination.parent.mkdir(parents=True)
     destination.write_bytes(b"existing")
 
     def incomplete_download(
@@ -433,10 +477,14 @@ def test_download_rejects_size_mismatch_and_preserves_existing(
 
     monkeypatch.setattr(cytebase, "download_bucket_files", incomplete_download)
 
-    with pytest.raises(OSError, match="Downloaded 3 bytes"):
-        cytebase.Repository("scarf_docs").download("alpha/data.bin", tmp_path)
+    with pytest.raises(
+        OSError,
+        match="^Downloaded 3 bytes for 'scarf_docs/alpha/data.bin', expected 4$",
+    ):
+        cytebase.Repository("scarf_docs").download("alpha/data.bin", downloads)
 
     assert destination.read_bytes() == b"existing"
+    assert _tree(downloads) == ["alpha", "alpha/data.bin"]
 
 
 def test_download_rejects_unsafe_tar_member(monkeypatch, tmp_path):
@@ -464,10 +512,299 @@ def test_download_rejects_unsafe_tar_member(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cytebase, "download_bucket_files", fake_download)
 
-    with pytest.raises(ValueError, match="Unsafe tar archive member"):
-        cytebase.Repository("scarf_docs").download("alpha/data.tar.gz", tmp_path)
+    downloads = tmp_path / "downloads"
+    with pytest.raises(ValueError, match="^Unsafe tar archive member: ../outside.txt$"):
+        cytebase.Repository("scarf_docs").download("alpha/data.tar.gz", downloads)
 
     assert not (tmp_path / "outside.txt").exists()
+    assert _tree(downloads) == ["alpha"]
+
+
+def test_download_of_a_directory_skips_folders_and_sibling_prefixes(
+    monkeypatch, tmp_path
+):
+    from scarf import cytebase
+
+    calls = []
+
+    def fake_list_bucket_tree(bucket_id, prefix=None, *, recursive=None, token=None):
+        calls.append((bucket_id, prefix, recursive, token))
+        return [
+            bucket_folder("scarf_docs/alpha/raw"),
+            bucket_file("scarf_docs/alpha/raw/matrix.mtx", 3),
+            bucket_file("scarf_docs/alpha/barcodes.tsv", 2),
+            # A string prefix match, not a file under alpha/.
+            bucket_file("scarf_docs/alphabet/other.bin", 1),
+        ]
+
+    requested = []
+
+    def fake_download(bucket_id, files, *, raise_on_missing_files=False, token=None):
+        for file, destination in files:
+            requested.append(file.path)
+            destination.write_bytes(b"x" * file.size)
+
+    monkeypatch.setattr(cytebase, "list_bucket_tree", fake_list_bucket_tree)
+    monkeypatch.setattr(cytebase, "download_bucket_files", fake_download)
+    downloads = tmp_path / "downloads"
+
+    downloaded = cytebase.Repository("scarf_docs").download("alpha", downloads)
+
+    assert calls == [("Nygen/cytebase", "scarf_docs/alpha", True, False)]
+    assert requested == [
+        "scarf_docs/alpha/barcodes.tsv",
+        "scarf_docs/alpha/raw/matrix.mtx",
+    ]
+    assert downloaded == [
+        downloads / "alpha" / "barcodes.tsv",
+        downloads / "alpha" / "raw" / "matrix.mtx",
+    ]
+    assert (downloads / "alpha" / "raw" / "matrix.mtx").read_bytes() == b"xxx"
+    assert _tree(downloads) == [
+        "alpha",
+        "alpha/barcodes.tsv",
+        "alpha/raw",
+        "alpha/raw/matrix.mtx",
+    ]
+
+
+def test_download_reports_a_path_without_files(monkeypatch, tmp_path):
+    from scarf import cytebase
+
+    monkeypatch.setattr(
+        cytebase,
+        "list_bucket_tree",
+        lambda *args, **kwargs: [bucket_folder("scarf_docs/alpha/empty")],
+    )
+
+    with pytest.raises(
+        FileNotFoundError, match="^No Cytebase files found at scarf_docs/alpha/empty$"
+    ):
+        cytebase.Repository("scarf_docs").download("alpha/empty", tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_download_rejects_a_listing_that_escapes_the_destination(monkeypatch, tmp_path):
+    from scarf import cytebase
+
+    monkeypatch.setattr(
+        cytebase,
+        "list_bucket_tree",
+        lambda *args, **kwargs: [bucket_file("scarf_docs/alpha/../../escape", 1)],
+    )
+    monkeypatch.setattr(cytebase, "download_bucket_files", _unexpected_download)
+
+    with pytest.raises(
+        ValueError, match="^Invalid bucket file path: 'alpha/../../escape'$"
+    ):
+        cytebase.Repository("scarf_docs").download("alpha", tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def _unexpected_download(*_args, **_kwargs):
+    raise AssertionError("nothing may be downloaded")
+
+
+@pytest.mark.parametrize("path", ["other/alpha/data.bin", "scarf_docs_v2/data.bin"])
+def test_bucket_file_paths_must_stay_inside_their_repository(path):
+    from scarf import cytebase
+
+    # Listings are filtered by the requested prefix first, so this guards the
+    # helper rather than a path that Repository methods reach today.
+    with pytest.raises(
+        ValueError, match=f"^File is outside repository 'scarf_docs': '{path}'$"
+    ):
+        cytebase._relative_file_path("scarf_docs", bucket_file(path, 1))
+
+
+def test_download_rejects_files_the_transfer_skipped(monkeypatch, tmp_path):
+    from scarf import cytebase
+
+    file = bucket_file("scarf_docs/alpha/data.bin", 3)
+    monkeypatch.setattr(
+        cytebase,
+        "_bucket_files",
+        lambda repository, path, recursive: [file],
+    )
+    downloads = tmp_path / "downloads"
+    destination = downloads / "alpha" / "data.bin"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old")
+    # The transfer returns without writing the file it was asked for.
+    monkeypatch.setattr(
+        cytebase, "download_bucket_files", lambda bucket_id, files, **kwargs: None
+    )
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="^Cytebase did not download 'scarf_docs/alpha/data.bin'$",
+    ):
+        cytebase.Repository("scarf_docs").download("alpha/data.bin", downloads)
+
+    assert destination.read_bytes() == b"old"
+    assert _tree(downloads) == ["alpha", "alpha/data.bin"]
+
+
+@pytest.mark.parametrize("previous", [True, False], ids=["replace", "first"])
+def test_failed_archive_install_restores_the_previous_download(
+    monkeypatch, tmp_path, previous
+):
+    from scarf import cytebase
+
+    dataset = tmp_path / "downloads" / "alpha"
+    dataset.mkdir(parents=True)
+    if previous:
+        (dataset / "data.zarr").mkdir()
+        (dataset / "data.zarr" / "old.json").write_text("old store")
+        (dataset / "data.zarr.tar.gz").write_bytes(b"old archive")
+    before = _tree(dataset)
+    archive_bytes = _write_tar(
+        tmp_path / "new.tar.gz", [("data.zarr/zarr.json", "file", b"{}")]
+    ).read_bytes()
+    remote = bucket_file("scarf_docs/alpha/data.zarr.tar.gz", len(archive_bytes))
+    monkeypatch.setattr(
+        cytebase, "_bucket_files", lambda repository, path, recursive: [remote]
+    )
+
+    def fake_download(bucket_id, files, *, raise_on_missing_files=False, token=None):
+        files[0][1].write_bytes(archive_bytes)
+
+    monkeypatch.setattr(cytebase, "download_bucket_files", fake_download)
+    real_replace = os.replace
+
+    def replace(source, destination):
+        # The extracted store is already in place when the archive move fails.
+        if ".cytebase-download-" in str(source):
+            raise OSError("No space left on device")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(cytebase.os, "replace", replace)
+
+    with pytest.raises(OSError, match="^No space left on device$"):
+        cytebase.Repository("scarf_docs").download_dataset(
+            "alpha", tmp_path / "downloads", zarr=True
+        )
+
+    assert _tree(tmp_path / "downloads") == ["alpha", *(f"alpha/{p}" for p in before)]
+    if previous:
+        assert (dataset / "data.zarr" / "old.json").read_text() == "old store"
+        assert (dataset / "data.zarr.tar.gz").read_bytes() == b"old archive"
+
+
+@pytest.mark.parametrize(
+    ("member", "message"),
+    [
+        pytest.param(
+            ("data.zarr/link", "symlink", "/etc/passwd"),
+            "Unsafe tar archive link: data.zarr/link",
+            id="absolute-symlink",
+        ),
+        pytest.param(
+            ("data.zarr/link", "symlink", "../../outside"),
+            "Unsafe tar archive link: data.zarr/link",
+            id="parent-symlink",
+        ),
+        pytest.param(
+            ("data.zarr/hard", "hardlink", "../outside"),
+            "Unsafe tar archive link: data.zarr/hard",
+            id="parent-hardlink",
+        ),
+        pytest.param(
+            ("data.zarr/pipe", "fifo", None),
+            "Unsupported tar archive member: data.zarr/pipe",
+            id="fifo",
+        ),
+        pytest.param(
+            ("data.zarr/tty", "chardev", None),
+            "Unsupported tar archive member: data.zarr/tty",
+            id="device",
+        ),
+    ],
+)
+def test_archive_rejects_unsafe_links_and_special_members(tmp_path, member, message):
+    from scarf.cytebase import _extract_and_replace
+
+    work = tmp_path / "work"
+    output = work / "data.zarr"
+    output.mkdir(parents=True)
+    (output / "zarr.json").write_text("original")
+    staged = _write_tar(
+        work / "download", [("data.zarr/zarr.json", "file", b"{}"), member]
+    )
+
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        _extract_and_replace(staged, work / "data.zarr.tar.gz")
+
+    assert (output / "zarr.json").read_text() == "original"
+    assert _tree(work) == ["data.zarr", "data.zarr/zarr.json", "download"]
+
+
+@pytest.mark.parametrize(
+    ("member", "message"),
+    [
+        (("escape/file", "file", b"x"), "Unsafe tar archive member: escape/file"),
+        (
+            ("data/hard", "hardlink", "escape/file"),
+            "Unsafe tar archive link: data/hard",
+        ),
+    ],
+)
+def test_tar_members_must_resolve_inside_the_staging_directory(
+    tmp_path, member, message
+):
+    from scarf.cytebase import _safe_tar_members
+
+    # Downloads extract into a fresh directory, where a relative name without
+    # ".." stays inside; an existing symlink is what could carry it outside.
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (staging / "escape").symlink_to(outside, target_is_directory=True)
+    path = _write_tar(tmp_path / "archive.tar.gz", [member])
+
+    with tarfile.open(path, "r:gz") as archive:
+        with pytest.raises(ValueError, match=f"^{message}$"):
+            _safe_tar_members(archive, staging)
+    assert list(outside.iterdir()) == []
+
+
+def test_archive_cannot_replace_its_own_download_path(tmp_path):
+    from scarf.cytebase import _extract_and_replace
+
+    work = tmp_path / "work"
+    work.mkdir()
+    staged = _write_tar(work / "download", [("data.zarr/zarr.json", "file", b"{}")])
+
+    # Without a .tar.gz suffix, the archive's directory would take the
+    # archive's own destination.
+    with pytest.raises(
+        ValueError,
+        match="^Tar archive member conflicts with an internal download path$",
+    ):
+        _extract_and_replace(staged, work / "data.zarr")
+    assert _tree(work) == ["download"]
+
+
+def test_remove_path_unlinks_symlinks_without_following_them(tmp_path):
+    from scarf.cytebase import _remove_path
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep")
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    nested = tmp_path / "nested" / "inner"
+    nested.mkdir(parents=True)
+    (nested / "data.bin").write_bytes(b"x")
+
+    _remove_path(link)
+    _remove_path(tmp_path / "nested")
+    _remove_path(tmp_path / "missing")
+
+    assert not link.is_symlink()
+    assert (target / "keep.txt").read_text() == "keep"
+    assert not (tmp_path / "nested").exists()
 
 
 @pytest.mark.integration

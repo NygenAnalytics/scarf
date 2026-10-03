@@ -39,6 +39,40 @@ For full CI parity, also run the visual regression step (or see `AGENTS.md`):
     MPLBACKEND=Agg SCARF_RUN_VISUAL_REGRESSION=1 \
       uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
 
+### Performance benchmarks
+
+`tests/benchmarks/` times the operations that dominate large runs and projects each timing onto production sizes, such as one and ten million cells.
+`test_kernels.py` covers the compute kernels behind the slowest pipeline stages, `test_stages.py` the `DataStore` stages of the recorded benchmark funnel, `test_cold_start.py` the import and compilation cost of a new process, and the `test_scaling_*.py` files known hot spots in readers, graphs, features, plotting, merge and export, and the agent.
+Every benchmark also checks its result against an independent reference.
+A normal test run executes each benchmark once at a small size, without timing it.
+Timed runs need a quiet machine and their own process:
+
+    SCARF_RUN_BENCHMARKS=1 uv run pytest -n 0 tests/benchmarks
+
+Each benchmark times a ladder of input sizes and fits one of three models: a power law for kernels, a fixed overhead plus a per-unit rate for calls whose overhead hides their per-unit work at small sizes, and a constant for per-call overheads and the cold start of a new process.
+Repeats are interleaved across sizes, so a change in machine load during the run slows every size alike instead of bending the fitted scaling.
+The run prints each benchmark's largest measured time, its fitted scaling, and its projected single-thread time at the production sizes, with the change from the baseline.
+A benchmark fails only when its slowdown exceeds timing noise (30% by default, after calibrating for machine speed) and projects to a meaningful delay at some production size: 2 s per million cells by default, so 2 s at one million and 20 s at ten million, or 0.5 s of fixed overhead per call.
+Judging every size catches a superlinear cost that is still small at one million cells.
+A growing power-law exponent also fails when it projects to a meaningful delay at ten million cells, even if small inputs look unchanged.
+Scaling is judged only when both fits are tight (r-squared at least 0.97); a noisier fit is judged at its largest measured size alone.
+Before failing, a benchmark measures its ladder again and keeps the fastest time at each size, so a regression must survive two measurements and transient noise cannot fail it.
+
+The committed baseline, `tests/benchmarks/baseline.json`, comes from one machine.
+The most reliable comparison measures both revisions on the same machine, for example from a worktree of the base revision:
+
+    SCARF_RUN_BENCHMARKS=1 SCARF_BENCHMARK_OUTPUT=/tmp/base.json uv run pytest -n 0 tests/benchmarks
+    # then, in the changed checkout:
+    SCARF_RUN_BENCHMARKS=1 SCARF_BENCHMARK_BASELINE=/tmp/base.json uv run pytest -n 0 tests/benchmarks
+
+Regenerate the committed baseline on a quiet machine after an intended performance change:
+
+    SCARF_RUN_BENCHMARKS=1 SCARF_BENCHMARK_UPDATE=1 uv run pytest -n 0 tests/benchmarks
+
+`SCARF_BENCHMARK_SLOWDOWN` sets the tolerated slowdown ratio, for example `1.5` when comparing across machines.
+`SCARF_BENCHMARK_THREADS` sets the Numba thread count, one by default.
+`SCARF_BENCHMARK_OUTPUT` sets where results are written, `build/benchmarks/latest.json` by default.
+
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing sections.

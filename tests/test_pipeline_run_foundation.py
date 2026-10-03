@@ -9,7 +9,6 @@ import zarr
 from zarr.storage import FsspecStore, LoggingStore, MemoryStore, ZipStore
 
 import scarf.storage.pipeline_runs as pipeline_run_storage
-from scarf.datastore.pipeline_accessor import PipelineAccessor
 from scarf.datastore.pipeline_run import (
     PipelineAxisView,
     PipelineExecutionError,
@@ -123,6 +122,8 @@ def _root(*, store: Any | None = None) -> zarr.Group:
     return root
 
 
+# Spawned label-claim workers import this module, so it keeps the
+# pipeline accessor import inside the tests that use it.
 def _complete_labeled_run_in_process(
     store_path: str,
     run_id: str,
@@ -910,6 +911,8 @@ def test_terminal_label_claim_advances_past_non_owner(
 def test_running_label_claim_requires_explicit_exact_owner_abandonment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from scarf.datastore.pipeline_accessor import PipelineAccessor
+
     root = _root()
     label = "abandoned-finalizer"
     artifact, (first,) = _ready_labeled_runs(root, label, count=1)
@@ -1068,6 +1071,8 @@ def test_label_claim_preflight_rechecks_an_owner_completed_during_scan(
 def test_torn_terminal_label_claim_can_be_explicitly_abandoned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from scarf.datastore.pipeline_accessor import PipelineAccessor
+
     root = _root()
     label = "torn-terminal-finalizer"
     artifact, (first,) = _ready_labeled_runs(root, label, count=1)
@@ -1127,6 +1132,8 @@ def test_torn_terminal_label_claim_can_be_explicitly_abandoned(
 def test_label_claim_abandonment_refuses_terminal_owner(
     terminal_status: str,
 ) -> None:
+    from scarf.datastore.pipeline_accessor import PipelineAccessor
+
     root = _root()
     label = f"terminal-{terminal_status}"
     artifact, (record,) = _ready_labeled_runs(root, label, count=1)

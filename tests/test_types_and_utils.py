@@ -98,10 +98,16 @@ def test_squared_sum_avoids_matrix_sized_temporaries(dtype, axis):
 
 
 def test_rescale_array_trims_extreme_values():
-    values = np.concatenate([np.linspace(-2, 2, 499), np.array([100.0])])
+    from scipy.stats import norm
+
+    values = np.array([-10.0, -1.0, 0.0, 1.0, 10.0])
+    # A normal at the median (0) with the values' spread (sqrt(40.4)) puts its
+    # 10th and 90th percentiles at -/+ 1.28155 * 6.35610 = -/+ 8.14572.
+    bound = norm.ppf(0.9) * np.sqrt(40.4)
+    assert bound == pytest.approx(8.14572, rel=1e-5)
     trimmed = rescale_array(values, frac=0.9)
-    assert trimmed.max() < 100.0
-    assert trimmed.min() > -100.0
+    assert trimmed is values
+    np.testing.assert_allclose(trimmed, [-bound, -1.0, 0.0, 1.0, bound])
 
 
 def test_set_verbosity_rejects_invalid_level():
@@ -110,8 +116,19 @@ def test_set_verbosity_rejects_invalid_level():
 
 
 def test_set_verbosity_accepts_valid_level():
-    set_verbosity("ERROR")
-    set_verbosity("INFO")
+    from scarf.utils.logging import _config
+
+    try:
+        set_verbosity("ERROR")
+        assert (_config.level, _config.filepath) == ("ERROR", None)
+        with pytest.raises(
+            ValueError, match="^Please provide a value for level recognized by Loguru$"
+        ):
+            set_verbosity(None)
+        assert _config.level == "ERROR"
+    finally:
+        set_verbosity("INFO")
+    assert (_config.level, _config.filepath) == ("INFO", None)
 
 
 def test_tqdmbar_uses_explicit_progress_independently_of_severity(monkeypatch):
@@ -141,6 +158,36 @@ def test_tqdmbar_uses_explicit_progress_independently_of_severity(monkeypatch):
         configure_output(level="INFO", progress=False, timestamps=False)
 
     assert captured == [False, False, True, True, True]
+
+
+def test_controlled_compute_bounds_deferred_threads_and_passes_arrays_through():
+    from scarf.utils.compute import controlled_compute
+
+    calls: list[int] = []
+
+    class Deferred:
+        def compute(self, nthreads):
+            calls.append(nthreads)
+            return [1, 2]
+
+    np.testing.assert_array_equal(controlled_compute(Deferred(), 3), [1, 2])
+    assert calls == [3]
+    values = np.arange(3)
+    assert controlled_compute(values, 2) is values
+    np.testing.assert_array_equal(controlled_compute([4, 5], 2), [4, 5])
+
+
+def test_sort_categories_orders_numbers_then_text_then_missing_values():
+    import pandas as pd
+
+    from scarf.utils.arrays import sort_categories
+
+    values = ["b10", np.float32("nan"), "b2", pd.NA, 3, None, "10", [1, 2], pd.NaT, 2.5]
+    ordered = sort_categories(values)
+    # Numbers by value, text in natural order (a list label sorts as its
+    # text), and every missing marker last in input order.
+    expected = [9, 4, 6, 7, 2, 0, 1, 3, 5, 8]
+    assert [id(value) for value in ordered] == [id(values[index]) for index in expected]
 
 
 def test_compute_with_progress_uses_explicit_progress_setting():
@@ -263,6 +310,15 @@ def test_array_digest_is_deterministic_and_shape_sensitive():
 
 def test_permute_into_chunks_preserves_all_indices():
     chunks = permute_into_chunks(10, 3, seed=7)
+    # Each run of three indices, and the short remainder, is shuffled within
+    # itself by one generator seeded once.
+    rng = np.random.default_rng(7)
+    expected = [
+        rng.permutation(np.arange(start, min(start + 3, 10))) for start in (0, 3, 6, 9)
+    ]
+    assert [chunk.tolist() for chunk in chunks] == [
+        chunk.tolist() for chunk in expected
+    ]
     merged = np.concatenate(chunks)
     assert np.array_equal(np.sort(merged), np.arange(10))
 

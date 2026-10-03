@@ -28,6 +28,7 @@ from tests.fixtures_cytebase import (
     NOW,
     PIPELINE_VERSION,
     SOURCE_URL,
+    UMAP,
     VERSION_ID,
     CytebaseBuild,
     FakeHub,
@@ -468,27 +469,66 @@ def test_build_local_imports_obs_columns_that_hdf5_nests(tmp_path):
     assert verification["countsBlock"] == COUNTS[:3].tolist()
 
 
+def _umap_dataset(values: Any) -> Any:
+    return lambda obsm: obsm.create_dataset("X_umap", data=values)
+
+
 @pytest.mark.parametrize(
-    ("damage", "problem"),
+    ("write_umap", "problem"),
     [
-        pytest.param("nan", "contains non-finite values", id="non-finite"),
-        pytest.param("shape", "has shape (6, 0), expected 6 rows", id="shape"),
+        pytest.param(_umap_dataset(UMAP), None, id="valid-float"),
+        pytest.param(_umap_dataset(np.arange(12).reshape(6, 2)), None, id="valid-int"),
+        pytest.param(
+            lambda obsm: obsm.create_group("X_umap"),
+            "is not a dense array",
+            id="sparse-group",
+        ),
+        pytest.param(
+            _umap_dataset(np.zeros((6, 0), dtype=np.float32)),
+            "has shape (6, 0), expected 6 rows",
+            id="no-columns",
+        ),
+        pytest.param(
+            _umap_dataset(UMAP[:5]),
+            "has shape (5, 2), expected 6 rows",
+            id="missing-rows",
+        ),
+        pytest.param(
+            _umap_dataset(UMAP[:, 0]),
+            "has shape (6,), expected 6 rows",
+            id="one-dimensional",
+        ),
+        pytest.param(
+            _umap_dataset(np.array([[b"a", b"b"]] * 6)),
+            "has non-numeric dtype |S1",
+            id="bytes",
+        ),
+        # Rows are scanned in blocks; this value sits in the last block of three.
+        pytest.param(
+            _umap_dataset(np.vstack([UMAP[:5], [[np.inf, 0.0]]])),
+            "contains non-finite values",
+            id="non-finite-in-last-block",
+        ),
     ],
 )
-def test_build_local_converts_without_a_umap_scarf_cannot_import(
-    tmp_path, damage, problem
+def test_umap_problem_names_why_scarf_cannot_import_the_coordinates(
+    tmp_path, monkeypatch, write_umap, problem
 ):
+    monkeypatch.setattr(build, "_EMBEDDING_BLOCK_ROWS", 2)
+    with h5py.File(tmp_path / "umap.h5", "w") as h5:
+        write_umap(h5.create_group("obsm"))
+        assert build._umap_problem(h5, 6) == problem
+
+
+def test_build_local_converts_without_a_umap_scarf_cannot_import(tmp_path):
+    problem = "contains non-finite values"
     source = write_h5ad(tmp_path / "source.h5ad")
     with h5py.File(source, "r+") as h5:
         umap = h5["obsm/X_umap"]
-        if damage == "nan":
-            # Visium spots left out of a UMAP are stored as NaN coordinates.
-            coordinates = umap[:]
-            coordinates[2] = np.nan
-            umap[...] = coordinates
-        else:
-            del h5["obsm/X_umap"]
-            h5["obsm"].create_dataset("X_umap", shape=(6, 0), dtype="float32")
+        # Visium spots left out of a UMAP are stored as NaN coordinates.
+        coordinates = umap[:]
+        coordinates[2] = np.nan
+        umap[...] = coordinates
     size, checksum = source_details(source)
     record = DatasetRecord.model_validate(dataset_record())
     store = tmp_path / "data.zarr"

@@ -1,5 +1,6 @@
 """Focused behavior tests for publication plotting features."""
 
+import warnings
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -10,10 +11,11 @@ import pytest
 
 matplotlib.use("Agg")
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 
 import scarf.plotting as splt
-from scarf.plotting._style import default_point_size, resolve_legend_loc
+
 from scarf.storage import ArtifactRef
 from scarf.storage.selections import read_stored_selection_indices
 
@@ -123,18 +125,6 @@ def _synthetic_stats_result(
     )
 
 
-def test_point_size_uses_population_and_panel_area():
-    assert default_point_size(500, panel_area=16) > default_point_size(
-        5_000,
-        panel_area=16,
-    )
-    assert default_point_size(5_000, panel_area=16) > default_point_size(
-        5_000,
-        panel_area=4,
-    )
-    assert resolve_legend_loc(80) == "right"
-
-
 def test_stored_display_metadata_does_not_hide_malformed_stores():
     from scarf.plotting._display import stored_display_metadata
 
@@ -149,70 +139,106 @@ def test_stored_display_metadata_does_not_hide_malformed_stores():
         stored_display_metadata(MalformedPlotStore(), "group")
 
 
-def test_embedding_density_highlight_and_labeled_colorbar(umap, datastore):
-    n = len(datastore.cells.active_index("I"))
-    highlighted = np.zeros(n, dtype=bool)
-    highlighted[: max(3, n // 10)] = True
-    datastore.cells.insert("plot_highlight", highlighted, overwrite=True)
+def _scatter_store(n=2000, seed=0, **extra):
+    rng = np.random.default_rng(seed)
+    return _synthetic_plot_store(
+        I=np.ones(n, dtype=bool),
+        umap1=rng.normal(size=n),
+        umap2=rng.normal(size=n),
+        score=rng.normal(size=n),
+        **extra,
+    )
+
+
+def test_embedding_density_highlight_and_labeled_colorbar():
+    from matplotlib.contour import ContourSet
+
+    flag = np.arange(2000) < 200
+    store = _scatter_store(flag=flag)
+    x = store.cells.fetch("umap1")
+    y = store.cells.fetch("umap2")
+    score = store.cells.fetch("score")
 
     result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
+        store,
+        layout_key="umap",
+        color_by="score",
         density_overlay=splt.DensityOverlay(pixels=32, levels=3, sigma=1),
-        highlight=splt.Highlight(by="plot_highlight"),
+        highlight=splt.Highlight(by="flag"),
         point_size_range=(2, 20),
         show_titles=False,
         show=False,
     )
 
-    ax = next(iter(result.axes.values()))
-    assert len(ax.collections) >= 3
-    selected = _artifact_cell_indices(datastore, umap)
-    assert result.provenance.extras["highlight"]["n_highlighted"] == int(
-        highlighted[selected].sum()
-    )
+    ax = result.axes["score"]
+    base, *overlays, highlight = ax.collections
+    assert any(isinstance(overlay, ContourSet) for overlay in overlays)
+    # The highlight redraws the flagged cells at 1.5x size over dimmed cells.
+    np.testing.assert_allclose(highlight.get_offsets(), np.column_stack((x, y))[flag])
+    assert highlight.get_sizes()[0] == pytest.approx(1.5 * base.get_sizes()[0])
+    assert base.get_alpha() == pytest.approx(0.12)
+    assert result.provenance.extras["highlight"]["n_highlighted"] == 200
     assert all(
         2 <= value <= 20
         for value in result.provenance.extras["point_size_by_panel"].values()
     )
-    auxiliary_labels = [
-        axis.get_xlabel() for axis in result.figure.axes if axis is not ax
-    ]
-    assert "RNA_nCounts" in auxiliary_labels
+    (colorbar,) = [axis for axis in result.figure.axes if axis is not ax]
+    assert colorbar.get_xlabel() == "score"
+    assert colorbar.get_xlim() == pytest.approx((score.min(), score.max()))
     assert ax.get_title() == ""
     result.close()
 
 
-def test_embedding_mean_contours_require_and_use_continuous_values(
-    umap,
-    datastore,
-):
-    result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
-        density_overlay=splt.DensityOverlay(
-            statistic="mean",
-            pixels=32,
-            sigma=1.5,
-            min_support=0.05,
-            levels=(0.6, 0.85),
-            max_hotspots=1,
-        ),
-        show=False,
+def test_embedding_mean_contours_require_and_use_continuous_values():
+    from matplotlib.contour import ContourSet
+
+    rng = np.random.default_rng(0)
+    # Two clusters: values 3 around x = -3 and values 5 around x = +3.
+    x = np.concatenate((rng.normal(-3, 0.4, 100), rng.normal(3, 0.4, 100)))
+    y = rng.normal(0, 0.4, 200)
+    values = np.repeat([3.0, 5.0], 100)
+    store = _synthetic_plot_store(
+        I=np.ones(200, dtype=bool), umap1=x, umap2=y, value=values
     )
 
-    ax = next(iter(result.axes.values()))
-    assert len(ax.collections) > 1
-    assert result.provenance.extras["density_overlay"]["statistic"] == "mean"
-    assert result.provenance.extras["density_overlay"]["max_hotspots"] == 1
-    result.close()
+    def lowest_level_vertices(max_hotspots):
+        result = splt.embedding(
+            store,
+            layout_key="umap",
+            color_by="value",
+            density_overlay=splt.DensityOverlay(
+                statistic="mean",
+                pixels=32,
+                sigma=1.5,
+                min_support=0.05,
+                levels=(2.0, 4.5),
+                max_hotspots=max_hotspots,
+            ),
+            show=False,
+        )
+        overlay = next(
+            collection
+            for collection in result.axes["value"].collections
+            if isinstance(collection, ContourSet)
+        )
+        paths = [path.vertices for path in overlay.get_paths()]
+        extras = result.provenance.extras["density_overlay"]
+        result.close()
+        return paths, extras
+
+    both, extras = lowest_level_vertices(None)
+    assert extras["statistic"] == "mean"
+    # Level 2 encloses both clusters; level 4.5 only the high-valued one.
+    assert both[0][:, 0].min() < 0 < both[0][:, 0].max()
+    assert both[1][:, 0].min() > 0
+    strongest, extras = lowest_level_vertices(1)
+    assert extras["max_hotspots"] == 1
+    assert strongest[0][:, 0].min() > 0
 
     with pytest.raises(ValueError, match="continuous color_by"):
         splt.embedding(
-            datastore,
-            layout=umap,
+            store,
+            layout_key="umap",
             color_by=splt.CellField("I", kind="categorical"),
             density_overlay=splt.DensityOverlay(statistic="mean"),
             show=False,
@@ -246,28 +272,26 @@ def test_contour_hotspot_limit_keeps_the_strongest_region():
     assert np.all(filtered[7:11, 7:11] >= 1.0)
 
 
-def test_embedding_point_size_uses_final_panel_area(umap, datastore):
+def test_embedding_point_size_uses_final_panel_area():
     result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by="RNA_nCounts",
+        _scatter_store(),
+        layout_key="umap",
+        color_by="score",
         point_size_range=(2, 20),
         show=False,
     )
 
     result.figure.canvas.draw()
-    ax = next(iter(result.axes.values()))
+    ax = result.axes["score"]
     bbox = ax.get_position()
     width, height = result.figure.get_size_inches()
     panel_area = float(bbox.width * width * bbox.height * height)
-    expected = default_point_size(
-        result.provenance.extras["input_n_cells"],
-        panel_area=panel_area,
-        size_min=2,
-        size_max=20,
-    )
+    # Size 16 at 1000 cells on a 3.2 inch square, scaled by panel area to the
+    # 0.72 power and by sqrt(1000 / cells), within the requested range.
+    expected = min(20.0, max(2.0, 16 * (panel_area / 3.2**2) ** 0.72 * 0.5**0.5))
     observed = next(iter(result.provenance.extras["point_size_by_panel"].values()))
     assert observed == pytest.approx(expected)
+    np.testing.assert_allclose(ax.collections[0].get_sizes(), expected)
     result.close()
 
 
@@ -296,33 +320,12 @@ def test_embedding_validates_layout_coordinate_and_facet_inputs():
     with pytest.raises(ValueError, match="panel_keys must be non-empty"):
         splt.embedding(store, layout_key="layout", color_by=[], show=False)
 
-    mismatched = _synthetic_plot_store(
-        layout1=[0.0, 1.0, 2.0],
-        layout2=[0.0, 1.0],
-    )
-    with pytest.raises(ValueError):
-        splt.embedding(mismatched, layout_key="layout", show=False)
-
     invalid = _synthetic_plot_store(
         layout1=[np.nan, np.inf],
         layout2=[np.nan, -np.inf],
     )
     with pytest.raises(ValueError, match="has no finite coordinates"):
         splt.embedding(invalid, layout_key="layout", show=False)
-
-    bad_facet = _synthetic_plot_store(
-        layout1=[0.0, 1.0, 2.0],
-        layout2=[0.0, 1.0, 0.0],
-        facet=["a", "b"],
-    )
-    with pytest.raises(ValueError):
-        splt.embedding(
-            bad_facet,
-            layout_key="layout",
-            facet_by="facet",
-            facet_order=["a", "b"],
-            show=False,
-        )
 
 
 @pytest.mark.parametrize(
@@ -454,6 +457,11 @@ def test_embedding_continuous_sorting_keeps_color_size_and_scatter_options_align
         collection.get_facecolors()[0, :3],
         matplotlib.colors.to_rgba("#ff00ff")[:3],
     )
+    # Scores 1, 2 and 3 span the explicit [1, 3] limits.
+    np.testing.assert_allclose(
+        collection.get_facecolors()[1:, :3],
+        plt.get_cmap("viridis")([0.0, 0.5, 1.0])[:, :3],
+    )
     assert collection.get_alpha() == pytest.approx(0.7)
     assert collection.get_linewidths() == pytest.approx([0.4])
     assert collection.get_rasterized() is True
@@ -553,11 +561,30 @@ def test_embedding_multi_layout_facets_include_requested_empty_panels():
     expected_keys = [(layout, "score", facet) for layout in layouts for facet in facets]
     assert list(result.axes) == expected_keys
     assert result.provenance.extras["n_layouts"] == 2
+    # Facet b holds cells 1 and 3, facet a cells 0 and 2.
+    expected_offsets = {
+        ("first", "score", "b"): [[1.0, 1.0], [3.0, 1.0]],
+        ("first", "score", "a"): [[0.0, 0.0], [2.0, 0.0]],
+        ("second", "score", "b"): [[2.0, 0.0], [0.0, 0.0]],
+        ("second", "score", "a"): [[3.0, 1.0], [1.0, 1.0]],
+    }
+    for key, offsets in expected_offsets.items():
+        np.testing.assert_allclose(
+            result.axes[key].collections[0].get_offsets(), offsets
+        )
     for layout in layouts:
         child = result.provenance.extras["layout_provenance"][layout]
         assert child.extras["n_facets"] == 3
         assert child.extras["color_scale_scope"] == "panel"
+        # Panel scope gives each facet the range of its own scores.
+        assert child.extras["color_limits"] == {
+            "('score', 'b')": pytest.approx((10.0, 11.0)),
+            "('score', 'a')": pytest.approx((0.0, 1.0)),
+        }
         assert result.axes[(layout, "score", "missing")].axison is False
+    assert result.axes[("first", "score", "missing")].get_title() == (
+        "first | score | facet=missing (empty)"
+    )
     result.close()
 
 
@@ -628,6 +655,23 @@ def test_embedding_multi_layout_derives_facets_from_selected_cells():
 
     assert result.owns_figure is True
     assert len(result.axes) == 6
+    # Selected cells carry facets a, b and missing; the unselected cell's facet
+    # never becomes a panel.
+    offsets = [
+        np.asarray(axis.collections[0].get_offsets()).tolist()
+        for axis in result.axes.values()
+    ]
+    assert offsets == [
+        [[2.0, 0.0]],
+        [[0.0, 0.0]],
+        [[1.0, 1.0], [3.0, 1.0]],
+        [[2.0, 1.0]],
+        [[4.0, 1.0]],
+        [[3.0, 0.0], [1.0, 0.0]],
+    ]
+    first_row = list(result.axes.values())[:3]
+    assert [axis.get_xlabel() for axis in first_row] == ["first1"] * 3
+    assert [axis.get_ylabel() for axis in first_row] == ["first2", "", ""]
     assert result.provenance.n_cells == 4
     assert result.provenance.extras["n_layouts"] == 2
     assert all(
@@ -723,34 +767,49 @@ def test_embedding_on_data_legend_reports_omitted_labels():
     result.close()
 
 
-@pytest.mark.parametrize(
-    ("scale", "values"),
-    [
-        ("log", [0.25, 0.5, 1.0, 2.0]),
-        ("symlog", [-2.0, -0.5, 0.5, 3.0]),
-    ],
-)
-def test_embedding_renders_non_linear_continuous_scales(scale, values):
-    store = _synthetic_plot_store(
-        layout1=[0.0, 1.0, 0.0, 1.0],
-        layout2=[0.0, 0.0, 1.0, 1.0],
-        score=values,
-    )
+def test_embedding_renders_non_linear_continuous_scales():
+    from matplotlib.colors import SymLogNorm
 
-    result = splt.embedding(
+    store = _synthetic_plot_store(
+        I=np.ones(4, dtype=bool),
+        umap1=np.arange(4.0),
+        umap2=np.zeros(4),
+        positive=np.array([0.25, 0.5, 1.0, 2.0]),
+        signed=np.array([-2.0, -0.5, 0.5, 3.0]),
+    )
+    viridis = plt.get_cmap("viridis")
+
+    log = splt.embedding(
         store,
-        layout_key="layout",
-        color_by=splt.CellField("score", kind="continuous"),
-        color_scale=splt.ColorScale(scale=scale),
-        point_size=5,
-        show_legend=False,
+        layout_key="umap",
+        color_by="positive",
+        color_scale=splt.ColorScale(scale="log"),
         show=False,
     )
+    points = log.axes["positive"].collections[0]
+    # Doubling values sit evenly on a log scale.
+    np.testing.assert_allclose(
+        points.get_facecolors(), viridis([0.0, 1 / 3, 2 / 3, 1.0]), atol=1e-6
+    )
+    assert log.provenance.extras["color_limits"]["positive"] == (0.25, 2.0)
+    log.close()
 
-    collection = result.axes["score"].collections[0]
-    assert np.isfinite(collection.get_facecolors()).all()
-    assert result.scales[0].scale == scale
-    result.close()
+    symlog = splt.embedding(
+        store,
+        layout_key="umap",
+        color_by="signed",
+        color_scale=splt.ColorScale(scale="symlog"),
+        show=False,
+    )
+    points = symlog.axes["signed"].collections[0]
+    # The linear region spans 0.1% of the value range.
+    norm = SymLogNorm(linthresh=0.005, vmin=-2.0, vmax=3.0)
+    expected = viridis(norm(np.array([-2.0, -0.5, 0.5, 3.0])))
+    assert symlog.provenance.extras["color_limits"]["signed"] == (-2.0, 3.0)
+    np.testing.assert_allclose(points.get_facecolors(), expected, atol=1e-6)
+    linear = viridis(np.array([0.0, 0.3, 0.5, 1.0]))
+    assert not np.allclose(points.get_facecolors(), linear, atol=1e-3)
+    symlog.close()
 
 
 def test_imported_embedding_reuse_guard_and_validator_reject_damage():
@@ -814,87 +873,118 @@ def test_imported_embedding_reuse_guard_and_validator_reject_damage():
         validate_imported_embedding_artifact(other_root, other_ref)
 
 
-def test_dotplot_feature_brackets_and_axis_swap(umap, leiden_clustering, datastore):
-    genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:4]]
-    features = {"Lineage": genes[:2], "State": genes[2:]}
+def _dotplot_store():
+    """Twelve cells in groups 0, 1 and 2 with four features."""
+    from tests.test_plotting_foundation import _ArrayStore
+
+    values = np.column_stack(
+        (
+            np.arange(12.0),
+            np.repeat([0.0, 1.0, 2.0], 4),
+            np.tile([0.0, 0.0, 3.0, 3.0], 3),
+            np.ones(12),
+        )
+    )
+    return _ArrayStore(
+        {"I": np.ones(12, dtype=bool), "cluster": np.repeat(["0", "1", "2"], 4)},
+        values,
+        names=("GeneA", "GeneB", "GeneC", "GeneD"),
+    )
+
+
+def test_dotplot_feature_brackets_and_axis_swap():
+    genes = ["GeneA", "GeneB", "GeneC", "GeneD"]
     result = splt.dotplot(
-        datastore,
-        features=features,
-        groups=leiden_clustering,
+        _dotplot_store(),
+        features={"Lineage": genes[:2], "State": genes[2:]},
+        group_by="cluster",
         swap_axes=True,
         marker_linewidth=0.6,
         show=False,
     )
 
     ax = result.axes["dotplot"]
-    assert result.provenance.extras["feature_group_brackets"] == 2
-    assert sum(line.get_gid() == "feature-group-bracket" for line in ax.lines) == 2
+    # Swapped axes put features on x and groups on y.
+    assert [text.get_text() for text in ax.get_xticklabels()] == genes
+    assert [text.get_text() for text in ax.get_yticklabels()] == ["0", "1", "2"]
+    assert ax.get_ylabel() == "cluster"
     assert ax.get_xlabel() == ""
+    dots = ax.collections[0]
+    offsets = np.asarray(dots.get_offsets())
+    assert sorted(map(tuple, offsets)) == [
+        (float(feature), float(group)) for feature in range(4) for group in range(3)
+    ]
+    assert dots.get_linewidths().tolist() == [0.6]
+    brackets = [line for line in ax.lines if line.get_gid() == "feature-group-bracket"]
+    # Brackets above the plot span each feature group's columns.
+    assert [
+        (line.get_xdata().tolist(), line.get_ydata().tolist()) for line in brackets
+    ] == [
+        (pytest.approx([-0.35, 1.35]), pytest.approx([1.03, 1.03])),
+        (pytest.approx([1.65, 3.35]), pytest.approx([1.03, 1.03])),
+    ]
+    assert result.provenance.extras["feature_group_brackets"] == 2
+    assert [(text.get_text(), text.get_position()) for text in ax.texts] == [
+        ("Lineage", pytest.approx((0.5, 1.07))),
+        ("State", pytest.approx((2.5, 1.07))),
+    ]
     result.close()
 
 
-def test_dotplot_marker_sizes_follow_physical_grid_cells(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:4]]
+def test_dotplot_marker_sizes_follow_physical_grid_cells():
+    genes = ["GeneA", "GeneB", "GeneC", "GeneD"]
     features = {"Lineage": genes[:2], "State": genes[2:]}
-    compact_figure, compact_ax = plt.subplots(figsize=(3, 2))
-    large_figure, large_ax = plt.subplots(figsize=(8, 6))
+    sizes = {}
+    for name, figsize in (("compact", (3, 2)), ("large", (8, 6))):
+        figure, ax = plt.subplots(figsize=figsize)
+        result = splt.dotplot(
+            _dotplot_store(),
+            features=features,
+            group_by="cluster",
+            target=ax,
+            show_legend=False,
+            show=False,
+        )
+        figure.canvas.draw()
+        # Marker diameters follow the physical size of one grid cell.
+        box = ax.get_position()
+        slot = min(box.width * figsize[0] * 72 / 3, box.height * figsize[1] * 72 / 4)
+        largest = np.clip(0.72 * slot, 2.5, 26.0)
+        smallest = np.clip(0.18 * largest, 1.0, 3.0)
+        assert result.provenance.extras["size_range"] == pytest.approx(
+            [smallest**2, largest**2]
+        )
+        fractions = result.tables["aggregate"]["fraction"].to_numpy()
+        np.testing.assert_allclose(
+            np.sort(ax.collections[0].get_sizes()),
+            np.sort(smallest**2 + fractions * (largest**2 - smallest**2)),
+        )
+        assert result.provenance.extras["size_scale_source"] == "panel"
+        sizes[name] = largest
+        if name == "compact":
+            renderer = figure.canvas.get_renderer()
+            label_left = min(
+                label.get_window_extent(renderer).x0
+                for label in ax.get_yticklabels()
+                if label.get_text()
+            )
+            bracket_right = max(
+                line.get_transform().transform(line.get_xydata())[:, 0].max()
+                for line in ax.lines
+                if line.get_gid() == "feature-group-bracket"
+            )
+            assert bracket_right < label_left
+        result.close()
+        plt.close(figure)
+    assert sizes["large"] > sizes["compact"]
 
-    compact = splt.dotplot(
-        datastore,
-        features=features,
-        groups=leiden_clustering,
-        target=compact_ax,
-        show_legend=False,
-        show=False,
-    )
-    large = splt.dotplot(
-        datastore,
-        features=features,
-        groups=leiden_clustering,
-        target=large_ax,
-        show_legend=False,
-        show=False,
-    )
 
-    compact_sizes = compact_ax.collections[0].get_sizes()
-    large_sizes = large_ax.collections[0].get_sizes()
-    assert large_sizes.max() > compact_sizes.max()
-    assert compact.provenance.extras["size_scale_source"] == "panel"
-
-    compact_figure.canvas.draw()
-    renderer = compact_figure.canvas.get_renderer()
-    label_left = min(
-        label.get_window_extent(renderer).x0
-        for label in compact_ax.get_yticklabels()
-        if label.get_text()
-    )
-    bracket_right = max(
-        line.get_transform().transform(line.get_xydata())[:, 0].max()
-        for line in compact_ax.lines
-        if line.get_gid() == "feature-group-bracket"
-    )
-    assert bracket_right < label_left
-
-    compact.close()
-    large.close()
-    plt.close(compact_figure)
-    plt.close(large_figure)
-
-
-def test_dotplot_left_group_labels_clear_feature_tick_labels(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:4]]
+def test_dotplot_left_group_labels_clear_feature_tick_labels():
+    genes = ["GeneA", "GeneB", "GeneC", "GeneD"]
     result = splt.dotplot(
-        datastore,
+        _dotplot_store(),
         features={"Myeloid lineage": genes[:2], "Cell state": genes[2:]},
-        groups=leiden_clustering,
+        group_by="cluster",
         show_legend=False,
         show=False,
     )
@@ -917,21 +1007,68 @@ def test_dotplot_left_group_labels_clear_feature_tick_labels(
     result.close()
 
 
-def test_stacked_violin_standardizes_rows(umap, leiden_clustering, datastore):
-    genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:2]]
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
-        row_standardize=True,
-        max_points=0,
-        show=False,
+def _violin_store():
+    """Groups a, b and c of four cells with two metadata keys and two genes.
+
+    ``metric`` has group means 1.5, 5.5 and 9.5; ``metric2`` has 5.15, 1.15
+    and 3.15. The genes carry the same values as features.
+    """
+    from tests.test_plotting_foundation import _ArrayStore
+
+    metric = np.arange(12, dtype=float)
+    metric2 = np.repeat([5.0, 1.0, 3.0], 4) + np.tile([0.0, 0.1, 0.2, 0.3], 3)
+    return _ArrayStore(
+        {
+            "I": np.ones(12, dtype=bool),
+            "group": np.repeat(["a", "b", "c"], 4).astype(object),
+            "metric": metric,
+            "metric2": metric2,
+            "constant": np.full(12, 5.0),
+        },
+        np.column_stack((metric, metric2)),
+        names=("GeneA", "GeneB"),
     )
 
-    assert len(result.axes) == 2
-    for table in result.tables.values():
-        assert np.nanmean(table["display_value"]) == pytest.approx(0, abs=1e-7)
+
+def _violin_colors(ax):
+    """Fill colors of the violin bodies, in group order."""
+    return np.asarray([body.get_facecolor()[0][:3] for body in ax.collections])
+
+
+def _expected_colors(fractions, cmap="viridis"):
+    from matplotlib import colormaps
+    from matplotlib.colors import to_rgb
+    from seaborn.utils import desaturate
+
+    return np.asarray(
+        [to_rgb(desaturate(colormaps[cmap](float(t)), 0.9)) for t in fractions]
+    )
+
+
+def _stacked(store, keys, **kwargs):
+    return splt.distribution(
+        store,
+        keys,
+        grouping=splt.CellField("group"),
+        kind="stacked_violin",
+        max_points=0,
+        show=False,
+        **kwargs,
+    )
+
+
+def test_stacked_violin_standardizes_rows():
+    result = _stacked(_violin_store(), ["metric", "metric2"], row_standardize=True)
+
+    assert list(result.axes) == ["metric", "metric2"]
+    store = _violin_store()
+    for key, table in result.tables.items():
+        values = store.cells.fetch(key)
+        # Rows standardize with the population standard deviation.
+        np.testing.assert_allclose(
+            table["display_value"], (values - values.mean()) / values.std()
+        )
+    assert result.axes["metric2"].get_ylabel() == "standardized value"
     assert result.provenance.extras["row_standardize"] is True
     result.close()
 
@@ -941,6 +1078,8 @@ def test_distribution_reads_cell_cycle_scores_from_exact_artifact(
     leiden_clustering,
     datastore,
 ):
+    from scarf.storage.artifacts import artifact_group
+
     result = splt.distribution(
         datastore,
         keys=cell_cycle_scoring,
@@ -950,13 +1089,19 @@ def test_distribution_reads_cell_cycle_scores_from_exact_artifact(
         show=False,
     )
 
-    assert set(result.tables) == {"s_score", "g2m_score"}
-    assert all(
-        len(table) == len(_artifact_cell_indices(datastore, cell_cycle_scoring))
-        for table in result.tables.values()
+    stored = artifact_group(datastore.zw, cell_cycle_scoring)
+    cells = _artifact_cell_indices(datastore, cell_cycle_scoring)
+    np.testing.assert_array_equal(
+        cells, _artifact_cell_indices(datastore, leiden_clustering)
     )
+    labels = np.asarray(artifact_group(datastore.zw, leiden_clustering)["values"][:])
+    assert set(result.tables) == {"s_score", "g2m_score"}
+    for name, table in result.tables.items():
+        np.testing.assert_allclose(table["value"], stored[name][:])
+        np.testing.assert_array_equal(table["group"], labels)
     assert result.provenance.cell_key is None
     assert result.provenance.assay is None
+    assert result.provenance.n_cells == len(cells)
     assert result.provenance.extras["values"] == cell_cycle_scoring.to_dict()
     assert result.provenance.extras["grouping"] == leiden_clustering.to_dict()
     assert (
@@ -967,6 +1112,115 @@ def test_distribution_reads_cell_cycle_scores_from_exact_artifact(
     assert "cell_key" not in result.provenance.extras
     assert result.provenance.extras["normalization"] is None
     result.close()
+
+
+def test_distribution_plots_cell_cycle_scores_without_grouping(
+    cell_cycle_scoring,
+    datastore,
+):
+    from scarf.storage.artifacts import artifact_group
+
+    result = splt.distribution(
+        datastore,
+        keys=cell_cycle_scoring,
+        kind="hist",
+        show=False,
+    )
+
+    stored = artifact_group(datastore.zw, cell_cycle_scoring)
+    cells = _artifact_cell_indices(datastore, cell_cycle_scoring)
+    # Without a grouping the artifact's own selection decides the cells.
+    for name in ("s_score", "g2m_score"):
+        np.testing.assert_allclose(result.tables[name]["value"], stored[name][:])
+    assert result.provenance.n_cells == len(cells)
+    assert (
+        result.provenance.extras["cell_selection"]
+        == datastore.inspect_artifact(cell_cycle_scoring).inputs["cell_selection"]
+    )
+    result.close()
+
+
+def test_distribution_rejects_cell_cycle_scores_for_other_cells(
+    cell_cycle_scoring,
+    datastore,
+):
+    cells = _artifact_cell_indices(datastore, cell_cycle_scoring)
+    assert len(cells) < datastore.cells.N
+    datastore.cells.insert(
+        "plot_every_cell", np.ones(datastore.cells.N, dtype=bool), overwrite=True
+    )
+    datastore.cells.insert(
+        "plot_cell_parity",
+        np.asarray(["even", "odd"] * (datastore.cells.N // 2 + 1))[: datastore.cells.N],
+        overwrite=True,
+    )
+
+    with pytest.raises(ValueError) as raised:
+        splt.distribution(
+            datastore,
+            keys=cell_cycle_scoring,
+            grouping=splt.CellField("plot_cell_parity"),
+            cell_selection=datastore.snapshot_cell_selection("plot_every_cell"),
+            show=False,
+        )
+
+    assert raised.value.args == (
+        "keys and grouping artifacts must use the same ordered cells",
+    )
+
+
+@pytest.mark.parametrize(
+    ("arrays", "error", "message"),
+    [
+        (
+            {"g2m_score": "aligned"},
+            ValueError,
+            "Cell-cycle artifact has no canonical 's_score' array",
+        ),
+        (
+            {"s_score": "short", "g2m_score": "aligned"},
+            ValueError,
+            "Cell-cycle 's_score' values do not align with their cell selection",
+        ),
+        (
+            {"s_score": "text", "g2m_score": "aligned"},
+            TypeError,
+            "Cell-cycle 's_score' values must be numeric",
+        ),
+    ],
+)
+def test_distribution_rejects_malformed_cell_cycle_payloads(
+    cell_cycle_scoring,
+    datastore,
+    monkeypatch,
+    arrays,
+    error,
+    message,
+):
+    import zarr
+    from zarr.storage import MemoryStore
+
+    distribution_module = import_module("scarf.plotting.distribution")
+    n_cells = len(_artifact_cell_indices(datastore, cell_cycle_scoring))
+    payloads = {
+        "aligned": np.zeros(n_cells),
+        "short": np.zeros(n_cells - 1),
+        "text": np.asarray(["S"] * n_cells),
+    }
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    for name, payload in arrays.items():
+        group.create_array(name, data=payloads[payload])
+    original = distribution_module.artifact_group
+    monkeypatch.setattr(
+        distribution_module,
+        "artifact_group",
+        lambda root, ref: group if ref == cell_cycle_scoring else original(root, ref),
+    )
+
+    with pytest.raises(error) as raised:
+        splt.distribution(datastore, keys=cell_cycle_scoring, show=False)
+
+    assert raised.value.args == (message,)
 
 
 def test_distribution_rejects_non_cell_cycle_or_mixed_value_artifacts(
@@ -984,210 +1238,273 @@ def test_distribution_rejects_non_cell_cycle_or_mixed_value_artifacts(
         )
 
 
-def test_stacked_violin_can_share_value_scale(umap, leiden_clustering, datastore):
-    genes = [str(value) for value in datastore.RNA.feats.fetch_all("names")[:2]]
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
-        share_y=True,
-        max_points=0,
-        show=False,
+def test_stacked_violin_can_share_value_scale():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+        metric2=10 * np.arange(12, dtype=float),
     )
 
-    limits = [axis.get_ylim() for axis in result.axes.values()]
-    assert all(limit == pytest.approx(limits[0]) for limit in limits[1:])
-    assert result.provenance.extras["share_y"] is True
-    result.close()
+    shared = _stacked(store, ["metric", "metric2"], share_y=True)
+    # Every row spans the pooled values 0 to 110 with 5% padding.
+    assert [axis.get_ylim() for axis in shared.axes.values()] == [
+        pytest.approx((-5.5, 115.5))
+    ] * 2
+    assert shared.provenance.extras["share_y"] is True
+    shared.close()
+
+    independent = _stacked(store, ["metric", "metric2"])
+    limits = [axis.get_ylim() for axis in independent.axes.values()]
+    assert limits[0] != pytest.approx(limits[1])
+    independent.close()
 
 
-def test_distribution_aggregates_biological_samples(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    samples = np.asarray([f"sample_{index % 8}" for index in range(n)])
-    datastore.cells.insert("plot_distribution_sample", samples, overwrite=True)
+def test_distribution_aggregates_biological_samples():
+    store = _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b"], 6),
+        sample=np.tile(["s1", "s1", "s2"], 4),
+        metric=np.array([1, 5, 2, 9, 4, 7, 3, 3, 8, 6, 0, 1], dtype=float),
+    )
 
     result = splt.distribution(
-        datastore,
-        keys="RNA_nCounts",
-        grouping=leiden_clustering,
-        sample_by="plot_distribution_sample",
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        sample_by="sample",
         sample_stat="median",
         kind="box",
         max_points=0,
         show=False,
     )
 
-    table = result.tables["RNA_nCounts"]
-    assert {"sample", "group", "value", "display_value", "nCells"} <= set(table)
-    assert not table.duplicated(["sample", "group"]).any()
-    assert result.provenance.n_samples == 8
+    table = result.tables["metric"].sort_values(["sample", "group"])
+    # Medians per sample and group: s1/a of [1, 5, 9, 4], s1/b of [3, 3, 6, 0],
+    # s2/a of [2, 7] and s2/b of [8, 1].
+    assert list(zip(table["sample"], table["group"], strict=True)) == [
+        ("s1", "a"),
+        ("s1", "b"),
+        ("s2", "a"),
+        ("s2", "b"),
+    ]
+    np.testing.assert_allclose(table["value"], [4.5, 3.0, 4.5, 4.5])
+    assert table["nCells"].tolist() == [4, 4, 2, 2]
+    assert result.provenance.n_samples == 2
     assert result.provenance.extras["sample_stat"] == "median"
+    assert result.axes["metric"].get_ylabel() == "Sample median metric"
     result.close()
 
 
-def test_distribution_draws_sample_aware_split_violins(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    sample_index = np.arange(n) % 8
-    samples = np.asarray([f"sample_{index}" for index in sample_index])
-    conditions = np.where(sample_index % 2 == 0, "control", "stimulated")
-    datastore.cells.insert("plot_split_sample", samples, overwrite=True)
-    datastore.cells.insert("plot_split_condition", conditions, overwrite=True)
+def test_distribution_draws_sample_aware_split_violins():
+    from matplotlib.colors import to_rgb
+    from seaborn.utils import desaturate
+
+    cells = np.arange(48)
+    sample_index = cells % 8
+    metric = cells.astype(float)
+    store = _synthetic_plot_store(
+        I=np.ones(48, dtype=bool),
+        group=np.where(cells < 24, "a", "b"),
+        sample=np.asarray([f"s{index}" for index in sample_index]),
+        cond=np.where(sample_index % 2 == 0, "control", "stimulated"),
+        metric=metric,
+    )
 
     result = splt.distribution(
-        datastore,
-        keys="RNA_nCounts",
-        grouping=leiden_clustering,
-        split_by="plot_split_condition",
-        study_design=splt.StudyDesign(sample_by="plot_split_sample"),
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        split_by="cond",
+        study_design=splt.StudyDesign(sample_by="sample"),
         kind="violin",
-        max_points=30,
+        max_points=0,
         show=False,
     )
 
-    table = result.tables["RNA_nCounts"]
-    assert set(table["split"]) == {"control", "stimulated"}
+    table = result.tables["metric"].sort_values(["group", "sample"])
+    # Sample s holds cells s, s + 8 and s + 16 in group a and s + 24, s + 32 and
+    # s + 40 in group b, so its means are s + 8 and s + 32.
+    assert len(table) == 16
+    expected = [index + 8.0 for index in range(8)] + [
+        index + 32.0 for index in range(8)
+    ]
+    np.testing.assert_allclose(table["value"], expected)
+    assert table["split"].tolist() == ["control", "stimulated"] * 8
     scale = result.scales[0]
-    assert isinstance(scale, splt.CategoricalScale)
     assert scale.order == ("control", "stimulated")
-    assert result.legends[0].label == "plot_split_condition"
+    assert result.legends[0].label == "cond"
+    ax = result.axes["metric"]
+    legend = ax.get_legend()
+    assert legend.get_title().get_text() == "cond"
+    assert [text.get_text() for text in legend.get_texts()] == ["control", "stimulated"]
+    bodies = [body.get_facecolor()[0][:3] for body in ax.collections]
+    expected_colors = [
+        to_rgb(desaturate(scale.palette[split], 0.9))
+        for split in ("control", "stimulated")
+    ] * 2
+    np.testing.assert_allclose(bodies, expected_colors, atol=0.005)
     result.close()
 
 
-def test_distribution_seed_repeats_point_jitter(
-    umap,
-    leiden_clustering,
-    datastore,
-):
+def test_distribution_seed_repeats_point_jitter():
+    rng = np.random.default_rng(3)
+    store = _synthetic_plot_store(
+        I=np.ones(120, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 40),
+        metric=rng.normal(size=120),
+    )
     kwargs = {
-        "keys": "RNA_nCounts",
-        "grouping": leiden_clustering,
+        "grouping": splt.CellField("group"),
         "kind": "box",
         "max_points": 80,
-        "seed": 17,
         "show": False,
     }
-    first = splt.distribution(datastore, **kwargs)
-    second = splt.distribution(datastore, **kwargs)
+    global_state = np.random.get_state()[1].copy()
 
-    first_offsets = [
-        np.asarray(collection.get_offsets())
-        for collection in next(iter(first.axes.values())).collections
-    ]
-    second_offsets = [
-        np.asarray(collection.get_offsets())
-        for collection in next(iter(second.axes.values())).collections
-    ]
-    assert len(first_offsets) == len(second_offsets)
-    for observed, repeated in zip(first_offsets, second_offsets, strict=True):
-        np.testing.assert_array_equal(observed, repeated)
-    first.close()
-    second.close()
+    def strip_offsets(seed):
+        result = splt.distribution(store, "metric", seed=seed, **kwargs)
+        offsets = np.concatenate(
+            [
+                np.asarray(collection.get_offsets())
+                for collection in result.axes["metric"].collections
+            ]
+        )
+        result.close()
+        return offsets
+
+    first = strip_offsets(17)
+    repeated = strip_offsets(17)
+    other = strip_offsets(18)
+
+    assert len(first) == 80
+    np.testing.assert_array_equal(first, repeated)
+    assert not np.array_equal(first, other)
+    # Jitter draws from a private generator and leaves NumPy's global state.
+    np.testing.assert_array_equal(np.random.get_state()[1], global_state)
+
+
+@pytest.fixture(scope="module")
+def imported_plot_store(tmp_path_factory):
+    from tests.test_plotting_foundation import _imported_plot_store
+
+    store, imported, counts = _imported_plot_store(
+        tmp_path_factory.mktemp("modern_plots"),
+        coordinates=np.column_stack((np.arange(16.0), np.arange(16.0) % 4)),
+        clusters=np.arange(16) % 2,
+    )
+    return SimpleNamespace(
+        store=store,
+        imported=imported,
+        layout=imported.embeddingArtifacts["X_umap"],
+        normalized=counts / counts.sum(axis=1, keepdims=True) * 1000.0,
+    )
 
 
 def test_sample_aggregated_feature_axis_retains_requested_italics(
-    umap,
-    datastore,
+    imported_plot_store,
 ):
-    n = len(datastore.cells.active_index("I"))
-    samples = np.asarray([f"sample_{index % 8}" for index in range(n)])
-    datastore.cells.insert("plot_italic_sample", samples, overwrite=True)
-    gene = str(datastore.RNA.feats.fetch_all("names")[0])
+    data = imported_plot_store
+    samples = np.asarray([f"sample_{index % 4}" for index in range(16)])
+    data.store.cells.insert("plot_italic_sample", samples, overwrite=True)
 
     result = splt.distribution(
-        datastore,
-        keys=gene,
-        cell_selection=datastore.snapshot_cell_selection("I"),
+        data.store,
+        keys="CD3E",
+        cell_selection=data.imported.cellSelection,
         sample_by="plot_italic_sample",
         kind="box",
         italicize_features=True,
         show=False,
     )
 
-    axis = next(iter(result.axes.values()))
-    assert axis.get_ylabel() == f"Sample mean {gene}"
+    axis = result.axes["CD3E"]
+    assert axis.get_ylabel() == "Sample mean CD3E"
     assert axis.yaxis.label.get_fontstyle() == "italic"
+    table = result.tables["CD3E"].sort_values("sample")
+    expected = [data.normalized[samples == f"sample_{i}", 0].mean() for i in range(4)]
+    np.testing.assert_allclose(table["value"], expected, rtol=1e-5)
     assert (
         result.provenance.extras["cell_selection"]
-        == datastore.snapshot_cell_selection("I").to_dict()
+        == data.imported.cellSelection.to_dict()
     )
     result.close()
 
 
-def test_per_sample_composition_reports_uncertainty(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    sample_index = np.arange(n) % 8
-    samples = np.asarray([f"sample_{index}" for index in sample_index])
-    conditions = np.where(sample_index < 4, "control", "stimulated")
-    subjects = np.asarray([f"subject_{index % 4}" for index in sample_index])
-    datastore.cells.insert("plot_ci_sample", samples, overwrite=True)
-    datastore.cells.insert("plot_ci_condition", conditions, overwrite=True)
-    datastore.cells.insert("plot_ci_subject", subjects, overwrite=True)
+def test_per_sample_composition_reports_uncertainty():
+    from scipy.stats import t as student_t
+
+    # Ten cells per sample; the count of category "a" per sample.
+    a_counts = {"c1": 2, "c2": 3, "c3": 3, "c4": 4, "t1": 5, "t2": 6, "t3": 6, "t4": 7}
+    samples = np.repeat(list(a_counts), 10)
+    categories = np.concatenate(
+        [["a"] * count + ["b"] * (10 - count) for count in a_counts.values()]
+    )
+    store = _synthetic_plot_store(
+        I=np.ones(80, dtype=bool),
+        cat=categories,
+        sample=samples,
+        condition=np.where(np.char.startswith(samples, "c"), "control", "stimulated"),
+        subject=np.char.add(
+            "s", np.char.replace(np.char.replace(samples, "c", ""), "t", "")
+        ),
+    )
 
     result = splt.composition(
-        datastore,
-        categories=leiden_clustering,
+        store,
+        category_by="cat",
         study_design=splt.StudyDesign(
-            sample_by="plot_ci_sample",
-            condition_by="plot_ci_condition",
-            subject_by="plot_ci_subject",
+            sample_by="sample",
+            condition_by="condition",
+            subject_by="subject",
         ),
         kind="per_sample",
         uncertainty="ci95",
         show=False,
     )
 
-    summary = result.tables["summary"]
-    assert {"mean_proportion", "lower", "upper", "n_samples"} <= set(summary)
-    assert np.all(summary["lower"] <= summary["mean_proportion"])
-    assert np.all(summary["mean_proportion"] <= summary["upper"])
+    summary = result.tables["summary"].set_index(["category", "condition"])
+    critical = student_t.ppf(0.975, 3)
+    for category, condition, proportions in (
+        ("a", "control", [0.2, 0.3, 0.3, 0.4]),
+        ("a", "stimulated", [0.5, 0.6, 0.6, 0.7]),
+        ("b", "control", [0.8, 0.7, 0.7, 0.6]),
+        ("b", "stimulated", [0.5, 0.4, 0.4, 0.3]),
+    ):
+        mean = np.mean(proportions)
+        margin = critical * np.std(proportions, ddof=1) / 2
+        row = summary.loc[(category, condition)]
+        assert row["mean_proportion"] == pytest.approx(mean)
+        assert (row["lower"], row["upper"]) == pytest.approx(
+            (mean - margin, mean + margin)
+        )
+        assert row["n_samples"] == 4
     assert result.provenance.extras["uncertainty"] == "ci95"
-    assert result.provenance.extras["n_pair_lines"] > 0
-    assert any(legend.kind == "marker" for legend in result.legends)
-    axis = next(iter(result.axes.values()))
-    assert axis.get_ylim()[1] >= float(summary["upper"].max())
-    for legend in result.figure.legends:
-        if legend.get_title().get_text() == "Condition":
-            assert all(
-                not text.get_text().startswith("mean") for text in legend.get_texts()
-            )
-    rendered_labels = [
-        text.get_text()
+    assert result.provenance.extras["n_pair_lines"] == 8
+    axis = result.axes["composition"]
+    assert axis.get_ylim()[1] >= float(result.tables["summary"]["upper"].max())
+    assert [
+        (
+            legend.get_title().get_text(),
+            [text.get_text() for text in legend.get_texts()],
+        )
         for legend in result.figure.legends
-        for text in legend.get_texts()
+    ] == [
+        ("cat", ["a", "b"]),
+        ("Condition", ["control", "stimulated"]),
+        ("Summary", ["mean with 95% CI"]),
     ]
-    assert any(
-        label.startswith("mean") or label.startswith("Summary: mean")
-        for label in rendered_labels
-    )
     result.close()
 
 
-def test_embedding_side_legend_stays_page_sized_for_many_categories(
-    umap,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    labels = np.full(n, "type_149", dtype=object)
-    selected = _artifact_cell_indices(datastore, umap)
-    labels[selected[:149]] = [f"type_{index:03d}" for index in range(149)]
-    datastore.cells.insert("plot_many_types", labels, overwrite=True)
+def test_embedding_side_legend_stays_page_sized_for_many_categories():
+    labels = np.full(300, "type_149", dtype=object)
+    labels[:149] = [f"type_{index:03d}" for index in range(149)]
+    store = _scatter_store(n=300, plot_many_types=labels)
 
     result = splt.embedding(
-        datastore,
-        layout=umap,
+        store,
+        layout_key="umap",
         color_by="plot_many_types",
         legend_loc="right",
         show=False,
@@ -1196,12 +1513,14 @@ def test_embedding_side_legend_stays_page_sized_for_many_categories(
     width, _ = result.figure.get_size_inches()
     assert width <= 12
     legend = result.figure.legends[0]
-    assert len(legend.get_texts()) == 80
+    shown = [text.get_text() for text in legend.get_texts()]
+    assert len(shown) == 80
     assert legend.get_title().get_text() == "plot_many_types (80 of 150)"
-    assert "type_149" in [text.get_text() for text in legend.get_texts()]
+    assert "type_149" in shown
     omitted = result.provenance.extras["omitted_legend_entries"]
     panel_key = str(next(iter(result.axes)))
-    assert len(omitted[panel_key]) == 70
+    # The largest category stays; the tail of the singletons is omitted.
+    assert omitted[panel_key] == [f"type_{index:03d}" for index in range(79, 149)]
     result.close()
 
 
@@ -1211,6 +1530,10 @@ def test_cluster_connectivity_runs_on_real_datastore_graph(
     connectivity_graph,
     datastore,
 ):
+    from scipy import sparse
+
+    from scarf.storage.artifacts import artifact_group
+
     result = datastore.plots.cluster_connectivity(
         groups=leiden_clustering,
         layout=umap,
@@ -1221,63 +1544,122 @@ def test_cluster_connectivity_runs_on_real_datastore_graph(
         show=False,
     )
 
-    observed = len(result.tables["nodes"])
-    assert len(result.tables["nodes"]) == observed
-    assert set(result.tables["edges"]) == {
-        "source",
-        "target",
-        "rawWeight",
-        "normalizedWeight",
-    }
-    assert result.provenance.extras["n_edges"] <= 3 * observed // 2
+    labels = np.asarray(artifact_group(datastore.zw, leiden_clustering)["values"][:])
+    coordinates = np.asarray(artifact_group(datastore.zw, umap)["values"][:])
+    graph = sparse.csr_matrix(
+        datastore.load_graph(connectivity_graph, symmetric=True), dtype=np.float64
+    )
+    graph.setdiag(0.0)
+    graph.eliminate_zeros()
+
+    nodes = result.tables["nodes"].set_index("category")
+    order = list(nodes.index)
+    assert sorted(order) == sorted(np.unique(labels).tolist())
+    for category in order:
+        cells = labels == category
+        assert nodes.loc[category, "nCells"] == cells.sum()
+        assert nodes.loc[category, "x"] == pytest.approx(
+            np.median(coordinates[cells, 0])
+        )
+        assert nodes.loc[category, "y"] == pytest.approx(
+            np.median(coordinates[cells, 1])
+        )
+
+    # Undirected intercluster weights, each cell edge counted once.
+    upper = sparse.triu(graph, k=1).tocoo()
+    pairs = pd.DataFrame(
+        {
+            "a": labels[upper.row],
+            "b": labels[upper.col],
+            "weight": upper.data,
+        }
+    )
+    pairs = pairs[pairs["a"] != pairs["b"]]
+    pairs[["a", "b"]] = np.sort(pairs[["a", "b"]].to_numpy(), axis=1)
+    raw = pairs.groupby(["a", "b"])["weight"].sum()
+    incident = pd.Series(np.asarray(graph.sum(axis=1)).ravel()).groupby(labels).sum()
+    edges = result.tables["edges"]
+    assert result.provenance.extras["n_aggregated_edges"] == len(raw)
+    for row in edges.itertuples():
+        key = tuple(sorted((row.source, row.target)))
+        assert row.rawWeight == pytest.approx(raw.loc[key])
+        assert row.normalizedWeight == pytest.approx(
+            raw.loc[key] / np.sqrt(incident[row.source] * incident[row.target])
+        )
+    degree = pd.concat([edges["source"], edges["target"]]).value_counts()
+    assert degree.max() <= 3
+
     background = result.axes["cluster_connectivity"].collections[0]
     assert background.get_alpha() == pytest.approx(0.3)
     assert background.get_sizes()[0] >= 4
-    assert not hasattr(background, "_scarf_layout_point_size")
-    assert len(np.unique(background.get_facecolors(), axis=0)) > 1
+    np.testing.assert_allclose(background.get_offsets(), coordinates)
+    palette = result.scales[0].palette
+    np.testing.assert_allclose(
+        background.get_facecolors()[:, :3],
+        [mcolors.to_rgb(palette[label]) for label in labels],
+    )
     assert result.provenance.extras["cell_size_source"] == "panel"
     result.close()
 
 
-def test_composition_borders_labels_and_stored_palette(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    samples = np.asarray([f"s{index % 3}" for index in range(n)], dtype=object)
-    datastore.cells.insert("plot_modern_samples", samples, overwrite=True)
+def test_composition_borders_labels_and_stored_palette():
+    display = {
+        "kind": "categorical",
+        "categories": [
+            {"value": "a", "label": "Alpha", "color": "#123456"},
+            {"value": "b", "label": "Beta", "color": "#abcdef"},
+        ],
+    }
+    store = _synthetic_plot_store(
+        I=np.ones(8, dtype=bool),
+        umap1=np.arange(8.0),
+        umap2=np.zeros(8),
+        category=np.array(list("aaababbb"), dtype=object),
+        sample=np.repeat(["s0", "s1"], 4),
+    )
+    store._stored_display_metadata = lambda column: (
+        display if column == "category" else None
+    )
 
     embedding = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by=leiden_clustering,
-        show_legend=False,
-        show=False,
+        store, layout_key="umap", color_by="category", show=False
     )
     composition = splt.composition(
-        datastore,
-        categories=leiden_clustering,
-        sample_by="plot_modern_samples",
+        store,
+        category_by="category",
+        sample_by="sample",
         segment_linewidth=0.8,
         show_percent_labels=True,
-        label_min_fraction=0.01,
+        label_min_fraction=0.3,
         show=False,
     )
 
+    points = embedding.axes["category"].collections[0]
+    assert [mcolors.to_hex(color) for color in points.get_facecolors()] == [
+        "#123456" if value == "a" else "#abcdef" for value in "aaababbb"
+    ]
+    assert [text.get_text() for text in embedding.figure.legends[0].get_texts()] == [
+        "Alpha",
+        "Beta",
+    ]
+    # Sample s0 is 3/4 a and s1 is 1/4 a; bars stack a then b.
     bars = composition.axes["composition"].patches
-    assert bars
+    assert [mcolors.to_hex(bar.get_facecolor()) for bar in bars] == [
+        "#123456",
+        "#123456",
+        "#abcdef",
+        "#abcdef",
+    ]
+    assert [bar.get_height() for bar in bars] == pytest.approx([0.75, 0.25, 0.25, 0.75])
     assert all(bar.get_linewidth() == pytest.approx(0.8) for bar in bars)
-    assert composition.axes["composition"].texts
-    embedding_scale = next(
-        scale for scale in embedding.scales if isinstance(scale, splt.CategoricalScale)
-    )
-    composition_scale = next(
-        scale
-        for scale in composition.scales
-        if isinstance(scale, splt.CategoricalScale)
-    )
-    assert embedding_scale.palette == composition_scale.palette
+    assert [
+        (text.get_text(), text.get_position())
+        for text in composition.axes["composition"].texts
+    ] == [("75%", pytest.approx((0.0, 0.375))), ("75%", pytest.approx((0.94, 0.625)))]
+    assert [text.get_text() for text in composition.figure.legends[0].get_texts()] == [
+        "Alpha",
+        "Beta",
+    ]
     embedding.close()
     composition.close()
 
@@ -1322,30 +1704,28 @@ def test_composition_uses_two_exact_artifact_axes(
         )
 
 
-def test_compose_results_namespaces_tables_and_renders_shared_legend(
-    umap,
-    leiden_clustering,
-    datastore,
-):
-    n = len(datastore.cells.active_index("I"))
-    phases = np.asarray(["G1", "S", "G2M"] * (n // 3 + 1), dtype=object)[:n]
-    datastore.cells.insert("plot_composite_phase", phases, overwrite=True)
+def test_compose_results_namespaces_tables_and_renders_shared_legend():
+    store = _scatter_store(
+        n=60,
+        cluster=np.repeat(["c1", "c2", "c3"], 20),
+        plot_composite_phase=np.tile(["G1", "S", "G2M"], 20),
+    )
     figure, axes = plt.subplot_mosaic(
         [["embedding", "composition"]],
         figsize=(7, 3),
         layout="constrained",
     )
     first = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by=leiden_clustering,
+        store,
+        layout_key="umap",
+        color_by="cluster",
         target=axes["embedding"],
         show_legend=True,
         theme="paper",
         show=False,
     )
     second = splt.composition(
-        datastore,
+        store,
         category_by="plot_composite_phase",
         target=axes["composition"],
         show_legend=True,
@@ -1362,7 +1742,16 @@ def test_compose_results_namespaces_tables_and_renders_shared_legend(
     assert result.owns_figure is False
     assert result.provenance.notes == ("composite",)
     assert "composition:aggregate" in result.tables
-    assert len(figure.legends) == 2
+    assert [
+        (
+            legend.get_title().get_text(),
+            [text.get_text() for text in legend.get_texts()],
+        )
+        for legend in figure.legends
+    ] == [
+        ("cluster", ["c1", "c2", "c3"]),
+        ("plot_composite_phase", ["G1", "G2M", "S"]),
+    ]
     assert all(axis.get_legend() is None for axis in axes.values())
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
@@ -1385,9 +1774,11 @@ def test_compose_results_namespaces_tables_and_renders_shared_legend(
     plt.close(figure)
 
 
-def test_recipe_execution_is_headless_and_read_only(umap, datastore):
-    columns_before = frozenset(datastore.cells.columns)
-    artifacts_before = frozenset(datastore.list_artifacts())
+def test_recipe_execution_is_headless_and_read_only(imported_plot_store):
+    data = imported_plot_store
+    store = data.store
+    columns_before = frozenset(store.cells.columns)
+    artifacts_before = frozenset(store.list_artifacts())
     recipe = splt.PlotRecipe(
         (
             splt.PlotStep(
@@ -1401,19 +1792,25 @@ def test_recipe_execution_is_headless_and_read_only(umap, datastore):
         )
     )
 
-    execution = datastore.plots.run_recipe(recipe, artifacts={"umap": umap})
+    execution = store.plots.run_recipe(recipe, artifacts={"umap": data.layout})
 
     assert not execution.written_paths
     assert not execution.failures
     assert len(execution.outputs) == 1
-    assert frozenset(datastore.cells.columns) == columns_before
-    assert frozenset(datastore.list_artifacts()) == artifacts_before
+    assert frozenset(store.cells.columns) == columns_before
+    assert frozenset(store.list_artifacts()) == artifacts_before
     result = execution.outputs[0].result
+    np.testing.assert_allclose(
+        result.axes["RNA_nCounts"].collections[0].get_offsets(),
+        np.column_stack((np.arange(16.0), np.arange(16.0) % 4)),
+    )
     assert plt.fignum_exists(result.figure.number)
     result.close()
 
 
-def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
+def test_recipe_batch_output_closes_owned_figure(imported_plot_store, tmp_path):
+    from PIL import Image
+
     recipe = splt.PlotRecipe(
         (
             splt.PlotStep(
@@ -1421,6 +1818,7 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
                 plot="embedding",
                 kwargs={
                     "color_by": "RNA_nCounts",
+                    "figsize": (3.0, 2.0),
                 },
                 artifact_kwargs={"layout": "umap"},
                 output=splt.PlotOutputSettings(
@@ -1432,124 +1830,99 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
     )
 
     execution = splt.run_recipe(
-        datastore,
+        imported_plot_store.store,
         recipe,
-        artifacts={"umap": umap},
+        artifacts={"umap": imported_plot_store.layout},
         output_dir=tmp_path,
     )
     plot_result = execution.outputs[0].result
 
     assert execution.written_paths == (tmp_path / "overview.png",)
-    assert execution.written_paths[0].stat().st_size > 0
+    with Image.open(execution.written_paths[0]) as image:
+        assert image.size == (270, 180)
     assert not plt.fignum_exists(plot_result.figure.number)
 
 
-def _expressed_gene_names(datastore, n=3):
-    names = datastore.RNA.feats.fetch_all("names")
-    counts = np.asarray(
-        datastore.RNA.rawData[:, : len(names)].sum(axis=0).compute(),
-        dtype=np.float64,
-    ).ravel()
-    order = np.argsort(-counts)
-    chosen = []
-    for index in order:
-        if counts[index] > 0:
-            chosen.append(str(names[index]))
-        if len(chosen) == n:
-            break
-    return chosen
-
-
-def test_stacked_violin_mean_color_expression(umap, leiden_clustering, datastore):
-    genes = _expressed_gene_names(datastore)
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_expression():
+    result = _stacked(
+        _violin_store(),
+        ["GeneA", "GeneB"],
         color_by="mean",
         color_scale=splt.ColorScale(scope="shared"),
-        max_points=0,
-        show=False,
     )
     try:
-        assert len(result.axes) == len(genes)
+        assert len(result.axes) == 2
         assert result.legends[0].kind == "colorbar"
         assert result.legends[0].label == "mean expression"
-        assert any(isinstance(scale, splt.ColorScale) for scale in result.scales)
-        assert any(ax.get_label().startswith("<colorbar") for ax in result.figure.axes)
         assert result.provenance.extras["color_by"] == "mean"
-        # Shared scale spans the min/max of every group mean.
-        all_means = [
-            mean
-            for table in result.tables.values()
-            for mean in table.groupby("group")["display_value"].mean()
+        # One scale spans every group mean: 1.15 to 9.5.
+        assert (result.provenance.extras["vmin"], result.provenance.extras["vmax"]) == (
+            pytest.approx(1.15),
+            pytest.approx(9.5),
+        )
+        (colorbar,) = [
+            ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
         ]
-        assert result.provenance.extras["vmin"] == pytest.approx(min(all_means))
-        assert result.provenance.extras["vmax"] == pytest.approx(max(all_means))
-        # Mean coloring gives each group a distinct colour within a row.
-        ax = list(result.axes.values())[0]
-        face_colors = {
-            tuple(np.round(color.get_facecolor()[0][:3], 3))
-            for color in ax.collections
-            if hasattr(color, "get_facecolor") and len(color.get_facecolor())
-        }
-        assert len(face_colors) >= 2
+        assert colorbar.get_ylim() == pytest.approx((1.15, 9.5))
+        assert colorbar.get_ylabel() == "mean expression"
+        for axis, means in zip(
+            result.axes.values(), ([1.5, 5.5, 9.5], [5.15, 1.15, 3.15]), strict=True
+        ):
+            fractions = (np.asarray(means) - 1.15) / 8.35
+            np.testing.assert_allclose(
+                _violin_colors(axis), _expected_colors(fractions), atol=0.005
+            )
     finally:
         result.close()
 
 
-def test_stacked_violin_mean_color_explicit_bounds(umap, leiden_clustering, datastore):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    result = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_explicit_bounds():
+    result = _stacked(
+        _violin_store(),
+        "metric",
         color_by="mean",
-        color_scale=splt.ColorScale(cmap="magma", vmin=0.0, vmax=5.0, scope="shared"),
-        max_points=0,
-        show=False,
+        color_scale=splt.ColorScale(cmap="magma", vmin=0.0, vmax=10.0, scope="shared"),
     )
     try:
         color_scale = next(
             scale for scale in result.scales if isinstance(scale, splt.ColorScale)
         )
-        assert color_scale.cmap == "magma"
-        assert color_scale.vmin == 0.0
-        assert color_scale.vmax == 5.0
-        assert color_scale.scope == "shared"
-        assert result.legends[0].extras["vmin"] == 0.0
-        assert result.legends[0].extras["vmax"] == 5.0
-        assert result.provenance.extras["vmin"] == 0.0
-        assert result.provenance.extras["vmax"] == 5.0
+        assert (color_scale.cmap, color_scale.vmin, color_scale.vmax) == (
+            "magma",
+            0.0,
+            10.0,
+        )
+        assert result.legends[0].extras == {"vmin": 0.0, "vmax": 10.0}
         assert result.provenance.extras["color_scale_scope"] == "shared"
+        (colorbar,) = [
+            ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
+        ]
+        assert colorbar.get_ylim() == pytest.approx((0.0, 10.0))
+        # Group means 1.5, 5.5 and 9.5 sit at those fractions of [0, 10].
+        np.testing.assert_allclose(
+            _violin_colors(result.axes["metric"]),
+            _expected_colors([0.15, 0.55, 0.95], cmap="magma"),
+            atol=0.005,
+        )
     finally:
         result.close()
 
 
-def test_stacked_violin_mean_color_constant_row(umap, leiden_clustering, datastore):
-    n = len(datastore.cells.active_index("I"))
-    datastore.cells.insert("constant_metric", np.full(n, 5.0), overwrite=True)
-    result = splt.distribution(
-        datastore,
-        keys="constant_metric",
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_constant_row():
+    result = _stacked(
+        _violin_store(),
+        "constant",
         row_standardize=True,
         color_by="mean",
         color_scale=splt.ColorScale(scope="shared"),
-        max_points=0,
-        show=False,
     )
     try:
-        table = list(result.tables.values())[0]
-        assert np.nanmean(table["display_value"]) == pytest.approx(0, abs=1e-9)
+        table = result.tables["constant"]
+        assert (table["display_value"] == 0).all()
         # Tied means follow the shared limit policy: the tied value takes the
         # low end and the colourbar still renders a unit range.
         assert result.provenance.extras["vmin"] == pytest.approx(0.0)
         assert result.provenance.extras["vmax"] == pytest.approx(1.0)
-        assert any(ax.get_label().startswith("<colorbar") for ax in result.figure.axes)
         colorbar = next(
             ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
         )
@@ -1558,115 +1931,76 @@ def test_stacked_violin_mean_color_constant_row(umap, leiden_clustering, datasto
         result.close()
 
 
-def test_stacked_violin_color_scale_requires_mean(umap, leiden_clustering, datastore):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    with pytest.raises(
-        ValueError, match="color_scale applies only when color_by='mean'"
-    ):
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        (
+            {"color_scale": splt.ColorScale(cmap="magma")},
+            ValueError,
+            "color_scale applies only when color_by='mean'",
+        ),
+        (
+            {"color_by": "mean", "split_by": "group"},
+            ValueError,
+            "color_by='mean' cannot be combined with split_by",
+        ),
+        (
+            {"color_by": "mean", "color_scale": splt.ColorScale(scale="log")},
+            NotImplementedError,
+            "distribution mean coloring currently supports only linear color scales",
+        ),
+    ],
+)
+def test_stacked_violin_mean_color_rejects_unsupported_options(kwargs, error, message):
+    store = _synthetic_plot_store(
+        I=np.ones(4, dtype=bool), group=np.array(["a", "b"] * 2), metric=np.ones(4)
+    )
+    with pytest.raises(error) as raised:
         splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
+            store,
+            "metric",
+            grouping=splt.CellField("group"),
             kind="stacked_violin",
-            color_scale=splt.ColorScale(cmap="magma"),
             show=False,
+            **kwargs,
         )
 
-
-def test_stacked_violin_mean_color_rejects_split(umap, leiden_clustering, datastore):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    with pytest.raises(ValueError, match="cannot be combined with split_by"):
-        splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
-            split_by="RNA_leiden_cluster",
-            kind="stacked_violin",
-            color_by="mean",
-            show=False,
-        )
+    assert raised.value.args == (message,)
 
 
-def test_stacked_violin_mean_color_rejects_log_scale(
-    umap, leiden_clustering, datastore
-):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    with pytest.raises(NotImplementedError, match="linear"):
-        splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
-            kind="stacked_violin",
-            color_by="mean",
-            color_scale=splt.ColorScale(scale="log"),
-            show=False,
-        )
-
-
-def test_stacked_violin_mean_color_quantiles(umap, leiden_clustering, datastore):
-    genes = _expressed_gene_names(datastore, n=2)
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_quantiles():
+    result = _stacked(
+        _violin_store(),
+        ["metric", "metric2"],
         color_by="mean",
         color_scale=splt.ColorScale(quantiles=(0.25, 0.75), scope="shared"),
-        max_points=0,
-        show=False,
     )
     try:
         color_scale = next(
             scale for scale in result.scales if isinstance(scale, splt.ColorScale)
         )
-        all_means = [
-            mean
-            for table in result.tables.values()
-            for mean in table.groupby("group")["display_value"].mean()
-        ]
-        finite = np.asarray([m for m in all_means if np.isfinite(m)])
-        assert color_scale.vmin == pytest.approx(np.quantile(finite, 0.25))
-        assert color_scale.vmax == pytest.approx(np.quantile(finite, 0.75))
-        # Rendered face colours honour the quantile clip: the lowest mean maps
-        # to the bottom of the colormap and the highest to the top. Seaborn
-        # desaturates the fills by ``saturation=0.9``.
-        from matplotlib import colormaps
-        from matplotlib.colors import to_rgb
-        from seaborn.utils import desaturate
-
-        face_colors = {
-            tuple(np.round(color.get_facecolor()[0][:3], 3))
-            for ax in result.axes.values()
-            for color in ax.collections
-            if hasattr(color, "get_facecolor") and len(color.get_facecolor())
-        }
-
-        def desat(t: float) -> tuple[float, float, float]:
-            return tuple(
-                np.round(to_rgb(desaturate(to_rgb(colormaps["viridis"](t)), 0.9)), 3)
+        pooled = np.array([1.5, 5.5, 9.5, 5.15, 1.15, 3.15])
+        low, high = np.quantile(pooled, [0.25, 0.75])
+        assert (color_scale.vmin, color_scale.vmax) == pytest.approx((1.9125, 5.4125))
+        assert (low, high) == pytest.approx((1.9125, 5.4125))
+        # Means outside the quantile window clip to the colormap ends.
+        for axis, means in zip(
+            result.axes.values(), ([1.5, 5.5, 9.5], [5.15, 1.15, 3.15]), strict=True
+        ):
+            fractions = np.clip((np.asarray(means) - low) / (high - low), 0, 1)
+            np.testing.assert_allclose(
+                _violin_colors(axis), _expected_colors(fractions), atol=0.005
             )
-
-        def close_to(fc: tuple[float, ...], expected: tuple[float, ...]) -> bool:
-            return all(abs(a - b) <= 0.01 for a, b in zip(fc, expected))
-
-        assert any(close_to(fc, desat(0.0)) for fc in face_colors)
-        assert any(close_to(fc, desat(1.0)) for fc in face_colors)
-        assert len(face_colors) >= 3
     finally:
         result.close()
 
 
-def test_stacked_violin_mean_color_panel_scope(umap, leiden_clustering, datastore):
-    genes = _expressed_gene_names(datastore, n=2)
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_panel_scope():
+    result = _stacked(
+        _violin_store(),
+        ["metric", "metric2"],
         color_by="mean",
         color_scale=splt.ColorScale(scope="panel"),
-        max_points=0,
-        show=False,
     )
     try:
         color_scale = next(
@@ -1674,101 +2008,86 @@ def test_stacked_violin_mean_color_panel_scope(umap, leiden_clustering, datastor
         )
         assert color_scale.scope == "panel"
         assert result.provenance.extras["color_scale_scope"] == "panel"
-        # Panel scope still draws a single reference colourbar from the pooled
-        # group means.
+        # Panel scope draws one reference colorbar on the unit relative scale.
         colorbars = [
             ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
         ]
         assert len(colorbars) == 1
-        assert colorbars[0].get_ylabel() == "Relative Expression Per Gene"
-        # Panel scope draws a single colorbar on the unit 0-to-1 relative scale.
-        assert color_scale.vmin == pytest.approx(0.0)
-        assert color_scale.vmax == pytest.approx(1.0)
-        assert result.legends[0].extras["vmin"] == pytest.approx(0.0)
-        assert result.legends[0].extras["vmax"] == pytest.approx(1.0)
-        assert result.provenance.extras["vmin"] == pytest.approx(0.0)
-        assert result.provenance.extras["vmax"] == pytest.approx(1.0)
+        assert colorbars[0].get_ylabel() == "Relative Value Per Key"
+        assert (color_scale.vmin, color_scale.vmax) == (0.0, 1.0)
+        assert result.legends[0].extras == {"vmin": 0.0, "vmax": 1.0}
+        # Each row rescales its own group means to [0, 1].
+        np.testing.assert_allclose(
+            _violin_colors(result.axes["metric"]),
+            _expected_colors([0.0, 0.5, 1.0]),
+            atol=0.005,
+        )
+        np.testing.assert_allclose(
+            _violin_colors(result.axes["metric2"]),
+            _expected_colors([1.0, 0.0, 0.5]),
+            atol=0.005,
+        )
     finally:
         result.close()
 
 
-def test_stacked_violin_scope_follows_share_y(umap, leiden_clustering, datastore):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    independent = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
-        color_by="mean",
-        max_points=0,
-        show=False,
-    )
+def test_stacked_violin_scope_follows_share_y():
+    independent = _stacked(_violin_store(), "GeneA", color_by="mean")
     try:
         assert independent.provenance.extras["color_scale_scope"] == "panel"
         assert independent.legends[0].label == "Relative Expression Per Gene"
     finally:
         independent.close()
-    shared = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
-        color_by="mean",
-        share_y=True,
-        max_points=0,
-        show=False,
-    )
+    shared = _stacked(_violin_store(), "GeneA", color_by="mean", share_y=True)
     try:
         assert shared.provenance.extras["color_scale_scope"] == "shared"
         assert shared.legends[0].label == "mean expression"
+        assert (shared.provenance.extras["vmin"], shared.provenance.extras["vmax"]) == (
+            pytest.approx(1.5),
+            pytest.approx(9.5),
+        )
     finally:
         shared.close()
 
 
-def test_stacked_violin_mean_color_default_scale_scope_is_ergonomic(
-    umap, leiden_clustering, datastore
-):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    result = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_default_scale_scope_is_ergonomic():
+    result = _stacked(
+        _violin_store(),
+        "metric2",
         color_by="mean",
         color_scale=splt.ColorScale(cmap="magma"),
-        max_points=0,
-        show=False,
     )
     try:
         scale = next(s for s in result.scales if isinstance(s, splt.ColorScale))
-        assert scale.scope == "panel"
-        assert scale.cmap == "magma"
+        # The general "feature" default resolves to panel scope here.
+        assert (scale.scope, scale.cmap) == ("panel", "magma")
+        np.testing.assert_allclose(
+            _violin_colors(result.axes["metric2"]),
+            _expected_colors([1.0, 0.0, 0.5], cmap="magma"),
+            atol=0.005,
+        )
     finally:
         result.close()
 
 
-def test_stacked_violin_mean_color_no_colorbar_on_target(
-    umap, leiden_clustering, datastore
-):
-    genes = _expressed_gene_names(datastore, n=2)
+def test_stacked_violin_mean_color_no_colorbar_on_target():
     fig, axes = plt.subplots(1, 2)
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+    result = _stacked(
+        _violin_store(),
+        ["metric", "metric2"],
         color_by="mean",
         color_scale=splt.ColorScale(scope="shared"),
-        max_points=0,
         target=[axes[0], axes[1]],
-        show=False,
     )
     try:
         assert result.owns_figure is False
-        assert not any(
-            ax.get_label().startswith("<colorbar") for ax in result.figure.axes
-        )
-        assert any(legend.kind == "colorbar" for legend in result.legends)
+        assert list(result.axes.values()) == [axes[0], axes[1]]
+        assert fig.axes == [axes[0], axes[1]]
+        assert result.legends[0].kind == "colorbar"
+        assert result.legends[0].extras == {
+            "vmin": pytest.approx(1.15),
+            "vmax": pytest.approx(9.5),
+        }
     finally:
         result.close()
         plt.close(fig)
@@ -1781,139 +2100,80 @@ def test_stacked_violin_mean_color_missing_group_missing_color():
     color_scale = splt.ColorScale(scope="shared")
     palette = _mean_group_palette(
         means,
-        ["a", "b"],
+        ["a", "b", "c"],
         color_scale=color_scale,
         lo=0.0,
         hi=2.0,
     )
     assert palette["b"] == color_scale.missing_color
-    assert palette["a"] != color_scale.missing_color
+    assert palette["c"] == color_scale.missing_color
+    # 1.0 sits halfway between the limits.
+    assert mcolors.to_hex(palette["a"]) == mcolors.to_hex(plt.get_cmap("viridis")(0.5))
 
 
-def test_stacked_violin_mean_color_vcenter_extends_bounds(
-    umap, leiden_clustering, datastore
-):
-    gene = _expressed_gene_names(datastore, n=1)[0]
-    result = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
+def test_stacked_violin_mean_color_vcenter_extends_bounds():
+    result = _stacked(
+        _violin_store(),
+        "metric",
         color_by="mean",
         color_scale=splt.ColorScale(vcenter=0.0, scope="shared"),
-        max_points=0,
-        show=False,
     )
     try:
         scale = next(s for s in result.scales if isinstance(s, splt.ColorScale))
-        assert scale.vmin <= 0.0
-        assert scale.vmax > 0.0
-        assert result.legends[0].kind == "colorbar"
+        # All means are positive, so the low limit moves just below the pivot.
+        assert scale.vmin < 0.0
+        assert scale.vmin == pytest.approx(0.0, abs=1e-4)
+        assert scale.vmax == pytest.approx(9.5)
+        # Above the pivot, values fill the upper half of the colormap.
+        fractions = 0.5 + 0.5 * np.array([1.5, 5.5, 9.5]) / 9.5
+        np.testing.assert_allclose(
+            _violin_colors(result.axes["metric"]),
+            _expected_colors(fractions),
+            atol=0.005,
+        )
     finally:
         result.close()
 
 
-def test_stacked_violin_explicit_none_uses_no_overlay(
-    umap, leiden_clustering, datastore
-):
-    gene = _expressed_gene_names(datastore, n=1)[0]
+def test_stacked_violin_explicit_none_uses_no_overlay():
     result = splt.distribution(
-        datastore,
-        keys=gene,
-        grouping=leiden_clustering,
+        _violin_store(),
+        "metric",
+        grouping=splt.CellField("group"),
         kind="stacked_violin",
         max_points=None,
         show=False,
     )
     try:
         assert result.provenance.extras["max_points"] == 0
-        for ax in result.axes.values():
-            point_collections = [
-                collection
-                for collection in ax.collections
-                if hasattr(collection, "get_offsets")
-            ]
-            # Violin bodies carry a single default offset; a jitter overlay
-            # would add a collection with one offset per drawn cell.
-            assert all(
-                len(collection.get_offsets()) <= 1 for collection in point_collections
-            )
+        # Only the three violin bodies are drawn; no point overlay.
+        collections = result.axes["metric"].collections
+        assert len(collections) == 3
+        assert all(len(body.get_offsets()) <= 1 for body in collections)
     finally:
         result.close()
 
 
-def test_stacked_violin_panel_scope_strict_minmax(umap, leiden_clustering, datastore):
-    genes = _expressed_gene_names(datastore, n=2)
-    result = splt.distribution(
-        datastore,
-        keys=genes,
-        grouping=leiden_clustering,
-        kind="stacked_violin",
-        color_by="mean",
-        color_scale=splt.ColorScale(scope="panel"),
-        max_points=0,
-        show=False,
+@pytest.mark.parametrize(
+    "scale",
+    [
+        splt.ColorScale(scope="panel", vmin=0.0),
+        splt.ColorScale(scope="panel", quantiles=(0.1, 0.9)),
+        splt.ColorScale(scope="panel", vcenter=0.0),
+    ],
+)
+def test_stacked_violin_panel_scope_rejects_bounds(scale):
+    store = _synthetic_plot_store(
+        I=np.ones(4, dtype=bool), group=np.array(["a", "b"] * 2), metric=np.ones(4)
     )
-    try:
-        from matplotlib import colormaps
-        from matplotlib.colors import to_rgb
-        from seaborn.utils import desaturate
-
-        def desat(t: float) -> tuple[float, float, float]:
-            return tuple(
-                np.round(to_rgb(desaturate(to_rgb(colormaps["viridis"](t)), 0.9)), 3)
-            )
-
-        def close_to(fc: tuple[float, ...], expected: tuple[float, ...]) -> bool:
-            return all(abs(a - b) <= 0.01 for a, b in zip(fc, expected))
-
-        lo_color, hi_color = desat(0.0), desat(1.0)
-        # Every panel rescales to its own 0-to-1 range, so the lowest and
-        # highest-mean clusters in EVERY row land on the colormap endpoints.
-        for ax in result.axes.values():
-            face_colors = {
-                tuple(np.round(c.get_facecolor()[0][:3], 3))
-                for c in ax.collections
-                if hasattr(c, "get_facecolor") and len(c.get_facecolor())
-            }
-            assert any(close_to(fc, lo_color) for fc in face_colors)
-            assert any(close_to(fc, hi_color) for fc in face_colors)
-    finally:
-        result.close()
-
-
-def test_stacked_violin_panel_scope_rejects_bounds(umap, leiden_clustering, datastore):
-    gene = _expressed_gene_names(datastore, n=1)[0]
     with pytest.raises(ValueError, match="apply only to scope='shared'"):
         splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
+            store,
+            "metric",
+            grouping=splt.CellField("group"),
             kind="stacked_violin",
             color_by="mean",
-            color_scale=splt.ColorScale(scope="panel", vmin=0.0),
-            max_points=0,
-            show=False,
-        )
-    with pytest.raises(ValueError, match="apply only to scope='shared'"):
-        splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
-            kind="stacked_violin",
-            color_by="mean",
-            color_scale=splt.ColorScale(scope="panel", quantiles=(0.1, 0.9)),
-            max_points=0,
-            show=False,
-        )
-    with pytest.raises(ValueError, match="apply only to scope='shared'"):
-        splt.distribution(
-            datastore,
-            keys=gene,
-            grouping=leiden_clustering,
-            kind="stacked_violin",
-            color_by="mean",
-            color_scale=splt.ColorScale(scope="panel", vcenter=0.0),
+            color_scale=scale,
             max_points=0,
             show=False,
         )
@@ -1936,8 +2196,10 @@ def test_stacked_violin_sparse_quantile_limits_preserve_outlier_color():
 
     # Collapsed quantiles keep the tied mean at the low end while the outlying
     # mean clips to the high end.
+    assert limits == [(0.0, 1.0)]
     assert reference == (0.0, 1.0)
-    assert palette["a"] != palette["e"]
+    assert mcolors.to_hex(palette["a"]) == "#440154"
+    assert mcolors.to_hex(palette["e"]) == "#fde725"
 
 
 def test_stacked_violin_mean_color_honors_hidden_legend_and_generic_label():
@@ -2101,6 +2363,118 @@ def test_distribution_stats_rejects_same_size_different_identity():
             show=False,
         )
     result.close()
+
+
+def _three_group_metric_store():
+    return _synthetic_plot_store(
+        I=np.ones(12, dtype=bool),
+        group=np.repeat(["a", "b", "c"], 4),
+        metric=np.arange(12, dtype=float),
+    )
+
+
+def _plot_metric_with_stats(store, stats):
+    return splt.distribution(
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        max_points=0,
+        stats_results=stats,
+        show=False,
+    )
+
+
+def test_distribution_stats_skip_panels_without_a_result_or_table():
+    store = _three_group_metric_store()
+    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
+    stats = _synthetic_stats_result(store, table)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        unmatched = _plot_metric_with_stats(store, {"other_panel": stats})
+        # The panel keeps its tested identity but carries no table to draw.
+        stats.tables = {"metric": None}
+        untabled = _plot_metric_with_stats(store, stats)
+    try:
+        for result in (unmatched, untabled):
+            assert result.provenance.extras["stats_annotated"] is False
+            assert len(result.axes["metric"].texts) == 0
+    finally:
+        unmatched.close()
+        untabled.close()
+
+    stats.tables = {"metric": table}
+    annotated = _plot_metric_with_stats(store, {"metric": stats})
+    try:
+        assert annotated.provenance.extras["stats_annotated"] is True
+        assert [text.get_text() for text in annotated.axes["metric"].texts] == [
+            "p=0.01"
+        ]
+    finally:
+        annotated.close()
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "statistic": [3.0]}),
+        pd.DataFrame({"statistic": [3.0], "p_value": [0.01]}),
+    ],
+    ids=["no-p-value", "no-group-columns"],
+)
+def test_distribution_stats_warn_when_no_table_can_be_annotated(table):
+    store = _three_group_metric_store()
+    stats = _synthetic_stats_result(store, table, method="welch")
+
+    with pytest.warns(UserWarning) as warned:
+        result = _plot_metric_with_stats(store, stats)
+    try:
+        assert [str(warning.message) for warning in warned] == [
+            "stats_results contains no supported pairwise or omnibus annotation "
+            "table for method 'welch'; skipping statistical annotations"
+        ]
+        assert result.provenance.extras["stats_annotated"] is False
+        assert len(result.axes["metric"].texts) == 0
+    finally:
+        result.close()
+
+
+def test_distribution_excludes_cells_whose_subset_flag_is_masked():
+    class MaskedSubsetCells(_SyntheticCells):
+        def _get_missing_mask_array(self, column):
+            if column == "subset":
+                return np.array([False, True, False, False, False, True])
+            return None
+
+    store = SimpleNamespace(
+        cells=MaskedSubsetCells(
+            I=np.ones(6, dtype=bool),
+            group=np.repeat(["a", "b"], 3),
+            subset=np.array([True, True, False, True, True, True]),
+            metric=np.arange(6, dtype=float),
+        ),
+        _defaultAssay="RNA",
+        zw=None,
+        _stored_display_metadata=lambda _column: None,
+    )
+
+    result = splt.distribution(
+        store,
+        "metric",
+        grouping=splt.CellField("group"),
+        subset_by="subset",
+        kind="box",
+        max_points=0,
+        show=False,
+    )
+    try:
+        # Cell 2 is unflagged and cells 1 and 5 hold masked placeholder flags.
+        table = result.tables["metric"]
+        assert table["value"].tolist() == [0.0, 3.0, 4.0]
+        assert table["group"].tolist() == ["a", "b", "b"]
+        assert result.provenance.n_cells == 3
+    finally:
+        result.close()
 
 
 def test_distribution_stats_rejects_changed_assay_normalization_state():
@@ -2390,36 +2764,6 @@ def test_distribution_paired_stats_reject_missing_pair_values():
             stats_results=stats,
             show=False,
         )
-
-
-def test_distribution_stats_annotations_use_theme_foreground():
-    from scarf.plotting._style import foreground_color
-
-    store = _synthetic_plot_store(
-        I=np.ones(12, dtype=bool),
-        group=np.repeat(["a", "b", "c"], 4),
-        metric=np.arange(12, dtype=float),
-    )
-    table = pd.DataFrame({"group_1": ["a"], "group_2": ["b"], "p_value": [0.01]})
-    stats = _synthetic_stats_result(store, table)
-
-    result = splt.distribution(
-        store,
-        "metric",
-        grouping=splt.CellField("group"),
-        theme="dark",
-        max_points=0,
-        stats_results=stats,
-        show=False,
-    )
-    try:
-        bracket = next(
-            line for line in result.axes["metric"].lines if len(line.get_xdata()) == 4
-        )
-        assert bracket.get_color() == foreground_color("dark")
-        assert result.axes["metric"].texts[0].get_color() == foreground_color("dark")
-    finally:
-        result.close()
 
 
 def test_distribution_stats_annotations_use_custom_dark_theme_foreground(monkeypatch):
@@ -2722,7 +3066,7 @@ def test_masked_metadata_is_missing_in_embedding_and_connectivity_inputs():
 
 
 def test_grouping_plots_exclude_masked_labels_and_samples(tmp_path):
-    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.storage_helpers import insert_nullable_cell_column
     from tests.test_quality_control_missing_values import (
         import_nullable_cluster_h5ad,
     )
@@ -2732,7 +3076,7 @@ def test_grouping_plots_exclude_masked_labels_and_samples(tmp_path):
     donor_missing = np.zeros(store.cells.N, dtype=bool)
     donor_missing[1::7] = True
     donor = np.where(donor_missing, 0, np.arange(store.cells.N) % 2 + 1)
-    _insert_nullable_cell_column(store, "donor", donor.astype(np.int64), donor_missing)
+    insert_nullable_cell_column(store, "donor", donor.astype(np.int64), donor_missing)
     gene = str(store.RNA.feats.fetch_all("names")[0])
     members = {group: int(((codes == group) & ~missing).sum()) for group in range(3)}
 

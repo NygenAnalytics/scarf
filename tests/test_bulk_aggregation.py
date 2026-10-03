@@ -203,18 +203,18 @@ def test_bulk_mean_retains_other_normalizers(tmp_path, normalizer, replicates):
 
 @pytest.mark.parametrize("aggregation", ["sum", "mean"])
 def test_bulk_excludes_masked_labels_like_null_values(tmp_path, aggregation):
-    from .test_pipeline import _insert_nullable_cell_column
+    from tests.storage_helpers import insert_nullable_cell_column
 
     counts = np.random.default_rng(13).integers(1, 50, (6, 8), dtype=np.uint16)
     store, cells = _bulk_store(tmp_path, counts)
     # Placeholders equal real labels: 0 is a group and "" would be a sub-group.
-    _insert_nullable_cell_column(
+    insert_nullable_cell_column(
         store,
         "group",
         np.array([0, 1, 0, 0, 1, 0]),
         np.array([False, False, True, False, False, True]),
     )
-    _insert_nullable_cell_column(
+    insert_nullable_cell_column(
         store,
         "secondary",
         np.array(["x", "x", "y", "", "y", "x"]),

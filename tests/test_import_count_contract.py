@@ -356,6 +356,19 @@ def _import(
     return zarr.open_group(str(directory / "counts.zarr"), mode="r")
 
 
+def _planned_policy(
+    writer: str, directory: Path, values: np.ndarray, encoding: str, **options: Any
+) -> CountMatrixPolicy:
+    """Return the layout an import writer records when it creates its counts."""
+    directory.mkdir(parents=True, exist_ok=True)
+    source = _source(writer, directory, values, encoding)
+    try:
+        _writer(writer, source, str(directory / "counts.zarr"), nthreads=1, **options)
+    finally:
+        _close(source)
+    return _policy(zarr.open_group(str(directory / "counts.zarr"), mode="r"))
+
+
 def _fingerprint(values: np.ndarray, dtype: Any) -> str:
     """Return the content fingerprint of ``values`` stored in ``dtype``."""
     root = zarr.open_group(store=MemoryStore(), mode="w")
@@ -956,8 +969,6 @@ def test_every_writer_finds_the_count_layout_that_fits_its_budget(
             policy=_named_policy(refused.value),
         )
 
-    roomy = _layout_import(writer, tmp_path / "roomy", large_store, mem_budget="1G")
-    assert _policy(roomy) == DEFAULT_COUNT_MATRIX_POLICY
     policy = _policy(fitted)
     halvings = DEFAULT_COUNT_MATRIX_POLICY.unitBytes // policy.unitBytes
     assert halvings > 1 and halvings & (halvings - 1) == 0
@@ -966,12 +977,28 @@ def test_every_writer_finds_the_count_layout_that_fits_its_budget(
     assert fitted["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(fitted["RNA/counts"][:], values)
     np.testing.assert_array_equal(fitted["RNA/countsT"][:], values.T)
-    # Identity does not depend on the layout.
-    assert (
-        fitted["RNA/counts"].attrs["content_fingerprint"]
-        == roomy["RNA/counts"].attrs["content_fingerprint"]
-        == _fingerprint(values, np.uint32)
+    # Identity does not depend on the layout: the fingerprint is that of the
+    # same counts in a plain array.
+    assert fitted["RNA/counts"].attrs["content_fingerprint"] == _fingerprint(
+        values, np.uint32
     )
+
+    # An ample budget keeps the default layout. An import records its layout
+    # when it creates the counts; subset and repack fit it as they write.
+    if writer in ("subset", "repack"):
+        roomy = _layout_import(writer, tmp_path / "roomy", large_store, mem_budget="1G")
+        assert _policy(roomy) == DEFAULT_COUNT_MATRIX_POLICY
+        assert (
+            roomy["RNA/counts"].attrs["content_fingerprint"]
+            == fitted["RNA/counts"].attrs["content_fingerprint"]
+        )
+    else:
+        assert (
+            _planned_policy(
+                writer, tmp_path / "roomy", values, _encoding, mem_budget="1G"
+            )
+            == DEFAULT_COUNT_MATRIX_POLICY
+        )
 
 
 @pytest.mark.parametrize("writer", list(_LAYOUT_CASES))

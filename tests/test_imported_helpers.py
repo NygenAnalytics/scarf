@@ -112,3 +112,26 @@ def test_string_block_validates_identifiers_and_length():
         _string_block(np.array([1, 2]), 0, 2)
     with pytest.raises(ValueError, match="invalid UTF-8"):
         _string_block(np.array([b"\xff"], dtype=object), 0, 1)
+    # A lone surrogate is a str that cannot be stored as UTF-8.
+    with pytest.raises(ValueError, match="contain invalid Unicode"):
+        _string_block(["cell-1", "\ud800"], 0, 2)
+
+
+class _ShortReads:
+    """A sequence whose slices return one row fewer than requested."""
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, key: slice) -> np.ndarray:
+        return np.array(["a", "b", "c"])[key][:-1]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [[["cell-1"], ["cell-2"]], _ShortReads()],
+    ids=["nested_rows", "short_reads"],
+)
+def test_string_block_requires_bounded_one_dimensional_reads(values):
+    with pytest.raises(ValueError, match="do not support bounded one-dimensional"):
+        _string_block(values, 0, 2)

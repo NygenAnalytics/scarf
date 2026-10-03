@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -234,8 +235,10 @@ def test_import_materializes_metadata_counts_membership_and_pca(
     assert root.attrs["complete"] is True
     assert root.attrs["scarf:import_complete"] is True
     assert root.attrs["scarf:import_source"] == "seurat"
-    assert len(root.attrs["scarf:import_source_sha256"]) == 64
-    assert len(root.attrs["scarf:import_payload_sha256"]) == 64
+    # The fixture is uncompressed, so its payload is the source file itself.
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert root.attrs["scarf:import_source_sha256"] == digest
+    assert root.attrs["scarf:import_payload_sha256"] == digest
     assert root.attrs["defaultAssay"] == "RNA"
     assert root["cellData/ids"][:].tolist() == ["c1", "c2", "c3"]
     assert root["cellData/names"][:].tolist() == ["c1", "c2", "c3"]
@@ -342,7 +345,7 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     source = _write_fixture(tmp_path / "datastore.rds")
     destination = MemoryStore()
     with SeuratReader(source) as reader:
-        SeuratToZarr(
+        result = SeuratToZarr(
             reader,
             destination,
             mem_budget="64M",
@@ -360,13 +363,19 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     assert store._defaultAssay == "RNA"
     assert store.assay_names == ["ADT", "RNA"]
     assert store.cells.fetch_all("ids").tolist() == ["c1", "c2", "c3"]
-    assert store.get_assay("RNA").rawData.shape == (3, 2)
+    np.testing.assert_array_equal(
+        store.get_assay("RNA").rawData.compute(), [[1, 0], [0, 2], [3, 0]]
+    )
+    # The stitched Assay5 layers, counts.1 over c1 and c3 and counts.2 over c2.
+    np.testing.assert_array_equal(
+        store.get_assay("ADT").rawData.compute(), [[1, 3, 0], [2, 4, 0], [0, 5, 6]]
+    )
     assert store.list_artifacts(
         kind="imported_coordinates",
         from_assay="RNA",
         scope="assay",
         complete_only=True,
-    )
+    ) == [result.reductionArtifacts["pca"]]
 
 
 def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
@@ -404,7 +413,9 @@ def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
         mem_budget="64M",
     )
     assert store.assay_names == ["ATAC"]
-    assert store.ATAC.rawData.shape == (3, 2)
+    np.testing.assert_array_equal(
+        store.ATAC.rawData.compute(), [[1, 0], [0, 2], [3, 0]]
+    )
 
 
 def test_import_preserves_source_reduction_name_in_explicit_artifact(

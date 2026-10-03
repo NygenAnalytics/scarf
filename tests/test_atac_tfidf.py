@@ -427,9 +427,13 @@ def test_cells_without_accessible_peaks_keep_summary_finite(tmp_path):
         top_n=2,
     )
     summary = store.load_artifact(_feature_summary_ref(store, selection))
+    # The empty cell divides by a total of one, so it adds nothing.
+    expected, expected_df = _reference_tfidf(counts, np.arange(4), np.arange(4))
 
-    assert np.isfinite(np.asarray(summary["prevalence"][:])).all()
-    assert np.isfinite(np.asarray(summary["document_frequency"][:])).all()
+    np.testing.assert_allclose(
+        summary["prevalence"][:], expected.sum(axis=0), rtol=1e-12, atol=1e-12
+    )
+    np.testing.assert_array_equal(summary["document_frequency"][:], expected_df)
 
 
 def test_empty_cell_selection_is_shape_safe(atac_tfidf_store):

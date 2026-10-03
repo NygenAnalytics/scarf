@@ -46,6 +46,11 @@ from scarf.storage.selections import (
     resolve_generated_selection_artifact,
 )
 from scarf.storage.types import as_zarr_array as checked_zarr_array
+from tests.test_mapping_reference import (
+    MappingStoreSource,
+    build_mapping_query,
+    build_mapping_store,
+)
 
 
 class _RecordingProjectionArray:
@@ -76,30 +81,6 @@ def _record_projection_reads(monkeypatch, reads: list[tuple[str, object]]) -> No
 
     monkeypatch.setattr(mapping_operations, "as_zarr_array", recording_array)
     monkeypatch.setattr(projection_storage, "as_zarr_array", recording_array)
-
-
-def _plain_reference(datastore):
-    graphs = datastore.list_artifacts(
-        kind="connectivity_map",
-        from_assay="RNA",
-        scope="assay",
-        complete_only=True,
-    )
-    assert len(graphs) == 1
-    neighbors = ArtifactRef.from_dict(
-        datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
-    )
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    return datastore.get_mapping_reference(reference_ref)
-
-
-def _copied_query(datastore, path: Path, *, zarr_mode: str = "r+") -> DataStore:
-    shutil.copytree(datastore.zarr_loc, path)
-    return DataStore(
-        str(path),
-        default_assay="RNA",
-        zarr_mode=zarr_mode,
-    )
 
 
 def _snapshot_store(path: str) -> dict[str, bytes]:
@@ -281,11 +262,32 @@ def _write_reference_layout(
     return layout, planned.ref
 
 
+@pytest.fixture(scope="module")
+def mapping_source(tmp_path_factory) -> MappingStoreSource:
+    return build_mapping_store(
+        tmp_path_factory.mktemp("mapping_label_transfer") / "reference.zarr",
+        with_references=True,
+    )
+
+
+@pytest.fixture(scope="module")
+def query_source(tmp_path_factory) -> Path:
+    return build_mapping_query(
+        tmp_path_factory.mktemp("mapping_label_transfer_query") / "query.zarr"
+    )
+
+
 @pytest.fixture
-def mapping_consumer_context(analyzed_datastore_ephemeral, tmp_path):
-    reference_store = analyzed_datastore_ephemeral
-    reference = _plain_reference(reference_store)
-    query = _copied_query(reference_store, tmp_path / "query.zarr")
+def mapping_consumer_context(mapping_source, query_source, tmp_path):
+    """A writable reference copy, its plain reference, and a writable query.
+
+    The query holds the counts of the reference cells, so it measures every
+    reference feature.
+    """
+    reference_store = mapping_source.open_copy(tmp_path / "reference.zarr")
+    reference = reference_store.get_mapping_reference(mapping_source.reference)
+    shutil.copytree(query_source, tmp_path / "query.zarr")
+    query = DataStore(str(tmp_path / "query.zarr"), default_assay="RNA")
     return reference_store, reference, query
 
 
@@ -320,7 +322,9 @@ def test_mapping_result_requires_explicit_ref_and_reference_after_cold_reopen(
 
     assert loaded.ref == result
     assert loaded.reference is reopened_reference
-    assert loaded.indices is not None
+    np.testing.assert_array_equal(loaded.indices, [[0, 1], [1, 0]])
+    np.testing.assert_array_equal(loaded.distances, [[1.0, 9.0], [9.0, 1.0]])
+    np.testing.assert_array_equal(loaded.uninformative, [False, False])
     with pytest.raises(TypeError, match="required keyword-only.*reference"):
         query.get_mapping_result(result)
     with pytest.raises(TypeError, match="result must be an ArtifactRef"):
@@ -397,10 +401,21 @@ def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
                 reference=reference,
             )
         )
-    with pytest.raises(ValueError, match="fixed_weight"):
+    with pytest.raises(ValueError, match="fixed_weight must be finite and positive"):
         list(query.get_mapping_score(result, reference=reference, fixed_weight=0.0))
-    with pytest.raises(TypeError, match="weighted"):
+    with pytest.raises(TypeError, match="weighted must be a boolean"):
         list(query.get_mapping_score(result, reference=reference, weighted=1))
+    with pytest.raises(TypeError, match="log_transform must be a boolean"):
+        list(query.get_mapping_score(result, reference=reference, log_transform=1))
+    for multiplier in (-1.0, np.inf, True):
+        with pytest.raises(
+            ValueError, match="multiplier must be finite and non-negative"
+        ):
+            list(
+                query.get_mapping_score(
+                    result, reference=reference, multiplier=multiplier
+                )
+            )
 
 
 def test_mapping_scores_keep_missing_target_groups_distinct(
@@ -543,7 +558,11 @@ def test_label_transfer_saves_labels_frozen_inputs_and_evidence(
     ):
         assert np.isnan(evidence.loc[1, column])
         assert np.isfinite(evidence.loc[[0, 2], column]).all()
+    # Distances 1 and 9 split the inverse-distance weight 0.9 to 0.1.
+    entropy = -(0.9 * np.log(0.9) + 0.1 * np.log(0.1))
     np.testing.assert_allclose(evidence.loc[[0, 2], "voteFraction"], [0.9, 0.9])
+    np.testing.assert_allclose(evidence.loc[[0, 2], "voteEntropy"], [entropy] * 2)
+    np.testing.assert_allclose(evidence.loc[[0, 2], "topTwoMargin"], [0.8, 0.8])
     np.testing.assert_allclose(evidence.loc[[0, 2], "nearestDistance"], [1.0, 1.0])
     np.testing.assert_array_equal(loaded.cell_idx, [0, 1, 2])
     assert not loaded.cell_idx.flags.writeable
@@ -983,10 +1002,17 @@ def test_label_vote_shares_calibrate_prediction_sets(mapping_consumer_context):
     with pytest.raises(ValueError, match="one value per"):
         loaded.label_vote_shares(["winner"])
 
+    # With nonconformities 0.1 and 1.0, even a class without votes is not
+    # exceeded by more than 40% of the calibration cells, so every reference
+    # class joins the sets of the informative cells.
     sets = loaded.prediction_sets(1.0 - shares[[0, 2]], alpha=0.4)
     assert sets.name == "predictionSet"
-    assert "winner" in sets[0]
-    assert sets[1] == ()
+    every_class = ("winner", "runner_up", "other")
+    assert sets.tolist() == [every_class, (), every_class]
+    # Calibration nonconformities 0.1 and 0.2 admit only vote shares of at
+    # least 0.8: the 0.9 winner of each informative cell.
+    narrow = loaded.prediction_sets(np.array([0.2, 0.1]), alpha=0.4)
+    assert narrow.tolist() == [("winner",), (), ("runner_up",)]
 
 
 def test_label_transfer_reads_its_payload_once(mapping_consumer_context, monkeypatch):
@@ -1095,7 +1121,7 @@ def test_label_transfer_loads_votes_only_on_request_without_copies(
         with_votes.categories,
     ):
         assert not array.flags.writeable
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
             array.setflags(write=True)
     pd.testing.assert_frame_equal(with_votes.evidence, without_votes.evidence)
 

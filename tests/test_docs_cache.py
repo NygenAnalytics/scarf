@@ -566,6 +566,16 @@ def test_frozen_progress_survives_modal_cache_transport(tmp_path: Path) -> None:
         source_dir=docs_root / "source",
         docs_root=docs_root,
     )
+    cache = get_cache(restored)
+    try:
+        record = cache.match_cache_notebook(source.notebook)
+        restored_notebook = cache.get_cache_bundle(record.pk).nb
+    finally:
+        close_cache(cache)
+    assert "widgets" not in restored_notebook.metadata
+    frozen = _first_code_cell(notebook).outputs
+    assert _first_code_cell(restored_notebook).outputs == frozen
+    assert frozen[0].data["text/plain"] == "Writing data: 1 / 1 complete"
 
 
 def test_modal_page_cache_archive_round_trip(tmp_path: Path) -> None:
@@ -696,10 +706,18 @@ def test_modal_wait_honors_polling_deadline(
     assert observed_timeouts == [0.25]
 
 
-@pytest.mark.parametrize("corruption", ["stale", "orphan", "journal"])
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("stale", "Cache contains stale record hashes: [0-9a-f]{32}$"),
+        ("orphan", f"Cache contains orphan executed directories: {'f' * 32}$"),
+        ("journal", "Cache contains SQLite journal files: global.db-journal$"),
+    ],
+)
 def test_validation_detects_stale_and_orphan_state(
     tmp_path: Path,
     corruption: str,
+    message: str,
 ) -> None:
     docs_root = tmp_path / "docs"
     _write_source(docs_root, "page")
@@ -717,7 +735,7 @@ def test_validation_detects_stale_and_orphan_state(
     else:
         (cache_path / "global.db-journal").write_bytes(b"journal")
 
-    with pytest.raises(CacheValidationError):
+    with pytest.raises(CacheValidationError, match=f"^{message}"):
         validate_cache(
             cache_path,
             source_dir=docs_root / "source",
@@ -778,7 +796,10 @@ def test_execution_failure_preserves_target(tmp_path: Path) -> None:
     def fail_runner(source, cache_path):
         raise RuntimeError("execution failed")
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="^Page execution failed:\n  source/page.md: execution failed$",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -800,7 +821,10 @@ def test_import_failure_preserves_target(tmp_path: Path) -> None:
         _initialize_cache(cache_path)
         return cache_path
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="source/page.md: No cache output matches source/page.md$",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -822,7 +846,10 @@ def test_candidate_validation_failure_preserves_target(tmp_path: Path) -> None:
         _cache_output(cache_path, source, error=True)
         return cache_path
 
-    with pytest.raises(CacheValidationError):
+    with pytest.raises(
+        CacheValidationError,
+        match="^Unexpected error output in source/page.md code cell",
+    ):
         execute_and_publish(
             ["page"],
             docs_root=docs_root,
@@ -1003,7 +1030,10 @@ def test_explicit_resume_reuses_matching_successes(tmp_path: Path) -> None:
         _cache_output(cache_path, source, text="new first\n")
         return cache_path
 
-    with pytest.raises(ExecutionBatchError):
+    with pytest.raises(
+        ExecutionBatchError,
+        match="^Page execution failed:\n  source/second.md: second failed$",
+    ):
         execute_and_publish(
             ["first", "second"],
             docs_root=docs_root,
@@ -1086,7 +1116,9 @@ def test_modal_fanout_spawns_before_wait_and_resumes_failures(
 
     first_launcher = SpawnedPageRunner(first_run_spawn)
     try:
-        with pytest.raises(ExecutionBatchError):
+        with pytest.raises(
+            ExecutionBatchError, match="source/second.md: second failed$"
+        ):
             execute_and_publish(
                 ["first", "second"],
                 jobs=2,

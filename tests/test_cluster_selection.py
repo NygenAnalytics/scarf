@@ -456,3 +456,113 @@ def test_cluster_selection_result_rejects_an_inconsistent_winner() -> None:
             max_sample_size=2,
             working_memory_mib=8,
         )
+
+
+def _result_arguments(**overrides: Any) -> dict[str, Any]:
+    arguments: dict[str, Any] = {
+        "candidate_keys": ("first", "second"),
+        "sample_indices": np.asarray([0, 2], dtype=np.int64),
+        "scores": np.asarray([0.2, np.nan], dtype=np.float64),
+        "invalid_reasons": (None, "not scoreable"),
+        "selected_key": "first",
+        "seed": 4466,
+        "population_size": 3,
+        "max_sample_size": 2,
+        "working_memory_mib": 8,
+    }
+    return arguments | overrides
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error", "message"),
+    [
+        ({"candidate_keys": ()}, ValueError, "candidate_keys must be non-empty"),
+        ({"candidate_keys": ("first", "")}, TypeError, "non-empty strings"),
+        ({"candidate_keys": ("first", 2)}, TypeError, "non-empty strings"),
+        ({"candidate_keys": ("first", "first")}, ValueError, "must be unique"),
+        (
+            {"sample_indices": np.asarray([0.0, 2.0])},
+            TypeError,
+            "one-dimensional integer array",
+        ),
+        (
+            {"sample_indices": np.asarray([[0, 2]])},
+            TypeError,
+            "one-dimensional integer array",
+        ),
+        (
+            {"scores": np.asarray([1, 0])},
+            TypeError,
+            "one-dimensional floating-point array",
+        ),
+        ({"scores": np.asarray([0.2])}, ValueError, "scores must align"),
+        ({"invalid_reasons": (None,)}, ValueError, "invalid_reasons must align"),
+        (
+            {"invalid_reasons": ("odd", "not scoreable")},
+            ValueError,
+            "finite scores must not have an invalid reason",
+        ),
+        (
+            {"scores": np.asarray([0.2, np.inf])},
+            ValueError,
+            "invalid scores must be represented by NaN",
+        ),
+        (
+            {"invalid_reasons": (None, "")},
+            ValueError,
+            "invalid scores must have a non-empty reason",
+        ),
+        (
+            {"sample_indices": np.asarray([0, 1, 2])},
+            ValueError,
+            "sample_indices has an unexpected size",
+        ),
+        (
+            {"sample_indices": np.asarray([2, 0])},
+            ValueError,
+            "sorted, unique, and within the population",
+        ),
+        (
+            {"sample_indices": np.asarray([0, 3])},
+            ValueError,
+            "sorted, unique, and within the population",
+        ),
+        (
+            {
+                "scores": np.asarray([np.nan, np.nan]),
+                "invalid_reasons": ("a", "b"),
+            },
+            ValueError,
+            "at least one finite value",
+        ),
+    ],
+)
+def test_cluster_selection_result_validates_its_record(
+    overrides: dict[str, Any],
+    error: type[Exception],
+    message: str,
+) -> None:
+    ClusterSelectionResult(**_result_arguments())
+
+    with pytest.raises(error, match=message):
+        ClusterSelectionResult(**_result_arguments(**overrides))
+
+
+def test_select_clusters_rejects_blank_keys_and_misshapen_coordinate_rows() -> None:
+    labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    coordinates = np.zeros((4, 2), dtype=np.float64)
+
+    for key in ("", None):
+        with pytest.raises(TypeError, match="keys must be non-empty strings"):
+            select_clusters_by_silhouette(coordinates, ((key, labels),))
+
+    class WideRows:
+        """Coordinates whose row reads return one column too many."""
+
+        shape = (4, 2)
+
+        def __getitem__(self, rows: np.ndarray) -> np.ndarray:
+            return np.zeros((len(rows), 3))
+
+    with pytest.raises(ValueError, match="Sampled coordinates have an unexpected"):
+        select_clusters_by_silhouette(WideRows(), (("a", labels),))  # type: ignore[arg-type]

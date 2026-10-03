@@ -1,6 +1,9 @@
 """Results stay offline until numerical access and bind exports to the frozen run."""
 
 import json
+import shutil
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,9 +17,43 @@ from scarf.agent.result import AnalysisRun
 from scarf.storage.artifacts import ArtifactRef
 
 
+_TEMPLATES: dict[tuple[object, ...], Path] = {}
+_TEMPLATE_ROOTS: list[tempfile.TemporaryDirectory[str]] = []
+
+
+def _copy_template(
+    tmp_path: Path, key: tuple[object, ...], build: Callable[[Path], RunRecords]
+) -> RunRecords:
+    """Copy a saved history that is built once per process.
+
+    Building appends hash-chained events with a file and directory sync each,
+    which dominates these report tests; a copy has identical bytes.
+    """
+    template = _TEMPLATES.get(key)
+    if template is None:
+        if not _TEMPLATE_ROOTS:
+            _TEMPLATE_ROOTS.append(
+                tempfile.TemporaryDirectory(prefix="scarf-agent-records-")
+            )
+        # A unique base also isolates templates that build on other templates.
+        base = Path(tempfile.mkdtemp(dir=_TEMPLATE_ROOTS[0].name))
+        template = _TEMPLATES[key] = build(base).path
+    destination = tmp_path / "analysis"
+    shutil.copytree(template, destination)
+    return RunRecords(destination)
+
+
 def _records(
     tmp_path: Path, status: str = "completed", final: bool = True
 ) -> RunRecords:
+    return _copy_template(
+        tmp_path,
+        ("records", status, final),
+        lambda base: _build_records(base, status, final),
+    )
+
+
+def _build_records(tmp_path: Path, status: str, final: bool) -> RunRecords:
     records = RunRecords.create(
         tmp_path / "analysis",
         {
@@ -350,7 +387,12 @@ def test_saved_plots_are_high_resolution_atomic_and_closed(
         target.write_bytes(expected)
         umap.symlink_to(target)
     if failure:
-        with pytest.raises((OSError, ValueError, RecordError)):
+        error, message = {
+            "save": (OSError, "Disk full"),
+            "markers": (ValueError, "No qualifying markers"),
+            "symlink": (RecordError, "Refusing to replace a symlink plot: umap"),
+        }[failure]
+        with pytest.raises(error, match=message):
             result.save_plots()
     else:
         paths = result.save_plots()
@@ -699,15 +741,20 @@ def test_report_refuses_symlink_outputs_without_changing_the_target(
 def test_large_report_truncates_visible_sections_but_preserves_full_saved_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import os
+
     records = _records(tmp_path)
     _, observed = _bind(monkeypatch, records)
-    for index in range(102):
-        records.append(
-            "decisionAccepted",
-            decisionId=f"decision-{index:03d}",
-            stage="annotate",
-            output={"rationale": f"Observed evidence for batch {index:03d}."},
-        )
+    # Durability is covered by the record tests; skip syncs for this setup only.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", lambda descriptor: None)
+        for index in range(102):
+            records.append(
+                "decisionAccepted",
+                decisionId=f"decision-{index:03d}",
+                stage="annotate",
+                output={"rationale": f"Observed evidence for batch {index:03d}."},
+            )
     before = records.events()
     result = AnalysisRun(records.path)
     html = result.report().read_text()

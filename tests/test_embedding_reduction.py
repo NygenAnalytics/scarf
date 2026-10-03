@@ -102,6 +102,9 @@ def test_incremental_pca_is_deterministic_across_chunked_input():
         second_model.explained_variance_ratio_,
     )
     np.testing.assert_array_equal(values, original_values)
+    # The loadings are the leading principal axes, up to sign.
+    _, _, axes = np.linalg.svd(values - values.mean(axis=0), full_matrices=False)
+    np.testing.assert_allclose(np.abs(first.T @ axes[:3].T), np.eye(3), atol=1e-8)
 
 
 def test_gram_pca_matches_full_svd_and_preserves_model_contract():
@@ -329,7 +332,11 @@ def test_lsi_returns_requested_components():
 
     assert loadings.shape == (5, 2)
     assert params == {"n_iter": 4}
-    assert np.all(np.isfinite(loadings))
+    # Uncentered LSI keeps the second and third right singular vectors.
+    _, _, right_vectors = np.linalg.svd(values, full_matrices=False)
+    np.testing.assert_allclose(
+        np.abs(loadings.T @ right_vectors[1:3].T), np.eye(2), atol=1e-8
+    )
 
 
 @pytest.mark.parametrize("reserved", ["n_components", "random_state"])

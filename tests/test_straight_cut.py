@@ -4,7 +4,9 @@ from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import pdist
 from sknetwork.hierarchy import cut_straight as reference_straight_cut
 
-from scarf.clustering.paris import straight_cut
+from scipy.sparse import csr_matrix
+
+from scarf.clustering.paris import fit_paris_hierarchy, fixed_cut, straight_cut
 
 
 def _assert_matches_reference_partition(
@@ -157,3 +159,28 @@ def test_straight_cut_rejects_malformed_children_before_one_cluster_return(
 
     with pytest.raises(ValueError, match=message):
         straight_cut(dendrogram, n_clusters=1)
+
+
+@pytest.mark.parametrize(
+    "dendrogram",
+    [
+        np.asarray([[0, 1 + 0j, 1, 2], [2, 3, 2, 3]], dtype=complex),
+        np.asarray([["0", "one", 1, 2], [2, 3, 2, 3]], dtype=object),
+    ],
+    ids=["complex", "text"],
+)
+def test_straight_cut_rejects_non_real_child_ids(dendrogram: np.ndarray) -> None:
+    with pytest.raises(ValueError, match="child IDs must be finite integers"):
+        straight_cut(dendrogram, n_clusters=1)
+
+
+def test_fixed_cut_never_applies_synthetic_component_joins() -> None:
+    # Three separate pairs give three components joined only synthetically.
+    dense = np.zeros((6, 6))
+    for left in (0, 2, 4):
+        dense[left, left + 1] = dense[left + 1, left] = 1.0
+    hierarchy = fit_paris_hierarchy(csr_matrix(dense))
+
+    assert fixed_cut(hierarchy, 3).tolist() == [1, 1, 2, 2, 3, 3]
+    with pytest.raises(ValueError, match="cannot be cut into 2 clusters"):
+        fixed_cut(hierarchy, 2)

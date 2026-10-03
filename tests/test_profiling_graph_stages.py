@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,7 +10,7 @@ from profiling.config import (
     StageResources,
     WorkflowParameters,
 )
-from profiling.stages import _run_analysis, run_stage
+from profiling.stages import _run_analysis, profile_stage_inputs, run_stage
 from scarf import DataStore
 from scarf.storage import ArtifactRef
 
@@ -228,29 +227,6 @@ def test_graph_construction_profile_stage_uses_explicit_refs_and_parameters(
     assert store.resolved_features == []
 
 
-def test_profile_normalization_consumes_explicit_feature_ref() -> None:
-    store = _RecordingStore()
-
-    _run_analysis(
-        "runNormalization",
-        store,
-        WorkflowParameters(),
-        _resources(),
-        inputRefs={"cells": _CELL_SELECTION, "features": _FEATURE_REF},
-    )
-
-    assert store.resolved_features == []
-    assert store.calls == [
-        (
-            "run_normalization",
-            (_CELL_SELECTION, _FEATURE_REF),
-            {
-                "invalidate_cache": False,
-            },
-        )
-    ]
-
-
 def test_profile_marker_search_uses_explicit_cluster_and_feature_refs() -> None:
     store = _RecordingStore()
 
@@ -294,16 +270,23 @@ def test_run_stage_reports_store_open_as_input_setup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from profiling.metrics import StageTimer
+
+    # Time passes only while the fakes work, so every scope is exact.
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        "profiling.stages.StageTimer", lambda: StageTimer(clock=lambda: clock.now)
+    )
     store = object()
     analysis_kwargs: dict[str, Any] = {}
 
     def open_store(*_args: Any, **_kwargs: Any) -> object:
-        time.sleep(0.02)
+        clock.now += 2.0
         return store
 
     def run_analysis(*_args: Any, **kwargs: Any) -> None:
         analysis_kwargs.update(kwargs)
-        time.sleep(0.02)
+        clock.now += 3.0
 
     monkeypatch.setattr("profiling.stages._open_datastore", open_store)
     monkeypatch.setattr("profiling.stages._run_analysis", run_analysis)
@@ -320,12 +303,9 @@ def test_run_stage_reports_store_open_as_input_setup(
     )
 
     assert result.status == "ok"
-    assert result.inputSetupSeconds is not None
-    assert result.inputSetupSeconds >= 0.015
-    assert result.seconds is not None
-    assert result.seconds >= 0.015
-    assert result.wholeFunctionSeconds is not None
-    assert result.wholeFunctionSeconds >= (result.inputSetupSeconds + result.seconds)
+    assert result.inputSetupSeconds == 2.0
+    assert result.seconds == 3.0
+    assert result.wholeFunctionSeconds == 5.0
     assert result.modalMemoryMb == 4096
     assert result.modalCpuRequest == 1.0
     assert result.modalCpuLimit == 1.0
@@ -434,6 +414,7 @@ def test_graph_construction_profile_stages_chain_through_explicit_artifacts(
             "markHvgs": features,
         }
     }
+    stage_results: dict[str, ArtifactRef] = {}
     for stage in GRAPH_CONSTRUCTION_STAGE_ORDER:
         result = run_stage(
             stage,
@@ -446,24 +427,37 @@ def test_graph_construction_profile_stages_chain_through_explicit_artifacts(
             submissionId="testsubmission",
         )
         assert result.status == "ok", result.error
+        assert result.details is not None
+        assert result.details["artifactDisposition"] == "created", stage
+        stage_results[stage] = ArtifactRef.from_dict(result.details["artifact"])
 
+    produced = session["artifactRefs"]
+    assert {
+        stage: produced[stage].kind for stage in GRAPH_CONSTRUCTION_STAGE_ORDER
+    } == {
+        "runNormalization": "normalized",
+        "runPca": "reduction",
+        "buildEmbeddingInitialization": "embedding_initialization",
+        "buildAnnIndex": "ann_index",
+        "queryNeighbors": "neighbors",
+        "buildConnectivityMap": "connectivity_map",
+    }
     reopened = DataStore(store_uri)
-    for kind in (
-        "normalized",
-        "reduction",
-        "embedding_initialization",
-        "ann_index",
-        "neighbors",
-        "connectivity_map",
-    ):
-        refs = reopened.list_artifacts(
-            kind=kind,
-            from_assay="RNA",
-            scope="assay",
-            complete_only=True,
-        )
-        assert refs
-        assert reopened.inspect_artifact(refs[-1]).complete
+    for stage in GRAPH_CONSTRUCTION_STAGE_ORDER:
+        status = reopened.inspect_artifact(produced[stage])
+        assert status.complete, stage
+        assert produced[stage] == stage_results[stage]
+        # Each artifact records exactly the upstream artifact this run produced.
+        recorded = {
+            ArtifactRef.from_dict(value)
+            for value in (status.inputs or {}).values()
+            if isinstance(value, dict) and "artifact_id" in value
+        }
+        upstream = {
+            produced[source_stage]
+            for source_stage, _kind in profile_stage_inputs(workflow, stage).values()
+        }
+        assert upstream and upstream <= recorded, (stage, upstream, recorded)
 
 
 def test_run_stage_persists_every_execution_report_and_wire_counts(

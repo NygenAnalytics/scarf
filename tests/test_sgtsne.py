@@ -380,3 +380,23 @@ def test_run_sgtsne_requires_an_available_backend(monkeypatch):
             csr_matrix((1, 1), dtype=np.float64),
             np.zeros((1, 2)),
         )
+
+
+def test_export_knn_to_mtx_writes_every_row_block(tmp_path):
+    rng = np.random.default_rng(3)
+    dense = (rng.random((7, 7)) < 0.4) * rng.random((7, 7))
+    path = tmp_path / "graph.mtx"
+
+    # Blocks of three rows leave a final block of one.
+    sgtsne_module.export_knn_to_mtx(str(path), csr_matrix(dense), batch_size=3)
+
+    np.testing.assert_array_equal(mmread(path, spmatrix=False).toarray(), dense)
+
+
+def test_export_knn_to_mtx_refuses_a_batch_size_that_skips_rows(tmp_path):
+    # A negative batch size iterates no row blocks; the row count check stops
+    # the header-only file from passing as the whole graph.
+    with pytest.raises(ValueError, match="Internal loop count error"):
+        sgtsne_module.export_knn_to_mtx(
+            str(tmp_path / "graph.mtx"), _graph(), batch_size=-1
+        )

@@ -14,6 +14,7 @@ from scarf.storage.partition import (
     affordable_width,
     checked_indices,
     contiguous_ranges,
+    is_contiguous,
     partition_indices,
     row_band,
 )
@@ -121,6 +122,26 @@ def test_row_band_uses_the_fallback_without_geometry() -> None:
 def test_contiguous_ranges_cover_the_axis_without_overlap() -> None:
     assert contiguous_ranges(12, 5) == [(0, 5), (5, 10), (10, 12)]
     assert contiguous_ranges(0, 5) == []
+
+
+@pytest.mark.parametrize(
+    ("indices", "expected"),
+    [
+        ([], True),
+        ([7], True),
+        ([2, 3, 4], True),
+        ([2, 4], False),
+        ([3, 2], False),
+        ([2, 2], False),
+        # A negative start would wrap around as a slice, so it is no run.
+        ([-1, 0, 1], False),
+        ([-1], False),
+    ],
+)
+def test_is_contiguous_accepts_only_increasing_consecutive_runs(
+    indices, expected
+) -> None:
+    assert is_contiguous(np.asarray(indices, dtype=np.int64)) is expected
 
 
 def test_affordable_width_finds_the_largest_accepted_width() -> None:

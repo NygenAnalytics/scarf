@@ -157,3 +157,41 @@ def test_preflight_paris_fit_and_artifact_cut_respect_budget():
         nthreads=1,
     )
     assert cut_bytes == estimate_hierarchy_group_peak_bytes(generation, "fixed")
+
+
+def test_cut_diagnostics_must_match_the_recorded_schema_and_mode():
+    from dataclasses import asdict
+
+    from scarf.clustering.paris_multiscale import ParisClusterDiagnostic
+    from scarf.datastore._operations.paris_persistence import (
+        read_paris_cut_diagnostics,
+    )
+
+    diagnostic = ParisClusterDiagnostic(
+        label=1,
+        selected_node=6,
+        parent_event=-1,
+        component=0,
+        size=4,
+        resolution_lower=None,
+        resolution_upper=None,
+        persistence=None,
+        forced=True,
+        blocking_child_count=1,
+        folded_cell_count=1,
+        decision_margin=None,
+    )
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.attrs["diagnostics"] = [asdict(diagnostic)]
+
+    assert read_paris_cut_diagnostics(group, "auto") == (diagnostic,)
+    with pytest.raises(ValueError, match="Fixed Paris cuts cannot record adaptive"):
+        read_paris_cut_diagnostics(group, "fixed")
+    group.attrs["diagnostics"] = []
+    assert read_paris_cut_diagnostics(group, "fixed") == ()
+    group.attrs["diagnostics"] = [{**asdict(diagnostic), "retired": 1}]
+    with pytest.raises(ValueError, match="do not match the current schema"):
+        read_paris_cut_diagnostics(group, "auto")
+    group.attrs["diagnostics"] = {"label": 1}
+    with pytest.raises(ValueError, match="must be a list"):
+        read_paris_cut_diagnostics(group, "auto")

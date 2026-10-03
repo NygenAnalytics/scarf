@@ -10,12 +10,12 @@ from scipy.stats import norm
 from scipy.stats import rankdata
 from scipy.stats import ttest_ind
 from scipy.stats import wilcoxon as scipy_wilcoxon
-from statsmodels.stats.multitest import multipletests
 
 from scarf.features.markers import mannwhitneyu_from_ranks
 from scarf.features.statistical import (
     GroupComparisonResult,
     StatisticalTestResult,
+    _dunn_posthoc,
     _mann_whitney_exact_p_value,
     _mann_whitney_p_value_method,
     adjust_pvalues,
@@ -28,10 +28,28 @@ from scarf.metadata.selection import CellField
 pytestmark = pytest.mark.filterwarnings("ignore:Cell-level statistical testing")
 
 
+def _adjusted_reference(p_values: np.ndarray, method: str) -> np.ndarray:
+    """Textbook Bonferroni, Holm step-down, and Benjamini-Hochberg step-up."""
+    p_values = np.asarray(p_values, dtype=np.float64)
+    m = len(p_values)
+    order = np.argsort(p_values, kind="stable")
+    ranked = p_values[order]
+    if method == "bonferroni":
+        return np.minimum(1.0, m * p_values)
+    if method == "holm":
+        stepped = np.maximum.accumulate((m - np.arange(m)) * ranked)
+    else:
+        scaled = m * ranked / np.arange(1, m + 1)
+        stepped = np.minimum.accumulate(scaled[::-1])[::-1]
+    adjusted = np.empty(m)
+    adjusted[order] = np.minimum(1.0, stepped)
+    return adjusted
+
+
 def _dunn_reference(values, groups):
     """Independent Dunn's test reference using scipy rankdata and norm."""
     values = np.asarray(values, dtype=np.float64)
-    groups = np.asarray(groups, dtype=object)
+    groups = np.asarray(groups)
     present = sorted(pd.unique(groups), key=str)
     ranks = rankdata(values, method="average")
     n_total = len(values)
@@ -244,8 +262,9 @@ def test_dunn_posthoc_matches_reference():
     reference = _dunn_reference(values, groups)
     assert len(table) == 6
     merged = table.merge(reference, on=["group_1", "group_2"], suffixes=("", "_ref"))
-    assert np.allclose(merged["z"], merged["z_ref"])
-    assert np.allclose(merged["p_value"], merged["p_value_ref"])
+    assert len(merged) == 6
+    np.testing.assert_allclose(merged["z"], merged["z_ref"], rtol=1e-12)
+    np.testing.assert_allclose(merged["p_value"], merged["p_value_ref"], rtol=1e-12)
 
 
 def test_dunn_preserves_omnibus_and_posthoc():
@@ -273,6 +292,35 @@ def test_dunn_preserves_omnibus_and_posthoc():
         omnibus.loc[0, "kruskal_statistic"],
     )
     assert np.isclose(result.table.loc[0, "p_value"], omnibus.loc[0, "p_value"])
+
+
+@pytest.mark.parametrize("adjustment", ["fdr_bh", "bonferroni", "holm"])
+def test_dunn_adjusts_pairwise_p_values_within_its_table(adjustment):
+    rng = np.random.default_rng(44)
+    values = np.concatenate(
+        [rng.normal(0, 1, 30), rng.normal(0.6, 1, 30), rng.normal(1.2, 1, 30)]
+    )
+    groups = np.repeat(np.array(["a", "b", "c"], dtype=object), 30)
+
+    adjusted = compare_group_distributions(
+        values, groups, test="kruskal_wallis", posthoc="dunn", adjustment=adjustment
+    )
+    unadjusted = compare_group_distributions(
+        values, groups, test="kruskal_wallis", posthoc="dunn"
+    )
+
+    pairwise = adjusted.posthoc_table
+    assert pairwise is not None and unadjusted.posthoc_table is not None
+    pd.testing.assert_frame_equal(
+        pairwise.drop(columns="p_value_adjusted"), unadjusted.posthoc_table
+    )
+    np.testing.assert_allclose(
+        pairwise["p_value_adjusted"],
+        _adjusted_reference(pairwise["p_value"].to_numpy(), adjustment),
+        rtol=1e-12,
+    )
+    # A one-row omnibus table is a single test, so it has nothing to adjust.
+    pd.testing.assert_frame_equal(adjusted.table, unadjusted.table)
 
 
 def test_group_order_determines_contrast_direction():
@@ -420,22 +468,21 @@ def test_wilcoxon_matches_scipy_on_aggregated_pairs():
         samples=samples,
         pairs=pairs,
     ).table
-    aggregated = aggregate_samples(
-        values,
-        groups,
-        samples,
-        pairs=pairs,
+    # Each donor's sample of a group is the mean of its cells.
+    donor_means = (
+        pd.DataFrame({"value": values, "group": groups, "pair": pairs})
+        .groupby(["pair", "group"])["value"]
+        .mean()
+        .unstack("group")
     )
-    left = aggregated[aggregated["group"] == "g0"]
-    right = aggregated[aggregated["group"] == "g1"]
-    merged = left.merge(right, on="pair")
     stat, p = scipy_wilcoxon(
-        merged["value_x"].to_numpy(),
-        merged["value_y"].to_numpy(),
+        donor_means["g0"].to_numpy(),
+        donor_means["g1"].to_numpy(),
     )
-    assert table.loc[0, "n_pairs"] == len(merged)
-    assert np.isclose(table.loc[0, "statistic"], float(stat))
-    assert np.isclose(table.loc[0, "p_value"], float(p))
+    assert (table.loc[0, "group_1"], table.loc[0, "group_2"]) == ("g0", "g1")
+    assert table.loc[0, "n_pairs"] == len(donor_means) == 15
+    assert table.loc[0, "statistic"] == pytest.approx(float(stat), rel=1e-12)
+    assert table.loc[0, "p_value"] == pytest.approx(float(p), rel=1e-12)
 
 
 def test_wilcoxon_rejects_duplicate_pair_groups():
@@ -469,6 +516,72 @@ def test_wilcoxon_requires_samples_and_pairs():
             test="wilcoxon",
             samples=samples,
         )
+
+
+def _paired_design(
+    group_of_sample: dict[str, str], pair_of_sample: dict[str, str]
+) -> tuple[np.ndarray, ...]:
+    """Two cells of every sample, with each sample's group and pair key."""
+    names = np.repeat(np.array(list(group_of_sample), dtype=object), 2)
+    groups = np.array([group_of_sample[name] for name in names], dtype=object)
+    pairs = np.array([pair_of_sample[name] for name in names], dtype=object)
+    return groups, names, pairs
+
+
+@pytest.mark.parametrize(
+    ("group_of_sample", "pair_of_sample", "message"),
+    [
+        (
+            {"s0": "a", "s1": "b", "s2": "c", "s3": "a", "s4": "b", "s5": "c"},
+            {"s0": "p0", "s1": "p0", "s2": "p0", "s3": "p1", "s4": "p1", "s5": "p1"},
+            "wilcoxon requires exactly two groups on aggregated sample data",
+        ),
+        (
+            {"s0": "a", "s1": "a", "s2": "b", "s3": "b"},
+            {"s0": "p0", "s1": "p1", "s2": "p2", "s3": "p3"},
+            "found no samples measured in both groups",
+        ),
+        (
+            {"s0": "a", "s1": "b", "s2": "a", "s3": "b"},
+            {"s0": "p0", "s1": "p0", "s2": "p1", "s3": "p2"},
+            "requires at least two matched pairs",
+        ),
+    ],
+    ids=["three-groups", "no-shared-pairs", "one-pair"],
+)
+def test_wilcoxon_rejects_designs_without_two_matched_groups(
+    group_of_sample, pair_of_sample, message
+):
+    groups, samples, pairs = _paired_design(group_of_sample, pair_of_sample)
+    values = np.arange(len(groups), dtype=np.float64)
+
+    with pytest.raises(ValueError, match=message):
+        compare_group_distributions(
+            values, groups, test="wilcoxon", samples=samples, pairs=pairs
+        )
+
+
+def test_wilcoxon_reports_no_shift_when_every_pair_is_unchanged():
+    groups, samples, pairs = _paired_design(
+        {"s0": "a", "s1": "b", "s2": "a", "s3": "b", "s4": "a", "s5": "b"},
+        {"s0": "p0", "s1": "p0", "s2": "p1", "s3": "p1", "s4": "p2", "s5": "p2"},
+    )
+    # The cells differ, but every pair has the same sample mean in both groups.
+    values = np.array([1.0, 3.0, 0.0, 4.0, 5.0, 5.0, 2.0, 8.0, 7.0, 1.0, 4.0, 4.0])
+
+    table = compare_group_distributions(
+        values, groups, test="wilcoxon", samples=samples, pairs=pairs
+    ).table
+
+    assert table.to_dict("records") == [
+        {
+            "group_1": "a",
+            "group_2": "b",
+            "n_pairs": 3,
+            "statistic": 0.0,
+            "p_value": 1.0,
+        }
+    ]
 
 
 def test_pairs_require_samples():
@@ -505,6 +618,33 @@ def test_aggregate_samples_semantics():
     for _, row in frac_frame.iterrows():
         cells = values[(groups == row["group"]) & (samples == row["sample"])]
         assert np.isclose(row["value"], float(np.mean(cells > 1.0)))
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"values": np.zeros((4, 1))}, "values must be one-dimensional"),
+        ({"groups": np.array(["a"], dtype=object)}, "groups length must match"),
+        ({"samples": np.array(["s0"], dtype=object)}, "samples length must match"),
+        ({"pairs": np.array(["p0"], dtype=object)}, "pairs length must match"),
+        (
+            {"samples": np.array([None, np.nan, "", "  "], dtype=object)},
+            "No selected cells have a valid sample value",
+        ),
+        ({"sample_stat": "mode"}, "sample_stat must be 'mean', 'median'"),
+    ],
+    ids=["values-2d", "groups", "samples", "pairs", "no-samples", "statistic"],
+)
+def test_aggregate_samples_rejects_misaligned_or_missing_inputs(changes, message):
+    arguments = {
+        "values": np.arange(4, dtype=np.float64),
+        "groups": np.array(["a", "a", "b", "b"], dtype=object),
+        "samples": np.array(["s0", "s0", "s1", "s1"], dtype=object),
+        **changes,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        aggregate_samples(**arguments)
 
 
 def test_aggregate_samples_rejects_sample_in_multiple_groups():
@@ -600,18 +740,32 @@ def test_auto_selects_test_by_design():
     assert "n_pairs" in paired_table.columns
 
 
-def test_adjust_pvalues_matches_statsmodels():
+def test_adjust_pvalues_matches_textbook_corrections():
     rng = np.random.default_rng(14)
-    p_values = rng.uniform(0, 1, 50)
+    # Small p-values make the step-down and step-up orders matter.
+    p_values = rng.uniform(0, 1, 50) ** 4
     for method in ("fdr_bh", "bonferroni", "holm"):
-        expected = multipletests(p_values, method=method)[1]
-        assert np.allclose(adjust_pvalues(p_values, method), expected)
-    assert np.allclose(adjust_pvalues(p_values, "none"), p_values)
+        np.testing.assert_allclose(
+            adjust_pvalues(p_values, method),
+            _adjusted_reference(p_values, method),
+            rtol=1e-12,
+            err_msg=method,
+        )
+    unadjusted = adjust_pvalues(p_values, "none")
+    np.testing.assert_array_equal(unadjusted, p_values)
+    assert unadjusted is not p_values
     with_nan = p_values.copy()
     with_nan[3] = np.nan
     adjusted = adjust_pvalues(with_nan, "fdr_bh")
+    # Missing p-values are left out of the family that is corrected.
+    finite = np.flatnonzero(np.isfinite(with_nan))
     assert np.isnan(adjusted[3])
-    assert np.isfinite(adjusted).sum() == 49
+    np.testing.assert_allclose(
+        adjusted[finite], _adjusted_reference(with_nan[finite], "fdr_bh"), rtol=1e-12
+    )
+    assert np.isnan(adjust_pvalues(np.array([np.nan, np.inf]), "holm")).all()
+    with pytest.raises(ValueError, match="adjustment must be 'fdr_bh'"):
+        adjust_pvalues(p_values, "sidak")
 
 
 def test_compare_rejects_bad_inputs():
@@ -642,6 +796,38 @@ def test_compare_rejects_bad_inputs():
     dropped_groups[::2] = ""
     with pytest.raises(ValueError, match="two populated groups"):
         compare_group_distributions(values[:20], dropped_groups)
+    missing_groups = np.array([None, np.nan, "", " "] * 10, dtype=object)
+    with pytest.raises(ValueError, match="No values remain after dropping missing"):
+        compare_group_distributions(values, missing_groups)
+    with pytest.raises(ValueError, match="comparisons must be non-empty"):
+        compare_group_distributions(values, groups, comparisons=[])
+
+
+@pytest.mark.parametrize(
+    ("test", "groups"),
+    [
+        ("welch", ["a", "b", "b", "b"]),
+        ("one_way_anova", ["a", "a", "b", "c", "c"]),
+        ("kruskal_wallis", ["a", "a", "b", "c", "c"]),
+    ],
+)
+def test_tests_require_two_cells_in_every_group(test, groups):
+    values = np.arange(len(groups), dtype=np.float64)
+
+    with pytest.raises(ValueError, match=f"{test} requires at least two cells"):
+        compare_group_distributions(values, np.array(groups, dtype=object), test=test)
+
+
+@pytest.mark.parametrize("test", ["welch", "one_way_anova"])
+def test_parametric_tests_refuse_undefined_statistics(test):
+    # The variance of values near the float64 maximum overflows, so SciPy
+    # returns NaN for values that are finite and not all tied.
+    largest = np.finfo(np.float64).max
+    values = np.array([largest, largest, 0.0, 1.0, 2.0])
+    groups = np.array(["a", "a", "a", "b", "b"], dtype=object)
+
+    with pytest.raises(ValueError, match=f"{test} returned an undefined statistic"):
+        compare_group_distributions(values, groups, test=test)
 
 
 def test_compare_validates_auxiliary_arrays():
@@ -767,6 +953,11 @@ def test_resolve_group_order_rejects_missing_requested_group():
     groups = _seeded_groups(rng, 40, 2)
     with pytest.raises(ValueError, match="not present in the data"):
         resolve_group_order(groups, group_order=["g0", "missing"])
+    # A group absent from the unfiltered data is an error, not a filtered group.
+    with pytest.raises(ValueError, match="labels not present in the data: missing$"):
+        resolve_group_order(
+            groups[groups == "g0"], group_order=["g0", "missing"], full_groups=groups
+        )
     with pytest.raises(ValueError, match="duplicate labels"):
         resolve_group_order(groups, group_order=["g0", "g0", "g1"])
 
@@ -1048,39 +1239,6 @@ def test_group_order_controls_welch_direction():
     assert forward.loc[0, "p_value"] == reversed_order.loc[0, "p_value"]
 
 
-def test_summary_scope_tracks_sample_aggregation():
-    rng = np.random.default_rng(26)
-    values = rng.normal(size=40)
-    groups = _seeded_groups(rng, 40, 2)
-    result = StatisticalTestResult(
-        method="mann_whitney",
-        posthoc=None,
-        adjustment_method="fdr_bh",
-        grouping=None,
-        group_field=CellField("grp"),
-        sample_by="sample",
-        summary_scope="sample",
-        tables={
-            "k": compare_group_distributions(
-                values,
-                groups,
-                test="mann_whitney",
-            ).table
-        },
-    )
-    assert result.summary_scope == "sample"
-    assert (
-        StatisticalTestResult(
-            method="mann_whitney",
-            posthoc=None,
-            adjustment_method="fdr_bh",
-            grouping=None,
-            group_field=CellField("grp"),
-        ).summary_scope
-        == "cell"
-    )
-
-
 def test_statistical_test_result_is_frozen():
     result = StatisticalTestResult(
         method="mann_whitney",
@@ -1115,24 +1273,20 @@ def test_statistical_test_result_identity_defaults_are_optional():
 
 def test_dunn_tie_correction_survives_more_than_two_million_tied_values():
     # A cubed int64 tie count wraps once a group holds about 2.1 million equal
-    # values, which inflated the variance and shrank every z statistic.
+    # values, which inflated the variance and shrank every z statistic. The
+    # post-hoc kernel ranks integer group codes here: validating 2.2 million
+    # text labels on the public path costs seconds, the statistic does not.
     rng = np.random.default_rng(41)
     n_zeros = 2_200_000
     values = np.zeros(n_zeros + 3000)
     values[n_zeros:] = rng.random(3000) + 1.0
-    groups = np.array(["a", "b", "c"], dtype=object)[rng.integers(0, 3, len(values))]
-    groups[n_zeros : n_zeros + 1000] = "a"
+    groups = rng.integers(0, 3, len(values))
+    groups[n_zeros : n_zeros + 1000] = 0
 
-    table = compare_group_distributions(
-        values,
-        groups,
-        test="kruskal_wallis",
-        posthoc="dunn",
-        group_order=["a", "b", "c"],
-    ).posthoc_table
+    table = _dunn_posthoc(values, groups, [0, 1, 2], None)
     reference = _dunn_reference(values, groups)
 
-    assert table is not None
+    assert table[["group_1", "group_2"]].to_numpy().tolist() == [[0, 1], [0, 2], [1, 2]]
     np.testing.assert_allclose(table["z"], reference["z"], rtol=1e-9)
     np.testing.assert_allclose(table["p_value"], reference["p_value"], rtol=1e-6)
     assert table.loc[0, "z"] > 20

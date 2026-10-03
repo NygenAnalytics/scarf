@@ -23,9 +23,14 @@ from scarf.storage.artifacts import ArtifactRef, artifact_path, fingerprint_arra
 from scarf.writers import SparseToZarr
 
 
-@pytest.fixture
-def zero_weight_graphs(tmp_path):
-    path = tmp_path / "cells.zarr"
+@pytest.fixture(scope="module")
+def zero_weight_template(tmp_path_factory):
+    """A store whose RNA and ADT graphs both hold 54 zero-weight edges.
+
+    The cells form two groups of nine far apart, so with eleven neighbors each
+    cell reaches three cells of the other group at weight zero.
+    """
+    path = tmp_path_factory.mktemp("zero_weight") / "cells.zarr"
     cell_ids = np.array([f"cell_{i}" for i in range(18)])
     counts = np.random.default_rng(31).integers(10, 100, size=(18, 6), dtype=np.uint32)
     SparseToZarr(
@@ -61,6 +66,22 @@ def zero_weight_graphs(tmp_path):
         )
         neighbors = store.query_neighbors(store.build_ann_index(imported), k=11)
         graphs.append(store.build_connectivity_map(neighbors))
+    return path, graphs
+
+
+@pytest.fixture
+def zero_weight_graphs(zero_weight_template, tmp_path):
+    """A private writable copy of the zero-weight template."""
+    template, graphs = zero_weight_template
+    path = tmp_path / "cells.zarr"
+    shutil.copytree(template, path)
+    store = DataStore(
+        str(path),
+        default_assay="RNA",
+        assay_types={"RNA": "RNA", "ADT": "ADT"},
+        min_features_per_cell=0,
+        nthreads=1,
+    )
     return store, graphs
 
 
@@ -249,13 +270,6 @@ def test_graph_consumer_argument_records_have_no_feature_or_path_routes() -> Non
         assert "feat_key" not in names
         assert "integrated_graph" not in names
         assert "graph_loc" not in names
-
-
-def test_integrated_snn_loads_captured_graph_refs() -> None:
-    source = inspect.getsource(DataStore.integrate_assays)
-    assert "self._load_graph_artifact(" in source
-    assert "self.load_graph(" not in source
-    assert "self._store_to_sparse(" not in source
 
 
 def test_removed_public_path_locators_are_absent() -> None:

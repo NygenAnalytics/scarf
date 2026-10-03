@@ -158,6 +158,30 @@ class TestNumpySemantics:
             values[[2, 0]] / row_totals[[2, 0]],
         )
 
+    def test_full_shape_operands_and_boolean_keys_follow_numpy(self):
+        values = np.arange(1, 13, dtype=np.float64).reshape(4, 3)
+        offsets = np.arange(12, dtype=np.float64).reshape(4, 3) * 10
+        ca = ChunkedArray.from_numpy(values, block_size=2)
+        rows = np.array([True, False, True, True])
+        cols = np.array([False, True, True])
+
+        shifted = ca + offsets
+        np.testing.assert_array_equal(
+            shifted[:, np.array([2, 0])].compute(), (values + offsets)[:, [2, 0]]
+        )
+        np.testing.assert_array_equal(
+            shifted[rows][:, cols].compute(), (values + offsets)[rows][:, cols]
+        )
+        reflected = offsets - ca
+        np.testing.assert_array_equal(
+            reflected[:, cols].compute(), (offsets - values)[:, cols]
+        )
+        np.testing.assert_array_equal(
+            ca[rows, cols].compute(), values[np.ix_(rows, cols)]
+        )
+        with pytest.raises(IndexError):
+            ca[np.array([True, False])]
+
     def test_operands_that_numpy_cannot_broadcast_are_rejected(self):
         ca = ChunkedArray.from_numpy(np.ones((2, 3)))
         with pytest.raises(ValueError, match=r"scale rows with a \(2, 1\) array"):
@@ -286,10 +310,13 @@ class TestPublicApiCompat:
     """Mirror the rawData/normed usage documented in the vignettes."""
 
     def test_rawdata_is_chunked(self, datastore):
-        raw = datastore.RNA.rawData
+        assay = datastore.RNA
+        raw = assay.rawData
+        counts = assay.matrixGroup["counts"]
         assert isinstance(raw, ChunkedArray)
-        assert len(raw.chunksize) == 2
-        assert raw.shape[0] == datastore.RNA.cells.N
+        assert raw.shape == counts.shape == (assay.cells.N, assay.feats.N)
+        assert raw.dtype == counts.dtype
+        np.testing.assert_array_equal(raw[:5, :40].compute(), counts[:5, :40])
 
     def test_rawdata_mean_axis0_compute_reshape(self, datastore):
         # Pattern from the MNIST vignette.
@@ -301,13 +328,18 @@ class TestPublicApiCompat:
             .compute()
             .reshape(1, -1)
         )
-        assert out.shape == (1, 20)
+        counts = datastore.RNA.matrixGroup["counts"]
+        expected = counts.get_orthogonal_selection((cidx, fidx)).mean(axis=0)
+        np.testing.assert_allclose(out, expected.reshape(1, -1))
 
     def test_normed_mean_axis1_compute(self, datastore):
         # Pattern from the pseudotime dynamics vignette.
-        vals = datastore.RNA.normed().mean(axis=1).compute()
-        assert vals.shape[0] == datastore.RNA.cells.active_index("I").shape[0]
-        assert np.all(np.isfinite(vals))
+        assay = datastore.RNA
+        vals = assay.normed().mean(axis=1).compute()
+        # Library-size normalization scales each cell's values to sum to the
+        # size factor over all features, so every row mean is sf / features.
+        assert vals.shape == assay.cells.active_index("I").shape
+        np.testing.assert_allclose(vals, assay.sf / assay.feats.N, rtol=1e-10)
 
     def test_custom_normmethod_numpy_semantics(self, datastore):
         # User-overridable normMethod must accept NumPy-like array semantics.
@@ -316,10 +348,16 @@ class TestPublicApiCompat:
             return np.log2(counts / lib * 1000 + 1)
 
         assay = datastore.RNA
+        cells = assay.cells.active_index("I")
+        # The first 1,000 features share one stored chunk, and every cell
+        # has counts among them.
+        features = np.arange(1_000)
         original = assay.normMethod
         try:
             assay.normMethod = custom
-            out = assay.normed().compute()
-            assert np.all(np.isfinite(out))
+            out = assay.normed(feat_idx=features).compute()
         finally:
             assay.normMethod = original
+        counts = assay.matrixGroup["counts"].get_orthogonal_selection((cells, features))
+        expected = np.log2(counts / counts.sum(axis=1, keepdims=True) * 1000 + 1)
+        np.testing.assert_allclose(out, expected)

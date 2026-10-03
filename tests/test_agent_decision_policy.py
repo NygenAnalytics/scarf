@@ -364,3 +364,30 @@ def test_context_role_citations_require_supplied_visible_declarations() -> None:
     assert "feature exclusions must come from the supplied inventory" in message
     assert "unknown evidenceIds" in message
     assert "source:summary" in message and "column:donor" in message
+
+
+def test_policy_resolution_requires_a_known_mode_and_a_complete_deferral() -> None:
+    order = ["c0:r0.75", "c1:r0.5"]
+    with pytest.raises(
+        ValueError, match="^interaction_mode must be strict or lenient$"
+    ):
+        resolve_deferral(
+            ambiguous_choice(),
+            interaction_mode="automatic",
+            option_order=order,
+            unresolved_fact_ids=set(),
+        )
+    # A stored deferral is rechecked before any policy can resolve it.
+    incomplete = ambiguous_choice().model_copy(
+        update={"question": " ", "evidenceIds": []}
+    )
+    with pytest.raises(ValueError) as error:
+        resolve_deferral(
+            incomplete,
+            interaction_mode="lenient",
+            option_order=order,
+            unresolved_fact_ids=set(),
+        )
+    assert str(error.value) == (
+        "defer requires an actionable question; defer requires supplied evidenceIds"
+    )

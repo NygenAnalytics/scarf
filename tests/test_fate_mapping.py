@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -6,7 +7,7 @@ from scipy.sparse import block_diag, csr_matrix, diags
 
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.metadata import MetaData
-from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.storage.artifacts import ArtifactRef, artifact_group, list_artifacts
 from scarf.storage.selections import (
     resolve_metadata_snapshot,
     resolve_stored_selection_artifact,
@@ -31,6 +32,31 @@ def _y_graph() -> tuple[csr_matrix, np.ndarray, np.ndarray]:
     return csr_matrix(adjacency), pseudotime, labels
 
 
+def _biased_transition_reference(
+    graph: csr_matrix,
+    pseudotime: np.ndarray,
+    beta: float,
+) -> csr_matrix:
+    """Row-normalize a graph after biasing its backward edges, edge by edge.
+
+    An edge from a later to an earlier cell keeps ``2 / (1 + exp(beta * d))``
+    of its weight, where ``d`` is the drop in min-max scaled pseudotime.
+    Self-loops are dropped.
+    """
+    edges = graph.tocoo()
+    keep = edges.row != edges.col
+    rows, cols = edges.row[keep], edges.col[keep]
+    values = np.asarray(pseudotime, dtype=np.float64)
+    scaled = (values - values.min()) / (values.max() - values.min())
+    drop = scaled[rows] - scaled[cols]
+    weights = np.asarray(edges.data[keep], dtype=np.float64) * np.where(
+        drop > 0, 2.0 / (1.0 + np.exp(beta * drop)), 1.0
+    )
+    biased = csr_matrix((weights, (rows, cols)), shape=graph.shape)
+    biased.sum_duplicates()
+    return csr_matrix(diags(1.0 / np.asarray(biased.sum(axis=1)).ravel()) @ biased)
+
+
 def _direct_fate_reference(
     graph: csr_matrix,
     pseudotime: np.ndarray,
@@ -43,12 +69,7 @@ def _direct_fate_reference(
     from scipy.sparse.linalg import spsolve
 
     absorbing = np.isin(labels, sinks)
-    transition = _make_transition(
-        graph.copy(),
-        _normalize_pseudotime(pseudotime),
-        absorbing,
-        beta,
-    )
+    transition = _biased_transition_reference(graph, pseudotime, beta)
     transient = np.flatnonzero(~absorbing)
     system = (
         identity(transient.size, format="csc")
@@ -68,19 +89,34 @@ def test_soft_transition_preserves_support_and_normalizes_rows():
     graph.setdiag(2.0)
     expected_support = graph.toarray() > 0
     np.fill_diagonal(expected_support, False)
+    # The middle cell of each branch keeps its forward edge and 2 / (1 + e^5)
+    # of its backward one; the root has only forward edges.
+    backward = 2.0 / (1.0 + np.exp(5.0))
+    expected_middle = np.array([backward, 1.0]) / (1.0 + backward)
 
     transition = _make_transition(
-        graph,
+        graph.copy(),
         _normalize_pseudotime(pseudotime),
         np.zeros(graph.shape[0], dtype=bool),
         beta=10.0,
     )
 
     np.testing.assert_array_equal(transition.toarray() > 0, expected_support)
-    np.testing.assert_allclose(np.asarray(transition.sum(axis=1)).ravel(), 1.0)
     assert transition.dtype == np.float64
-    assert transition[1, 0] < transition[1, 2]
-    assert transition[0, 1] == pytest.approx(transition[0, 3])
+    np.testing.assert_allclose(
+        transition.toarray(),
+        _biased_transition_reference(graph, pseudotime, 10.0).toarray(),
+        rtol=1e-12,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(transition[1, [0, 2]].toarray()[0], expected_middle)
+    np.testing.assert_allclose(transition[3, [0, 4]].toarray()[0], expected_middle)
+    np.testing.assert_allclose(transition[0, [1, 3]].toarray()[0], [0.5, 0.5])
+    # A branch tip has one neighbor, so its only edge keeps all of its weight.
+    np.testing.assert_array_equal(
+        transition[[2, 4]].toarray(),
+        [[0.0, 1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0]],
+    )
 
 
 def test_soft_transition_is_affine_invariant_and_beta_zero_is_unbiased():
@@ -124,8 +160,13 @@ def test_soft_transition_preserves_extreme_penalty_ratios():
         beta=1000.0,
     )
 
-    assert transition[0, 1] > 1.0 - 1e-12
-    assert 0.0 < transition[0, 2] < 1e-80
+    # Both edges of cell 0 point backward, by 0.8 and 1.0. Their biased
+    # weights, 2 / (1 + e^800) and 2 / (1 + e^1000), underflow in linear space,
+    # but their ratio is e^-200, which the normalized row must keep.
+    ratio = np.exp(-200.0)
+    assert transition[0, 1] == pytest.approx(1.0 / (1.0 + ratio), rel=1e-15)
+    assert transition[0, 2] == pytest.approx(ratio / (1.0 + ratio), rel=1e-12)
+    np.testing.assert_array_equal(transition[[1, 2], 0].toarray().ravel(), [1.0, 1.0])
     np.testing.assert_allclose(np.asarray(transition.sum(axis=1)).ravel(), 1.0)
 
 
@@ -619,12 +660,21 @@ def test_localized_solver_error_fails_residual_validation(
         )
 
 
-@pytest.mark.parametrize(
-    "include_disconnected_cells", [False, True], ids=["all-cells", "largest-component"]
-)
-def test_datastore_fate_mapping_is_reproducible_and_keeps_the_graph(
-    include_disconnected_cells: bool,
-):
+@dataclass(frozen=True)
+class _ScoredStore:
+    store: Any
+    graph: ArtifactRef
+    pseudotime: ArtifactRef
+    labels: ArtifactRef
+    label_values: np.ndarray
+
+
+def _scored_y_store(*, include_disconnected_cells: bool = False) -> _ScoredStore:
+    """Store the Y graph, a pseudotime scored on it, and its cell labels.
+
+    With ``include_disconnected_cells`` a separate two-cell component joins
+    the graph; the pseudotime keeps only the Y, so those cells stay unscored.
+    """
     graph, _, label_values = _y_graph()
     source_sink = np.array([-1.0, 0.0, 0.6, 0.0, 0.4])
     if include_disconnected_cells:
@@ -666,8 +716,48 @@ def test_datastore_fate_mapping_is_reproducible_and_keeps_the_graph(
         inputs={"cell_selection": selection},
         source_columns=["label"],
     )
+    return _ScoredStore(
+        store=store,
+        graph=graph_ref,
+        pseudotime=pseudotime,
+        labels=labels,
+        label_values=label_values,
+    )
 
-    original_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
+
+def _fate_maps(store: Any) -> list[ArtifactRef]:
+    return list_artifacts(store.zw, scope="assay", assay="RNA", kind="fate_map")
+
+
+def _cell_metadata(store: Any) -> dict[str, np.ndarray]:
+    table = store.zw["cellData"]
+    return {name: np.asarray(table[name][:]).copy() for name in table.array_keys()}
+
+
+def _assert_cell_metadata_unchanged(store: Any, before: dict[str, np.ndarray]):
+    after = _cell_metadata(store)
+    assert set(after) == set(before)
+    for name, expected in before.items():
+        np.testing.assert_array_equal(after[name], expected)
+
+
+@pytest.mark.parametrize(
+    "include_disconnected_cells", [False, True], ids=["all-cells", "largest-component"]
+)
+def test_datastore_fate_mapping_is_reproducible_and_keeps_the_graph(
+    include_disconnected_cells: bool,
+):
+    scored_store = _scored_y_store(
+        include_disconnected_cells=include_disconnected_cells
+    )
+    store = scored_store.store
+    pseudotime = scored_store.pseudotime
+    labels = scored_store.labels
+    label_values = scored_store.label_values
+
+    original_graph = store.load_graph(
+        scored_store.graph, symmetric=True, upper_only=False
+    )
     results = {}
     for beta in (10.0, 5.0):
         ref = store.run_fate_mapping(pseudotime, labels, sinks=["A", "B"], beta=beta)
@@ -677,54 +767,83 @@ def test_datastore_fate_mapping_is_reproducible_and_keeps_the_graph(
         == results[5.0].ref
     )
     # The solve biases its own copy of the graph, never the stored edges.
-    reloaded_graph = store.load_graph(graph_ref, symmetric=True, upper_only=False)
+    reloaded_graph = store.load_graph(
+        scored_store.graph, symmetric=True, upper_only=False
+    )
     np.testing.assert_array_equal(reloaded_graph.data, original_graph.data)
     np.testing.assert_array_equal(reloaded_graph.indices, original_graph.indices)
     np.testing.assert_array_equal(reloaded_graph.indptr, original_graph.indptr)
 
+    scored = store.load_pseudotime_scoring(pseudotime)
+    retained = np.flatnonzero(scored.valid)
+    np.testing.assert_array_equal(retained, np.arange(5))
     for beta, result in results.items():
         fresh = store.run_fate_mapping(
             pseudotime, labels, sinks=["A", "B"], beta=beta, invalidate_cache=True
         )
         fresh_result = store.load_fate_mapping(fresh)
-        np.testing.assert_array_equal(result.valid, np.arange(len(cell_ids)) < 5)
+        np.testing.assert_array_equal(result.valid, np.arange(len(label_values)) < 5)
         np.testing.assert_array_equal(result.valid, fresh_result.valid)
         np.testing.assert_array_equal(result.values, fresh_result.values)
+        # The stored probabilities solve the Dirichlet system on the scored
+        # cells of the stored graph, with the stored pseudotime.
+        np.testing.assert_allclose(
+            result.values[retained],
+            _direct_fate_reference(
+                original_graph[retained][:, retained].tocsr(),
+                scored.values[retained],
+                label_values[retained],
+                ["A", "B"],
+                beta,
+            ),
+            rtol=0.0,
+            atol=1e-6,
+        )
+        assert np.isnan(result.values[~result.valid]).all()
+    # A weaker backward penalty sends the branch middles back more often.
+    assert not np.allclose(results[10.0].values[:5], results[5.0].values[:5])
 
 
-def test_datastore_fate_mapping_returns_an_artifact_without_metadata_writes(
-    datastore,
-    pseudotime_scoring,
-    legacy_leiden_clustering,
-):
-    cell_columns_before = tuple(datastore.cells.columns)
-    cell_values_before = {
-        column: datastore.cells.fetch_all(column).copy()
-        for column in cell_columns_before
-    }
+def test_datastore_fate_mapping_returns_an_artifact_without_metadata_writes():
+    scored_store = _scored_y_store(include_disconnected_cells=True)
+    store = scored_store.store
+    metadata_before = _cell_metadata(store)
 
-    ref = datastore.run_fate_mapping(
-        pseudotime_scoring,
-        legacy_leiden_clustering,
-        sinks=[3],
+    ref = store.run_fate_mapping(
+        scored_store.pseudotime,
+        scored_store.labels,
+        sinks=["A"],
     )
-    result = datastore.load_fate_mapping(ref)
+    result = store.load_fate_mapping(ref)
 
     assert isinstance(ref, ArtifactRef)
     assert isinstance(result, FateMappingResult)
     assert result.ref == ref
-    assert result.pseudotime == pseudotime_scoring
-    assert result.sink_labels_artifact == legacy_leiden_clustering
-    assert result.sink_labels == (3,)
-    assert result.values.shape == (len(result.valid), 1)
-    assert set(datastore.cells.columns) == set(cell_columns_before)
-    for column, expected in cell_values_before.items():
-        np.testing.assert_array_equal(datastore.cells.fetch_all(column), expected)
+    assert result.graph == scored_store.graph
+    assert result.pseudotime == scored_store.pseudotime
+    assert result.sink_labels_artifact == scored_store.labels
+    assert result.sink_labels == ("A",)
+    # One sink absorbs every walk of its component, so each fate-mapped cell
+    # has probability one; the unscored component keeps NaN.
+    np.testing.assert_array_equal(result.valid, np.arange(7) < 5)
+    np.testing.assert_array_equal(result.values[:5], np.ones((5, 1)))
+    assert np.isnan(result.values[5:]).all()
+    assert _fate_maps(store) == [ref]
+    _assert_cell_metadata_unchanged(store, metadata_before)
 
 
-@pytest.mark.parametrize("sinks", [[], ("A",)])
+@pytest.mark.parametrize(
+    ("sinks", "error", "message"),
+    [
+        (None, ValueError, "sinks must be provided"),
+        ([], ValueError, "At least one sink label must be provided"),
+        (("A",), TypeError, "sinks must be a list"),
+    ],
+)
 def test_datastore_rejects_invalid_sink_container_before_loading_graph(
     sinks: Any,
+    error: type[Exception],
+    message: str,
 ):
     ref = ArtifactRef(
         scope="assay",
@@ -733,7 +852,9 @@ def test_datastore_rejects_invalid_sink_container_before_loading_graph(
         artifact_id="f" * 64,
     )
 
-    with pytest.raises((TypeError, ValueError)):
+    # The bare object has no store, so any graph or label read would fail
+    # with an AttributeError instead of the argument error.
+    with pytest.raises(error, match=message):
         GraphDataStore.run_fate_mapping(
             object(),
             ref,
@@ -742,19 +863,12 @@ def test_datastore_rejects_invalid_sink_container_before_loading_graph(
         )
 
 
-def test_failed_solver_writes_no_metadata(
-    datastore,
-    pseudotime_scoring,
-    legacy_leiden_clustering,
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_failed_solver_writes_no_metadata(monkeypatch: pytest.MonkeyPatch):
     from scarf.datastore._operations import trajectory as trajectory_operations
 
-    cell_columns_before = tuple(datastore.cells.columns)
-    cell_values_before = {
-        column: datastore.cells.fetch_all(column).copy()
-        for column in cell_columns_before
-    }
+    scored_store = _scored_y_store()
+    store = scored_store.store
+    metadata_before = _cell_metadata(store)
 
     def fail(*_args: Any, **_kwargs: Any):
         raise RuntimeError("forced non-convergence")
@@ -765,54 +879,43 @@ def test_failed_solver_writes_no_metadata(
         fail,
     )
     with pytest.raises(RuntimeError, match="forced non-convergence"):
-        datastore.run_fate_mapping(
-            pseudotime_scoring,
-            legacy_leiden_clustering,
-            sinks=[3, 6],
-            invalidate_cache=True,
+        store.run_fate_mapping(
+            scored_store.pseudotime,
+            scored_store.labels,
+            sinks=["A", "B"],
         )
 
-    assert set(datastore.cells.columns) == set(cell_columns_before)
-    for column, expected in cell_values_before.items():
-        np.testing.assert_array_equal(datastore.cells.fetch_all(column), expected)
+    assert _fate_maps(store) == []
+    _assert_cell_metadata_unchanged(store, metadata_before)
 
 
 def test_fate_mapping_loads_graph_once_and_not_on_reuse(
-    datastore,
-    pseudotime_scoring,
-    legacy_leiden_clustering,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    original_load = datastore._store_to_sparse
+    scored_store = _scored_y_store()
+    store = scored_store.store
+    original_load = store._store_to_sparse
     loaded: list[str] = []
 
     def counted_load(location: str, *args: Any, **kwargs: Any):
         loaded.append(location)
         return original_load(location, *args, **kwargs)
 
-    monkeypatch.setattr(datastore, "_store_to_sparse", counted_load)
-    computed = datastore.run_fate_mapping(
-        pseudotime_scoring,
-        legacy_leiden_clustering,
-        sinks=[3, 6],
-        invalidate_cache=True,
-    )
+    monkeypatch.setattr(store, "_store_to_sparse", counted_load)
+    arguments = (scored_store.pseudotime, scored_store.labels)
+    computed = store.run_fate_mapping(*arguments, sinks=["A", "B"])
     # Validating the pseudotime loads its graph once and the solve reuses it.
     assert len(loaded) == 1
 
     loaded.clear()
-    reused = datastore.run_fate_mapping(
-        pseudotime_scoring,
-        legacy_leiden_clustering,
-        sinks=[3, 6],
-    )
+    reused = store.run_fate_mapping(*arguments, sinks=["A", "B"])
     # Reuse only validates the pseudotime; the fate solve loads nothing more.
     assert reused == computed
     assert len(loaded) == 1
 
-    monkeypatch.setattr(datastore, "_store_to_sparse", original_load)
-    result = datastore.load_fate_mapping(reused)
-    np.testing.assert_allclose(result.values[result.valid].sum(axis=1), 1.0, atol=1e-5)
+    monkeypatch.setattr(store, "_store_to_sparse", original_load)
+    result = store.load_fate_mapping(reused)
+    np.testing.assert_allclose(result.values.sum(axis=1), 1.0, atol=1e-6)
 
 
 def _ring_sinks_with_chain(
@@ -938,15 +1041,30 @@ def test_elongated_trajectory_converges_with_default_iterations():
 
 
 def test_fate_mapping_checks_solver_memory_before_solving(
-    datastore,
-    pseudotime_scoring,
-    legacy_leiden_clustering,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    options = {"sinks": [3, 6], "invalidate_cache": True}
-    datastore.run_fate_mapping(pseudotime_scoring, legacy_leiden_clustering, **options)
-    monkeypatch.setattr(datastore, "memoryBytes", 128 * 1024)
-    with pytest.raises(MemoryError, match="Fate mapping needs about"):
-        datastore.run_fate_mapping(
-            pseudotime_scoring, legacy_leiden_clustering, **options
-        )
+    from scarf.datastore._operations import trajectory as trajectory_operations
+
+    scored_store = _scored_y_store()
+    store = scored_store.store
+    arguments = (scored_store.pseudotime, scored_store.labels)
+
+    def forbidden(*_args: Any, **_kwargs: Any):
+        raise AssertionError("the solve must not start")
+
+    # Two sinks on the five-cell Y graph, with eight directed edges, need
+    # 2 * 8 * 12 bytes for the transition and its coarse product, and per cell
+    # 22 Krylov and 8 work float64 vectors, 4 int64 index arrays and two
+    # float32 probabilities: 192 + 5 * 280 = 1592 bytes.
+    monkeypatch.setattr(store, "memoryBytes", 1592)
+    monkeypatch.setattr(
+        trajectory_operations, "_compute_fate_probabilities_impl", forbidden
+    )
+    with pytest.raises(MemoryError, match="Fate mapping needs about 1592 bytes"):
+        store.run_fate_mapping(*arguments, sinks=["A", "B"])
+    assert _fate_maps(store) == []
+
+    monkeypatch.undo()
+    monkeypatch.setattr(store, "memoryBytes", 1593)
+    ref = store.run_fate_mapping(*arguments, sinks=["A", "B"])
+    assert store.load_fate_mapping(ref).valid.all()

@@ -194,12 +194,22 @@ def test_version_resolution_rejects_missing_or_invalid_file(tmp_path: Path):
     assert scarf._resolve_version(_missing_distribution, version_path) == "unavailable"
 
 
-def test_bare_import_is_lazy():
+@pytest.fixture(scope="module")
+def cold_import_probe() -> dict[str, object]:
+    """Observe one fresh interpreter through the lazy import contract.
+
+    Each step records its observation before the next step imports more: the
+    bare import, the zarr warning filter, module attributes, then a star
+    import of the exports.
+    """
     lazy_names = [*_EXPECTED_EXPORTS, *_EXPECTED_MODULE_ATTRIBUTES]
-    result = _run_probe(
+    return _run_probe(
         f"""
+import importlib
 import json
 import sys
+import warnings
+
 import scarf
 
 heavy_modules = {{
@@ -215,7 +225,7 @@ heavy_modules = {{
     "zarr",
 }}
 lazy_names = {lazy_names!r}
-print(json.dumps({{
+bare = {{
     "boundLazyNames": sorted(name for name in lazy_names if name in vars(scarf)),
     "heavyModules": sorted(heavy_modules.intersection(sys.modules)),
     "plotsInDir": "plots" in dir(scarf),
@@ -225,11 +235,56 @@ print(json.dumps({{
         if name == "scarf" or name.startswith("scarf.")
     ),
     "versionIsSet": isinstance(scarf.__version__, str) and bool(scarf.__version__),
+}}
+
+zarr_was_loaded = "zarr" in sys.modules
+
+import numpy as np
+import zarr
+from zarr.storage import MemoryStore
+
+with warnings.catch_warnings(record=True) as caught:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_array("text", data=np.asarray(["a", "bb"]))
+zarr_warning = {{
+    "unstableWarnings": [
+        type(item.message).__name__
+        for item in caught
+        if type(item.message).__name__ == "UnstableSpecificationWarning"
+    ],
+    "zarrWasLoaded": zarr_was_loaded,
+}}
+
+module_names = {_EXPECTED_MODULE_ATTRIBUTES!r}
+before = sorted(name for name in module_names if name in vars(scarf))
+advertised = sorted(name for name in module_names if name in dir(scarf))
+identical = {{
+    name: getattr(scarf, name) is importlib.import_module(module_name)
+    for name, module_name in module_names.items()
+}}
+cached = sorted(name for name in module_names if name in vars(scarf))
+module_attributes = {{
+    "advertised": advertised,
+    "before": before,
+    "cached": cached,
+    "identical": identical,
+}}
+
+namespace = {{}}
+exec("from scarf import *", namespace)
+bound = sorted(name for name in namespace if not name.startswith("__"))
+print(json.dumps({{
+    "bare": bare,
+    "moduleAttributes": module_attributes,
+    "starImport": {{"bound": bound}},
+    "zarrWarning": zarr_warning,
 }}))
 """
     )
 
-    assert result == {
+
+def test_bare_import_is_lazy(cold_import_probe: dict[str, object]):
+    assert cold_import_probe["bare"] == {
         "boundLazyNames": [],
         "heavyModules": [],
         "plotsInDir": False,
@@ -461,44 +516,16 @@ def test_domain_packages_export_canonical_objects():
         assert getattr(package, symbol) is getattr(canonical, symbol)
 
 
-def test_star_import_matches_all():
-    result = _run_probe(
-        """
-import json
-
-namespace = {}
-exec("from scarf import *", namespace)
-bound = sorted(name for name in namespace if not name.startswith("__"))
-print(json.dumps({"bound": bound}))
-"""
-    )
+def test_star_import_matches_all(cold_import_probe: dict[str, object]):
+    result = cast(dict[str, object], cold_import_probe["starImport"])
 
     assert result["bound"] == sorted(_EXPECTED_EXPORTS)
 
 
-def test_de_facto_module_attributes_resolve_lazily():
-    result = _run_probe(
-        f"""
-import importlib
-import json
-import scarf
-
-module_names = {_EXPECTED_MODULE_ATTRIBUTES!r}
-before = sorted(name for name in module_names if name in vars(scarf))
-advertised = sorted(name for name in module_names if name in dir(scarf))
-identical = {{
-    name: getattr(scarf, name) is importlib.import_module(module_name)
-    for name, module_name in module_names.items()
-}}
-cached = sorted(name for name in module_names if name in vars(scarf))
-print(json.dumps({{
-    "advertised": advertised,
-    "before": before,
-    "cached": cached,
-    "identical": identical,
-}}))
-"""
-    )
+def test_de_facto_module_attributes_resolve_lazily(
+    cold_import_probe: dict[str, object],
+):
+    result = cast(dict[str, object], cold_import_probe["moduleAttributes"])
 
     expected_names = sorted(_EXPECTED_MODULE_ATTRIBUTES)
     assert result["advertised"] == expected_names
@@ -692,37 +719,13 @@ print(json.dumps({
     }
 
 
-def test_zarr_warning_filter_does_not_make_import_eager():
-    result = _run_probe(
-        """
-import json
-import sys
-import warnings
-
-import scarf
-
-zarr_was_loaded = "zarr" in sys.modules
-
-import numpy as np
-import zarr
-from zarr.storage import MemoryStore
-
-with warnings.catch_warnings(record=True) as caught:
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    root.create_array("text", data=np.asarray(["a", "bb"]))
-
-print(json.dumps({
-    "unstableWarnings": [
-        type(item.message).__name__
-        for item in caught
-        if type(item.message).__name__ == "UnstableSpecificationWarning"
-    ],
-    "zarrWasLoaded": zarr_was_loaded,
-}))
-"""
-    )
-
-    assert result == {"unstableWarnings": [], "zarrWasLoaded": False}
+def test_zarr_warning_filter_does_not_make_import_eager(
+    cold_import_probe: dict[str, object],
+):
+    assert cold_import_probe["zarrWarning"] == {
+        "unstableWarnings": [],
+        "zarrWasLoaded": False,
+    }
 
 
 def test_modern_plotting_surface_matches_baseline():

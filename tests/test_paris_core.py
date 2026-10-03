@@ -424,3 +424,24 @@ def test_fit_stops_when_neighbor_scan_cannot_make_progress(
     with pytest.raises(RuntimeError, match="made no progress"):
         fit_paris_hierarchy(graph, nthreads=2)
     assert scan_count == 1
+
+
+def _bridged_pairs(bridge: float) -> csr_matrix:
+    """Two pairs joined by weight 1e200, bridged by ``bridge``."""
+    dense = np.zeros((4, 4))
+    dense[0, 1] = dense[1, 0] = dense[2, 3] = dense[3, 2] = 1e200
+    dense[1, 2] = dense[2, 1] = bridge
+    return csr_matrix(dense)
+
+
+def test_merge_distances_must_stay_finite() -> None:
+    # The root joins volumes of 2e200 each over a total of 4e200, so its
+    # distance is (2e200 / 4e200) * (2e200 / bridge).
+    hierarchy = fit_paris_hierarchy(_bridged_pairs(1e-100))
+    np.testing.assert_allclose(hierarchy.heights, [0.25, 0.25, 1e300])
+    assert not hierarchy.synthetic_joins.any()
+
+    # A weaker but still positive bridge overflows; it is not a synthetic join.
+    with np.errstate(over="ignore"):
+        with pytest.raises(ValueError, match="merge distances must be finite"):
+            fit_paris_hierarchy(_bridged_pairs(1e-200))

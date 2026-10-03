@@ -102,8 +102,17 @@ def test_simulate_doublet_pairs_allows_homotypic_when_fraction_is_zero():
         rng=np.random.default_rng(3),
     )
 
-    assert left.shape == right.shape == (40,)
+    # Without a heterotypic quota the pairs are two plain uniform draws.
+    expected = np.random.default_rng(3)
+    np.testing.assert_array_equal(left, expected.integers(0, 4, size=40))
+    np.testing.assert_array_equal(right, expected.integers(0, 4, size=40))
     assert np.any(clusters[left] == clusters[right])
+    # One cluster cannot form heterotypic pairs, so none are redrawn.
+    single = simulate_doublet_pairs(
+        np.zeros(4, dtype=int), 40, 1.0, np.random.default_rng(3)
+    )
+    np.testing.assert_array_equal(single[0], left)
+    np.testing.assert_array_equal(single[1], right)
 
 
 def test_sample_cluster_pool_respects_fraction_and_cap():
@@ -536,6 +545,14 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
     diffusion_before = set(
         datastore.list_artifacts(kind="diffusion_operator", from_assay="RNA")
     )
+    raw_scores: list[np.ndarray] = []
+    score_doublets = doublets.score_synthetic_doublets
+
+    def recording_scores(*args, **kwargs):
+        raw_scores.append(np.array(score_doublets(*args, **kwargs)))
+        return raw_scores[-1].copy()
+
+    monkeypatch.setattr(doublets, "score_synthetic_doublets", recording_scores)
 
     score_ref = datastore.run_doublet_detection(
         clusters,
@@ -581,7 +598,20 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
             "values",
         ).shape
     )
-    assert np.all(np.isfinite(scores))
+    # Stored scores are one row-normalized diffusion step of the raw mapping
+    # scores over the symmetrized graph, min-max scaled to [0, 1].
+    (raw,) = raw_scores
+    assert raw.shape == scores.shape
+    assert np.all(raw >= 0) and np.any(raw > 0)
+    graph = datastore.load_graph(
+        selected_connectivity, symmetric=True, upper_only=False
+    )
+    degree = np.asarray(graph.sum(axis=1)).ravel()
+    inverse = np.divide(1.0, degree, out=np.zeros_like(degree), where=degree > 0)
+    smoothed = graph.multiply(inverse[:, None]).tocsr() @ raw
+    expected = (smoothed - smoothed.min()) / (smoothed.max() - smoothed.min())
+    np.testing.assert_allclose(scores, expected, rtol=1e-9, atol=1e-12)
+    assert scores.min() == 0.0 and scores.max() == 1.0
     assert "RNA_doublet_score__raw" not in datastore.cells.columns
     assert (
         _snapshot_store(str(Path(datastore.zarr_loc) / "cellData")) == metadata_before

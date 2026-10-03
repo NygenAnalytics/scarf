@@ -393,3 +393,204 @@ def test_plateau_storage_scales_linearly() -> None:
     assert (small_children, large_children) == (1_998, 3_998)
     assert 1.9 * small_bytes < large_bytes < 2.1 * small_bytes
     assert large_bytes < 100 * 2_000
+
+
+def test_clustering_result_validates_its_labels_and_mode() -> None:
+    from scarf.clustering.paris_multiscale import ParisClusteringResult
+
+    hierarchy, _other = _plateau_variants()
+    adaptive = adaptive_cut(hierarchy, 2)
+
+    with pytest.raises(ValueError, match="one-dimensional int32 array"):
+        ParisClusteringResult(
+            labels=np.ones(4, dtype=np.int64), mode="fixed", n_clusters=1
+        )
+    with pytest.raises(ValueError, match="one-dimensional int32 array"):
+        ParisClusteringResult(
+            labels=np.ones((2, 2), dtype=np.int32), mode="fixed", n_clusters=1
+        )
+    with pytest.raises(ValueError, match="n_clusters must be positive"):
+        ParisClusteringResult(
+            labels=np.ones(4, dtype=np.int32), mode="fixed", n_clusters=0
+        )
+    with pytest.raises(ValueError, match="fixed cuts cannot contain adaptive"):
+        ParisClusteringResult(
+            labels=np.ones(6, dtype=np.int32),
+            mode="fixed",
+            n_clusters=2,
+            diagnostics=adaptive.diagnostics,
+        )
+
+
+def test_plateau_forest_requires_aligned_event_arrays() -> None:
+    from dataclasses import replace
+
+    hierarchy, _other = _plateau_variants()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    n_events = forest.representatives.size
+
+    with pytest.raises(ValueError, match="heights must have one value per event"):
+        replace(forest, heights=np.ones(n_events + 1))
+    with pytest.raises(ValueError, match="one more item than events"):
+        replace(forest, child_offsets=forest.child_offsets[:-1].copy())
+    with pytest.raises(ValueError, match="do not span child_refs"):
+        replace(forest, child_refs=forest.child_refs[:-1].copy())
+
+
+def _with(hierarchy: ParisHierarchy, **changes: object) -> ParisHierarchy:
+    from dataclasses import replace
+
+    return replace(hierarchy, **changes)
+
+
+@pytest.mark.parametrize(
+    ("damage", "error", "message"),
+    [
+        (
+            lambda h: ParisHierarchy(
+                children=np.empty((0, 2), dtype=np.int32),
+                heights=np.empty(0),
+                sizes=np.empty(0, dtype=np.int32),
+                component_roots=np.zeros(1, dtype=np.int32),
+                synthetic_joins=np.empty(0, dtype=bool),
+                n_leaves=1,
+                total_weight=0.0,
+            ),
+            ValueError,
+            "at least two leaves",
+        ),
+        (
+            lambda h: _with(h, children=h.children.astype(np.float64)),
+            TypeError,
+            "child references must be integers",
+        ),
+        (
+            lambda h: _with(h, sizes=h.sizes.astype(np.float64)),
+            TypeError,
+            "subtree sizes must be integers",
+        ),
+        (
+            lambda h: _with(h, heights=np.array([1.0, 1.0, np.inf])),
+            ValueError,
+            "Only synthetic component joins may have infinite distance",
+        ),
+        (
+            lambda h: _with(h, synthetic_joins=np.array([False, False, True])),
+            ValueError,
+            "Synthetic component joins must have infinite distance",
+        ),
+        (
+            lambda h: _with(h, children=np.array([[0, 1], [2, 2], [4, 5]], np.int32)),
+            ValueError,
+            "distinct topological references",
+        ),
+        (
+            lambda h: _with(h, children=np.array([[0, 1], [1, 2], [4, 5]], np.int32)),
+            ValueError,
+            "more than one parent",
+        ),
+        (
+            lambda h: _with(h, sizes=np.array([2, 2, 3], dtype=np.int32)),
+            ValueError,
+            "subtree size does not match its children",
+        ),
+        (
+            lambda h: _with(
+                h,
+                heights=np.array([np.inf, 1.0, 2.0]),
+                synthetic_joins=np.array([True, False, False]),
+            ),
+            ValueError,
+            "finite merge cannot contain a synthetic join",
+        ),
+    ],
+    ids=[
+        "one_leaf",
+        "float_children",
+        "float_sizes",
+        "infinite_finite_merge",
+        "finite_synthetic_join",
+        "repeated_child",
+        "shared_child",
+        "wrong_size",
+        "synthetic_inside_finite",
+    ],
+)
+def test_hierarchy_validation_rejects_malformed_hierarchies(
+    damage, error, message
+) -> None:
+    # Four leaves: (0, 1) -> 4, (2, 3) -> 5, (4, 5) -> 6.
+    valid = _hierarchy([(0, 1), (2, 3), (4, 5)], [1.0, 1.0, 2.0])
+    collapse_equal_height_plateaus(valid)
+
+    with pytest.raises(error, match=message):
+        collapse_equal_height_plateaus(damage(valid))
+
+
+def test_events_above_a_rounding_inversion_have_no_persistence() -> None:
+    from scarf.clustering.paris_multiscale import _event_keep_score
+
+    # The child merge sits one ulp above its parent, which validation accepts.
+    hierarchy = _hierarchy([(0, 1), (3, 2)], [np.nextafter(1.0, np.inf), 1.0])
+    forest = collapse_equal_height_plateaus(hierarchy)
+
+    assert forest.parent_events.tolist() == [1, -1]
+    assert _event_keep_score(forest, 0) == 0.0
+    result = adaptive_cut(hierarchy, 2)
+    # Leaf 2 alone cannot form a cluster, so the root is kept whole.
+    assert result.labels.tolist() == [1, 1, 1]
+    assert result.diagnostics[0].forced
+
+
+def test_a_root_smaller_than_the_minimum_size_is_kept_whole() -> None:
+    hierarchy = _hierarchy([(0, 1), (2, 3), (4, 5)], [1.0, 1.0, 2.0])
+
+    result = adaptive_cut(hierarchy, 5)
+
+    assert result.labels.tolist() == [1, 1, 1, 1]
+    (diagnostic,) = result.diagnostics
+    assert diagnostic.forced
+    assert diagnostic.selected_node == 6
+    assert diagnostic.persistence is None
+
+
+def test_adaptive_cut_rejects_a_forest_of_another_hierarchy() -> None:
+    hierarchy, _other = _plateau_variants()
+    smaller = collapse_equal_height_plateaus(
+        _hierarchy([(0, 1), (2, 3), (4, 5)], [1.0, 1.0, 2.0])
+    )
+
+    with pytest.raises(ValueError, match="different leaf counts"):
+        adaptive_cut(hierarchy, 2, plateau_forest=smaller)
+
+
+def test_labels_from_selected_nodes_regenerates_and_validates_a_cut() -> None:
+    from scarf.clustering.paris_multiscale import labels_from_selected_nodes
+
+    # Four leaves: (0, 1) -> 4, (2, 3) -> 5, (4, 5) -> 6.
+    hierarchy = _hierarchy([(0, 1), (2, 3), (4, 5)], [1.0, 1.0, 2.0])
+    np.testing.assert_array_equal(
+        labels_from_selected_nodes(hierarchy, np.array([5, 0, 1])), [2, 3, 1, 1]
+    )
+
+    for selected, error, message in (
+        (np.array([], dtype=np.int64), ValueError, "non-empty one-dimensional"),
+        (np.array([[4, 5]]), ValueError, "non-empty one-dimensional"),
+        (np.array([4.0, 5.0]), TypeError, "must contain integers"),
+        (np.array([4, 4, 5]), ValueError, "must not contain duplicates"),
+        (np.array([4, 7]), ValueError, "outside the hierarchy"),
+        (np.array([4, -1]), ValueError, "outside the hierarchy"),
+        (np.array([6, 0]), RuntimeError, "clusters overlap"),
+        (np.array([4]), RuntimeError, "did not cover every leaf"),
+    ):
+        with pytest.raises(error, match=message):
+            labels_from_selected_nodes(hierarchy, selected)
+
+    # Two pairs joined only synthetically: the join node cannot be selected.
+    disconnected = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[4, 5],
+    )
+    with pytest.raises(ValueError, match="synthetic component joins cannot"):
+        labels_from_selected_nodes(disconnected, np.array([6]))

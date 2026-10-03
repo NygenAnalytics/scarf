@@ -135,7 +135,7 @@ def _write_h5ad(path: Path, values: np.ndarray) -> Path:
 
 @pytest.fixture(scope="module")
 def wide_counts(tmp_path_factory) -> tuple[Path, np.ndarray]:
-    values = np.random.default_rng(0).poisson(0.3, size=(4_000, 600))
+    values = np.random.default_rng(0).poisson(0.3, size=(2_000, 600))
     # One count past uint16 keeps uint32 storage and wide count rows.
     values[0, 0] = 70_000
     path = tmp_path_factory.mktemp("layout") / "wide.h5ad"
@@ -157,7 +157,7 @@ def _policy(root: zarr.Group) -> CountMatrixPolicy:
 
 def test_h5ad_import_names_the_count_layout_that_fits_its_budget(wide_counts, tmp_path):
     path, values = wide_counts
-    budget = 24 * 1024**2
+    budget = 12 * 1024**2
     # The import keeps the default layout, which writes the whole matrix as
     # one band. That does not fit this budget, so it fails before the
     # destination exists and names the layout that fits.

@@ -350,10 +350,11 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
     monkeypatch.setattr(sharding, "write_sparse_bands", recording_write)
     values = np.eye(8, 4, dtype=np.uint16)
     reader = _PlanningReader(values)
+    store = MemoryStore()
     # The counts store as uint8, so 16 bytes give four-row shards.
     writer = CrToZarr(
         reader,
-        MemoryStore(),
+        store,
         mem_budget="64M",
         policy=CountMatrixPolicy(unitBytes=16, chunkBytes=8),
     )
@@ -364,6 +365,9 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
     assert 4 in reader.windowRequests
     assert observed == {"writes": 2, "total": 2}
     assert writer._lastImportPlan.writeTasks == 2
+    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
+    assert array_shard_rows(counts) == 4
+    np.testing.assert_array_equal(counts[:], values)
 
     rejected = _PlanningReader(values)
     destination = MemoryStore()
@@ -593,8 +597,11 @@ def test_cellranger_h5_automatic_matches_explicit_and_caches_planning(
         for reader in readers:
             reader.close()
 
-    for name, expected in _assay_counts(stores[1]).items():
-        np.testing.assert_array_equal(_assay_counts(stores[0])[name], expected)
+    # Even source features are Gene Expression and odd ones Antibody Capture.
+    for store in stores:
+        counts = _assay_counts(store)
+        np.testing.assert_array_equal(counts["RNA"], values[:, ::2])
+        np.testing.assert_array_equal(counts["ADT"], values[:, 1::2])
 
 
 @pytest.mark.parametrize("encoding", ["csr", "csc"])
@@ -665,8 +672,11 @@ def test_h5ad_automatic_matches_explicit_for_split_assays(
         for reader in readers:
             reader.h5.close()
 
-    for name, expected in _assay_counts(stores[1]).items():
-        np.testing.assert_array_equal(_assay_counts(stores[0])[name], expected)
+    # Even source features are Gene Expression and odd ones Antibody Capture.
+    for store in stores:
+        counts = _assay_counts(store)
+        np.testing.assert_array_equal(counts["RNA"], values[:, ::2])
+        np.testing.assert_array_equal(counts["ADT"], values[:, 1::2])
 
 
 def test_sparse_automatic_matches_explicit() -> None:
@@ -697,4 +707,5 @@ def test_sparse_automatic_matches_explicit() -> None:
     assert automatic_array.dtype == explicit_array.dtype == np.dtype(np.uint8)
     assert automatic_array.chunks == explicit_array.chunks
     assert array_shard_rows(automatic_array) == array_shard_rows(explicit_array)
-    np.testing.assert_array_equal(automatic_array[:], explicit_array[:])
+    np.testing.assert_array_equal(automatic_array[:], values.toarray())
+    np.testing.assert_array_equal(explicit_array[:], values.toarray())

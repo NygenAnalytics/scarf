@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
@@ -85,7 +88,7 @@ def test_doublet_parent_pool_is_read_in_admitted_blocks(monkeypatch):
     np.testing.assert_array_equal(result.toarray(), counts[rows])
     assert len(sizes) > 1
     assert max(sizes) < len(rows)
-    with pytest.raises(MemoryError):
+    with pytest.raises(MemoryError, match="operation limit is 100 bytes"):
         doublets._load_parent_counts(raw, rows, ResourceBudget(100, 1), 0)
 
 
@@ -132,6 +135,70 @@ def test_doublet_smoothing_rejects_invalid_power(power, error):
         )
 
 
+def _write_counts(path: Path, counts) -> None:
+    ids = np.array([f"g{i}" for i in range(counts.shape[1])])
+    write_doublet_target_zarr(
+        str(path),
+        "RNA",
+        csr_matrix(counts),
+        ids,
+        ids,
+        dtype=str(counts.dtype),
+        nthreads=1,
+        policy=CountMatrixPolicy(unitBytes=16_384, chunkBytes=1024),
+    )
+
+
+@dataclass(frozen=True)
+class _DoubletStores:
+    """A reference store and a store holding the doublets it simulates."""
+
+    counts: np.ndarray
+    store: DataStore
+    query: DataStore
+    simulated: csr_matrix
+
+
+def _doublet_stores(directory: Path, variant: str) -> _DoubletStores:
+    rng = np.random.default_rng(73)
+    counts = (
+        np.full((30, 32), 5, dtype=np.uint16)
+        if variant == "constant"
+        else rng.integers(0, 200, (30, 24), dtype=np.uint16)
+    )
+    if variant == "filtered":
+        counts[:15, 4:] = 0
+    _write_counts(directory / "reference.zarr", counts)
+    store = DataStore(
+        str(directory / "reference.zarr"),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    # The simulation below repeats the one inside score_synthetic_doublets.
+    labels = np.arange(len(counts)) % 3
+    rng = np.random.default_rng(91)
+    parents = doublets.sample_cluster_pool(labels, 0.5, 3, rng)
+    left, right = doublets.simulate_doublet_pairs(labels[parents], 60, 0.8, rng)
+    simulated = doublets.sum_doublet_pairs(csr_matrix(counts[parents]), left, right)
+    _write_counts(directory / "query.zarr", simulated)
+    query = DataStore(str(directory / "query.zarr"), default_assay="RNA", nthreads=1)
+    return _DoubletStores(counts, store, query, simulated)
+
+
+@pytest.fixture(scope="module")
+def doublet_stores(tmp_path_factory):
+    """Build each count variant's stores once; normalizations share them."""
+    built: dict[str, _DoubletStores] = {}
+
+    def get(variant: str) -> _DoubletStores:
+        if variant not in built:
+            built[variant] = _doublet_stores(tmp_path_factory.mktemp(variant), variant)
+        return built[variant]
+
+    return get
+
+
 @pytest.mark.parametrize(
     "log,subset,constant,filtered",
     [
@@ -143,29 +210,11 @@ def test_doublet_smoothing_rejects_invalid_power(power, error):
     ],
 )
 def test_streamed_doublets_match_materialized_mapping(
-    tmp_path, monkeypatch, log, subset, constant, filtered
+    doublet_stores, monkeypatch, log, subset, constant, filtered
 ):
-    rng = np.random.default_rng(73)
-    counts = (
-        np.full((30, 32), 5, dtype=np.uint16)
-        if constant
-        else rng.integers(0, 200, (30, 24), dtype=np.uint16)
-    )
-    if filtered:
-        counts[:15, 4:] = 0
-    ids = np.array([f"g{i}" for i in range(counts.shape[1])])
-    path = str(tmp_path / "reference.zarr")
-    write_doublet_target_zarr(
-        path,
-        "RNA",
-        csr_matrix(counts),
-        ids,
-        ids,
-        dtype=str(counts.dtype),
-        nthreads=1,
-        policy=CountMatrixPolicy(unitBytes=16_384, chunkBytes=1024),
-    )
-    store = DataStore(path, default_assay="RNA", min_features_per_cell=0, nthreads=1)
+    variant = "constant" if constant else "filtered" if filtered else "random"
+    stores = doublet_stores(variant)
+    counts, store, query = stores.counts, stores.store, stores.query
     cells = store.snapshot_cell_selection("I")
     feature_indices = np.arange(0, counts.shape[1], 2)
     features = store.set_feature_selection(feature_indexes=feature_indices)
@@ -186,26 +235,10 @@ def test_streamed_doublets_match_materialized_mapping(
         random_seed=91,
         resources=ResourceBudget(128 * 1024**2, 1),
     )
-    rng = np.random.default_rng(91)
-    parents = doublets.sample_cluster_pool(labels, 0.5, 3, rng)
-    left, right = doublets.simulate_doublet_pairs(labels[parents], 60, 0.8, rng)
-    simulated = doublets.sum_doublet_pairs(csr_matrix(counts[parents]), left, right)
     if filtered:
-        detected = np.asarray((simulated > 0).sum(axis=1)).ravel()
+        detected = np.asarray((stores.simulated > 0).sum(axis=1)).ravel()
         assert np.median(detected) > 10
         assert np.any(detected <= 10)
-    query_path = str(tmp_path / "query.zarr")
-    write_doublet_target_zarr(
-        query_path,
-        "RNA",
-        simulated,
-        ids,
-        ids,
-        dtype=str(simulated.dtype),
-        nthreads=1,
-        policy=CountMatrixPolicy(unitBytes=16_384, chunkBytes=1024),
-    )
-    query = DataStore(query_path, default_assay="RNA", nthreads=1)
     result = query.run_mapping(
         reference, query.snapshot_cell_selection("I"), save_k=100
     )
@@ -245,7 +278,7 @@ def test_streamed_doublets_match_materialized_mapping(
         **options,
     )
     np.testing.assert_allclose(repeated, expected, rtol=1e-8, atol=1e-9)
-    with pytest.raises(MemoryError):
+    with pytest.raises(MemoryError, match="operation limit is 1000000 bytes"):
         doublets.score_synthetic_doublets(
             store.RNA,
             reference,

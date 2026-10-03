@@ -2,7 +2,6 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import math
 import threading
-import time
 from typing import Any
 
 import numpy as np
@@ -46,49 +45,49 @@ def _runner(
     return AsyncStorageRunner(operation=operation)
 
 
-def linger_pool_workers(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
-    """Make Scarf's pool workers keep each finished work item for ``seconds``.
-
-    A worker lets go of its work item, with the call and its result, only
-    after it has reported the result, and under CPU contention it can be
-    descheduled in between. The pause makes that happen after every call.
-    """
-    import concurrent.futures.thread as pool_thread
-
-    run = pool_thread._WorkItem.run
-
-    def linger(self: Any, *args: Any, **kwargs: Any) -> None:
-        run(self, *args, **kwargs)
-        if threading.current_thread().name.startswith("scarf-"):
-            time.sleep(seconds)
-
-    monkeypatch.setattr(pool_thread._WorkItem, "run", linger)
-
-
 def test_pool_workers_keep_no_call_or_result_once_it_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import concurrent.futures.thread as pool_thread
     import weakref
 
-    linger_pool_workers(monkeypatch, 0.5)
+    # A worker lets go of its work item, with the call and its result, only
+    # after it has reported the result, and under CPU contention it can be
+    # descheduled in between. Each Scarf worker here holds its finished work
+    # item until the operation has checked what that item still references.
+    run = pool_thread._WorkItem.run
+    holding = threading.Semaphore(0)
+    release = threading.Event()
+
+    def hold(self: Any, *args: Any, **kwargs: Any) -> None:
+        run(self, *args, **kwargs)
+        if threading.current_thread().name.startswith("scarf-"):
+            holding.release()
+            release.wait(10)
+
+    monkeypatch.setattr(pool_thread._WorkItem, "run", hold)
     runner = _runner(ResourceBudget(1024 * 1024, 2))
 
     async def operation(active: AsyncStorageRunner) -> list[bool]:
         freed: list[bool] = []
-        for call in (active.compute, active.offload):
-            captured = np.ones(8)
-            returned = np.ones(8)
-            refs = (weakref.ref(captured), weakref.ref(returned))
-            result = await call(lambda held=captured, value=returned: (held, value)[1])
-            assert result is returned
-            del captured, returned, result
-            # The worker that ran the call still lingers on its work item.
-            freed.extend(ref() is None for ref in refs)
+        try:
+            for call in (active.compute, active.offload):
+                captured = np.ones(8)
+                returned = np.ones(8)
+                refs = (weakref.ref(captured), weakref.ref(returned))
+                result = await call(
+                    lambda held=captured, value=returned: (held, value)[1]
+                )
+                assert result is returned
+                del captured, returned, result
+                # Wait until the worker that ran the call holds its work item.
+                assert holding.acquire(timeout=10)
+                freed.extend(ref() is None for ref in refs)
+        finally:
+            release.set()
         return freed
 
-    started = time.perf_counter()
     assert runner.run(operation) == [True] * 4
-    assert time.perf_counter() - started >= 0.5
 
 
 def test_io_results_do_not_travel_through_the_io_loop_future() -> None:
@@ -615,22 +614,45 @@ def test_byte_ledger_rejects_over_release() -> None:
     asyncio.run(exercise())
 
 
-def test_runner_splits_ledger_wait_from_held_time() -> None:
+def test_runner_splits_ledger_wait_from_held_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import scarf.storage.async_execution as async_execution
+
+    # A manual clock: the holder takes its bytes at 0, the waiter asks for
+    # them at 1, and the holder releases them at 3.
+    clock = [0.0]
+    monkeypatch.setattr(
+        async_execution, "time", SimpleNamespace(perf_counter=lambda: clock[0])
+    )
     runner = _runner(ResourceBudget(100, 2))
 
     async def contend(active: AsyncStorageRunner) -> None:
+        holding = asyncio.Event()
+        waiting = asyncio.Event()
+
         async def hold() -> None:
             async with active.reserve_bytes(80):
-                await asyncio.sleep(0.05)
+                holding.set()
+                await waiting.wait()
+                clock[0] = 3.0
 
         async def wait_for_bytes() -> None:
+            await holding.wait()
+            clock[0] = 1.0
+            waiting.set()
+            # The 80 held bytes leave no room, so this waits for the release.
             async with active.reserve_bytes(80):
                 pass
 
         await asyncio.gather(hold(), wait_for_bytes())
 
     runner.run(contend)
-    assert runner.readerWaitSeconds >= 0.04
+    # Only the two seconds the waiter spent waiting count; the holder's three
+    # seconds of holding its bytes do not.
+    assert runner.readerWaitSeconds == 2.0
 
 
 def test_compute_workers_apply_local_numba_cap() -> None:

@@ -61,7 +61,7 @@ def test_json_bytes_keeps_unicode_and_rejects_nan():
     assert _storage.json_bytes({"label": "café"}) == (
         '{\n  "label": "café"\n}\n'.encode()
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Out of range float values"):
         _storage.json_bytes({"value": float("nan")})
 
 
@@ -353,6 +353,23 @@ def test_retry_gives_up_on_xet_failures_after_three_retries(
 
 def _storage_reset_forbidden() -> None:
     raise AssertionError("Only transient Xet failures replace the session")
+
+
+def test_transient_xet_failure_aborts_the_shared_xet_session(
+    recorded_sleeps, monkeypatch
+):
+    from huggingface_hub.utils import _xet
+
+    aborted = []
+    # The hook huggingface_hub uses after an interrupt; renaming it upstream
+    # makes this patch fail instead of silently skipping the reset.
+    monkeypatch.setattr(_xet, "abort_xet_session", lambda: aborted.append(True))
+    operation, calls = _failing([RuntimeError("Previous task error: reset")])
+
+    assert _storage.retry(operation) == "done"
+    assert aborted == [True]
+    assert calls == [0, 1]
+    assert recorded_sleeps == [60.0]
 
 
 def test_retry_leaves_long_server_waits_to_the_caller(recorded_sleeps):

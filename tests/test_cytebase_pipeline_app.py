@@ -1807,8 +1807,9 @@ def test_process_run_stops_publishing_after_a_periodic_update_fails(
     assert result["error"] == "RuntimeError: catalog unavailable"
     assert result["catalog"] == {"status": "done", "updated": []}
     assert result["successes"] == [CYTEBASE_ID, OTHER_ID]
-    # Known issue: catalog errors end "blocked", never "failed".
-    assert result["state"] != "completed"
+    # Known issue: catalog errors end "blocked", never "failed"; see
+    # test_a_failed_catalog_publication_fails_the_run.
+    assert result["state"] in {"blocked", "failed"}
 
 
 @pytest.mark.parametrize(
@@ -1848,8 +1849,31 @@ def test_run_pipeline_reports_a_failed_catalog_publication(
     assert result["error"] == "RuntimeError: catalog unavailable"
     assert result["datasets"] == datasets
     assert result["failures"] == []
-    # Known issue: catalog errors end "blocked", never "failed".
-    assert result["state"] != "completed"
+    # Known issue: catalog errors end "blocked", never "failed"; see
+    # test_a_failed_catalog_publication_fails_the_run.
+    assert result["state"] in {"blocked", "failed"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="bug: a catalog worker that raised leaves the run blocked, not failed",
+)
+def test_a_failed_catalog_publication_fails_the_run(modal_harness, monkeypatch):
+    _register(modal_harness.hub)
+
+    def run_catalog(request, storage, check):
+        check()
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(pipeline_catalog, "run_catalog", run_catalog)
+    result = modal_harness.run("catalog", {}, run_id=RUN_ID)
+
+    assert result["error"] == "RuntimeError: catalog unavailable"
+    # The worker finished with an error, so its outcome is known: the run's
+    # final-state expression has a "failed" branch for exactly this case.
+    # Every worker exception marks the run uncertain, so it ends "blocked"
+    # and needs a drain-confirmed reset instead.
+    assert result["state"] == "failed"
 
 
 def test_blocked_run_must_be_reset_before_new_work(modal_harness, monkeypatch):

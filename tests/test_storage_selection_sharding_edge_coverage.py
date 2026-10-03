@@ -9,7 +9,7 @@ from zarr.storage import MemoryStore
 import scarf.storage.selections as selections
 import scarf.storage.sharding as sharding
 from scarf.storage.arrays import create_metadata_column, text_value
-from scarf.storage.artifacts import artifact_group
+from scarf.storage.artifacts import artifact_group, fingerprint_strings
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.geometry import ArrayGeometry
@@ -266,7 +266,8 @@ def test_selected_string_fingerprint_supports_object_backed_ids() -> None:
         _BooleanMask([True, True, False]),  # type: ignore[arg-type]
     )
     assert count == 2
-    assert isinstance(digest, str) and len(digest) == 64
+    # Object-backed ids hash as the same selected text in fixed-width form.
+    assert digest == fingerprint_strings(np.array(["a", "long"]))
 
 
 def test_selection_producers_reject_drift_and_invalid_sources(
@@ -358,16 +359,16 @@ def test_snapshot_scalar_and_source_column_contracts() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     table = root.create_group("table")
     table.create_array("value", data=np.arange(3))
-    cases: tuple[Any, ...] = (
-        "value",
-        (),
-        ("",),
-        ("value", "value"),
-        ("path/name",),
-        ("missing",),
+    cases: tuple[tuple[Any, type[Exception], str], ...] = (
+        ("value", TypeError, "must be a sequence of column names"),
+        ((), ValueError, "must not be empty"),
+        (("",), TypeError, "names must be non-empty strings"),
+        (("value", "value"), ValueError, "must be unique"),
+        (("path/name",), ValueError, r"cannot be paths .* \(use 'path_name'\)"),
+        (("missing",), KeyError, "column 'missing' is unavailable in 'table'"),
     )
-    for columns in cases:
-        with pytest.raises((TypeError, ValueError, KeyError)):
+    for columns, error, message in cases:
+        with pytest.raises(error, match=message):
             selections._snapshot_source_columns(
                 table,
                 table_path="table",

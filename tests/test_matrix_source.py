@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ from zarr.codecs import BloscCodec, ZstdCodec
 from zarr.storage import ObjectStore
 
 from scarf.datastore.datastore import DataStore, mount_datastore
-from scarf.storage.artifacts import ArtifactRef, artifact_group
+from scarf.storage.artifacts import ArtifactRef, artifact_group, artifact_path
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import (
@@ -117,11 +118,41 @@ def _snapshot_store_files(path: str) -> dict[str, bytes]:
     }
 
 
+_DEFAULT_VALUES = np.arange(40, dtype=np.uint32).reshape(10, 4)
+
+
+@pytest.fixture(scope="module")
+def default_sources(tmp_path_factory) -> dict[str | None, Path]:
+    """Prepared sources of the default counts, one per workspace layout."""
+    directory = tmp_path_factory.mktemp("default_sources")
+    sources: dict[str | None, Path] = {}
+    for workspace in (None, "analysis"):
+        path = directory / ("root.zarr" if workspace is None else f"{workspace}.zarr")
+        _write_source_store(str(path), workspace=workspace)
+        sources[workspace] = path
+    return sources
+
+
+def _copy_source(
+    default_sources: dict[str | None, Path],
+    location: str | Path,
+    *,
+    workspace: str | None = None,
+) -> np.ndarray:
+    """Copy a prepared default source to ``location`` and return its counts.
+
+    A copy holds the same bytes as a freshly written source, so each test owns
+    a source it may change without the cost of preparing one.
+    """
+    shutil.copytree(default_sources[workspace], location)
+    return _DEFAULT_VALUES.copy()
+
+
 @pytest.mark.parametrize("workspace", [None, "analysis"])
-def test_mount_datastore_creates_and_reopens(tmp_path, workspace):
+def test_mount_datastore_creates_and_reopens(default_sources, tmp_path, workspace):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    values = _write_source_store(source, workspace=workspace)
+    values = _copy_source(default_sources, source, workspace=workspace)
 
     ds = mount_datastore(
         source,
@@ -144,10 +175,10 @@ def test_mount_datastore_creates_and_reopens(tmp_path, workspace):
     assert MATRIX_SOURCE_ATTR in zarr.open_group(target, mode="r").attrs
 
 
-def test_mount_datastore_multiple_assays(tmp_path):
+def test_mount_datastore_multiple_assays(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    rna_values = _write_source_store(source, workspace=None)
+    rna_values = _copy_source(default_sources, source)
     adt_values = np.arange(30, dtype=np.uint32).reshape(10, 3)
     source_root = zarr.open_group(source, mode="r+")
     _write_assay(source_root, None, "ADT", adt_values)
@@ -169,10 +200,10 @@ def test_mount_datastore_multiple_assays(tmp_path):
     assert "counts" not in zarr.open_group(target, mode="r")["ADT"]
 
 
-def test_mount_datastore_does_not_copy_source_pipeline_runs(tmp_path):
+def test_mount_datastore_does_not_copy_source_pipeline_runs(default_sources, tmp_path):
     source = str(tmp_path / "source_with_run.zarr")
     target = str(tmp_path / "target_without_run.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     source_root = zarr.open_group(source, mode="r+")
     source_root.create_group(f"pipeline/runs/{'a' * 64}/stages")
 
@@ -188,9 +219,11 @@ def test_mount_datastore_does_not_copy_source_pipeline_runs(tmp_path):
     assert "pipeline" not in mounted_root
 
 
-def test_mounted_store_reopens_from_another_directory(monkeypatch, tmp_path):
+def test_mounted_store_reopens_from_another_directory(
+    default_sources, monkeypatch, tmp_path
+):
     monkeypatch.chdir(tmp_path)
-    values = _write_source_store("source.zarr", workspace=None)
+    values = _copy_source(default_sources, tmp_path / "source.zarr")
     mount_datastore(
         "source.zarr",
         at="target.zarr",
@@ -212,12 +245,13 @@ def test_mounted_store_reopens_from_another_directory(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("target_kind", ["path", "store"])
 def test_failed_mount_discards_target_and_allows_retry(
+    default_sources,
     monkeypatch,
     tmp_path,
     target_kind,
 ):
     source = str(tmp_path / "source.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     target: str | Store = (
         str(tmp_path / "target.zarr")
         if target_kind == "path"
@@ -246,18 +280,28 @@ def test_failed_mount_discards_target_and_allows_retry(
 
 
 @pytest.mark.parametrize(
-    ("options", "error"),
+    ("options", "error", "message"),
     [
-        ({"zarr_mode": "r"}, ValueError),
-        ({"zarr_loc": "elsewhere.zarr"}, TypeError),
+        (
+            {"zarr_mode": "r"},
+            ValueError,
+            "A mounted datastore is writable and needs zarr_mode 'r\\+', got 'r'",
+        ),
+        (
+            {"zarr_loc": "elsewhere.zarr"},
+            TypeError,
+            "mount_datastore takes the target location through 'at'",
+        ),
     ],
 )
-def test_mount_datastore_rejects_conflicting_options(tmp_path, options, error):
+def test_mount_datastore_rejects_conflicting_options(
+    default_sources, tmp_path, options, error, message
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
 
-    with pytest.raises(error):
+    with pytest.raises(error, match=message):
         mount_datastore(
             source,
             at=target,
@@ -268,17 +312,17 @@ def test_mount_datastore_rejects_conflicting_options(tmp_path, options, error):
     assert not Path(target).exists()
 
 
-def test_mount_datastore_rejects_existing_target(tmp_path):
+def test_mount_datastore_rejects_existing_target(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     mount_datastore(
         source,
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
     )
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError, match="already contains data"):
         mount_datastore(
             source,
             at=target,
@@ -287,12 +331,14 @@ def test_mount_datastore_rejects_existing_target(tmp_path):
         )
 
 
-def test_mount_rejects_overlap_chained_mounts_and_old_contracts(tmp_path):
+def test_mount_rejects_overlap_chained_mounts_and_old_contracts(
+    default_sources, tmp_path
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     chained = str(tmp_path / "chained.zarr")
     required = frozenset({"RNA"})
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     with pytest.raises(ValueError, match="must not overlap"):
         create_matrix_source(source, f"{source}/nested", required_transposes=required)
     assert not Path(f"{source}/nested").exists()
@@ -332,10 +378,10 @@ def test_mount_rejects_overlap_chained_mounts_and_old_contracts(tmp_path):
         resolve_matrix_source(zarr.open_group(target, mode="r"))
 
 
-def test_mounted_store_writes_only_to_target(tmp_path):
+def test_mounted_store_writes_only_to_target(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     source_before = _snapshot_store_files(source)
 
     ds = mount_datastore(
@@ -355,11 +401,12 @@ def test_mounted_store_writes_only_to_target(tmp_path):
 
 
 def test_mount_copies_literal_feature_metadata_and_resets_feature_selection(
+    default_sources,
     tmp_path,
 ):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     source_ds = DataStore(source, default_assay="RNA", min_features_per_cell=1)
     source_ds.RNA.feats.insert(
         "literal_flag",
@@ -533,10 +580,12 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         ("RNA/featureData", "feature"),
     ],
 )
-def test_matrix_source_id_mismatch_fails_closed(tmp_path, group_path, prefix):
+def test_matrix_source_id_mismatch_fails_closed(
+    default_sources, tmp_path, group_path, prefix
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace=None
     )
@@ -566,13 +615,14 @@ def test_matrix_source_id_mismatch_fails_closed(tmp_path, group_path, prefix):
     ],
 )
 def test_matrix_source_count_identity_mismatch_fails_closed(
+    default_sources,
     tmp_path,
     shape,
     dtype,
 ):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace=None
     )
@@ -589,35 +639,34 @@ def test_matrix_source_count_identity_mismatch_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("parent_path", "name", "error_type"),
+    ("parent_path", "name", "error_type", "message"),
     [
-        ("", "cellData", KeyError),
-        ("RNA", "featureData", KeyError),
-        ("RNA", "counts", ValueError),
+        ("", "cellData", KeyError, "'cellData'"),
+        ("RNA", "featureData", KeyError, "'featureData'"),
+        ("RNA", "counts", ValueError, "Raw counts are missing"),
     ],
 )
-def test_invalid_source_does_not_create_target(tmp_path, parent_path, name, error_type):
+def test_invalid_source_does_not_create_target(
+    default_sources, tmp_path, parent_path, name, error_type, message
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     source_root = zarr.open_group(source, mode="r+")
     parent = source_root if not parent_path else source_root[parent_path]
     del parent[name]
 
-    with pytest.raises(error_type):
+    with pytest.raises(error_type, match=message):
         create_matrix_source(
             source, target, required_transposes=frozenset({"RNA"}), workspace=None
         )
     assert not Path(target).exists()
 
 
-def test_matrix_source_dataset_fingerprint_fast_path(tmp_path):
+def test_matrix_source_dataset_fingerprint_fast_path(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(
-        source,
-        workspace=None,
-    )
+    _copy_source(default_sources, source)
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace=None
     )
@@ -634,10 +683,12 @@ def test_matrix_source_dataset_fingerprint_fast_path(tmp_path):
         resolve_matrix_source(zarr.open_group(target, mode="r"))
 
 
-def test_dataset_fingerprint_fast_path_reads_no_identifiers(monkeypatch, tmp_path):
+def test_dataset_fingerprint_fast_path_reads_no_identifiers(
+    default_sources, monkeypatch, tmp_path
+):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace=None
     )
@@ -654,10 +705,10 @@ def test_dataset_fingerprint_fast_path_reads_no_identifiers(monkeypatch, tmp_pat
     assert workspace is None
 
 
-def test_source_open_does_not_change_target_profile(tmp_path):
+def test_source_open_does_not_change_target_profile(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
 
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace=None
@@ -666,9 +717,9 @@ def test_source_open_does_not_change_target_profile(tmp_path):
     assert isinstance(target_ids.compressors[0], BloscCodec)
 
 
-def test_mount_profile_applies_to_store_target(tmp_path):
+def test_mount_profile_applies_to_store_target(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
-    _write_source_store(source, workspace=None)
+    _copy_source(default_sources, source)
     target_store = ObjectStore(store=ObjectMemoryStore())
 
     ds = mount_datastore(
@@ -740,10 +791,10 @@ def test_mounted_datastore_reads_remote_counts_and_persists_summary_locally(
     assert not any(name.startswith("summary_stats_") for name in target_assay.keys())
 
 
-def test_workspace_mismatch_raises(tmp_path):
+def test_workspace_mismatch_raises(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
-    _write_source_store(source, workspace="analysis")
+    _copy_source(default_sources, source, workspace="analysis")
     create_matrix_source(
         source, target, required_transposes=frozenset({"RNA"}), workspace="analysis"
     )
@@ -780,11 +831,19 @@ def test_mounted_store_normalization_and_graph(tmp_path):
     assert "counts" not in zarr.open_group(target, mode="r")["RNA"]
 
 
-def test_mounted_store_build_mapping_reference(datastore_zarr_root, tmp_path):
+def test_mounted_store_build_mapping_reference(tmp_path):
+    source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "mounted.zarr")
-    source_before = _snapshot_store_files(datastore_zarr_root)
+    # Three groups of 40 cells, each with 20 highly expressed genes of its own.
+    groups = np.arange(120) % 3
+    rates = np.ones((3, 200))
+    for group in range(3):
+        rates[group, group * 20 : group * 20 + 20] = 6.0
+    values = np.random.default_rng(0).poisson(rates[groups]).astype(np.uint32)
+    _write_source_store(source, workspace=None, values=values)
+    source_before = _snapshot_store_files(source)
     ds = mount_datastore(
-        datastore_zarr_root,
+        source,
         at=target,
         default_assay="RNA",
     )
@@ -805,6 +864,11 @@ def test_mounted_store_build_mapping_reference(datastore_zarr_root, tmp_path):
     reference_ref = ds.build_mapping_reference(neighbors)
     reference = ds.get_mapping_reference(reference_ref)
     assert reference.method == "pca"
-    assert reference.dataset_fingerprint
+    # The reference binds the source's identity and is written to the target.
+    assert (
+        reference.dataset_fingerprint
+        == zarr.open_group(source, mode="r")["RNA"].attrs["dataset_fingerprint"]
+    )
+    assert (Path(target) / artifact_path(reference_ref)).is_dir()
     assert "counts" not in zarr.open_group(target, mode="r")["RNA"]
-    assert _snapshot_store_files(datastore_zarr_root) == source_before
+    assert _snapshot_store_files(source) == source_before

@@ -1,6 +1,8 @@
+import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from profiling.config import (
     CONSUME_STAGE_ORDER,
@@ -216,18 +218,48 @@ def test_stage_run_result_json_shape():
         submissionId="testsubmission",
     )
     payload = result.to_json()
-    assert payload["stage"] == "reopenStore"
-    assert payload["nRows"] == 10_000
-    assert payload["status"] == "ok"
-    assert payload["seconds"] == 1.25
-    assert payload["modalCpuRequest"] == 4.0
-    assert payload["modalCpuLimit"] == 4.0
-    assert payload["rssBaselineBytes"] == 512
-    assert payload["rssIncrementalPeakBytes"] == 512
-    assert payload["rssAfterBytes"] == 768
-    assert payload["cgroupCurrentAfterBytes"] == 1536
-    assert payload["operationPeakSource"] == "cgroupMemoryCurrent"
-    assert payload["cgroupPeakScope"] == "operation"
+    # The persisted result schema: every key, with unset measurements as null.
+    assert payload == {
+        "submissionId": "testsubmission",
+        "stage": "reopenStore",
+        "nRows": 10_000,
+        "status": "ok",
+        "seconds": 1.25,
+        "peakRssBytes": 1024,
+        "peakCgroupBytes": 2048,
+        "modalMemoryMb": 20480,
+        "scarfMemoryBudget": 12884901888,
+        "storeUri": "s3://bucket/stores/10000.zarr",
+        "error": None,
+        "inputSetupSeconds": None,
+        "validationPersistenceSeconds": None,
+        "wholeFunctionSeconds": None,
+        "modalCpuRequest": 4.0,
+        "modalCpuLimit": 4.0,
+        "rssBaselineBytes": 512,
+        "rssIncrementalPeakBytes": 512,
+        "rssAfterBytes": 768,
+        "cgroupCurrentBaselineBytes": 1024,
+        "cgroupCurrentPeakBytes": 2048,
+        "cgroupCurrentAfterBytes": 1536,
+        "operationBaselineBytes": 1024,
+        "operationIncrementalPeakBytes": 1024,
+        "operationPeakSource": "cgroupMemoryCurrent",
+        "cgroupPeakScope": "operation",
+        "processCpuSeconds": None,
+        "childCpuSeconds": None,
+        "workers": None,
+        "cpuQuotaCores": None,
+        "memoryMaxBytes": None,
+        "memoryEventsDelta": None,
+        "utilization": None,
+        "details": None,
+        "provenance": None,
+        "datasetUri": None,
+        "datasetETag": None,
+        "datasetBytes": None,
+    }
+    assert json.loads(json.dumps(payload)) == payload
 
 
 def test_selected_stage_graph_is_available_and_rejects_gaps() -> None:
@@ -240,7 +272,7 @@ def test_selected_stage_graph_is_available_and_rejects_gaps() -> None:
     assert selected.effectiveStages == SELECTED_STAGE_ORDER
     payload = config.model_dump(mode="python")
     payload["stages"] = ("filterCells", "importClusters")
-    with pytest.raises(ValueError, match="requires"):
+    with pytest.raises(ValueError, match="filterCells requires reopenStore"):
         ProfilingConfig.model_validate(payload)
 
 
@@ -280,10 +312,24 @@ def test_consume_stages_preserve_pipeline_validation(
         ProfilingConfig.model_validate(payload)
 
 
-def test_partial_storage_io_is_rejected() -> None:
-    from profiling.config import ProfilingConfig
-
+@pytest.mark.parametrize("field", ["readWorkers", "computeWorkers", "writeWorkers"])
+@pytest.mark.parametrize("workers", [0, -1])
+def test_storage_io_worker_counts_must_be_positive(field: str, workers: int) -> None:
     payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
-    payload["storageIo"] = {"readWorkers": 0}
-    with pytest.raises(Exception):
+    payload["storageIo"] = {field: workers}
+    with pytest.raises(ValidationError, match=f"{field} must be positive when set"):
         ProfilingConfig.model_validate(payload)
+
+
+def test_partial_storage_io_leaves_other_worker_counts_to_scarf() -> None:
+    payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
+    payload["storageIo"] = {"readWorkers": 2}
+
+    storage_io = ProfilingConfig.model_validate(payload).storageIo
+
+    assert storage_io is not None
+    assert storage_io.model_dump() == {
+        "readWorkers": 2,
+        "computeWorkers": None,
+        "writeWorkers": None,
+    }

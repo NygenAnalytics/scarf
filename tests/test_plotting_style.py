@@ -16,9 +16,37 @@ from scarf.plotting._style import (
 )
 
 
-@pytest.mark.parametrize("size", [5, 15, 25, 50, 110])
-def test_palette_for_n_returns_requested_colors(size):
-    assert len(palette_for_n(size)) == size
+@pytest.mark.parametrize(
+    ("size", "index", "color"),
+    [
+        # Up to 10 categories use tab10, then tab20, then 28 and 102 color
+        # tables, and husl beyond those.
+        (10, 1, "#ff7f0e"),
+        (11, 1, "#aec7e8"),
+        (20, 19, "#9edae5"),
+        (21, 0, "#023fa5"),
+        (28, 27, "#336600"),
+        (29, 0, "#FFFF00"),
+        (102, 101, "#324E72"),
+    ],
+)
+def test_palette_for_n_switches_tables_at_their_sizes(size, index, color):
+    colors = palette_for_n(size)
+
+    assert len(colors) == size
+    assert len(set(colors)) == size
+    assert colors[index] == color
+
+
+def test_palette_for_n_falls_back_to_evenly_spaced_hues():
+    import seaborn as sns
+
+    assert palette_for_n(103) == sns.color_palette("husl", n_colors=103).as_hex()
+    assert palette_for_n(12, palette_name="colorblind")[:2] == ["#0072B2", "#E69F00"]
+    assert (
+        palette_for_n(13, palette_name="colorblind")
+        == sns.color_palette("husl", n_colors=13).as_hex()
+    )
 
 
 @pytest.mark.parametrize("palette_name", ["default", "colorblind"])
@@ -31,8 +59,8 @@ def test_palette_for_n_never_recycles_colors(size, palette_name):
 def test_side_legend_columns_stay_page_sized():
     from scarf.plotting._style import LEGEND_SIDE_MAX_COLUMNS, legend_side_columns
 
-    assert legend_side_columns(1) == 1
-    assert legend_side_columns(40) == 2
+    # One column holds up to 20 entries.
+    assert [legend_side_columns(n) for n in (1, 20, 21, 40, 41)] == [1, 1, 2, 2, 3]
     assert legend_side_columns(5_000) == LEGEND_SIDE_MAX_COLUMNS
 
 
@@ -45,7 +73,11 @@ def test_categorical_color_map_validates_custom_palette():
 def test_continuous_norm_supports_center_and_validates_bounds():
     _, mpl = require_matplotlib()
     norm = continuous_norm(mpl, vmin=-2, vmax=3, vcenter=0)
-    assert norm.__class__.__name__ == "TwoSlopeNorm"
+    assert isinstance(norm, mpl.colors.TwoSlopeNorm)
+    # Each side of the centre maps linearly onto its half of the colormap.
+    np.testing.assert_allclose(
+        norm(np.array([-2.0, -1.0, 0.0, 1.5, 3.0])), [0.0, 0.25, 0.5, 0.75, 1.0]
+    )
     with pytest.raises(ValueError, match="vcenter"):
         continuous_norm(mpl, vmin=0, vmax=3, vcenter=4)
 
@@ -68,27 +100,31 @@ def test_generated_palette_and_flat_norm_edge_cases():
 
 
 def test_square_axis_limits_and_dark_theme():
+    from matplotlib.colors import to_rgba
+
     from scarf.plotting._style import (
         apply_figure_chrome,
         square_axis_limits,
         scatter_edgecolor,
-        THEMES,
     )
 
-    xlim, ylim = square_axis_limits((0.0, 2.0), (-1.0, 0.0))
-    assert xlim[1] - xlim[0] == pytest.approx(ylim[1] - ylim[0])
+    # The shorter axis widens around its centre to the longer span.
+    assert square_axis_limits((0.0, 2.0), (-1.0, 0.0)) == (
+        pytest.approx((0.0, 2.0)),
+        pytest.approx((-1.5, 0.5)),
+    )
     assert scatter_edgecolor("dark") == "#8f8f8f"
-    assert THEMES["notebook"]["figure.facecolor"] == "white"
-    assert THEMES["paper"]["savefig.transparent"] is False
-    assert THEMES["dark"]["text.color"] == "#e8e8e8"
+    assert scatter_edgecolor("notebook") == "#333333"
     with theme_context("dark"):
         _, mpl = require_matplotlib()
         assert mpl.rcParams["axes.edgecolor"] == "#e8e8e8"
     plt, _ = require_matplotlib()
     fig, ax = plt.subplots(1, 1)
     apply_figure_chrome(fig, "notebook")
-    assert fig.patch.get_alpha() == 1.0
+    assert fig.patch.get_facecolor() == to_rgba("white")
     assert ax.patch.get_alpha() == 1.0
+    assert not ax.spines["top"].get_visible()
+    assert not ax.spines["right"].get_visible()
     apply_figure_chrome(fig, "dark")
     assert fig.patch.get_alpha() == 0
     plt.close(fig)
@@ -213,14 +249,15 @@ def test_color_limits_share_one_policy():
 
 def test_continuous_norm_follows_color_scale_scale():
     _, mpl = require_matplotlib()
-    assert isinstance(
-        continuous_norm(mpl, vmin=1.0, vmax=10.0, vcenter=None, scale="log"),
-        mpl.colors.LogNorm,
-    )
-    assert isinstance(
-        continuous_norm(mpl, vmin=-1.0, vmax=10.0, vcenter=None, scale="symlog"),
-        mpl.colors.SymLogNorm,
-    )
+    log = continuous_norm(mpl, vmin=1.0, vmax=10.0, vcenter=None, scale="log")
+    assert isinstance(log, mpl.colors.LogNorm)
+    # The geometric midpoint of [1, 10] maps to the middle of the colormap.
+    assert log(10**0.5) == pytest.approx(0.5)
+    symlog = continuous_norm(mpl, vmin=-1.0, vmax=10.0, vcenter=None, scale="symlog")
+    assert isinstance(symlog, mpl.colors.SymLogNorm)
+    # The linear region spans 0.1% of the larger absolute limit.
+    assert symlog.linthresh == pytest.approx(0.011)
+    assert (symlog.vmin, symlog.vmax) == (-1.0, 10.0)
     with pytest.raises(ValueError, match="positive values"):
         continuous_norm(mpl, vmin=0.0, vmax=10.0, vcenter=None, scale="log")
 
@@ -254,7 +291,7 @@ def test_category_scale_shows_observed_categories_with_stable_colors():
 def test_missing_categories_include_nulls_but_not_containers():
     import pandas as pd
 
-    from scarf.plotting._style import _is_missing_category
+    from scarf.plotting._style import _is_missing_category, resolve_category_scale
 
     assert _is_missing_category(None)
     assert _is_missing_category(float("nan"))
@@ -262,6 +299,12 @@ def test_missing_categories_include_nulls_but_not_containers():
     assert not _is_missing_category("a")
     # A sequence label has no single missingness answer.
     assert not _is_missing_category((1, None))
+    assert not _is_missing_category([1, None])
+    assert not _is_missing_category(np.array([np.nan, np.nan]))
+
+    labels = np.empty(3, dtype=object)
+    labels[:] = [("a", 1), None, ("b", 2)]
+    assert resolve_category_scale(labels, None).order == (("a", 1), ("b", 2))
 
 
 def test_padded_square_limits_and_colormap_palette():
@@ -271,8 +314,9 @@ def test_padded_square_limits_and_colormap_palette():
         np.array([0.0, 10.0, np.nan]),
         np.array([0.0, 2.0, 5.0]),
     )
+    # Only rows finite on both axes count: x spans [0, 10], y spans [0, 2].
     assert xlim == pytest.approx((-0.5, 10.5))
-    assert ylim[1] - ylim[0] == pytest.approx(11.0)
+    assert ylim == pytest.approx((-4.5, 6.5))
     with pytest.raises(ValueError, match="No finite coordinates"):
         padded_square_limits(np.array([np.nan]), np.array([1.0]))
     with pytest.raises(ValueError, match="matching shapes"):
@@ -374,12 +418,24 @@ def test_density_and_legend_helpers():
     )
     from scarf.utils.arrays import sort_categories
 
-    assert default_point_size(100) > default_point_size(20_000)
-    assert default_point_edgewidth(500) > 0
+    # Size 16 at 1000 cells on a 3.2 inch panel shrinks with sqrt(cells) and
+    # grows with panel area to the 0.72 power, within [2, 28].
+    assert default_point_size(1000) == pytest.approx(16.0)
+    assert default_point_size(4000) == pytest.approx(8.0)
+    assert default_point_size(20_000) == pytest.approx(16 * 0.05**0.5)
+    assert default_point_size(1000, panel_area=3.2**2 / 4) == pytest.approx(
+        16 * 0.25**0.72
+    )
+    assert default_point_size(100) == pytest.approx(28.0)
+    assert default_point_edgewidth(500) == pytest.approx(0.15)
     assert default_point_edgewidth(20_000) == 0.0
-    assert resolve_legend_loc(8) == "right"
-    assert resolve_legend_loc(20) == "on_data"
-    assert resolve_legend_loc(80) == "right"
+    # On-data labels serve 13 to 40 categories.
+    assert [resolve_legend_loc(n) for n in (12, 13, 40, 41)] == [
+        "right",
+        "on_data",
+        "on_data",
+        "right",
+    ]
     assert resolve_legend_loc(20, "right") == "right"
     assert capped_figsize(20.0, 4.0)[0] == pytest.approx(7.5)
     assert sort_categories([1, 10, 2, "B", "A10", "A2"]) == [
@@ -414,38 +470,58 @@ def test_sort_categories_handles_numpy_booleans_and_missing_values():
     assert np.isnan(ordered[-1])
 
 
-def test_embedding_on_data_legend(umap, leiden_clustering, datastore):
+def test_embedding_on_data_legend():
+    from types import SimpleNamespace
+
+    class Cells:
+        def __init__(self, **columns):
+            self._columns = {name: np.asarray(value) for name, value in columns.items()}
+            self.columns = tuple(self._columns)
+            self.N = 15
+
+        def fetch(self, column, key="I"):
+            return self._columns[column]
+
+        def fetch_all(self, column):
+            return self._columns[column]
+
+        def active_index(self, key="I"):
+            return np.arange(self.N)
+
+    offset = np.tile([0.0, 0.1, 0.2, 0.3, 0.4], 3)
+    store = SimpleNamespace(
+        cells=Cells(
+            I=np.ones(15, dtype=bool),
+            UMAP1=np.repeat([0.0, 10.0, 20.0], 5) + offset,
+            UMAP2=np.repeat([0.0, 10.0, 5.0], 5) + offset,
+            cluster=np.repeat(["c1", "c2", "c10"], 5).astype(object),
+        ),
+        _defaultAssay="RNA",
+        zw=None,
+        _stored_display_metadata=lambda _column: None,
+    )
+
     result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by=leiden_clustering,
+        store,
+        layout_key="UMAP",
+        color_by="cluster",
         legend_loc="on_data",
         frame="none",
         show=False,
     )
-    ax = next(iter(result.axes.values()))
+
+    ax = result.axes["cluster"]
+    # One label per category at its cells' median, placed from the lowest up.
+    assert [(text.get_text(), text.get_position()) for text in ax.texts] == [
+        ("c1", pytest.approx((0.2, 0.2))),
+        ("c10", pytest.approx((20.2, 5.2))),
+        ("c2", pytest.approx((10.2, 10.2))),
+    ]
+    assert ax.get_legend() is None
+    assert not result.figure.legends
     assert ax.get_xlabel() == ""
     assert ax.get_ylabel() == ""
-    assert len(ax.texts) >= 1
-    assert not result.figure.legends
-    result.close()
-
-
-def test_embedding_panel_is_square(umap, leiden_clustering, datastore):
-    result = splt.embedding(
-        datastore,
-        layout=umap,
-        color_by=leiden_clustering,
-        show=False,
-    )
-    ax = next(iter(result.axes.values()))
-    result.figure.canvas.draw()
-    bbox = ax.get_window_extent()
-    assert ax.get_box_aspect() == pytest.approx(1.0)
-    assert bbox.width == pytest.approx(bbox.height, rel=1e-3)
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    assert (xlim[1] - xlim[0]) == pytest.approx(ylim[1] - ylim[0])
+    assert not any(spine.get_visible() for spine in ax.spines.values())
     result.close()
 
 

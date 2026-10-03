@@ -2,22 +2,18 @@
 
 from copy import deepcopy
 from types import SimpleNamespace
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
-from scarf.agent.evidence import inspect_source, open_store
 from scarf.agent.execution import (
     execute_pipeline,
-    finalist_evidence,
     summarize_candidate,
     validate_harmony,
     _doublet_concentration,
 )
 from scarf.agent.models import AnalysisConfig, Candidate
-from tests.test_agent_evidence import runtime, study
 
 
 def test_pipeline_adapter_uses_explicit_recipe_without_optional_work() -> None:
@@ -100,20 +96,34 @@ def test_harmony_accepts_only_complete_matched_improvement() -> None:
 
 
 @pytest.mark.parametrize(
-    "damage",
+    ("damage", "reason"),
     [
-        "cells",
-        "features",
-        "resolution",
-        "missing",
-        "doublet",
-        "biology",
-        "marker",
-        "sample",
-        "other_batch",
+        ("cells", "Correction finalists do not share the exact selection artifact."),
+        ("features", "Correction finalists do not share the exact features artifact."),
+        ("resolution", "Correction finalists differ in settings or resolution."),
+        (
+            "missing",
+            "Matched doubletHighScoreConcentration evidence is unavailable.",
+        ),
+        (
+            "doublet",
+            "Doublet high-score concentration increased by more than 0.05 after correction.",
+        ),
+        (
+            "biology",
+            "Biological protection cLISI worsened by more than 0.05 for condition.",
+        ),
+        (
+            "marker",
+            "markerSupportFraction worsened by more than 0.05 after correction.",
+        ),
+        ("sample", "crossUnitSupport worsened by more than 0.05 after correction."),
+        ("other_batch", "Batch mixing worsened by more than 0.05 for other."),
     ],
 )
-def test_harmony_rejects_mismatch_missing_evidence_and_harm(damage: str) -> None:
+def test_harmony_rejects_mismatch_missing_evidence_and_harm(
+    damage: str, reason: str
+) -> None:
     native, corrected = _matched()
     if damage == "cells":
         corrected["selection"] = {"artifact_id": "different"}
@@ -134,7 +144,8 @@ def test_harmony_rejects_mismatch_missing_evidence_and_harm(damage: str) -> None
     else:
         native["metrics"]["mixing"]["other"] = 0.8
         corrected["metrics"]["mixing"]["other"] = 0.7
-    assert validate_harmony(native, corrected)
+    # The matched pair is otherwise admissible, so exactly one gate fails.
+    assert validate_harmony(native, corrected) == [reason]
 
 
 def test_doublet_metric_uses_cohort_top_decile_without_a_probability_threshold() -> (
@@ -214,51 +225,3 @@ def test_candidate_summary_caps_silhouette_and_preserves_unscoreable_partitions(
     assert len(evidence["partitions"]) == 1
     assert evidence["partitions"][0]["score"] == (None if unscoreable else 0.3)
     assert bool(evidence["limitations"]) is unscoreable
-
-
-@pytest.mark.slow
-def test_real_pipeline_screen_finalist_and_final_share_exact_scientific_artifacts(
-    agent_rna_source: Path,
-) -> None:
-    source = agent_rna_source
-    config = AnalysisConfig(
-        hvgCount=20, pcaDims=3, neighborsK=5, resolutions=(0.5, 1.0)
-    )
-    supplied = study(protectedColumns=["condition"])
-    prepared = inspect_source(source, supplied, config, runtime())
-    store = open_store(source, config, runtime(), writable=True)
-    candidate = Candidate(candidateId="c0", hvgCount=20, pcaDims=3, neighborsK=5)
-    screen = execute_pipeline(store, prepared, candidate, config, label="screen")
-    evidence = summarize_candidate(store, screen, candidate, prepared, config)
-    assert {item["optionId"] for item in evidence["partitions"]} == {"c0:r0.5", "c0:r1"}
-    assert all(row["count"] == 120 for row in evidence["partitions"])
-    finalist = execute_pipeline(
-        store,
-        prepared,
-        candidate,
-        config,
-        label="finalist",
-        resolution=0.5,
-        markers=True,
-    )
-    markers = finalist_evidence(store, finalist, candidate, prepared, config)
-    assert sum(group["count"] for group in markers["clusters"]) == 120
-    assert markers["diagnosticScope"]["sampleCells"] == 120
-    assert markers["metrics"]["protection"]["condition"]["cLISI"] is not None
-    assert set(group["clusterId"] for group in markers["clusters"]) == set(
-        finalist.cells.fetch("clusters").astype(str)
-    )
-    assert markers["selection"] == evidence["selection"]
-    # Reopening a completed computation uses core artifact reuse, not an
-    # agent-owned cache or private Zarr orchestration hierarchy.
-    repeated = execute_pipeline(
-        store,
-        prepared,
-        candidate,
-        config,
-        label="repeated",
-        resolution=0.5,
-        markers=True,
-    )
-    for field in ("analysis_cell_selection", "clusters", "markers"):
-        assert repeated[field] == finalist[field]

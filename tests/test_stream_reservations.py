@@ -250,8 +250,8 @@ def test_hvg_feature_statistics_reserve_their_totals_and_partials(
     tmp_path: Any,
 ) -> None:
     rng = np.random.default_rng(0)
-    values = rng.poisson(0.15, size=(200_000, 64)).astype(np.uint16)
-    assay = _hvg_store(tmp_path, values, nthreads=4, mem_budget="12M").RNA
+    values = rng.poisson(0.15, size=(100_000, 64)).astype(np.uint16)
+    assay = _hvg_store(tmp_path, values, nthreads=4, mem_budget="6M").RNA
     cells = np.arange(values.shape[0], dtype=np.int64)
     features = np.arange(values.shape[1], dtype=np.int64)
 
@@ -260,9 +260,10 @@ def test_hvg_feature_statistics_reserve_their_totals_and_partials(
     )
 
     (plan,) = [report.plan for report in reports]
-    # The inverse totals of 200,000 cells, the 80 bands' partial statistics,
-    # and the stream's band indices stay for the whole stream.
-    assert plan.residentBytes > 200_000 * 8 + 80 * 64 * 3 * 8 + 200_000 * 16
+    # The inverse totals of 100,000 cells, the partial statistics of the 40
+    # bands of 2,500 cells, and the stream's band indices stay for the whole
+    # stream, about two fifths of the budget.
+    assert plan.residentBytes > 100_000 * 8 + 40 * 64 * 3 * 8 + 100_000 * 16
     assert traced <= plan.reservedBytes <= assay.resources.memoryBytes
     normalized = values / values.sum(axis=1, keepdims=True).clip(1) * assay.sf
     np.testing.assert_allclose(stats["normed_tot"], normalized.sum(axis=0))

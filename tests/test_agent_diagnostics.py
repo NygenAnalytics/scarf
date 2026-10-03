@@ -304,6 +304,52 @@ def test_equal_resolution_comparison_handles_label_permutations_and_splits() -> 
         compare_candidates(None, parent, split, baseline, probe, config)
 
 
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("unfinished", "require completed pipelines"),
+        ("reordered", "cell ordering differs"),
+        ("truncated", "partition lengths differ"),
+    ],
+)
+def test_comparison_refuses_unfinished_reordered_or_misaligned_partitions(
+    damage: str, message: str
+) -> None:
+    selection = SimpleNamespace(to_dict=lambda: {"artifact_id": "same"})
+
+    class Run(dict[str, Any]):
+        status = "completed"
+        run_id = "test-comparison"
+
+        def __init__(self, ids: np.ndarray, labels: np.ndarray) -> None:
+            super().__init__(
+                {"analysis_cell_selection": selection, "leiden_0.5": "partition"}
+            )
+            columns = {"ids": ids, "leiden_0.5": labels}
+            self.cells = SimpleNamespace(fetch=columns.__getitem__)
+
+    ids = np.arange(8)
+    labels = np.repeat(["a", "b"], 4)
+    parent = Run(ids, labels)
+    if damage == "unfinished":
+        probe = Run(ids, labels)
+        probe.status = "failed"
+    elif damage == "reordered":
+        probe = Run(ids[::-1], labels)
+    else:
+        probe = Run(ids, labels[:-1])
+    baseline = Candidate(candidateId="c0", hvgCount=10, pcaDims=3, neighborsK=3)
+    candidate = baseline.model_copy(update={"candidateId": "c1", "parentId": "c0"})
+    config = AnalysisConfig(resolutions=(0.5,))
+    with pytest.raises(AnalysisInputError, match=message):
+        compare_candidates(None, parent, probe, baseline, candidate, config)
+    # The same comparison is accepted once the runs are aligned and complete.
+    aligned = compare_candidates(
+        None, parent, Run(ids, labels), baseline, candidate, config
+    )
+    assert aligned[0]["adjustedRandIndex"] == 1.0
+
+
 @pytest.fixture
 def diagnostic_artifacts() -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
     """Public artifact views with independent cell and feature axes."""

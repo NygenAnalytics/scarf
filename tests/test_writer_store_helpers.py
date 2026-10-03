@@ -129,3 +129,35 @@ def test_row_block_fingerprints_ignore_blocking_and_reject_non_finite() -> None:
     values[2, 1] = np.inf
     with pytest.raises(ValueError, match="Payload contains non-finite values"):
         fingerprint_row_blocks([values], values.shape, values.dtype, label="Payload")
+
+
+def test_create_zarr_obj_array_writes_metadata_columns_from_the_writers_facade():
+    from zarr.errors import ContainsArrayError
+
+    from scarf.writers import create_zarr_obj_array
+
+    group = _group()
+    labels = create_zarr_obj_array(
+        group, "labels", np.asarray([b"a", b"bbb", b"cc"]), chunk_size=2
+    )
+    # Byte strings are decoded and stored at the width of the longest value.
+    assert labels.dtype == np.dtype("U3")
+    assert labels.chunks == (2,)
+    np.testing.assert_array_equal(group["labels"][:], ["a", "bbb", "cc"])
+
+    counts = create_zarr_obj_array(group, "counts", np.asarray([1, 2]), np.int64)
+    assert counts.dtype == np.dtype(np.int64)
+    np.testing.assert_array_equal(group["counts"][:], [1, 2])
+
+    empty = create_zarr_obj_array(
+        group, "scores", None, np.float32, chunk_size=2, shape=3
+    )
+    assert (empty.shape, empty.chunks, empty.dtype) == ((3,), (2,), np.float32)
+    with pytest.raises(ValueError, match="shape is required when data is None"):
+        create_zarr_obj_array(group, "unsized", None, np.float32)
+
+    with pytest.raises(ContainsArrayError):
+        create_zarr_obj_array(group, "labels", np.asarray(["x"]), overwrite=False)
+    np.testing.assert_array_equal(group["labels"][:], ["a", "bbb", "cc"])
+    create_zarr_obj_array(group, "labels", np.asarray(["x"]))
+    np.testing.assert_array_equal(group["labels"][:], ["x"])

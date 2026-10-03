@@ -1,6 +1,7 @@
 """Offline tests for the Cytebase deployment command."""
 
 import os
+import runpy
 import sys
 from types import SimpleNamespace
 
@@ -97,6 +98,25 @@ def test_deploy_returns_the_modal_exit_code(monkeypatch):
         lambda *_args, **_kwargs: SimpleNamespace(returncode=2),
     )
     assert deploy.main([]) == 2
+
+
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules:RuntimeWarning")
+def test_running_the_module_exits_with_the_modal_exit_code(monkeypatch, capsys):
+    calls = []
+
+    def fake_run(command, *, env, check):
+        calls.append(command)
+        return SimpleNamespace(returncode=3)
+
+    monkeypatch.setattr(deploy.subprocess, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["deploy", "--env", "staging"])
+
+    with pytest.raises(SystemExit) as exited:
+        runpy.run_module(deploy.__name__, run_name="__main__")
+
+    assert exited.value.code == 3
+    assert calls == [[*MODAL_DEPLOY, "--env", "staging", "-m", APP_MODULE]]
+    assert capsys.readouterr().err.startswith("CYTEBASE_BUCKET_KEY=CYTEBASE_BUCKET ")
 
 
 def test_deploy_command_matches_the_modal_cli():

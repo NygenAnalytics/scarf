@@ -66,7 +66,7 @@ def test_diffusion_loading_validates_and_builds_from_one_read_per_array(monkeypa
         return original(array, key)
 
     monkeypatch.setattr(zarr.Array, "__getitem__", read)
-    with pytest.raises(MemoryError):
+    with pytest.raises(MemoryError, match="exceed the memory budget"):
         load_diffusion_payload(root, n_cells=3, memory_bytes=1)
     assert reads == []
     operator = load_diffusion_payload(root, n_cells=3, memory_bytes=4096)

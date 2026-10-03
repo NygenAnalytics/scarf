@@ -312,33 +312,162 @@ def test_silhouette_is_skipped_when_the_cap_starves_clusters(max_silhouette_cell
 
 
 @pytest.mark.parametrize(
-    ("coordinates", "clusterings", "kwargs", "message"),
+    ("coordinates", "clusterings", "kwargs", "error", "message"),
     [
-        (np.ones(4), {"labels": np.arange(4)}, {}, "two-dimensional"),
-        (np.ones((4, 2)), {"labels": np.arange(3)}, {}, "coordinate rows"),
+        (np.ones(4), {"labels": np.arange(4)}, {}, ValueError, "two-dimensional"),
+        (
+            np.ones((0, 2)),
+            {"labels": np.arange(0)},
+            {},
+            ValueError,
+            "must contain cells and dimensions",
+        ),
+        (
+            np.ones((4, 0)),
+            {"labels": np.arange(4)},
+            {},
+            ValueError,
+            "must contain cells and dimensions",
+        ),
+        (np.ones((4, 2)), {"labels": np.arange(3)}, {}, ValueError, "coordinate rows"),
         (
             np.ones((4, 2)),
             {"labels": np.asarray([0, 0, 1, np.nan])},
             {},
+            ValueError,
             "missing values",
+        ),
+        (
+            np.ones((4, 2)),
+            {"labels": np.zeros((4, 1))},
+            {},
+            ValueError,
+            "must be one-dimensional",
+        ),
+        (np.ones((4, 2)), [np.arange(4)], {}, TypeError, "must be a mapping"),
+        (np.ones((4, 2)), {}, {}, ValueError, "clusterings must be non-empty"),
+        (
+            np.ones((4, 2)),
+            {"": np.arange(4)},
+            {},
+            TypeError,
+            "names must be non-empty strings",
+        ),
+        (
+            np.ones((4, 2)),
+            {3: np.arange(4)},
+            {},
+            TypeError,
+            "names must be non-empty strings",
         ),
         (
             np.asarray([[0.0], [1.0], [np.inf], [2.0]]),
             {"labels": np.asarray([0, 0, 1, 1])},
             {},
+            ValueError,
             "finite values",
         ),
         (
             np.ones((4, 2)),
             {"labels": np.arange(4)},
             {"n_folds": 1},
+            ValueError,
             "at least 2",
+        ),
+        (
+            np.ones((4, 2)),
+            {"labels": np.arange(4)},
+            {"svm_c": "1"},
+            TypeError,
+            "svm_c must be numeric",
+        ),
+        (
+            np.ones((4, 2)),
+            {"labels": np.arange(4)},
+            {"svm_c": True},
+            TypeError,
+            "svm_c must be numeric",
+        ),
+        (
+            np.ones((4, 2)),
+            {"labels": np.arange(4)},
+            {"svm_c": 0.0},
+            ValueError,
+            "svm_c must be finite and greater than zero",
+        ),
+        (
+            np.ones((4, 2)),
+            {"labels": np.arange(4)},
+            {"svm_c": np.nan},
+            ValueError,
+            "svm_c must be finite and greater than zero",
+        ),
+        (
+            np.ones((6, 2)),
+            {"labels": np.arange(6) % 3},
+            {"max_sample_cells": 2},
+            ValueError,
+            "at least the number of clusters",
         ),
     ],
 )
-def test_invalid_inputs_are_rejected(coordinates, clusterings, kwargs, message):
-    with pytest.raises((TypeError, ValueError), match=message):
+def test_invalid_inputs_are_rejected(coordinates, clusterings, kwargs, error, message):
+    with pytest.raises(error, match=message):
         evaluate_cluster_separability(coordinates, clusterings, **kwargs)
+
+
+def test_sampled_coordinate_rows_must_keep_their_shape():
+    class WideRows:
+        """Coordinates whose row reads return one column too many."""
+
+        shape = (6, 2)
+
+        def __getitem__(self, rows: np.ndarray) -> np.ndarray:
+            return np.zeros((len(rows), 3))
+
+    with pytest.raises(ValueError, match="Sampled coordinate rows have an unexpected"):
+        evaluate_cluster_separability(WideRows(), {"labels": np.arange(6) % 2})
+
+
+def test_stratified_sampling_keeps_one_cell_of_each_rare_cluster():
+    from scarf.metrics.cluster_separability import _stratified_sample_indices
+
+    # Proportional quotas give the large cluster three cells and each rare
+    # cluster its one-cell floor, so the large cluster gives up cells to fit.
+    labels = np.repeat(["large", "rare_1", "rare_2", "rare_3"], [100, 1, 1, 1])
+
+    sampled = _stratified_sample_indices(labels, 4, np.random.default_rng(3))
+
+    assert len(sampled) == 4
+    assert sorted(labels[sampled]) == ["large", "rare_1", "rare_2", "rare_3"]
+    assert sampled.tolist() == sorted(sampled.tolist())
+
+
+def test_separability_result_validates_its_tables():
+    import pandas as pd
+
+    from scarf.metrics.cluster_separability import (
+        _CLUSTER_SCORE_COLUMNS,
+        _CLUSTERING_SCORE_COLUMNS,
+        _CONFUSION_COLUMNS,
+    )
+
+    tables = {
+        "clustering_scores": pd.DataFrame(columns=_CLUSTERING_SCORE_COLUMNS),
+        "cluster_scores": pd.DataFrame(columns=_CLUSTER_SCORE_COLUMNS),
+        "confusion": pd.DataFrame(columns=_CONFUSION_COLUMNS),
+    }
+    result = ClusterSeparabilityResult(**tables, sample_indices=np.arange(3))
+    assert not result.sample_indices.flags.writeable
+
+    with pytest.raises(ValueError, match="result columns are invalid"):
+        ClusterSeparabilityResult(
+            **(tables | {"confusion": pd.DataFrame(columns=["clustering"])}),
+            sample_indices=np.arange(3),
+        )
+    for indices in (np.arange(3.0), np.arange(4).reshape(2, 2)):
+        with pytest.raises(ValueError, match="one-dimensional integer array"):
+            ClusterSeparabilityResult(**tables, sample_indices=indices)
 
 
 def test_datastore_wrapper_uses_explicit_pca_without_writes(

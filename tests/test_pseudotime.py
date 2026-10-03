@@ -30,6 +30,47 @@ def _metadata_values(table):
     }
 
 
+@pytest.fixture(scope="module")
+def few_features(datastore, detected_features):
+    """Forty detected features: enough for each check, and quick to analyze."""
+    from scarf.storage.artifacts import artifact_group
+
+    detected = np.asarray(
+        artifact_group(datastore.zw, detected_features)["values"][:], dtype=bool
+    )
+    return datastore.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=np.flatnonzero(detected)[:40].tolist(),
+    )
+
+
+def _pearson_markers(datastore, pseudotime, feature_indices, normalization):
+    """Correlate lib-size normalized counts with pseudotime over scored cells."""
+    from scarf.storage.selections import read_stored_selection_indices
+
+    scored = datastore.load_pseudotime_scoring(pseudotime)
+    cells = read_stored_selection_indices(
+        datastore.zw,
+        scored.cell_selection,
+        kind="cell_selection",
+        scope="datastore",
+        assay=None,
+        table_path="cellData",
+    )[scored.valid]
+    counts = np.asarray(
+        datastore.RNA.rawData._backing.oindex[cells, feature_indices],
+        dtype=np.float64,
+    )
+    totals = np.asarray(datastore.cells.fetch_all("RNA_nCounts"), dtype=np.float64)
+    values = counts / totals[cells, np.newaxis] * normalization["size_factor"]
+    if normalization["log_transform"]:
+        values = np.log1p(values)
+    ptime = scored.values[scored.valid]
+    return np.array(
+        [np.corrcoef(column, ptime)[0, 1] for column in values.T], dtype=np.float64
+    )
+
+
 def _assert_metadata_unchanged(table, before):
     assert set(table.columns) == set(before)
     for column, values in before.items():
@@ -54,30 +95,41 @@ def test_source_sink_labels_reject_missing_and_overlap():
 
 
 def test_source_sink_vector_rejects_unbalanced_and_nonfinite_values():
-    for values in (
-        np.array([-2.0, 1.0]),
-        np.array([-1.0, 2.0]),
-        np.array([-1.0, np.nan]),
-        np.array([-1.0, np.inf]),
+    for values, message in (
+        (np.array([-2.0, 1.0]), "The values in ss_vec must sum to zero"),
+        (np.array([-1.0, 2.0]), "The values in ss_vec must sum to zero"),
+        # The tolerance scales with the vector, so a rounding residue passes
+        # but a residue of the same size on a unit vector does not.
+        (np.array([-1.0, 1.0 + 1e-9]), "The values in ss_vec must sum to zero"),
+        (np.array([-1.0, np.nan]), "ss_vec must contain only finite values"),
+        (np.array([-1.0, np.inf]), "ss_vec must contain only finite values"),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             _validate_source_sink_vector(values, 2, "ss_vec")
+    with pytest.raises(TypeError, match="ss_vec must contain numeric values"):
+        _validate_source_sink_vector(np.array(["source", "sink"]), 2, "ss_vec")
 
     column = _validate_source_sink_vector(
         np.array([[-1.0], [1.0]]),
         2,
         "ss_vec",
     )
-    assert column.shape == (2,)
+    np.testing.assert_array_equal(column, [-1.0, 1.0])
+    balanced = _validate_source_sink_vector(
+        np.array([-1e12, 1e12 + 1e-3]),
+        2,
+        "ss_vec",
+    )
+    np.testing.assert_array_equal(balanced, [-1e12, 1e12 + 1e-3])
 
 
 def test_source_sink_vector_rejects_wrong_shapes():
-    for values in (
-        np.zeros((2, 2)),
-        np.zeros((1, 2)),
-        np.zeros(3),
+    for values, message in (
+        (np.zeros((2, 2)), r"must be one-dimensional or have shape \(2, 1\)"),
+        (np.zeros((1, 2)), r"must be one-dimensional or have shape \(2, 1\)"),
+        (np.zeros(3), r"Size mismatch between ss_vec \(3\) and graph \(2\)"),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             _validate_source_sink_vector(values, 2, "ss_vec")
 
 
@@ -302,22 +354,33 @@ def test_truncated_pba_logs_svd_stage_start():
 
 def test_dense_pba_reference_orders_a_path_from_source_to_sink():
     adjacency = np.zeros((7, 7), dtype=float)
-    for index in range(6):
-        adjacency[index, index + 1] = 1.0
-        adjacency[index + 1, index] = 1.0
+    for index, weight in enumerate([1.0, 2.0, 1.5, 3.0, 0.75, 2.5]):
+        adjacency[index, index + 1] = weight
+        adjacency[index + 1, index] = weight
     laplacian_transpose = _random_walk_laplacian_transpose(csr_matrix(adjacency))
     source_sink = np.array([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
 
+    # The transposed random-walk Laplacian is I - A D^-1: column j of the
+    # adjacency is divided by the degree of cell j.
+    degree = adjacency.sum(axis=1)
+    np.testing.assert_allclose(
+        laplacian_transpose.toarray(),
+        np.eye(7) - adjacency / degree[np.newaxis, :],
+        rtol=0.0,
+        atol=1e-15,
+    )
     potential = np.linalg.pinv(laplacian_transpose.toarray().T) @ source_sink
 
     assert potential[0] < potential[-1]
     assert np.all(np.diff(potential) > 0)
+    with pytest.raises(ValueError, match="contains isolated cells"):
+        _random_walk_laplacian_transpose(csr_matrix(np.pad(adjacency, (0, 1))))
 
 
 def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
 ):
     from scarf.storage.artifacts import (
         ArtifactRef,
@@ -328,7 +391,7 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     feature_metadata_before = _metadata_values(datastore.RNA.feats)
     ref = datastore.run_pseudotime_marker_search(
         pseudotime_scoring,
-        features=detected_features,
+        features=few_features,
         min_cells=1,
     )
     result = datastore.load_pseudotime_markers(ref)
@@ -337,7 +400,26 @@ def test_marker_search_returns_an_explicit_artifact_without_feature_writes(
     assert isinstance(result, PseudotimeMarkerResult)
     assert result.ref == ref
     assert result.pseudotime == pseudotime_scoring
-    assert result.feature_selection == detected_features
+    assert result.feature_selection == few_features
+    # Each stored correlation is the Pearson r of the recorded normalization of
+    # one selected feature with the pseudotime of the scored cells.
+    parameters = datastore.inspect_artifact(ref).parameters or {}
+    tested = result.table.dropna(subset=["r_value"])
+    assert len(tested) > 30
+    np.testing.assert_allclose(
+        tested.r_value.to_numpy(),
+        _pearson_markers(
+            datastore,
+            pseudotime_scoring,
+            tested.feature_index.to_numpy(),
+            {
+                "size_factor": parameters["size_factor"],
+                "log_transform": parameters["normalization"]["log_transform"],
+            },
+        ),
+        rtol=0.0,
+        atol=1e-6,
+    )
     _assert_metadata_unchanged(datastore.RNA.feats, feature_metadata_before)
     group = datastore.zw[artifact_path(ref)]
     assert set(group.array_keys()) == {
@@ -427,6 +509,9 @@ def test_trajectory_feature_selection_indices_are_read_blockwise(
     from scarf.storage.artifacts import artifact_path
 
     selection_values_path = f"{artifact_path(detected_features)}/values"
+    expected = np.flatnonzero(
+        np.asarray(datastore.zw[selection_values_path][:], dtype=bool)
+    )
     original_getitem = zarr.Array.__getitem__
 
     def reject_full_selection_read(array, key):
@@ -452,7 +537,8 @@ def test_trajectory_feature_selection_indices_are_read_blockwise(
 
     assert resolved == detected_features
     assert indices.dtype == np.int64
-    assert len(indices) > 0
+    assert 0 < len(expected) < datastore.RNA.feats.N
+    np.testing.assert_array_equal(indices, expected)
 
 
 def test_marker_loader_uses_frozen_feature_names(
@@ -482,9 +568,13 @@ def test_trajectory_loaders_do_not_depend_on_live_normalization_settings(
     pseudotime_markers,
     pseudotime_aggregation,
     pseudotime_scoring,
-    detected_features,
+    few_features,
     monkeypatch,
 ):
+    search_before = datastore.run_pseudotime_marker_search(
+        pseudotime_scoring,
+        features=few_features,
+    )
     marker_before = datastore.load_pseudotime_markers(pseudotime_markers)
     aggregation_before = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
     monkeypatch.setattr(datastore.RNA, "sf", float(datastore.RNA.sf) * 2.0)
@@ -501,16 +591,23 @@ def test_trajectory_loaders_do_not_depend_on_live_normalization_settings(
         aggregation_before.feature_clusters,
     )
 
+    # A new search does follow the live size factor.
     rerun = datastore.run_pseudotime_marker_search(
         pseudotime_scoring,
-        features=detected_features,
+        features=few_features,
     )
-    assert rerun != pseudotime_markers
+    assert rerun != search_before
+    size_factors = [
+        (datastore.inspect_artifact(ref).parameters or {})["size_factor"]
+        for ref in (search_before, rerun)
+    ]
+    assert size_factors[1] == 2.0 * size_factors[0]
 
 
 def test_aggregation_provenance_records_resolved_ann_defaults(
     datastore,
     pseudotime_aggregation,
+    few_features,
 ):
     status = datastore.inspect_artifact(pseudotime_aggregation)
     expected = dict(AGGREGATION_ANN_DEFAULTS)
@@ -520,20 +617,33 @@ def test_aggregation_provenance_records_resolved_ann_defaults(
     result = datastore.load_pseudotime_aggregation(pseudotime_aggregation)
     arguments = {
         "pseudotime": result.pseudotime,
-        "features": result.feature_selection,
-        "n_clusters": 15,
+        "features": few_features,
+        "n_clusters": 3,
         "window_size": 50,
         "chunk_size": 10,
-        "ann_params": {"random_seed": 445},
     }
-    overridden = datastore.run_pseudotime_aggregation(**arguments)
-    assert overridden != pseudotime_aggregation
+    default = datastore.run_pseudotime_aggregation(**arguments)
+    overridden = datastore.run_pseudotime_aggregation(
+        **arguments, ann_params={"random_seed": 445}
+    )
+    assert overridden != default
+    default_parameters = datastore.inspect_artifact(default).parameters or {}
     overridden_parameters = datastore.inspect_artifact(overridden).parameters or {}
+    assert default_parameters["ann_params"] == expected
     assert overridden_parameters["ann_params"] == {
         **expected,
         "random_seed": 445,
     }
-    assert datastore.run_pseudotime_aggregation(**arguments) == overridden
+    # Only the requested ANN seed differs between the two records.
+    for parameters in (default_parameters, overridden_parameters):
+        parameters.pop("ann_params")
+    assert overridden_parameters == default_parameters
+    assert (
+        datastore.run_pseudotime_aggregation(
+            **arguments, ann_params={"random_seed": 445}
+        )
+        == overridden
+    )
 
 
 @pytest.mark.parametrize(
@@ -682,7 +792,7 @@ def test_trajectory_feature_producers_refuse_read_only_stores_before_computing(
 def test_marker_identity_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
     monkeypatch,
 ):
     import scarf.features.markers as marker_algorithms
@@ -713,7 +823,7 @@ def test_marker_identity_change_during_computation_discards_the_artifact(
         with pytest.raises(ValueError, match="identities changed"):
             datastore.run_pseudotime_marker_search(
                 pseudotime_scoring,
-                features=detected_features,
+                features=few_features,
                 min_cells=1,
                 invalidate_cache=True,
             )
@@ -736,7 +846,7 @@ def test_marker_identity_change_during_computation_discards_the_artifact(
 def test_marker_normalization_change_during_computation_discards_the_artifact(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
     monkeypatch,
 ):
     import scarf.features.markers as marker_algorithms
@@ -765,7 +875,7 @@ def test_marker_normalization_change_during_computation_discards_the_artifact(
         with pytest.raises(ValueError, match="normalization settings changed"):
             datastore.run_pseudotime_marker_search(
                 pseudotime_scoring,
-                features=detected_features,
+                features=few_features,
                 min_cells=1,
                 invalidate_cache=True,
             )
@@ -788,7 +898,7 @@ def test_marker_normalization_change_during_computation_discards_the_artifact(
 def test_aggregation_normalization_change_discards_the_artifact(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
     monkeypatch,
 ):
     before = set(
@@ -815,7 +925,7 @@ def test_aggregation_normalization_change_discards_the_artifact(
         with pytest.raises(ValueError, match="normalization settings changed"):
             datastore.run_pseudotime_aggregation(
                 pseudotime_scoring,
-                features=detected_features,
+                features=few_features,
                 window_size=10,
                 chunk_size=5,
                 n_neighbours=11,
@@ -841,7 +951,7 @@ def test_aggregation_normalization_change_discards_the_artifact(
 def test_incomplete_pseudotime_marker_artifact_is_recomputed(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
     monkeypatch,
 ):
     import scarf.features.markers as marker_algorithms
@@ -849,7 +959,7 @@ def test_incomplete_pseudotime_marker_artifact_is_recomputed(
 
     arguments = {
         "pseudotime": pseudotime_scoring,
-        "features": detected_features,
+        "features": few_features,
         "min_cells": 1,
         "gene_batch_size": 8,
     }
@@ -1009,8 +1119,10 @@ def test_aggregate_feature_profiles_orders_filters_and_bins():
         z_scale=True,
     )
     np.testing.assert_array_equal(z_valid, valid)
-    np.testing.assert_allclose(z_binned[0].mean(), 0.0, atol=1e-12)
-    assert z_binned[0, 0] < 0 < z_binned[0, 1]
+    # The ordered profile 0, 1, 2, 3 has mean 1.5 and population standard
+    # deviation sqrt(1.25), so its two bins average to -+1 / sqrt(1.25).
+    np.testing.assert_allclose(z_binned[0], np.array([-1.0, 1.0]) / np.sqrt(1.25))
+    np.testing.assert_array_equal(z_binned[1:], 0.0)
 
     with pytest.raises(ValueError, match="non-finite values"):
         aggregate_feature_profiles(
@@ -1023,6 +1135,41 @@ def test_aggregate_feature_profiles_orders_filters_and_bins():
             smooth=False,
             z_scale=False,
         )
+
+
+def test_aggregate_feature_profiles_rejects_profiles_that_lose_finiteness():
+    import warnings
+
+    options = {"min_expression": 0.0, "z_scale": False}
+    # Finite values near the float64 limit overflow the rolling-window sums.
+    with (
+        np.errstate(over="ignore", invalid="ignore"),
+        pytest.raises(ValueError, match="Smoothed feature profiles contain non-finite"),
+    ):
+        aggregate_feature_profiles(
+            np.array([[1e308, 0.0], [1e308, 1.0], [1e308, 2.0]]),
+            np.arange(3),
+            np.array([4, 7]),
+            window_size=2,
+            n_bins=1,
+            smooth=True,
+            **options,
+        )
+    # More bins than ordered cells leave an empty bin without a mean.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with pytest.raises(
+            ValueError, match="Binned feature profiles contain non-finite"
+        ):
+            aggregate_feature_profiles(
+                np.array([[1.0, 2.0], [3.0, 5.0]]),
+                np.arange(2),
+                np.array([4, 7]),
+                window_size=1,
+                n_bins=3,
+                smooth=False,
+                **options,
+            )
 
 
 def _ring_profiles(n_features: int) -> np.ndarray:
@@ -1071,7 +1218,7 @@ def _aggregation_artifacts(datastore) -> set:
 def test_aggregation_rejects_infeasible_clustering_before_starting_artifact(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
 ):
     before = _aggregation_artifacts(datastore)
 
@@ -1080,7 +1227,7 @@ def test_aggregation_rejects_infeasible_clustering_before_starting_artifact(
     with pytest.raises(ValueError, match="disconnected components"):
         datastore.run_pseudotime_aggregation(
             pseudotime_scoring,
-            features=detected_features,
+            features=few_features,
             window_size=10,
             chunk_size=5,
             n_neighbours=1,
@@ -1094,14 +1241,14 @@ def test_aggregation_rejects_infeasible_clustering_before_starting_artifact(
 def test_aggregation_min_exp_filter_failure_creates_no_artifact(
     datastore,
     pseudotime_scoring,
-    detected_features,
+    few_features,
 ):
     before = _aggregation_artifacts(datastore)
 
     with pytest.raises(ValueError, match="min_exp") as error:
         datastore.run_pseudotime_aggregation(
             pseudotime_scoring,
-            features=detected_features,
+            features=few_features,
             min_exp=1e12,
             window_size=10,
             chunk_size=5,
@@ -1124,10 +1271,12 @@ def test_aggregation_and_marker_search_respect_memory_budget(tmp_path):
     from scarf.writers import SparseToZarr
     from tests.fixtures_datastore import build_neighbourhood_graph
 
-    # All 2000 features form one 128 MB read group, so a 512 MiB budget holds
-    # the reads but not every normalized value together with its scratch.
-    n_cells, n_features = 16_000, 2_000
-    budget = 512 * 1024**2
+    # All 2000 features form one 32 MB read group, so a 128 MiB budget holds
+    # the reads but not every normalized value together with its scratch,
+    # about 256 MB. Peak use scales with the budget, so a larger store adds
+    # run time without testing anything new.
+    n_cells, n_features = 4_000, 2_000
+    budget = 128 * 1024**2
     rng = np.random.default_rng(7)
     counts = sparse_random(
         n_cells,

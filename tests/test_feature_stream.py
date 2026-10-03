@@ -1,3 +1,6 @@
+import threading
+from typing import Any
+
 import numpy as np
 import pytest
 import zarr
@@ -20,6 +23,39 @@ def setup_function() -> None:
 
 def teardown_function() -> None:
     reset_zarr_runtime()
+
+
+def _stream_threads(before: set[threading.Thread]) -> list[str]:
+    """Name the live threads started since ``before``, beside Zarr's own pool."""
+    return sorted(
+        thread.name
+        for thread in threading.enumerate()
+        if thread not in before and not thread.name.startswith(("asyncio_", "zarr_"))
+    )
+
+
+def hold_finished_work_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every Scarf pool worker keep its finished work item until its next.
+
+    A worker that is descheduled after it reports a result still holds the
+    work item, with the call and its result, until it takes the next one.
+    Making that the rule shows any buffer a work item still references in a
+    memory trace, without timing.
+    """
+    import concurrent.futures.thread as pool_thread
+
+    run = pool_thread._WorkItem.run
+    held: dict[int, Any] = {}
+
+    def keep(self: Any, *args: Any, **kwargs: Any) -> None:
+        scarf_worker = threading.current_thread().name.startswith("scarf-")
+        if scarf_worker:
+            held.pop(threading.get_ident(), None)
+        run(self, *args, **kwargs)
+        if scarf_worker:
+            held[threading.get_ident()] = self
+
+    monkeypatch.setattr(pool_thread._WorkItem, "run", keep)
 
 
 def _array(
@@ -363,29 +399,31 @@ def test_selected_values_and_persisted_groups_preserve_order() -> None:
     n_cells, n_feats = 12, 40
     values = np.arange(n_cells * n_feats, dtype=np.uint16).reshape(n_cells, n_feats)
     counts_t = _counts_t_with_plan(values)
-    starts = selected_feature_chunk_starts(counts_t)
-    assert starts
-    groups = list(
-        map_feature_read_groups(
+    feature_width, _bytes = persisted_read_group(counts_t)
+    assert selected_feature_chunk_starts(counts_t) == list(
+        range(0, n_feats, int(counts_t.chunks[0]))
+    )
+    groups = [
+        (group.featStart, group.featEnd, np.asarray(group.values).copy())
+        for group in map_feature_read_groups(
             counts_t,
             lambda group: group,
             resources=ResourceBudget(64 * 1024 * 1024, 2),
             progress="test-progress",
         )
-    )
-    first = groups[0]
-    keep = np.ones(first.values.shape[0], dtype=bool)
-    assert selected_feature_values(first.values, keep) is first.values
+    ]
+    # The groups tile the features in order, one persisted read group each.
+    assert [(start, end) for start, end, _values in groups] == [
+        (start, min(start + feature_width, n_feats))
+        for start in range(0, n_feats, feature_width)
+    ]
+    for start, end, group_values in groups:
+        np.testing.assert_array_equal(group_values, values.T[start:end])
+    first = groups[0][2]
+    keep = np.ones(first.shape[0], dtype=bool)
+    assert selected_feature_values(first, keep) is first
     keep[0] = False
-    filtered = selected_feature_values(first.values, keep)
-    assert filtered.shape[0] == first.values.shape[0] - 1
-    feature_width, _bytes = persisted_read_group(counts_t)
-    assert first.featEnd - first.featStart <= feature_width
-    starts = [group.featStart for group in groups]
-    assert starts
-    assert len(starts) == len(set(starts))
-    assert min(starts) == 0
-    assert max(group.featEnd for group in groups) == n_feats
+    np.testing.assert_array_equal(selected_feature_values(first, keep), first[1:])
 
 
 def test_consume_uses_persisted_two_gib_read_group() -> None:
@@ -397,7 +435,7 @@ def test_consume_uses_persisted_two_gib_read_group() -> None:
     values = np.arange(20 * 8, dtype=np.uint16).reshape(20, 8)
     policy = CountMatrixPolicy(unitBytes=2_000_000_000, chunkBytes=100_000_000)
     counts_t = _counts_t_with_plan(values, policy=policy)
-    feature_width, _bytes = persisted_read_group(counts_t)
+    assert persisted_read_group(counts_t) == (8, 20 * 8 * 2)
     widths = list(
         map_feature_read_groups(
             counts_t,
@@ -405,9 +443,8 @@ def test_consume_uses_persisted_two_gib_read_group() -> None:
             resources=ResourceBudget(8 * 1024**3, 2),
         )
     )
-    assert widths
-    assert all(width <= feature_width for width in widths)
-    assert widths[0] == min(8, feature_width)
+    # A two-GiB unit holds every feature, so one group reads them all.
+    assert widths == [8]
 
 
 def test_consume_uses_persisted_read_group_not_default_unit() -> None:
@@ -416,24 +453,35 @@ def test_consume_uses_persisted_read_group_not_default_unit() -> None:
         persisted_read_group,
     )
 
-    values = np.arange(80 * 50_001, dtype=np.uint16).reshape(80, 50_001)
-    policy = CountMatrixPolicy(unitBytes=20_000, chunkBytes=2_000)
-    counts_t = _counts_t_with_plan(values, policy=policy)
+    n_cells, n_feats = 16, 503
+    values = np.arange(n_cells * n_feats, dtype=np.uint16).reshape(n_cells, n_feats)
+    counts_t = _counts_t_with_plan(
+        values, policy=CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
+    )
     feature_width, _bytes = persisted_read_group(counts_t)
+    # The persisted group of 50 features is one chunk and half a countsT
+    # shard, and the default policy would read all 503 features as one group,
+    # so the group bounds tell the three units apart.
+    assert feature_width == int(counts_t.chunks[0]) == 50
+    assert int(counts_t.shards[0]) == 100
+    default = plan_count_matrix_pair(n_cells, n_feats, np.uint16)
+    assert default.readGroup.featureWidth == n_feats
     metrics: dict[str, object] = {}
-    widths = list(
-        map_feature_read_groups(
+    groups = [
+        (group.featStart, group.featEnd, np.asarray(group.values).copy())
+        for group in map_feature_read_groups(
             counts_t,
-            lambda group: group.featEnd - group.featStart,
+            lambda group: group,
             resources=ResourceBudget(8 * 1024**3, 2),
             metrics=metrics,
         )
-    )
-    assert widths
-    assert all(width <= feature_width for width in widths)
-    assert sum(widths) == 50_001, metrics
-    assert min(widths) < feature_width or 50_001 % feature_width == 0
-    assert int(metrics["featureWidth"]) == feature_width
+    ]
+    assert [(start, end) for start, end, _values in groups] == [
+        (start, min(start + 50, n_feats)) for start in range(0, n_feats, 50)
+    ]
+    for start, end, group_values in groups:
+        np.testing.assert_array_equal(group_values, values.T[start:end])
+    assert int(metrics["featureWidth"]) == 50
 
 
 def test_read_group_rows_counts_the_selected_features_of_each_read_group() -> None:
@@ -491,6 +539,7 @@ def test_map_feature_read_groups_early_close_does_not_block() -> None:
 
     values = np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
     counts_t = _counts_t_with_plan(values)
+    before = set(threading.enumerate())
     iterator = map_feature_read_groups(
         counts_t,
         lambda group: group.featStart,
@@ -498,7 +547,13 @@ def test_map_feature_read_groups_early_close_does_not_block() -> None:
         io=StorageIoPolicy(readWorkers=2),
     )
     assert next(iterator) == 0
+    # The producer and its pools are still running a later group.
+    assert _stream_threads(before)
     iterator.close()
+    # Closing joins every thread the stream started, and the stream stays closed.
+    assert _stream_threads(before) == []
+    with pytest.raises(StopIteration):
+        next(iterator)
 
 
 def test_map_feature_cell_bands_early_close_does_not_block() -> None:
@@ -506,15 +561,20 @@ def test_map_feature_cell_bands_early_close_does_not_block() -> None:
 
     values = np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
     counts_t = _counts_t_with_plan(values)
+    before = set(threading.enumerate())
     bands = map_feature_cell_bands(
         counts_t,
-        lambda band: band.featStart,
+        lambda band: (band.featStart, band.cellStart),
         resources=ResourceBudget(8 * 1024 * 1024, 2),
         io=StorageIoPolicy(readWorkers=4),
         orderedCompute=True,
     )
-    next(bands)
+    assert next(bands) == (0, 0)
+    assert _stream_threads(before)
     bands.close()
+    assert _stream_threads(before) == []
+    with pytest.raises(StopIteration):
+        next(bands)
 
 
 def test_feature_stream_empty_selection_and_keep_guard() -> None:
@@ -619,8 +679,14 @@ def test_cell_major_bands_visit_every_feature_group_of_a_band_first() -> None:
             cellMajorOrder=True,
         )
     )
-    assert order == sorted(order)
-    assert len({feat for _cell, feat in order}) > 1
+    # One feature group per chunk of features and one band per chunk of cells.
+    feature_chunk, cell_chunk = (int(extent) for extent in counts_t.chunks)
+    assert feature_chunk < 80
+    assert order == [
+        (cell, feature)
+        for cell in range(0, 40, cell_chunk)
+        for feature in range(0, 80, feature_chunk)
+    ]
 
 
 def test_feature_group_ranges_merge_only_adjacent_chunks() -> None:
@@ -857,8 +923,6 @@ def test_feature_streams_reserve_every_traced_buffer(
 ) -> None:
     from scarf.storage import feature_stream
 
-    from .test_async_execution import linger_pool_workers
-
     mapper = getattr(feature_stream, f"map_feature_{mapper_name}")
     rng = np.random.default_rng(0)
     values = rng.poisson(0.3, size=(100_000, 64)).astype(np.uint16)
@@ -867,13 +931,13 @@ def test_feature_streams_reserve_every_traced_buffer(
         values, policy=CountMatrixPolicy(unitBytes=3_200_000, chunkBytes=800_000)
     )
     cell_idx = np.sort(rng.choice(100_000, 70_000, replace=False))
-    # Every pool worker lingers after each call, as a descheduled worker does
-    # under CPU contention, so a buffer that a worker still references after
-    # the stream released it shows up in the trace. One worker runs one codec
-    # thread, which drops a chunk it decoded before it decodes the next read's,
-    # so Zarr's own buffers stay inside the reservations of the reads in
-    # flight.
-    linger_pool_workers(monkeypatch, 0.01)
+    # Every pool worker keeps its finished work item until it takes its next
+    # one, as a descheduled worker can, so a buffer that a worker still
+    # references after the stream released it shows up in the trace. One
+    # worker runs one codec thread, which drops a chunk it decoded before it
+    # decodes the next read's, so Zarr's own buffers stay inside the
+    # reservations of the reads in flight.
+    hold_finished_work_items(monkeypatch)
 
     traced, metrics = _traced_stream_peak(
         mapper, counts_t, cell_idx=cell_idx, resources=ResourceBudget(budget, 1)
@@ -986,23 +1050,23 @@ def test_early_close_joins_the_producer_and_surfaces_its_failure() -> None:
 @pytest.mark.parametrize("ordered", [False, True])
 def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> None:
     import asyncio
-    import threading
-    import time
     import types
 
     import scarf.storage.feature_stream as feature_stream
 
     counts_t = _counts_t_with_plan(np.arange(40 * 80, dtype=np.uint16).reshape(40, 80))
     stops: list[threading.Event] = []
+    scheduled = threading.Event()
 
-    class SlowStop(threading.Event):
+    class LateStop(threading.Event):
         def __init__(self) -> None:
             super().__init__()
             stops.append(self)
 
         def set(self) -> None:
-            # Widen the gap between acknowledging an item and stopping.
-            time.sleep(0.2)
+            # The consumer has acknowledged its item; it stops only once the
+            # scheduler, which saw no stop request, starts the next unit.
+            assert scheduled.wait(10)
             super().set()
 
     class RacingTaskGroup(asyncio.TaskGroup):
@@ -1013,6 +1077,7 @@ def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> No
             RacingTaskGroup.created += 1
             if RacingTaskGroup.created == 2:
                 # The scheduler saw no stop request; the unit starts after one.
+                scheduled.set()
                 stops[0].wait(10)
             return task
 
@@ -1021,7 +1086,7 @@ def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> No
     monkeypatch.setattr(
         feature_stream,
         "threading",
-        types.SimpleNamespace(Event=SlowStop, Thread=threading.Thread),
+        types.SimpleNamespace(Event=LateStop, Thread=threading.Thread),
     )
     patched_asyncio = types.SimpleNamespace(
         **{name: getattr(asyncio, name) for name in dir(asyncio) if name[0] != "_"}
@@ -1046,6 +1111,8 @@ def test_stream_closes_when_a_unit_starts_after_stop(monkeypatch, ordered) -> No
     consumer.start()
     consumer.join(10)
     assert finished.is_set()
+    # The second unit was scheduled before the stop request, so the race ran.
+    assert scheduled.is_set()
 
 
 def test_feature_streams_honor_cooperative_shutdown() -> None:
@@ -1087,7 +1154,8 @@ def test_feature_stream_reports_reach_the_callers_report_scope() -> None:
             )
         )
     assert [report.unitKind for report in reports] == ["countsTCellBand"]
-    assert reports[0].extra["featureGroupCount"] >= 1
+    feature_chunk = int(counts_t.chunks[0])
+    assert reports[0].extra["featureGroupCount"] == -(-80 // feature_chunk) > 1
 
 
 @pytest.mark.parametrize("mapper", ["read_groups", "cell_bands"])

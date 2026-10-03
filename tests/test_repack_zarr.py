@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -109,6 +110,16 @@ def test_repack_store_round_trip(toy_crdir_writer, tmp_path):
         assert "counts" in dst_assay
         assert src_assay["counts"].shape == dst_assay["counts"].shape
         assert (src_assay["counts"][...] == dst_assay["counts"][...]).all()
+        # The copy keeps the identities that saved artifacts are bound to.
+        assert dst_assay["counts"].dtype == src_assay["counts"].dtype
+        assert (
+            dst_assay.attrs["dataset_fingerprint"]
+            == src_assay.attrs["dataset_fingerprint"]
+        )
+        assert (
+            dst_assay["counts"].attrs["content_fingerprint"]
+            == src_assay["counts"].attrs["content_fingerprint"]
+        )
         if is_rna_assay_type(assay_name):
             assert dst_assay["countsT"].attrs["complete"] is True
             np.testing.assert_array_equal(
@@ -315,32 +326,72 @@ def test_repack_preserves_root_attrs(tmp_path):
     assert "complete" not in result.attrs
 
 
-def test_repack_preserves_non_count_completion_attrs(tmp_path):
-    source = tmp_path / "source.zarr"
-    output = tmp_path / "output.zarr"
+@pytest.fixture(scope="module")
+def repacked_extras(tmp_path_factory):
+    """One prepared source with every kind of non-count array, repacked once."""
+    directory = tmp_path_factory.mktemp("repack_extras")
+    source = directory / "source.zarr"
+    output = directory / "output.zarr"
     root = zarr.open_group(str(source), mode="w")
     assay = root.create_group("RNA")
     assay.attrs["is_assay"] = True
     assay.create_array(
-        "counts",
-        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
-        chunks=(2, 3),
+        "counts", data=np.arange(12, dtype=np.uint32).reshape(3, 4), chunks=(2, 2)
+    )
+    arrays = SimpleNamespace(
+        embedding=np.arange(15, dtype=np.float32).reshape(3, 5),
+        sharded=np.arange(40, dtype=np.float32).reshape(8, 5),
+        tall=np.arange(150 * 10, dtype=np.float32).reshape(150, 10),
+        ann=np.arange(ANN_INDEX_CHUNK_BYTES + 1000, dtype=np.uint8),
+    )
+    assay.create_array("embedding", data=arrays.embedding, chunks=(2, 5))
+    assay.create_array(
+        "sharded_embedding",
+        data=arrays.sharded,
+        chunks=(2, 5),
+        shards=(4, 5),
+        fill_value=np.nan,
+    )
+    # Chunks and shards taller than the array clamp against its shape.
+    assay.create_array(
+        "tall_embedding", data=arrays.tall, chunks=(200, 10), shards=(200, 10)
     )
     cell = root.create_group("cellData")
     cell.attrs["complete"] = True
-    cell.create_array("ids", data=np.array(["c1", "c2"]))
-    artifacts = root.create_group("artifacts")
-    table = artifacts.create_group("marker_table")
-    slot = table.create_group("slot")
+    cell.create_array("ids", data=np.array(["c1", "c2", "c3"]))
+    slot = root.create_group("artifacts/marker_table/slot")
     slot.attrs["complete"] = True
     slot.create_array("values", data=np.array([1.0, 2.0]))
+    ann = root.create_group("ann").create_array(
+        "ann_idx_bytes", data=arrays.ann, chunks=(ANN_INDEX_CHUNK_BYTES,)
+    )
+    ann.attrs.update(
+        {
+            "ann_index_format_version": ANN_INDEX_FORMAT_VERSION,
+            "metric": "l2",
+            "dimensions": 15,
+            "element_count": 100,
+            "payload_sha256": "abc",
+            "byte_length": int(arrays.ann.size),
+        }
+    )
 
     _prepare_source(root)
-    repack_store(str(source), str(output))
+    repack_store(str(source), str(output), profile="cloud")
+    return SimpleNamespace(
+        arrays=arrays,
+        ann_attrs=dict(ann.attrs),
+        result=zarr.open_group(str(output), mode="r"),
+    )
 
-    result = zarr.open_group(str(output), mode="r")
+
+def test_repack_preserves_non_count_completion_attrs(repacked_extras):
+    result = repacked_extras.result
     assert result["cellData"].attrs["complete"] is True
     assert result["artifacts/marker_table/slot"].attrs["complete"] is True
+    np.testing.assert_array_equal(
+        result["artifacts/marker_table/slot/values"][:], [1.0, 2.0]
+    )
 
 
 def _seed_labeled_pipeline_records(
@@ -547,109 +598,40 @@ def test_repack_skips_copying_counts_t_when_sharding(tmp_path, monkeypatch):
     np.testing.assert_array_equal(result["RNA/countsT"][:], values.T)
 
 
-def test_repack_streams_non_count_2d_arrays(tmp_path):
-    source = tmp_path / "source.zarr"
-    output = tmp_path / "output.zarr"
-    root = zarr.open_group(str(source), mode="w")
-    assay = root.create_group("RNA")
-    assay.attrs["is_assay"] = True
-    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
-    assay.create_array("counts", data=values, chunks=(2, 2))
-    embedding = np.arange(15, dtype=np.float32).reshape(3, 5)
-    assay.create_array("embedding", data=embedding, chunks=(2, 5))
-    cell = root.create_group("cellData")
-    cell.create_array("ids", data=np.array(["c1", "c2", "c3"]))
-
-    _prepare_source(root)
-    repack_store(str(source), str(output))
-
-    result = zarr.open_group(str(output), mode="r")
-    np.testing.assert_array_equal(result["RNA/embedding"][:], embedding)
+def test_repack_streams_non_count_2d_arrays(repacked_extras):
+    result = repacked_extras.result
+    np.testing.assert_array_equal(
+        result["RNA/embedding"][:], repacked_extras.arrays.embedding
+    )
+    assert result["RNA/embedding"].chunks == (2, 5)
     np.testing.assert_array_equal(result["cellData/ids"][:], ["c1", "c2", "c3"])
 
 
-def test_repack_preserves_ann_like_1d_chunks_and_attrs(tmp_path):
-    source = tmp_path / "source.zarr"
-    output = tmp_path / "output.zarr"
-    root = zarr.open_group(str(source), mode="w")
-    assay = root.create_group("RNA")
-    assay.attrs["is_assay"] = True
-    assay.create_array("counts", data=np.ones((2, 1), dtype=np.uint32))
-    n_bytes = ANN_INDEX_CHUNK_BYTES + 1000
-    payload = np.arange(n_bytes, dtype=np.uint8)
-    ann = root.create_group("ann")
-    arr = ann.create_array(
-        "ann_idx_bytes",
-        data=payload,
-        chunks=(ANN_INDEX_CHUNK_BYTES,),
-    )
-    arr.attrs["ann_index_format_version"] = ANN_INDEX_FORMAT_VERSION
-    arr.attrs["metric"] = "l2"
-    arr.attrs["dimensions"] = 15
-    arr.attrs["element_count"] = 100
-    arr.attrs["payload_sha256"] = "abc"
-    arr.attrs["byte_length"] = n_bytes
-
-    _prepare_source(root)
-    repack_store(str(source), str(output))
-
-    result = zarr.open_group(str(output), mode="r")["ann/ann_idx_bytes"]
-    expected_chunks = normalize_chunks((ANN_INDEX_CHUNK_BYTES,), (n_bytes,))
-    assert result.chunks == expected_chunks
+def test_repack_preserves_ann_like_1d_chunks_and_attrs(repacked_extras):
+    result = repacked_extras.result["ann/ann_idx_bytes"]
+    payload = repacked_extras.arrays.ann
+    # The payload spans two 8 MiB chunks, the second one short.
+    assert result.chunks == (ANN_INDEX_CHUNK_BYTES,)
+    assert result.chunks == normalize_chunks((ANN_INDEX_CHUNK_BYTES,), payload.shape)
     np.testing.assert_array_equal(result[:], payload)
     for key in _ANN_INDEX_METADATA:
-        assert result.attrs[key] == arr.attrs[key]
-    assert result.attrs["byte_length"] == n_bytes
+        assert result.attrs[key] == repacked_extras.ann_attrs[key]
+    assert result.attrs["byte_length"] == payload.size
 
 
-def test_repack_preserves_non_count_2d_shards(tmp_path):
-    source = tmp_path / "source.zarr"
-    output = tmp_path / "output.zarr"
-    root = zarr.open_group(str(source), mode="w")
-    assay = root.create_group("RNA")
-    assay.attrs["is_assay"] = True
-    assay.create_array("counts", data=np.ones((8, 2), dtype=np.uint32))
-    embedding = np.arange(40, dtype=np.float32).reshape(8, 5)
-    assay.create_array(
-        "embedding",
-        data=embedding,
-        chunks=(2, 5),
-        shards=(4, 5),
-        fill_value=np.nan,
-    )
-
-    _prepare_source(root)
-    repack_store(str(source), str(output), profile="cloud")
-
-    result = zarr.open_group(str(output), mode="r")["RNA/embedding"]
-    np.testing.assert_array_equal(result[:], embedding)
+def test_repack_preserves_non_count_2d_shards(repacked_extras):
+    result = repacked_extras.result["RNA/sharded_embedding"]
+    np.testing.assert_array_equal(result[:], repacked_extras.arrays.sharded)
     assert result.chunks == (2, 5)
     assert array_metadata_shards(result) == (4, 5)
     assert isinstance(result.compressors[0], ZstdCodec)
 
 
-def test_repack_realigns_shards_when_chunks_clamp(tmp_path):
-    source = tmp_path / "source.zarr"
-    output = tmp_path / "output.zarr"
-    root = zarr.open_group(str(source), mode="w")
-    assay = root.create_group("RNA")
-    assay.attrs["is_assay"] = True
-    assay.create_array("counts", data=np.ones((4, 2), dtype=np.uint32))
-    values = np.arange(150 * 10, dtype=np.float32).reshape(150, 10)
-    # Source claims tall chunks/shards that clamp against shape on repack.
-    assay.create_array(
-        "embedding",
-        data=values,
-        chunks=(200, 10),
-        shards=(200, 10),
-    )
-
-    _prepare_source(root)
-    repack_store(str(source), str(output))
-
-    result = zarr.open_group(str(output), mode="r")["RNA/embedding"]
-    np.testing.assert_array_equal(result[:], values)
-    assert result.chunks == normalize_chunks((200, 10), values.shape)
+def test_repack_realigns_shards_when_chunks_clamp(repacked_extras):
+    result = repacked_extras.result["RNA/tall_embedding"]
+    np.testing.assert_array_equal(result[:], repacked_extras.arrays.tall)
+    assert result.chunks == (150, 10)
+    assert result.chunks == normalize_chunks((200, 10), (150, 10))
     assert array_metadata_shards(result) == result.chunks
 
 

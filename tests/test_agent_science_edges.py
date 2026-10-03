@@ -165,10 +165,39 @@ def test_missing_metrics_and_zero_mad_are_flags_without_invented_bounds() -> Non
     assert flags["RNA_nFeatures"]["highFlags"] == 0
 
 
+_NOT_CROSSED = "Technical 'batch' is not fully crossed with protected 'condition'."
+_LEVELS = "Correction metadata 'batch' needs between 2 and 64 categorical levels."
+
+
 @pytest.mark.parametrize(
-    "damage", ["authorization", "protected", "missing", "one", "many"]
+    ("damage", "reasons"),
+    [
+        (None, []),
+        (
+            "authorization",
+            ["Technical batch correction lacks caller-supplied experimental evidence."],
+        ),
+        (
+            "protected",
+            [
+                "Correction has no explicitly protected biological metadata for validation."
+            ],
+        ),
+        (
+            "missing",
+            [
+                "Correction metadata 'batch' contains missing labels.",
+                "Correction metadata 'condition' contains missing labels.",
+                _NOT_CROSSED,
+            ],
+        ),
+        ("one", [_LEVELS]),
+        ("many", [_LEVELS, _NOT_CROSSED]),
+    ],
 )
-def test_uncertain_experimental_design_never_authorizes_correction(damage: str) -> None:
+def test_uncertain_experimental_design_never_authorizes_correction(
+    damage: str | None, reasons: list[str]
+) -> None:
     frame = pd.DataFrame(
         {"batch": ["a", "b"] * 34, "condition": ["x"] * 34 + ["y"] * 34}
     )
@@ -183,7 +212,7 @@ def test_uncertain_experimental_design_never_authorizes_correction(damage: str) 
         frame.loc[1, "condition"] = None
     elif damage == "one":
         frame["batch"] = "one"
-    else:
+    elif damage == "many":
         frame["batch"] = [f"batch{i}" for i in range(len(frame))]
     eligible, design, limitations = evidence._design(
         SimpleNamespace(cells=Metadata(frame)),
@@ -192,8 +221,9 @@ def test_uncertain_experimental_design_never_authorizes_correction(damage: str) 
         protected,
         authorization,
     )
-    assert not eligible
-    assert limitations
+    # Only the undamaged, authorized and crossed design permits correction.
+    assert eligible is (damage is None)
+    assert limitations == reasons
     assert design["limitations"] == limitations
 
 
@@ -323,6 +353,67 @@ def test_context_adds_protection_but_rechecks_source_identity(
         evidence.verify_source(
             path, prepared, supplied, AnalysisConfig(), RuntimeConfig()
         )
+
+
+def test_absent_qc_metrics_offer_only_the_retained_projection(
+    metadata_source: tuple[Path, Any],
+) -> None:
+    path, store = metadata_source
+    store.cells.frame = store.cells.frame.drop(columns=["RNA_nCounts", "RNA_nFeatures"])
+    prepared = evidence.inspect_source(path, study(), AnalysisConfig(), RuntimeConfig())
+    assert prepared["qcFlags"] == {}
+    projections = {row["policy"]: row for row in prepared["qcProjections"]}
+    assert projections["retain"]["available"] is True
+    assert projections["retain"]["retainedCells"] == 8
+    assert projections["gentleMad5"] == {
+        "policy": "gentleMad5",
+        "available": False,
+        "executed": False,
+        "inputCells": 8,
+        "retainedCells": None,
+        "removedCells": None,
+        "bounds": {},
+        "byGroup": {},
+        "limitations": ["No available QC metrics support this projection."],
+    }
+    assert projections["manual"]["limitations"] == [
+        "No manual thresholds were supplied; none are invented."
+    ]
+    assert (
+        "Optional QC outlier flags are unavailable for missing columns: "
+        "['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito']."
+    ) in prepared["limitations"]
+
+
+@pytest.mark.parametrize("role", ["sample", "capture"])
+def test_context_cannot_replace_a_supplied_sample_or_capture_column(
+    metadata_source: tuple[Path, Any], role: str
+) -> None:
+    path, _ = metadata_source
+    supplied = study(**{f"{role}Column": "batch"})
+    prepared = evidence.inspect_source(
+        path, supplied, AnalysisConfig(), RuntimeConfig()
+    )
+    with pytest.raises(
+        AnalysisInputError, match="cannot replace a supplied sample or capture column"
+    ):
+        evidence.prepare_context(
+            prepared,
+            ContextDecision(
+                rationale="Suggested experimental unit",
+                columnRoles={"condition": role},
+            ),
+            supplied,
+            AnalysisConfig(),
+        )
+    # Confirming the supplied column itself is not a replacement.
+    confirmed = evidence.prepare_context(
+        prepared,
+        ContextDecision(rationale="Supplied unit", columnRoles={"batch": role}),
+        supplied,
+        AnalysisConfig(),
+    )
+    assert confirmed[f"{role}Column"] == "batch"
 
 
 @pytest.mark.parametrize("invalid", [np.nan, -1])
@@ -578,8 +669,18 @@ def test_correction_gate_rejects_missing_or_wrong_direction_metrics(
     )
 
 
-@pytest.mark.parametrize("damage", ["harmony", "resolution", "pca", "neighbors"])
-def test_impossible_pipeline_recipes_fail_before_numerical_work(damage: str) -> None:
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("harmony", "Harmony requires an authorized, crossed experimental design"),
+        ("resolution", "The selected resolution is outside the configured panel"),
+        ("pca", "PCA dimensions must be smaller than selected cells and features"),
+        ("neighbors", "Neighbor count must be smaller than the retained cohort"),
+    ],
+)
+def test_impossible_pipeline_recipes_fail_before_numerical_work(
+    damage: str, message: str
+) -> None:
     candidate = Candidate(candidateId="c0", hvgCount=20, pcaDims=3, neighborsK=5)
     prepared = {
         "correctionEligible": False,
@@ -595,7 +696,8 @@ def test_impossible_pipeline_recipes_fail_before_numerical_work(damage: str) -> 
         candidate = candidate.model_copy(update={"pcaDims": 8})
     else:
         candidate = candidate.model_copy(update={"neighborsK": 8})
-    with pytest.raises(AnalysisInputError):
+    # The store is None: any numerical call would fail with another error.
+    with pytest.raises(AnalysisInputError, match=message):
         execution.execute_pipeline(
             None,
             prepared,

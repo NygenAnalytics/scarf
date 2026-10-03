@@ -533,14 +533,14 @@ def test_artifact_cluster_tree_reads_the_fill_column_missing_mask(
     tmp_path: Path,
 ) -> None:
     from scarf.storage.selections import read_stored_selection_indices
-    from tests.test_pipeline import _insert_nullable_cell_column
+    from tests.storage_helpers import insert_nullable_cell_column
 
     store, wnn = _wnn_store(wnn_store_template, tmp_path)
     clusters = store.run_paris_clustering(wnn, n_clusters=3)
     missing = np.zeros(store.cells.N, dtype=bool)
     missing[::4] = True
     donor = np.where(missing, 0, np.arange(store.cells.N) % 2 + 1)
-    _insert_nullable_cell_column(store, "donor", donor.astype(np.int64), missing)
+    insert_nullable_cell_column(store, "donor", donor.astype(np.int64), missing)
 
     prepared = store._prepare_cluster_tree(
         graph=wnn,
@@ -624,6 +624,56 @@ def test_coalesce_tree_rejects_non_monophyletic_clusters() -> None:
 
     with pytest.raises(ValueError, match="not monophyletic"):
         CoalesceTree(graph, clusters)
+
+
+def test_coalesce_tree_holds_a_singleton_cluster_at_its_leaf() -> None:
+    clusters = np.asarray([0, 0, 1, 1, 2, 2, 3, 4])
+    graph = make_digraph(_balanced_linkage())
+
+    coalesced = CoalesceTree(graph, clusters)
+
+    assert set(coalesced.nodes) == {6, 7, *range(8, 11), *range(11, 15)}
+    assert set(coalesced.edges) == {
+        (11, 6),
+        (11, 7),
+        (12, 8),
+        (12, 9),
+        (13, 10),
+        (13, 11),
+        (14, 12),
+        (14, 13),
+    }
+    assert _partition_ids(coalesced) == {8: 0, 9: 1, 10: 2, 6: 3, 7: 4}
+
+
+def test_coalesce_tree_rejects_a_cluster_no_ancestor_can_hold() -> None:
+    # Leaf counts understated as one leaf per merge hide every ancestor that
+    # could hold a two-cell cluster.
+    dendrogram = _balanced_linkage()
+    dendrogram[:, 3] = 1
+    graph = make_digraph(dendrogram)
+
+    with pytest.raises(ValueError, match="incompatible with the hierarchy"):
+        CoalesceTree(graph, np.asarray([0, 0, 1, 1, 2, 2, 3, 3]))
+
+
+def test_make_digraph_warns_when_a_merge_repeats_a_child() -> None:
+    from scarf.utils import logger
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        graph = make_digraph(np.asarray([[0, 0, 0.5, 2], [1, 3, 1.0, 3]]))
+    finally:
+        logger.remove(sink)
+
+    assert set(graph.edges) == {(3, 0), (4, 1), (4, 3)}
+    assert messages == [
+        "Number of edges in directed graph not twice the dendrogram shape"
+    ]
 
 
 def test_artifact_cluster_tree_cache_hit_is_compute_free_and_read_only(

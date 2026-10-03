@@ -17,6 +17,7 @@ from tests.fixtures_cytebase import (
     DATASET_ID,
     NOW,
     VERSION_ID,
+    FakeHub,
     dataset_record,
     publish_catalog_rows,
 )
@@ -75,9 +76,18 @@ def _downloads(hub, remote: str) -> int:
     )
 
 
+@pytest.fixture(scope="module")
+def catalog_files(tmp_path_factory) -> dict[str, bytes]:
+    """Write the catalog database for ``_records()`` once for this module."""
+    hub = FakeHub(tmp_path_factory.mktemp("published-catalog"))
+    publish_catalog_rows(hub, _records())
+    return {path: hub.read(path) for path in (DB_PATH, HASH_PATH)}
+
+
 @pytest.fixture
-def published(fake_hub):
-    publish_catalog_rows(fake_hub, _records())
+def published(fake_hub, catalog_files):
+    for path, data in catalog_files.items():
+        fake_hub.put(path, data)
     return fake_hub
 
 
@@ -268,7 +278,7 @@ def test_save_hash_reraises_when_the_sidecar_differs(tmp_path, monkeypatch, exis
     if existing is not None:
         sidecar.write_text(existing)
     _replace_raising(monkeypatch, ".checksum-")
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="is open elsewhere"):
         catalog_module._save_hash(sidecar, "c" * 64)
     assert list(tmp_path.glob(".checksum-*")) == []
 
@@ -376,8 +386,10 @@ def test_search_matches_every_word_ignoring_case(catalog):
         row["cytebase_id"] for row in catalog.search("covid", ready_only=False)
     ] == [BLOOD_ID]
     everything = catalog.search("atlas", ready_only=False, limit=None)
-    assert len(everything) == 3
-    assert len(catalog.search("atlas", ready_only=False, limit=2)) == 2
+    ordered = [CYTEBASE_ID, BLOOD_ID, COLON_ID]
+    assert [row["cytebase_id"] for row in everything] == ordered
+    limited = catalog.search("atlas", ready_only=False, limit=2)
+    assert [row["cytebase_id"] for row in limited] == ordered[:2]
     assert everything.to_markdown(max_rows=0).splitlines()[0] == (
         "| Cytebase ID | Title | Cells | Tissues | Diseases |"
     )

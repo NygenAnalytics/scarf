@@ -243,3 +243,26 @@ def test_network_rejects_boolean_weights():
             tmin=1,
             weighted=True,
         )
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [("Ggt1", "GGT1"), ("GGT1", "GGT1"), ("GGT1", ""), ["GGT1"]],
+    ids=["unsorted", "repeated", "empty", "list"],
+)
+def test_prepared_network_rejects_malformed_dropped_targets(dropped):
+    import dataclasses
+
+    prepared = prepare_network(
+        pd.DataFrame({"source": ["Set", "Set"], "target": ["GeneA", "GeneB"]}),
+        active_feature_names=np.array(["GeneA", "GeneB"]),
+        active_feature_index=np.array([0, 1]),
+        tmin=2,
+        weighted=False,
+    )
+    assert dataclasses.replace(
+        prepared, dropped_ambiguous_targets=("GGT1", "Ggt1")
+    ).dropped_ambiguous_targets == ("GGT1", "Ggt1")
+
+    with pytest.raises(ValueError, match="dropped targets must be sorted unique"):
+        dataclasses.replace(prepared, dropped_ambiguous_targets=dropped)

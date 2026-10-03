@@ -84,10 +84,11 @@ def test_runner_preserves_order_suppresses_plot_show_and_manages_outputs(
 
     result = run_recipe(store, recipe, output_dir=tmp_path, show=True)
 
-    assert [name for name, _, _ in calls] == ["embedding", "dotplot"]
-    assert all(store_arg is store for _, store_arg, _ in calls)
-    assert all(kwargs["show"] is False for _, _, kwargs in calls)
-    assert calls[0][2]["layout_key"] == "umap"
+    # Steps run in order with exactly their kwargs, and never show themselves.
+    assert calls == [
+        ("embedding", store, {"layout_key": "umap", "show": False}),
+        ("dotplot", store, {"features": ["A"], "group_by": "cluster", "show": False}),
+    ]
     expected_paths = (
         tmp_path / "figures/overview.png",
         tmp_path / "figures/markers.svg",
@@ -103,6 +104,9 @@ def test_runner_preserves_order_suppresses_plot_show_and_manages_outputs(
     for name, expected_path in zip(("embedding", "dotplot"), expected_paths):
         plot_result = plot_results[name]
         assert plot_result.saved == [expected_path]
+        assert plot_result.save_kwargs == [
+            {"dpi": None, "transparent": False, "exact_size": True}
+        ]
         assert plot_result.show_calls == 1
         assert plot_result.close_calls == 1
     assert result.failures == {}
@@ -255,56 +259,28 @@ categoryBy = "cluster"
     assert dict(from_toml.steps[1].kwargs) == {"category_by": "cluster"}
 
 
-def test_runner_resolves_json_config_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    seen: list[dict[str, object]] = []
-    plot_result = FakePlotResult("embedding")
-
-    def embedding(store: object, **kwargs: object) -> FakePlotResult:
-        seen.append(kwargs)
-        return plot_result
-
-    monkeypatch.setattr(plotting, "embedding", embedding)
-    path = tmp_path / "recipe.json"
-    path.write_text(
-        json.dumps(
-            {
-                "steps": [
-                    {
-                        "name": "overview",
-                        "plot": "embedding",
-                        "kwargs": {"layoutKey": "umap"},
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    result = run_recipe(object(), path)
-
-    assert seen == [{"layout_key": "umap", "show": False}]
-    assert [output.result for output in result.outputs] == [plot_result]
-
-
 @pytest.mark.parametrize(
-    "filename",
+    ("filename", "message"),
     [
-        "/tmp/plot.png",
-        "../plot.png",
-        "nested/../../plot.png",
-        r"C:\plots\plot.png",
+        ("/tmp/plot.png", "outputFilename must be a relative path"),
+        (r"C:\plots\plot.png", "outputFilename must be a relative path"),
+        ("C:plot.png", "outputFilename must be a relative path"),
+        (r"\\server\share\plot.png", "outputFilename must be a relative path"),
+        ("../plot.png", "outputFilename must not contain parent traversal"),
+        ("nested/../../plot.png", "outputFilename must not contain parent traversal"),
     ],
 )
-def test_output_filename_rejects_absolute_and_traversal_paths(filename: str) -> None:
-    with pytest.raises(ValueError, match="relative|traversal"):
+def test_output_filename_rejects_absolute_and_traversal_paths(
+    filename: str, message: str
+) -> None:
+    with pytest.raises(ValueError) as raised:
         PlotStep(
             name="overview",
             plot="embedding",
             output_filename=filename,
         )
+
+    assert raised.value.args == (message,)
 
 
 def test_output_filename_requires_supported_format_and_output_directory() -> None:
@@ -329,9 +305,13 @@ def test_output_filename_requires_supported_format_and_output_directory() -> Non
 
 
 @pytest.mark.parametrize(
-    ("config", "message"),
+    ("config", "error", "message"),
     [
-        ({"steps": [], "extra": True}, "Unknown plot recipe"),
+        (
+            {"steps": [], "extra": True},
+            ValueError,
+            r"Unknown plot recipe key\(s\): 'extra'",
+        ),
         (
             {
                 "steps": [
@@ -342,20 +322,27 @@ def test_output_filename_requires_supported_format_and_output_directory() -> Non
                     }
                 ]
             },
-            "Unknown plot step",
+            ValueError,
+            r"Unknown plot step 0 key\(s\): 'output_filename'",
         ),
         (
             {"steps": [{"name": "overview", "plot": "embedding", "kwargs": []}]},
-            "mapping",
+            TypeError,
+            "kwargs for plot step 0 must be a mapping",
         ),
-        ({"steps": [{"name": "overview", "plot": "unknown"}]}, "Unknown plot"),
+        (
+            {"steps": [{"name": "overview", "plot": "unknown"}]},
+            ValueError,
+            "Unknown plot 'unknown'; choose from",
+        ),
     ],
 )
 def test_from_dict_rejects_unknown_keys_and_invalid_values(
     config: dict[str, object],
+    error: type[Exception],
     message: str,
 ) -> None:
-    with pytest.raises((TypeError, ValueError), match=message):
+    with pytest.raises(error, match=message):
         PlotRecipe.from_dict(config)
 
 
@@ -559,19 +546,31 @@ def test_json_loader_rejects_duplicate_keys_and_non_object_roots() -> None:
         PlotRecipe.from_json("[]")
 
 
+def test_output_formats_are_the_documented_set() -> None:
+    assert ALLOWED_OUTPUT_FORMATS == frozenset({"pdf", "png", "svg", "tif", "tiff"})
+
+
 @pytest.mark.parametrize(
     "filename",
-    [
-        f"nested/plot.{extension.upper()}"
-        for extension in sorted(ALLOWED_OUTPUT_FORMATS)
-    ],
+    ["plot.PDF", "plot.Png", "plot.SVG", "plot.TIF", "nested/plot.tIFF"],
 )
 def test_output_settings_accept_supported_formats_case_insensitively(
     filename: str,
 ) -> None:
-    output = PlotOutputSettings(filename)
+    step = PlotStep(name="s", plot="embedding", output_filename=filename)
 
-    assert output.filename == filename
+    assert step.output == PlotOutputSettings(filename)
+    assert step.output_filename == filename
+
+
+def test_inline_json_longer_than_a_file_name_is_parsed_as_text() -> None:
+    # A one-line source this long cannot name a file, so it parses as JSON.
+    name = "a" * 300
+    recipe = PlotRecipe.from_json(
+        json.dumps({"steps": [{"name": name, "plot": "embedding"}]})
+    )
+
+    assert [step.name for step in recipe.steps] == [name]
 
 
 @pytest.mark.parametrize(

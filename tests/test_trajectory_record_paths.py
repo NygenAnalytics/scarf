@@ -7,7 +7,8 @@ The others pin the record and payload forms that validation must accept.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cache
 from typing import Any
 
 import numpy as np
@@ -124,6 +125,22 @@ class _Trajectory:
         return list_artifacts(self.store.zw, scope="assay", assay="RNA", kind=kind)
 
 
+def _copy_store(store: Any) -> Any:
+    """Return an independent copy of an in-memory trajectory store.
+
+    Every stored buffer is copied, so even an in-place partial write to one
+    store never reaches the other.
+    """
+    copied = _memory_graph_store(list(store._assay_names))
+    buffers = {
+        key: type(buffer).from_bytes(buffer.to_bytes())
+        for key, buffer in store.z.store._store_dict.items()
+    }
+    copied.z = zarr.open_group(store=MemoryStore(buffers), mode="r+")
+    copied.cells = MetaData(copied.z["cellData"])
+    return copied
+
+
 def _trajectory_store(
     adjacency: np.ndarray,
     *,
@@ -133,7 +150,20 @@ def _trajectory_store(
 
     A second selection holds the same cells under a different identity, so
     an artifact aligned to it has the right length but the wrong lineage.
+    Each test receives its own copy of a store built once per graph.
     """
+    values = np.asarray(adjacency, dtype=np.float64)
+    template = _trajectory_template(values.tobytes(), values.shape, assays)
+    return replace(template, store=_copy_store(template.store))
+
+
+@cache
+def _trajectory_template(
+    adjacency_bytes: bytes,
+    shape: tuple[int, ...],
+    assays: tuple[str, ...],
+) -> _Trajectory:
+    adjacency = np.frombuffer(adjacency_bytes, dtype=np.float64).reshape(shape)
     n_cells = adjacency.shape[0]
     store = _memory_graph_store()
     table = store.z.create_group("cellData")
@@ -618,6 +648,14 @@ class _ScoredTrajectory:
 
 
 def _scored_trajectory() -> _ScoredTrajectory:
+    """Return a private copy of the scored Y trajectory, built once."""
+    template = _scored_template()
+    trajectory = replace(template.trajectory, store=_copy_store(template.store))
+    return replace(template, trajectory=trajectory)
+
+
+@cache
+def _scored_template() -> _ScoredTrajectory:
     trajectory = _trajectory_store(_y_graph(), assays=("RNA", "ADT"))
     labels = trajectory.labels(_Y_LABELS)
     return _ScoredTrajectory(
@@ -749,6 +787,15 @@ class _MappedTrajectory:
 
 
 def _mapped_trajectory() -> _MappedTrajectory:
+    """Return a private copy of the fate-mapped Y trajectory, built once."""
+    template = _mapped_template()
+    scored = template.scored
+    trajectory = replace(scored.trajectory, store=_copy_store(scored.store))
+    return replace(template, scored=replace(scored, trajectory=trajectory))
+
+
+@cache
+def _mapped_template() -> _MappedTrajectory:
     scored = _scored_trajectory()
     return _MappedTrajectory(
         scored=scored,
@@ -896,6 +943,14 @@ def test_marker_search_stores_no_correlation_that_is_not_finite(
     detected_features,
     monkeypatch,
 ) -> None:
+    # Forty detected features keep the forced recomputation quick.
+    detected = np.asarray(
+        artifact_group(datastore.zw, detected_features)["values"][:], dtype=bool
+    )
+    features = datastore.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=np.flatnonzero(detected)[:40].tolist(),
+    )
     import scarf.features.markers as marker_algorithms
 
     original_search = marker_algorithms.find_markers_by_regression
@@ -920,7 +975,7 @@ def test_marker_search_stores_no_correlation_that_is_not_finite(
     ):
         datastore.run_pseudotime_marker_search(
             pseudotime_scoring,
-            features=detected_features,
+            features=features,
             invalidate_cache=True,
         )
     assert (

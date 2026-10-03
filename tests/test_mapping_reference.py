@@ -1,3 +1,7 @@
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import pytest
 import zarr
@@ -5,11 +9,10 @@ from zarr.storage import MemoryStore
 
 import scarf.mapping as mapping
 from scarf.datastore.datastore import DataStore
-from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.metadata.artifacts import plan_cell_data_artifact, write_cell_data_artifact
 from scarf.storage.artifacts import ArtifactRef, artifact_group, artifact_path
 from scarf.storage.selections import read_stored_selection_indices
-
+from tests.storage_helpers import write_count_store
 
 _COMMON_ARRAYS = {
     "feature_ids",
@@ -28,6 +31,148 @@ _SYMPHONY_ARRAYS = {
     "sigma",
 }
 
+# The reference keeps all but two cells and the first 26 of 30 genes, so its
+# cell and feature selections differ from the full store axes.
+MAPPING_N_CELLS = 64
+MAPPING_N_GENES = 30
+MAPPING_REFERENCE_GENES = 26
+MAPPING_EXCLUDED_CELLS = (5, 22)
+
+
+@dataclass(frozen=True)
+class MappingStoreSource:
+    """A built reference store that each writing test copies first.
+
+    Four cell programs of sixteen cells each raise their own five genes, so
+    the PCA, the neighbor graph and the Harmony clusters have structure. The
+    store also holds a three-protein ADT assay. ``reference`` and
+    ``symphony_reference`` are set when the source was built with them.
+    """
+
+    path: Path
+    cells: ArtifactRef
+    features: ArtifactRef
+    normalized: ArtifactRef
+    reduction: ArtifactRef
+    other_reduction: ArtifactRef
+    neighbors: ArtifactRef
+    correction: ArtifactRef
+    symphony_neighbors: ArtifactRef
+    reference: ArtifactRef | None = None
+    symphony_reference: ArtifactRef | None = None
+
+    def open_copy(self, path: Path, *, zarr_mode: str = "r+") -> DataStore:
+        shutil.copytree(self.path, path)
+        return DataStore(str(path), default_assay="RNA", zarr_mode=zarr_mode)
+
+
+def mapping_counts(seed: int = 17) -> np.ndarray:
+    """Return the reference counts: every cell measures every gene."""
+    rng = np.random.default_rng(seed)
+    programs = np.arange(MAPPING_N_CELLS) % 4
+    counts = rng.poisson(4.0, size=(MAPPING_N_CELLS, MAPPING_N_GENES)) + 1
+    for program in range(4):
+        counts[programs == program, 5 * program : 5 * program + 5] += 30
+    return counts
+
+
+def build_mapping_store(path: Path, *, with_references: bool) -> MappingStoreSource:
+    """Write and analyze the small reference store described above."""
+    rng = np.random.default_rng(23)
+    write_count_store(
+        str(path),
+        {
+            "RNA": mapping_counts(),
+            "ADT": rng.integers(1, 20, size=(MAPPING_N_CELLS, 3)),
+        },
+        "uint32",
+    )
+    store = DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+    keep = np.ones(MAPPING_N_CELLS, dtype=bool)
+    keep[list(MAPPING_EXCLUDED_CELLS)] = False
+    store.cells.insert("reference_cells", keep)
+    store.cells.insert(
+        "mapping_batch",
+        np.where(np.arange(MAPPING_N_CELLS) % 2, "a", "b"),
+    )
+    cells = store.snapshot_cell_selection("reference_cells")
+    features = store.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=list(range(MAPPING_REFERENCE_GENES)),
+    )
+    normalized = store.run_normalization(cells, features)
+    reduction = store.run_pca(normalized, dims=4, local_cache=False)
+    other_reduction = store.run_pca(normalized, dims=3, local_cache=False)
+    neighbors = store.query_neighbors(
+        store.build_ann_index(reduction),
+        coordinates=reduction,
+        k=5,
+    )
+    correction = store.run_harmony(
+        reduction,
+        ["mapping_batch"],
+        harmony_params={"nclust": 3},
+    )
+    symphony_neighbors = store.query_neighbors(
+        store.build_ann_index(correction),
+        coordinates=correction,
+        k=5,
+    )
+    references = {}
+    if with_references:
+        references = {
+            "reference": store.build_mapping_reference(neighbors),
+            "symphony_reference": store.build_mapping_reference(symphony_neighbors),
+        }
+    return MappingStoreSource(
+        path=path,
+        cells=cells,
+        features=features,
+        normalized=normalized,
+        reduction=reduction,
+        other_reduction=other_reduction,
+        neighbors=neighbors,
+        correction=correction,
+        symphony_neighbors=symphony_neighbors,
+        **references,
+    )
+
+
+def build_mapping_query(path: Path) -> Path:
+    """Write a query store with the RNA counts of the reference cells.
+
+    It measures every reference gene but holds no artifacts.
+    """
+    write_count_store(str(path), {"RNA": mapping_counts()}, "uint32")
+    DataStore(str(path), default_assay="RNA", min_features_per_cell=0)
+    return path
+
+
+@pytest.fixture(scope="module")
+def mapping_source(tmp_path_factory) -> MappingStoreSource:
+    return build_mapping_store(
+        tmp_path_factory.mktemp("mapping_reference") / "reference.zarr",
+        with_references=False,
+    )
+
+
+@pytest.fixture
+def reference_store(mapping_source, tmp_path) -> DataStore:
+    return mapping_source.open_copy(tmp_path / "reference.zarr")
+
+
+def _edit_provenance(group, section, key, value) -> None:
+    provenance = dict(group.attrs["provenance"])
+    if section is None:
+        provenance[key] = value
+    else:
+        provenance[section] = dict(provenance[section]) | {key: value}
+    group.attrs["provenance"] = provenance
+
+
+def _input_ref(datastore, ref: ArtifactRef, name: str) -> ArtifactRef:
+    return ArtifactRef.from_dict(datastore.inspect_artifact(ref).inputs[name])
+
 
 def test_embedded_mapping_reference_helpers_are_not_public():
     for name in (
@@ -43,47 +188,6 @@ def test_embedded_mapping_reference_helpers_are_not_public():
         assert name not in mapping.__all__
         assert not hasattr(mapping, name)
     assert not hasattr(mapping.MappingReference, "map_query")
-
-
-def _selected_neighbors(datastore):
-    graphs = datastore.list_artifacts(
-        kind="connectivity_map",
-        from_assay="RNA",
-        scope="assay",
-        complete_only=True,
-    )
-    assert len(graphs) == 1
-    raw_neighbors = datastore.inspect_artifact(graphs[0]).inputs["neighbors"]
-    return ArtifactRef.from_dict(raw_neighbors)
-
-
-def _symphony_neighbors(datastore):
-    graphs = datastore.list_artifacts(
-        kind="connectivity_map",
-        from_assay="RNA",
-        scope="assay",
-        complete_only=True,
-    )
-    assert len(graphs) == 1
-    reduction = resolve_native_graph_inputs(datastore.zw, graphs[0]).coordinates
-    datastore.cells.insert(
-        "mapping_batch",
-        np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
-        overwrite=True,
-    )
-    correction = datastore.run_harmony(
-        reduction,
-        ["mapping_batch"],
-        harmony_params={"nclust": 5},
-    )
-    ann_index = datastore.build_ann_index(
-        correction,
-    )
-    return datastore.query_neighbors(
-        ann_index,
-        coordinates=correction,
-        k=3,
-    )
 
 
 def _mapping_reference_source_paths(datastore, neighbors):
@@ -177,10 +281,11 @@ def _reject_full_array_reads(monkeypatch, paths):
 
 
 def test_plain_mapping_reference_packages_and_loads_existing_chain(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
     before = set(datastore.list_artifacts(from_assay="RNA"))
     reference_ref = datastore.build_mapping_reference(neighbors)
     assert isinstance(reference_ref, ArtifactRef)
@@ -189,6 +294,9 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
     assert reference.method == "pca"
     assert reference.symphony_state is None
     assert reference.neighbors == neighbors
+    assert reference.reduction == mapping_source.reduction
+    assert reference.cell_selection == mapping_source.cells
+    assert reference.feature_selection == mapping_source.features
     assert not hasattr(reference, "feature_key")
     assert reference.dataset_fingerprint == datastore._ensure_dataset_fingerprint("RNA")
     selected_cells = read_stored_selection_indices(
@@ -199,9 +307,41 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
         assay=None,
         table_path="cellData",
     )
+    np.testing.assert_array_equal(
+        selected_cells,
+        np.setdiff1d(np.arange(MAPPING_N_CELLS), MAPPING_EXCLUDED_CELLS),
+    )
     assert reference.selected_cell_count == len(selected_cells)
-    assert reference.size_factor > 0
-    assert reference.ann_metric in {"l2", "cosine"}
+    assert reference.ann_metric == "l2"
+    np.testing.assert_array_equal(
+        reference.feature_ids,
+        [f"RNA{index}" for index in range(MAPPING_REFERENCE_GENES)],
+    )
+    # The model is an exact copy of the feature scaling and PCA it packages.
+    normalized_status = datastore.inspect_artifact(mapping_source.normalized)
+    assert reference.normalization_parameters == normalized_status.parameters
+    assert reference.size_factor == normalized_status.parameters["size_factor"]
+    pca = artifact_group(datastore.zw, mapping_source.reduction)
+    scaling = artifact_group(
+        datastore.zw,
+        _input_ref(datastore, mapping_source.reduction, "feature_scaling"),
+    )
+    np.testing.assert_array_equal(reference.model.feature_means, scaling["mean"][:])
+    np.testing.assert_array_equal(reference.model.feature_scales, scaling["scale"][:])
+    np.testing.assert_array_equal(reference.model.center, pca["center"][:])
+    np.testing.assert_array_equal(reference.model.loadings, pca["loadings"][:])
+    # The distance summary holds quantiles of each cell's first-neighbor
+    # distance, one quantile per reference cell when cells are few.
+    first_distances = np.asarray(
+        artifact_group(datastore.zw, neighbors)["distances"][:, 0],
+        dtype=np.float64,
+    )
+    quantiles = np.linspace(0.0, 1.0, len(selected_cells))
+    np.testing.assert_allclose(reference.reference_distance_quantiles, quantiles)
+    np.testing.assert_allclose(
+        reference.reference_distance_values,
+        np.quantile(first_distances, quantiles),
+    )
 
     group = artifact_group(datastore.zw, reference.ref)
     assert "feature_key" not in group.attrs["reference_metadata"]
@@ -219,6 +359,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
     assert created == {reference.ref}
 
     assert datastore.get_mapping_reference(reference.ref).ref == reference.ref
+    assert datastore.build_mapping_reference(neighbors) == reference.ref
 
     expected_layout = np.column_stack(
         (
@@ -254,11 +395,12 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
 
 
 def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     monkeypatch,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _symphony_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.symphony_neighbors
     _reject_full_array_reads(
         monkeypatch,
         _mapping_reference_source_paths(datastore, neighbors),
@@ -268,10 +410,24 @@ def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
 
     assert reference.method == "symphony"
     assert reference.symphony_state is not None
-    assert reference.batch_correction is not None
+    assert reference.batch_correction == mapping_source.correction
+    assert reference.reduction == mapping_source.reduction
     assert reference.symphony_state.n_dims == reference.model.n_dims
+    assert reference.symphony_state.n_clusters == 3
     assert reference.metadata["batch_columns"] == ["mapping_batch"]
-    assert reference.metadata["harmony_parameters"]["nclust"] == 5
+    assert reference.metadata["harmony_parameters"]["nclust"] == 3
+    # Harmony stores centroids as dimensions by clusters; the reference keeps
+    # them as clusters by dimensions, like its other centroid arrays.
+    harmony = artifact_group(datastore.zw, mapping_source.correction)
+    assert reference.metadata["batch_levels"] == harmony.attrs["batch_levels"]
+    np.testing.assert_array_equal(
+        reference.symphony_state.centroids,
+        np.asarray(harmony["centroids"][:]).T,
+    )
+    for name in ("raw_centroids", "corrected_centroids", "cluster_mass", "sigma"):
+        np.testing.assert_array_equal(
+            getattr(reference.symphony_state, name), harmony[name][:]
+        )
 
     group = artifact_group(datastore.zw, reference.ref)
     assert set(group.array_keys()) == _COMMON_ARRAYS | _SYMPHONY_ARRAYS
@@ -306,34 +462,32 @@ def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
     assert loaded.ref == reference.ref
     assert loaded.symphony_state is not None
     np.testing.assert_array_equal(loaded.feature_ids, reference.feature_ids)
-    np.testing.assert_allclose(
+    np.testing.assert_array_equal(
         loaded.symphony_state.corrected_centroids,
         reference.symphony_state.corrected_centroids,
     )
 
 
 def test_symphony_mapping_reference_requires_recorded_batch_levels(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _symphony_neighbors(datastore)
-    correction = ArtifactRef.from_dict(
-        datastore.inspect_artifact(neighbors).inputs["coordinates"]
-    )
-    del artifact_group(datastore.zw, correction).attrs["batch_levels"]
+    datastore = reference_store
+    del artifact_group(datastore.zw, mapping_source.correction).attrs["batch_levels"]
 
     with pytest.raises(ValueError, match="Re-run run_harmony"):
-        datastore.build_mapping_reference(neighbors)
+        datastore.build_mapping_reference(mapping_source.symphony_neighbors)
 
 
 def test_symphony_mapping_reference_load_rejects_each_tampered_record(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
     from scarf.mapping.artifact import load_artifact_mapping_reference
 
-    datastore = analyzed_datastore_ephemeral
+    datastore = reference_store
     reference = datastore.get_mapping_reference(
-        datastore.build_mapping_reference(_symphony_neighbors(datastore))
+        datastore.build_mapping_reference(mapping_source.symphony_neighbors)
     )
     group = artifact_group(datastore.zw, reference.ref)
     correction = artifact_group(datastore.zw, reference.batch_correction)
@@ -380,16 +534,13 @@ def test_symphony_mapping_reference_load_rejects_each_tampered_record(
 
 @pytest.mark.parametrize("missing", ["batch_levels", "batch_columns"])
 def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     missing,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _symphony_neighbors(datastore)
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    correction = ArtifactRef.from_dict(
-        datastore.inspect_artifact(neighbors).inputs["coordinates"]
-    )
-    group = artifact_group(datastore.zw, correction)
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.symphony_neighbors)
+    group = artifact_group(datastore.zw, mapping_source.correction)
     if missing == "batch_levels":
         del group.attrs["batch_levels"]
     else:
@@ -403,18 +554,22 @@ def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
 
 
 def test_loaded_mapping_reference_is_deeply_immutable(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
+    datastore = reference_store
     reference = datastore.get_mapping_reference(
-        datastore.build_mapping_reference(_selected_neighbors(datastore))
+        datastore.build_mapping_reference(mapping_source.symphony_neighbors)
     )
+    assert reference.symphony_state is not None
 
     arrays = (
         reference.model.feature_means,
         reference.model.feature_scales,
         reference.model.center,
         reference.model.loadings,
+        reference.symphony_state.centroids,
+        reference.symphony_state.corrected_centroids,
         reference.feature_ids,
         reference.reference_distance_quantiles,
         reference.reference_distance_values,
@@ -424,27 +579,34 @@ def test_loaded_mapping_reference_is_deeply_immutable(
         with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
             values.flags.writeable = True
 
-    with pytest.raises(TypeError):
-        reference.metadata["method"] = "symphony"  # type: ignore[index]
-    batch_columns = reference.metadata.get("batch_columns")
-    if batch_columns is not None:
-        assert batch_columns == ["mapping_batch"]
-        assert not batch_columns != ["mapping_batch"]
-        assert ["mapping_batch"] == batch_columns
-        assert not ["mapping_batch"] != batch_columns
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        reference.metadata["method"] = "pca"  # type: ignore[index]
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        reference.metadata["harmony_parameters"]["nclust"] = 9  # type: ignore[index]
+    # Frozen lists keep list equality in both directions.
+    batch_columns = reference.metadata["batch_columns"]
+    with pytest.raises(AttributeError, match="append"):
+        batch_columns.append("other")  # type: ignore[attr-defined]
+    assert batch_columns == ["mapping_batch"]
+    assert not batch_columns != ["mapping_batch"]
+    assert ["mapping_batch"] == batch_columns
+    assert not ["mapping_batch"] != batch_columns
+    assert batch_columns != ["other"]
     normalization = reference.normalization_parameters
     normalization["size_factor"] = -1
-    assert reference.size_factor > 0
+    assert reference.size_factor == 1000.0
+    assert reference.current_model_digest() == reference.model_digest
 
 
 def test_mapping_reference_binding_and_publication_validation_are_blockwise(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     monkeypatch,
 ):
     import scarf.mapping.artifact as mapping_artifact
 
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
     reference_ref = datastore.build_mapping_reference(neighbors)
     reference = datastore.get_mapping_reference(reference_ref)
     _reject_full_array_reads(
@@ -555,16 +717,20 @@ def test_mapping_reference_source_streaming_uses_bounded_explicit_slices(
     assert max(row_spans[center.path]) <= 10_000
     assert row_spans[loadings.path]
     assert max(row_spans[loadings.path]) <= 1_000
+    monkeypatch.undo()
+    np.testing.assert_array_equal(target_group["loadings"][:], loadings[:])
+    np.testing.assert_array_equal(target_group["center"][:], center[:])
 
 
 @pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_mapping_reference_rejects_valid_shaped_payload_tampering(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     array_name,
 ):
-    datastore = analyzed_datastore_ephemeral
+    datastore = reference_store
     reference = datastore.get_mapping_reference(
-        datastore.build_mapping_reference(_selected_neighbors(datastore))
+        datastore.build_mapping_reference(mapping_source.neighbors)
     )
     group = artifact_group(datastore.zw, reference.ref)
     values = group[array_name]
@@ -579,12 +745,13 @@ def test_mapping_reference_rejects_valid_shaped_payload_tampering(
 
 
 def test_mapping_reference_binds_distance_summary_to_neighbor_input(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
     import scarf.mapping.artifact as mapping_artifact
 
-    datastore = analyzed_datastore_ephemeral
-    reference_ref = datastore.build_mapping_reference(_selected_neighbors(datastore))
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.neighbors)
     group = artifact_group(datastore.zw, reference_ref)
     values = group["reference_distance_values"]
     values[:] = np.asarray(values[:], dtype=np.float64) + 0.25
@@ -599,37 +766,51 @@ def test_mapping_reference_binds_distance_summary_to_neighbor_input(
         datastore.get_mapping_reference(reference_ref)
 
 
-def test_mapping_reference_rejects_duplicate_selected_feature_ids(
-    analyzed_datastore_ephemeral,
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("duplicate", "feature IDs must be unique"),
+        ("drop", "Selected reference features do not match PCA loadings"),
+    ],
+)
+def test_mapping_reference_rejects_selected_feature_ids_unlike_the_loadings(
+    mapping_source,
+    reference_store,
     monkeypatch,
+    change,
+    message,
 ):
     import scarf.datastore._operations.mapping_reference as reference_operations
 
-    datastore = analyzed_datastore_ephemeral
+    datastore = reference_store
     original = reference_operations._selected_feature_ids
 
-    def duplicate_feature_ids(*args, **kwargs):
+    def changed_feature_ids(*args, **kwargs):
         feature_ids = np.array(original(*args, **kwargs), copy=True)
+        if change == "drop":
+            return feature_ids[:-1]
         feature_ids[1] = feature_ids[0]
         return feature_ids
 
     monkeypatch.setattr(
         reference_operations,
         "_selected_feature_ids",
-        duplicate_feature_ids,
+        changed_feature_ids,
     )
-    with pytest.raises(ValueError, match="feature IDs must be unique"):
-        datastore.build_mapping_reference(_selected_neighbors(datastore))
+    with pytest.raises(ValueError, match=message):
+        datastore.build_mapping_reference(mapping_source.neighbors)
+    assert datastore.list_artifacts(kind="mapping_reference", from_assay="RNA") == []
 
 
 def test_mapping_reference_validates_payload_before_finish(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     monkeypatch,
 ):
     import scarf.datastore._operations.mapping_reference as reference_operations
 
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
     before = set(
         datastore.list_artifacts(
             kind="mapping_reference",
@@ -666,14 +847,15 @@ def test_mapping_reference_validates_payload_before_finish(
 
 @pytest.mark.parametrize("array_name", ["loadings", "center"])
 def test_mapping_reference_rejects_source_mutation_during_publication(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
     monkeypatch,
     array_name,
 ):
     import scarf.datastore._operations.mapping_reference as reference_operations
 
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
     before = set(
         datastore.list_artifacts(
             kind="mapping_reference",
@@ -710,32 +892,71 @@ def test_mapping_reference_rejects_source_mutation_during_publication(
     assert created == set()
 
 
-def test_mapping_reference_rejects_corrupt_neighbor_payload_on_build_and_load(
-    analyzed_datastore_ephemeral,
-):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
-    reference_ref = datastore.build_mapping_reference(neighbors)
-    neighbor_group = artifact_group(datastore.zw, neighbors)
-    n_cells = int(neighbor_group["indices"].shape[0])
-    del neighbor_group["distances"]
-    neighbor_group.create_array(
+def _flatten_neighbor_distances(group: zarr.Group) -> None:
+    n_cells = int(group["indices"].shape[0])
+    del group["distances"]
+    group.create_array(
         "distances",
         data=np.zeros(n_cells, dtype=np.float32),
         chunks=(max(1, min(n_cells, 10)),),
     )
 
-    with pytest.raises(ValueError, match="neighbor distances are invalid"):
+
+def _drop_last_neighbor_row(group: zarr.Group) -> None:
+    """Store a valid neighbor graph over one cell fewer than the selection."""
+    n_cells = int(group["indices"].shape[0]) - 1
+    n_neighbors = int(group["indices"].shape[1])
+    rows = np.arange(n_cells)[:, np.newaxis]
+    indices = (rows + 1 + np.arange(n_neighbors)) % n_cells
+    distances = np.tile(
+        np.linspace(1.0, 2.0, n_neighbors, dtype=np.float32), (n_cells, 1)
+    )
+    for name, values in (
+        ("indices", indices.astype(np.uint32)),
+        ("distances", distances),
+    ):
+        del group[name]
+        group.create_array(name, data=values)
+    group.attrs["n_cells"] = n_cells
+
+
+@pytest.mark.parametrize(
+    ("tamper", "load_cause", "build_message"),
+    [
+        (_flatten_neighbor_distances, "stored dimensions", "stored dimensions"),
+        (
+            _drop_last_neighbor_row,
+            "Neighbors do not match the selected reference cell count",
+            "Neighbor rows must match the selected reference cells",
+        ),
+    ],
+    ids=["flat-distances", "fewer-rows"],
+)
+def test_mapping_reference_rejects_corrupt_neighbor_payload_on_build_and_load(
+    mapping_source,
+    reference_store,
+    tamper,
+    load_cause,
+    build_message,
+):
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
+    reference_ref = datastore.build_mapping_reference(neighbors)
+    tamper(artifact_group(datastore.zw, neighbors))
+
+    with pytest.raises(ValueError, match="neighbor distances are invalid") as caught:
         datastore.get_mapping_reference(reference_ref)
-    with pytest.raises(ValueError, match="stored dimensions"):
+    assert load_cause in str(caught.value.__cause__)
+    with pytest.raises(ValueError, match=build_message):
         datastore.build_mapping_reference(neighbors, invalidate_cache=True)
 
 
 def test_mapping_reference_rejects_corrupt_ann_payload_on_build_and_load(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
+    datastore = reference_store
+    neighbors = mapping_source.neighbors
     reference = datastore.get_mapping_reference(
         datastore.build_mapping_reference(neighbors)
     )
@@ -749,31 +970,286 @@ def test_mapping_reference_rejects_corrupt_ann_payload_on_build_and_load(
         datastore.build_mapping_reference(neighbors, invalidate_cache=True)
 
 
-def test_mapping_reference_rejects_invalid_chain_contract(
-    analyzed_datastore_ephemeral,
+def test_get_mapping_reference_requires_a_mapping_reference_artifact(
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
-    neighbors_status = datastore.inspect_artifact(neighbors)
-    assert neighbors_status.inputs is not None
-    ann_index = neighbors_status.inputs["ann_index"]
-    ann_ref = type(neighbors).from_dict(ann_index)
-    ann_group = artifact_group(datastore.zw, ann_ref)
-    provenance = dict(ann_group.attrs["provenance"])
-    parameters = dict(provenance["parameters"])
-    parameters["ann_metric"] = "ip"
-    provenance["parameters"] = parameters
-    ann_group.attrs["provenance"] = provenance
+    datastore = reference_store
 
-    with pytest.raises(ValueError, match="only l2 and cosine"):
+    with pytest.raises(TypeError, match="reference must be an ArtifactRef"):
+        datastore.get_mapping_reference("reference")
+    for ref in (
+        mapping_source.neighbors,
+        ArtifactRef(
+            scope="datastore",
+            kind="mapping_reference",
+            artifact_id="a" * 64,
+        ),
+    ):
+        with pytest.raises(ValueError, match="assay-scoped mapping_reference"):
+            datastore.get_mapping_reference(ref)
+
+
+def test_build_mapping_reference_validates_arguments_before_reading(
+    mapping_source,
+    reference_store,
+):
+    datastore = reference_store
+    read_only = DataStore(datastore.zarr_loc, default_assay="RNA", zarr_mode="r")
+    adt_neighbors = ArtifactRef(
+        scope="assay",
+        assay="ADT",
+        kind="neighbors",
+        artifact_id="b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="requires a read-write store"):
+        read_only.build_mapping_reference(mapping_source.neighbors)
+    for arguments, error, message in (
+        ({"neighbors": "neighbors"}, TypeError, "neighbors must be an ArtifactRef"),
+        (
+            {"neighbors": mapping_source.neighbors, "invalidate_cache": 1},
+            TypeError,
+            "invalidate_cache must be a boolean",
+        ),
+        (
+            {"neighbors": mapping_source.reduction},
+            ValueError,
+            "neighbors must identify an assay-scoped neighbors artifact",
+        ),
+        ({"neighbors": adt_neighbors}, TypeError, "support RNA assays only"),
+    ):
+        with pytest.raises(error, match=message):
+            datastore.build_mapping_reference(**arguments)
+    assert datastore.list_artifacts(kind="mapping_reference", from_assay="RNA") == []
+
+
+def _source_groups(datastore, source: MappingStoreSource) -> dict[str, zarr.Group]:
+    normalized = source.normalized
+    return {
+        "neighbors": artifact_group(datastore.zw, source.neighbors),
+        "ann_index": artifact_group(
+            datastore.zw, _input_ref(datastore, source.neighbors, "ann_index")
+        ),
+        "reduction": artifact_group(datastore.zw, source.reduction),
+        "normalized": artifact_group(datastore.zw, normalized),
+        "scaling": artifact_group(
+            datastore.zw,
+            _input_ref(datastore, source.reduction, "feature_scaling"),
+        ),
+        "correction": artifact_group(datastore.zw, source.correction),
+    }
+
+
+def test_build_mapping_reference_rejects_each_inconsistent_chain_record(
+    mapping_source,
+    reference_store,
+):
+    datastore = reference_store
+    groups = _source_groups(datastore, mapping_source)
+    datastore.cells.insert(
+        "no_cells", np.zeros(MAPPING_N_CELLS, dtype=bool), overwrite=True
+    )
+    empty_cells = datastore.snapshot_cell_selection("no_cells").to_dict()
+    other_kind = mapping_source.features.to_dict()
+    other_reduction = mapping_source.other_reduction.to_dict()
+    plain = mapping_source.neighbors
+    symphony = mapping_source.symphony_neighbors
+    for neighbors, target, section, key, value, message in (
+        (plain, "neighbors", None, "operation", "old_knn", "require query_neighbors"),
+        (plain, "ann_index", None, "operation", "old_ann", "require build_ann_index"),
+        (
+            plain,
+            "neighbors",
+            "inputs",
+            "coordinates",
+            other_kind,
+            "must be a PCA reduction or batch correction",
+        ),
+        (
+            plain,
+            "ann_index",
+            "inputs",
+            "coordinates",
+            other_reduction,
+            "Neighbors and ANN index use different coordinates",
+        ),
+        (
+            symphony,
+            "correction",
+            None,
+            "operation",
+            "run_scanorama",
+            "require run_harmony correction",
+        ),
+        (plain, "reduction", None, "operation", "run_svd", "require a run_pca"),
+        (
+            plain,
+            "reduction",
+            "parameters",
+            "feat_scaling",
+            False,
+            "require PCA with feature scaling",
+        ),
+        (
+            plain,
+            "normalized",
+            None,
+            "operation",
+            "old_norm",
+            "require a run_normalization artifact",
+        ),
+        (
+            plain,
+            "normalized",
+            "inputs",
+            "dataset_fingerprint",
+            "",
+            "Normalized artifact is missing its dataset fingerprint",
+        ),
+        (
+            plain,
+            "scaling",
+            "parameters",
+            "enabled",
+            False,
+            "require enabled scaling for the same normalized data",
+        ),
+        (plain, "ann_index", "parameters", "ann_metric", "ip", "only l2 and cosine"),
+        (
+            plain,
+            "neighbors",
+            "parameters",
+            "distance_metric",
+            "cosine",
+            "Neighbor and ANN distance metrics do not match",
+        ),
+        (
+            plain,
+            "normalized",
+            "inputs",
+            "cell_selection",
+            empty_cells,
+            "require at least one selected cell",
+        ),
+    ):
+        group = groups[target]
+        original = group.attrs["provenance"]
+        _edit_provenance(group, section, key, value)
+        try:
+            with pytest.raises(ValueError, match=message):
+                datastore.build_mapping_reference(neighbors)
+        finally:
+            group.attrs["provenance"] = original
+    assert datastore.list_artifacts(kind="mapping_reference", from_assay="RNA") == []
+    # The restored records build both references.
+    for neighbors in (plain, symphony):
+        assert datastore.inspect_artifact(
+            datastore.build_mapping_reference(neighbors)
+        ).complete
+
+
+def _resize_columns(name: str, change: int):
+    def resize(group: zarr.Group) -> None:
+        array = group[name]
+        array.resize((array.shape[0], array.shape[1] + change))
+
+    return resize
+
+
+def _replace_values(name: str, shape_change: tuple[int, ...]):
+    def replace(group: zarr.Group) -> None:
+        values = np.asarray(group[name][:])
+        del group[name]
+        group.create_array(
+            name,
+            data=np.ones(
+                tuple(
+                    size + change
+                    for size, change in zip(values.shape, shape_change, strict=True)
+                ),
+                dtype=values.dtype,
+            ),
+        )
+
+    return replace
+
+
+def _flatten_loadings(group: zarr.Group) -> None:
+    values = np.asarray(group["loadings"][:])
+    del group["loadings"]
+    group.create_array("loadings", data=values[:, 0].copy())
+
+
+@pytest.mark.parametrize(
+    ("method", "target", "tamper", "message"),
+    [
+        (
+            "pca",
+            "reduction",
+            _flatten_loadings,
+            "Reference PCA loadings have incompatible dimensions",
+        ),
+        (
+            "pca",
+            "reduction",
+            _resize_columns("data", 1),
+            "PCA rows must match the selected reference cells and dimensions",
+        ),
+        (
+            "symphony",
+            "correction",
+            _resize_columns("data", 1),
+            "Harmony coordinates do not match the reference PCA dimensions",
+        ),
+        (
+            "symphony",
+            "correction",
+            _replace_values("centroids", (1, 0)),
+            "Harmony correction dimensions do not match PCA loadings",
+        ),
+        (
+            "symphony",
+            "correction",
+            _replace_values("sigma", (1,)),
+            "Harmony correction arrays have incompatible dimensions",
+        ),
+    ],
+    ids=[
+        "flat-loadings",
+        "pca-columns",
+        "harmony-columns",
+        "harmony-centroid-rows",
+        "harmony-sigma-length",
+    ],
+)
+def test_build_mapping_reference_rejects_misshapen_source_payloads(
+    mapping_source,
+    reference_store,
+    method,
+    target,
+    tamper,
+    message,
+):
+    datastore = reference_store
+    neighbors = (
+        mapping_source.neighbors
+        if method == "pca"
+        else mapping_source.symphony_neighbors
+    )
+    tamper(_source_groups(datastore, mapping_source)[target])
+
+    with pytest.raises(ValueError, match=message):
         datastore.build_mapping_reference(neighbors)
+    assert datastore.list_artifacts(kind="mapping_reference", from_assay="RNA") == []
 
 
 def test_mapping_reference_rejects_array_attributes(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    reference_ref = datastore.build_mapping_reference(_selected_neighbors(datastore))
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.neighbors)
     artifact_group(datastore.zw, reference_ref)["loadings"].attrs["schema_version"] = 1
 
     with pytest.raises(ValueError, match="array attributes"):
@@ -781,33 +1257,23 @@ def test_mapping_reference_rejects_array_attributes(
 
 
 def test_mapping_reference_rejects_unsupported_normalization_at_build_time(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
-    coordinates = ArtifactRef.from_dict(
-        datastore.inspect_artifact(neighbors).inputs["coordinates"]
-    )
-    normalized = ArtifactRef.from_dict(
-        datastore.inspect_artifact(coordinates).inputs["normalized"]
-    )
-    group = artifact_group(datastore.zw, normalized)
-    provenance = dict(group.attrs["provenance"])
-    parameters = dict(provenance["parameters"])
-    parameters["normalization_method"] = "unsupported"
-    provenance["parameters"] = parameters
-    group.attrs["provenance"] = provenance
+    datastore = reference_store
+    group = artifact_group(datastore.zw, mapping_source.normalized)
+    _edit_provenance(group, "parameters", "normalization_method", "unsupported")
 
     with pytest.raises(ValueError, match="Unsupported reference normalization"):
-        datastore.build_mapping_reference(neighbors)
+        datastore.build_mapping_reference(mapping_source.neighbors)
 
 
 def test_mapping_reference_rejects_incomplete_contract(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    neighbors = _selected_neighbors(datastore)
-    reference_ref = datastore.build_mapping_reference(neighbors)
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.neighbors)
     group = artifact_group(datastore.zw, reference_ref)
     del group["feature_scales"]
     with pytest.raises(ValueError, match="build_mapping_reference\\(neighbors\\)"):
@@ -815,21 +1281,35 @@ def test_mapping_reference_rejects_incomplete_contract(
 
 
 def test_mapping_reference_validates_live_dataset_fingerprint(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    reference_ref = datastore.build_mapping_reference(_selected_neighbors(datastore))
-    datastore.RNA.attrs["dataset_fingerprint"] = "changed"
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.neighbors)
+    # Normalized data recorded for another dataset cannot become a reference.
+    normalized = artifact_group(datastore.zw, mapping_source.normalized)
+    original = normalized.attrs["provenance"]
+    _edit_provenance(normalized, "inputs", "dataset_fingerprint", "stale-dataset")
+    with pytest.raises(
+        ValueError,
+        match="Normalized artifact does not match the current reference dataset",
+    ):
+        datastore.build_mapping_reference(
+            mapping_source.neighbors, invalidate_cache=True
+        )
+    normalized.attrs["provenance"] = original
 
+    datastore.RNA.attrs["dataset_fingerprint"] = "changed"
     with pytest.raises(ValueError, match="dataset fingerprint"):
         datastore.get_mapping_reference(reference_ref)
 
 
 def test_mapping_reference_rejects_nonmonotonic_distance_summary(
-    analyzed_datastore_ephemeral,
+    mapping_source,
+    reference_store,
 ):
-    datastore = analyzed_datastore_ephemeral
-    reference_ref = datastore.build_mapping_reference(_selected_neighbors(datastore))
+    datastore = reference_store
+    reference_ref = datastore.build_mapping_reference(mapping_source.neighbors)
     values = artifact_group(datastore.zw, reference_ref)["reference_distance_values"]
     values[:] = np.linspace(1.0, 0.0, values.shape[0])
 

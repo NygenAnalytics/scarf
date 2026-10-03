@@ -253,17 +253,24 @@ def _run_create_counts_mat(
 
 def test_create_bed_from_coord_ids_sorts_intervals():
     bed = create_bed_from_coord_ids(["chr2:100-200", "chr1:50-150", "chr1:300-400"])
-    assert bed.iloc[0, 0] == "chr1"
-    assert bed.iloc[0, 1] == 50
-    assert bed.iloc[-1, 0] == "chr2"
+
+    # Rows sort by chromosome and start, and keep their input positions.
+    assert bed.values.tolist() == [
+        ["chr1", 50, 150],
+        ["chr1", 300, 400],
+        ["chr2", 100, 200],
+    ]
+    assert bed.index.tolist() == [1, 2, 0]
 
 
 def test_binary_search_finds_overlapping_ranges():
     ranges = np.array([[0, 10], [10, 20], [20, 30], [30, 40]], dtype=np.int64)
-    queries = np.array([[5, 8], [15, 18], [25, 28]], dtype=np.int64)
+    queries = np.array([[5, 8], [15, 18], [25, 28], [8, 32]], dtype=np.int64)
+
     hits = binary_search(ranges, queries)
-    assert hits.shape == (3, 2)
-    assert hits[0, 0] <= hits[0, 1]
+
+    # Each row is the half-open range of overlapping interval positions.
+    np.testing.assert_array_equal(hits, [[0, 1], [1, 2], [2, 3], [0, 4]])
 
 
 def test_get_feature_mappings_builds_sparse_overlap_matrix():
@@ -328,6 +335,29 @@ def test_get_feature_mappings_uniquifies_duplicate_ids():
     )
     feat_ids, _, _ = get_feature_mappings(peaks, features)
     assert list(feat_ids) == ["dup", "dup_2"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="bug: the suffix of a repeated id can equal another id, such as dup_2",
+)
+def test_get_feature_mappings_uniquifies_ids_that_collide_with_suffixes():
+    peaks = create_bed_from_coord_ids(["chr1:100-200"])
+    features = _features_bed(
+        [
+            ("chr1", 120, 160, "dup", "A", "+"),
+            ("chr1", 500, 600, "dup", "B", "+"),
+            ("chr1", 700, 800, "dup_2", "C", "+"),
+        ]
+    )
+
+    # Melding raises "Somehow the feature ids are not unique ... Please
+    # report this bug" instead of returning three distinct ids.
+    feat_ids, _, mapping = get_feature_mappings(peaks, features)
+
+    assert len(set(feat_ids)) == 3
+    assert feat_ids[0] == "dup"
+    assert mapping.shape == (1, 3)
 
 
 def test_get_feature_mappings_follows_feature_bed_order():
@@ -618,6 +648,46 @@ def test_add_melded_assay_rna_writes_complete_counts_t(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("idf_cell_idx", "error", "message"),
+    [
+        (np.array([True, False, True]), TypeError, "integer indices"),
+        (np.array([0.0, 1.0]), TypeError, "integer indices"),
+        (np.array([[0, 1]]), ValueError, "one-dimensional"),
+        (np.array([], dtype=np.int64), ValueError, "at least one selected cell"),
+        (np.array([0, 3]), IndexError, "out-of-range cell"),
+        (np.array([-1, 0]), IndexError, "out-of-range cell"),
+    ],
+    ids=["boolean", "float", "two-dimensional", "empty", "past-end", "negative"],
+)
+def test_create_counts_mat_rejects_invalid_idf_cells(idf_cell_idx, error, message):
+    assay, mapping, *_ = _build_melding_scenario()
+
+    with pytest.raises(error, match=message):
+        _run_create_counts_mat(assay, mapping, 1e4, False, idf_cell_idx=idf_cell_idx)
+
+
+def test_create_counts_mat_learns_idf_from_each_selected_cell_once():
+    assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
+
+    repeated = _run_create_counts_mat(
+        assay, mapping, 1e4, False, idf_cell_idx=np.array([2, 1, 2])
+    )
+
+    np.testing.assert_allclose(
+        repeated,
+        _reference_melded(
+            raw,
+            n_counts,
+            n_cells_peak,
+            mapping.toarray(),
+            scalar_coeff=1e4,
+            renorm=False,
+            idf_cell_idx=np.array([1, 2]),
+        ),
+    )
+
+
 def test_create_counts_mat_with_renormalization_and_zero_sum_cell():
     assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
     written = _run_create_counts_mat(
@@ -725,8 +795,13 @@ def test_create_counts_mat_writes_under_budget_sparse_admission_rejected() -> No
         renormalization=False,
     )
     assert store.shape == (n_cells, n_genes)
-    assert np.isfinite(store[:]).all()
-    assert store[:].sum() > 0
+    np.testing.assert_allclose(
+        store[:],
+        _reference_melded(
+            raw, n_counts, n_cells_peak, mapping.toarray(), 1e4, renorm=False
+        ),
+        rtol=1e-12,
+    )
 
 
 def test_create_counts_mat_rejects_unaffordable_one_cell_band() -> None:

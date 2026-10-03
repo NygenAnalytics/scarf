@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -443,3 +444,112 @@ def test_summarize_zarr_readonly_supports_workspace(tmp_path: Path) -> None:
     assert [assay.name for assay in summary.assays] == ["RNA"]
     assert summary.assays[0].total_features == 2
     assert _file_snapshot(location) == before
+
+
+def _write_assay_layout(
+    location: Path,
+    assays: dict[str, int],
+    *,
+    root_attrs: dict[str, object] | None = None,
+) -> None:
+    """Write the cell and assay tables a read-only summary reads, and no counts.
+
+    The summary adapter never opens a DataStore, so these layouts reach the
+    default-assay and empty-table branches that DataStore preparation hides.
+    """
+    root = zarr.open_group(str(location), mode="w")
+    root.attrs.update(root_attrs or {})
+    cells = root.create_group("cellData")
+    cell_ids = np.asarray(["cell-0", "cell-1", "cell-2"])
+    cells.create_array("ids", data=cell_ids)
+    cells.create_array("names", data=cell_ids)
+    cells.create_array("I", data=np.asarray([True, False, True]))
+    for name, n_features in assays.items():
+        assay = root.create_group(name)
+        assay.attrs["is_assay"] = True
+        features = assay.create_group("featureData")
+        feature_ids = np.asarray(
+            [f"{name}-{index}" for index in range(n_features)], dtype="<U16"
+        )
+        features.create_array("ids", data=feature_ids)
+        features.create_array("names", data=feature_ids)
+        features.create_array("I", data=np.arange(n_features) != 1)
+
+
+def test_readonly_summary_of_assays_without_rna_or_recorded_types(
+    tmp_path: Path,
+) -> None:
+    from scarf.datastore.summary import summarize_zarr_readonly
+
+    location = tmp_path / "no-rna.zarr"
+    # Assay types written by another tool as a list carry no per-assay type.
+    _write_assay_layout(
+        location,
+        {"HTO": 0, "ADT": 3},
+        root_attrs={"assayTypes": ["ADT", "HTO"]},
+    )
+    before = _file_snapshot(location)
+
+    summary = summarize_zarr_readonly(str(location))
+
+    # Without RNA or a stored default, the first assay in name order is used.
+    assert summary.default_assay == "ADT"
+    assert (summary.total_cells, summary.active_cells) == (3, 2)
+    assert [
+        (assay.name, assay.assay_type, assay.total_features, assay.active_features)
+        for assay in summary.assays
+    ] == [("ADT", "Assay", 3, 2), ("HTO", "Assay", 0, 0)]
+    assert summary.assays[1].feature_columns == ("I", "ids", "names")
+    assert _file_snapshot(location) == before
+
+
+@pytest.mark.parametrize(
+    ("assays", "stored", "expected"),
+    [
+        ({"ADT": 2, "HTO": 2}, "HTO", "HTO"),
+        ({"ADT": 2, "HTO": 2}, "deleted", "ADT"),
+        ({"ADT": 2, "RNA": 2}, "deleted", "RNA"),
+        ({"ADT": 2, "RNA": 2}, None, "RNA"),
+    ],
+)
+def test_readonly_summary_prefers_a_stored_default_that_names_an_assay(
+    tmp_path: Path,
+    assays: dict[str, int],
+    stored: str | None,
+    expected: str,
+) -> None:
+    from scarf.datastore.summary import summarize_zarr_readonly
+
+    location = tmp_path / "stored-default.zarr"
+    _write_assay_layout(
+        location,
+        assays,
+        root_attrs={} if stored is None else {"defaultAssay": stored},
+    )
+
+    assert summarize_zarr_readonly(str(location)).default_assay == expected
+
+
+def test_readonly_summary_rejects_missing_assays(tmp_path: Path) -> None:
+    from scarf.datastore.summary import _ReadOnlySummaryStore, summarize_zarr_readonly
+
+    location = tmp_path / "adt-only.zarr"
+    _write_assay_layout(location, {"ADT": 2, "HTO": 1})
+    with pytest.raises(
+        ValueError,
+        match=r"^Default assay 'RNA' was not found\. Choose one from: ADT HTO$",
+    ):
+        summarize_zarr_readonly(str(location), default_assay="RNA")
+    # Summaries list assays before reading them, so only an assay removed
+    # after listing reaches the adapter's own lookup error.
+    adapter = _ReadOnlySummaryStore(str(location))
+    with pytest.raises(ValueError, match="^Assay 'RNA' not found in the Zarr file$"):
+        adapter._get_assay("RNA")
+    assert adapter._get_assay(None).name == "ADT"
+
+    empty = tmp_path / "no-assays.zarr"
+    _write_assay_layout(empty, {})
+    with pytest.raises(
+        ValueError, match=f"^No assays found in Zarr store at {re.escape(str(empty))}$"
+    ):
+        summarize_zarr_readonly(str(empty))

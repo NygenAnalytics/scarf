@@ -3,8 +3,10 @@ import importlib
 import inspect
 import pkgutil
 import textwrap
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
+from functools import cache
 
 import pytest
 
@@ -452,6 +454,19 @@ def _call_name(call: ast.Call) -> str | None:
     return None
 
 
+@cache
+def _module_call_counts() -> dict[str, Counter[str]]:
+    """Count the calls of each name in every operation module, parsed once."""
+    return {
+        module.__name__: Counter(
+            name
+            for call in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(module))))
+            if isinstance(call, ast.Call) and (name := _call_name(call)) is not None
+        )
+        for module in _OPERATION_MODULES
+    }
+
+
 def test_every_operation_arguments_class_has_a_contract() -> None:
     registered = [contract.arguments for contract in _CONTRACTS]
 
@@ -521,16 +536,10 @@ def test_operation_model_has_no_unregistered_producer(
     constructor = contract.constructor or contract.producer
     expected_module = inspect.getmodule(constructor)
     assert expected_module is not None
-    calls_by_module: dict[str, int] = {}
-    for module in _OPERATION_MODULES:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(module)))
-        count = sum(
-            1
-            for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            and _call_name(call) == contract.arguments.__name__
-        )
-        if count:
-            calls_by_module[module.__name__] = count
+    calls_by_module = {
+        module_name: counts[contract.arguments.__name__]
+        for module_name, counts in _module_call_counts().items()
+        if counts[contract.arguments.__name__]
+    }
 
     assert calls_by_module == {expected_module.__name__: 1}

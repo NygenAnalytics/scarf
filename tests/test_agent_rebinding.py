@@ -1,7 +1,6 @@
 """Relocation admits the saved numerical history before changing the run locator."""
 
 import json
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,7 +14,6 @@ from scarf.agent import (
     AnalysisConfig,
     RuntimeConfig,
     Study,
-    analyze_rna,
     open_analysis,
     resume_rna,
 )
@@ -23,9 +21,15 @@ from scarf.agent import evidence, workflow
 from scarf.agent.models import AnalysisInputError, NeedsInput
 from scarf.agent.records import RunRecords
 from scarf.storage.artifacts import ArtifactRef
-from tests.test_agent_recovery import Ref, Run, _analyze, _model
+from tests.test_agent_recovery import (
+    Ref,
+    Run,
+    _analyze,
+    _model,
+    completed_template,
+    restore_completed,
+)
 from tests.test_agent_recovery import science as science
-from tests.test_agent_workflow import scripted_model
 
 
 def _replacement_store(
@@ -56,15 +60,30 @@ def _replacement_store(
     return SimpleNamespace(store=store, runs=runs)
 
 
-@pytest.mark.parametrize("fault", ["missing", "unfinished", "artifact", "mapping"])
+@pytest.fixture(scope="module")
+def completed_history(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
+    return completed_template(tmp_path_factory.mktemp("completed-history"))
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("missing", "Replacement source cannot open a saved pipeline run"),
+        ("unfinished", "Replacement source has an incomplete saved pipeline run"),
+        ("artifact", "Replacement source has incomplete saved artifacts"),
+        ("mapping", "Final pipeline no longer matches its saved artifact mapping"),
+    ],
+)
 def test_rejected_completed_relocation_preserves_the_previous_binding(
     science: Any,
+    completed_history: SimpleNamespace,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fault: str,
+    message: str,
 ) -> None:
     observed: list[Any] = []
-    result = _analyze(science, tmp_path, _model(observed))
+    result = restore_completed(completed_history, science, tmp_path)
     assert result.status == "completed"
     records = RunRecords(result.run_dir)
     before = records.events()
@@ -87,7 +106,7 @@ def test_rejected_completed_relocation_preserves_the_previous_binding(
         )
     else:
         alternate.runs[final_id]["clusters"] = Ref("different-final-clusters")
-    with pytest.raises(ValueError, match="Replacement source|Final pipeline"):
+    with pytest.raises(ValueError, match=message):
         resume_rna(result.run_dir, source=replacement, model=_model(observed))
     assert records.events() == before
     assert open_analysis(result.run_dir).source == science.source
@@ -261,59 +280,3 @@ def test_initial_assay_answer_rebinds_only_after_successful_source_inspection(
         assert reopened.source == replacement
         assert reopened.pipeline is science.runs["run-3"]
         assert len(science.calls) == 3
-
-
-def test_real_fresh_mount_cannot_replace_history_but_a_complete_copy_can(
-    agent_rna_source: Path, tmp_path: Path
-) -> None:
-    from scarf import DataStore, mount_datastore
-
-    observed: list[Any] = []
-    result = analyze_rna(
-        agent_rna_source,
-        run_dir=tmp_path / "analysis",
-        model=scripted_model(observed),
-        study=Study(context="One donor", objective="Describe major populations"),
-        config=AnalysisConfig(
-            hvgCount=40,
-            pcaDims=4,
-            neighborsK=7,
-            resolutions=(0.5,),
-            maxCandidates=4,
-        ),
-        runtime=RuntimeConfig(nthreads=2, memBudget="512M"),
-    )
-    records = RunRecords(result.run_dir)
-    assert result.status == "completed", records.latest("status")
-    original_pipeline = result.pipeline
-    original_refs = dict(original_pipeline)
-    before = records.events()
-    requests = len(observed)
-    mount_path = tmp_path / "fresh-mount.zarr"
-    mounted = mount_datastore(
-        str(agent_rna_source),
-        str(mount_path),
-        default_assay="RNA",
-        min_features_per_cell=-1,
-        nthreads=2,
-        mem_budget="512M",
-    )
-    assert mounted.pipeline.list_runs() == ()
-    assert all(mounted.inspect_artifact(ref).complete for ref in original_refs.values())
-    with pytest.raises(ValueError, match="Replacement source"):
-        resume_rna(result.run_dir, model=None, source=mount_path)
-    assert records.events() == before
-    assert open_analysis(result.run_dir).source == agent_rna_source
-    assert open_analysis(result.run_dir).pipeline.run_id == original_pipeline.run_id
-
-    relocated = tmp_path / "complete-copy.zarr"
-    shutil.copytree(agent_rna_source, relocated)
-    resumed = resume_rna(result.run_dir, model=None, source=relocated)
-    assert resumed.status == "completed"
-    assert open_analysis(result.run_dir).source == relocated
-    assert dict(resumed.pipeline) == original_refs
-    assert len(observed) == requests
-    appended = records.events()[len(before) :]
-    assert [row["kind"] for row in appended] == ["sourceRebound"]
-    copied = DataStore(str(relocated), zarr_mode="r", nthreads=2, mem_budget="512M")
-    assert len(copied.pipeline.list_runs()) == 5

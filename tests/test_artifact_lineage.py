@@ -195,21 +195,29 @@ def test_datastore_lineage_builds_a_bounded_markdown_report() -> None:
         root,
         ref,
         operation="calculate_qc",
-        inputs={"fingerprint": "a" * 500},
-        parameters={"payload": "b" * 500},
+        inputs={"fingerprint": "a" * 500, "sources": [_ref("normalized", "1"), "x"]},
+        parameters={
+            "payload": "b" * 500,
+            **{f"z{index:02d}": index for index in range(13)},
+        },
     )
     datastore = BaseDataStore.__new__(BaseDataStore)
     datastore.z = root
     datastore.workspace = None
 
     lineage = datastore.lineage(ref)
-    markdown = lineage.to_markdown()
+    lines = lineage.to_markdown().splitlines()
 
     assert isinstance(lineage, ArtifactLineage)
     assert lineage.outputs == {"output": ref}
-    assert "a" * 200 not in markdown
-    assert "b" * 200 not in markdown
-    assert "..." in markdown
+    # A value keeps its first 157 characters of JSON, and a mapping its first
+    # 12 items; artifact references are left out of the other inputs.
+    shown = "; ".join(f"z{index:02d}={index}" for index in range(11))
+    assert f'- Parameters: `payload="{"b" * 156}...; {shown}; ... 2 more`' in lines
+    assert (
+        f'- Other inputs: `fingerprint="{"a" * 156}...; sources={{"[1]":"x"}}`' in lines
+    )
+    assert repr(lineage) == "ArtifactLineage(outputs=1, artifacts=2, dependencies=1)"
 
 
 def test_lineage_renders_missing_and_incomplete_artifacts() -> None:
@@ -232,13 +240,90 @@ def test_lineage_renders_missing_and_incomplete_artifacts() -> None:
     )
 
     lineage = ArtifactLineage.from_store(root, unfinished)
-    mermaid = lineage.to_mermaid()
 
-    assert len(lineage.graph) == 3
-    assert "status: missing" in mermaid
-    assert "status: incomplete" in mermaid
     assert lineage.graph.nodes[missing]["status"].exists is False
     assert lineage.graph.nodes[unfinished]["status"].complete is False
+    assert lineage.to_mermaid() == "\n".join(
+        [
+            "flowchart LR",
+            (
+                '    artifact0["RNA / normalized | operation unavailable | '
+                '555555555555 | status: missing"]'
+            ),
+            '    artifact1["RNA / reduction | run_pca | 666666666666"]',
+            (
+                '    artifact2["RNA / ann_index | build_ann_index | 777777777777 | '
+                'outputs: output | status: incomplete"]'
+            ),
+            '    artifact0 -->|"normalized"| artifact1',
+            '    artifact1 -->|"coordinates"| artifact2',
+        ]
+    )
+    markdown = lineage.to_markdown()
+    # A missing artifact has a path but no operation or recorded inputs.
+    assert (
+        "#### RNA / normalized / 555555555555\n"
+        "- Status: `missing`\n"
+        f"- Path: `{artifact_path(missing)}`\n\n"
+        "#### RNA / reduction / 666666666666\n"
+    ) in markdown
+
+
+def test_lineage_rejects_malformed_targets_inputs_and_external_roots() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    ref = _ref("normalized", "1")
+    for target, error, message in (
+        ([ref], TypeError, "lineage target must be an ArtifactRef or a named mapping"),
+        ({}, ValueError, "lineage output mapping cannot be empty"),
+        ({"": ref}, TypeError, "lineage output names must be non-empty strings"),
+        ({1: ref}, TypeError, "lineage output names must be non-empty strings"),
+        (
+            {"pca": ref.to_dict()},
+            TypeError,
+            "lineage output 'pca' must be an ArtifactRef",
+        ),
+    ):
+        with pytest.raises(error, match=message):
+            ArtifactLineage.from_store(root, target)
+    for roots, error, message in (
+        ([root], TypeError, "external_roots must be a mapping or None"),
+        ({"": root}, ValueError, "fingerprints must be non-empty strings"),
+        ({"dataset": "a.zarr"}, TypeError, "'dataset' must be a Zarr group"),
+    ):
+        with pytest.raises(error, match=message):
+            ArtifactLineage.from_store(root, ref, external_roots=roots)
+
+    _write_artifact(
+        root,
+        ref,
+        operation="run_normalization",
+        inputs={"cells": {"selection": {"type": "artifact", "scope": "assay"}}},
+    )
+    with pytest.raises(
+        ValueError,
+        match="Invalid artifact reference at lineage input 'cells.selection'",
+    ):
+        ArtifactLineage.from_store(root, ref)
+
+    external = ExternalArtifactRef("reference-dataset", _ref("mapping_reference", "2"))
+    projection = _ref("projection", "3")
+    _write_artifact(
+        root,
+        projection,
+        operation="map_query",
+        inputs={"mapping_reference": external},
+    )
+    reference_root = zarr.open_group(store=MemoryStore(), mode="w")
+    reference_root.create_group("ADT")
+    with pytest.raises(
+        ValueError,
+        match="fingerprint 'reference-dataset' is missing assay group 'RNA'",
+    ):
+        ArtifactLineage.from_store(
+            root,
+            projection,
+            external_roots={"reference-dataset": reference_root},
+        )
 
 
 def test_lineage_rejects_cyclic_provenance() -> None:

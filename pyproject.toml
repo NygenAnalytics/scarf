@@ -127,6 +127,7 @@ markers = [
     "integration: live network tests",
     "slow: tests that build graphs or run iterative numerical workflows",
     "visual: deterministic image comparison tests",
+    "benchmark: scaling micro-benchmarks, timed only with SCARF_RUN_BENCHMARKS=1",
 ]
 testpaths = [
     "tests",
@@ -139,6 +140,9 @@ norecursedirs = [
 source = ["scarf"]
 omit = ["scarf/_version.py"]
 parallel = true
+# sys.monitoring measures the same lines with less overhead than the C tracer
+# on Python 3.12 and 3.13; coverage already uses it on Python 3.14.
+core = "sysmon"
 
 [tool.interrogate]
 ignore-init-method = true

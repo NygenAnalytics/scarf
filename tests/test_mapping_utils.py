@@ -156,20 +156,82 @@ def test_distance_quantile_summary_handles_vectors_and_neighbor_matrices():
     np.testing.assert_allclose(matrix_summary[1], vector_summary[1])
 
 
-def test_conformal_membership_includes_high_score_labels():
-    calibration, alpha = _validated_conformal_calibration(
-        np.array([0.05, 0.1, 0.2, 0.25]),
-        0.2,
-    )
-    sets = _conformal_membership(
-        np.array([[0.95, 0.1], [0.7, 0.7]]),
-        calibration,
-        alpha,
+def test_distance_quantile_summary_samples_stride_rows_across_chunks():
+    # Ten rows read in chunks of four and sampled at most four times keep
+    # every third row, counted from the first row rather than per chunk.
+    rng = np.random.default_rng(5)
+    values = np.sort(rng.uniform(0.0, 5.0, size=(10, 3)), axis=1)
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    stored = root.create_array("distances", data=values, chunks=(4, 3))
+
+    quantiles, summary = _distance_quantile_summary(
+        stored,
+        max_samples=4,
+        n_quantiles=11,
     )
 
-    assert sets.shape == (2, 2)
-    assert sets[0, 0]
-    assert not sets[0, 1]
+    sampled = values[[0, 3, 6, 9], 0]
+    np.testing.assert_allclose(quantiles, np.linspace(0.0, 1.0, 4))
+    np.testing.assert_allclose(summary, np.quantile(sampled, quantiles))
+    # Few rows cap the quantile count at the number of samples.
+    capped = _distance_quantile_summary(values[:2], n_quantiles=1_001)
+    np.testing.assert_allclose(capped[0], [0.0, 1.0])
+    np.testing.assert_allclose(capped[1], np.sort(values[:2, 0]))
+
+
+@pytest.mark.parametrize(
+    ("distances", "options", "message"),
+    [
+        (np.zeros((2, 2, 2)), {}, "one- or two-dimensional"),
+        (np.zeros((0, 3)), {}, "Neighbor distances are empty"),
+        (np.zeros(0), {}, "Neighbor distances are empty"),
+        (np.zeros((3, 0)), {}, "do not contain any neighbors"),
+        (np.ones(3), {"max_samples": 0}, "counts must be positive"),
+        (np.ones(3), {"n_quantiles": 0}, "counts must be positive"),
+    ],
+)
+def test_distance_quantile_summary_rejects_unusable_inputs(
+    distances,
+    options,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        _distance_quantile_summary(distances, **options)
+
+
+def _reference_conformal_membership(scores, calibration, alpha):
+    """Split-conformal p-value with ties counted as exceedances."""
+    exceedances = (
+        np.asarray(calibration)[np.newaxis, np.newaxis, :]
+        >= (1.0 - np.asarray(scores))[..., np.newaxis]
+    ).sum(axis=-1)
+    return (exceedances + 1) / (len(calibration) + 1) > alpha
+
+
+@pytest.mark.parametrize("alpha", [0.2, 0.5])
+def test_conformal_membership_includes_high_score_labels(alpha):
+    raw_calibration = np.array([0.25, 0.05, 0.2, 0.1])
+    calibration, resolved_alpha = _validated_conformal_calibration(
+        raw_calibration,
+        alpha,
+    )
+    # The nonconformity of 0.75 equals the calibration value 0.25 exactly, so
+    # it decides whether ties count as exceedances; 0.74 falls just short.
+    scores = np.array([[0.95, 0.1], [0.7, 0.7], [0.75, 0.74], [0.8, 0.79]])
+    sets = _conformal_membership(scores, calibration, resolved_alpha)
+
+    np.testing.assert_array_equal(calibration, np.sort(raw_calibration))
+    assert resolved_alpha == alpha
+    np.testing.assert_array_equal(
+        sets,
+        _reference_conformal_membership(scores, raw_calibration, alpha),
+    )
+    expected = (
+        [[True, False], [False, False], [True, False], [True, True]]
+        if alpha == 0.2
+        else [[True, False], [False, False], [False, False], [True, False]]
+    )
+    np.testing.assert_array_equal(sets, expected)
 
 
 def test_feature_identifier_order_is_preserved():
@@ -292,3 +354,39 @@ def test_same_physical_store_matches_normalized_and_nested_locations(tmp_path):
     assert not _same_physical_store(datastore(tmp_path / "query.zarr"), reference)
     shared = SimpleNamespace(z=zarr.open_group(store=MemoryStore(), mode="w"))
     assert _same_physical_store(shared, SimpleNamespace(datastore=shared))
+    with pytest.raises(
+        TypeError, match="reference.datastore must be an open DataStore"
+    ):
+        _same_physical_store(shared, SimpleNamespace(datastore=object()))
+
+
+def test_projected_coordinate_replay_is_contiguous_and_rejects_truncation():
+    from tempfile import TemporaryFile
+
+    from scarf.datastore._operations.mapping import _read_projected_blocks
+
+    coordinates = np.arange(10, dtype=np.float64).reshape(5, 2) / 4.0
+    uninformative = np.array([False, True, False, False, True])
+
+    with TemporaryFile() as handle:
+        coordinates.tofile(handle)
+        blocks = list(
+            _read_projected_blocks(handle, uninformative, n_dims=2, block_rows=2)
+        )
+    assert [start for start, _, _ in blocks] == [0, 2, 4]
+    assert [len(values) for _, values, _ in blocks] == [2, 2, 1]
+    np.testing.assert_array_equal(
+        np.vstack([values for _, values, _ in blocks]), coordinates
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([flags for _, _, flags in blocks]), uninformative
+    )
+
+    # A replay file one row short must fail instead of yielding a short block.
+    with TemporaryFile() as handle:
+        coordinates[:4].tofile(handle)
+        replay = _read_projected_blocks(handle, uninformative, n_dims=2, block_rows=2)
+        assert next(replay)[0] == 0
+        assert next(replay)[0] == 2
+        with pytest.raises(RuntimeError, match="coordinates are incomplete"):
+            next(replay)
