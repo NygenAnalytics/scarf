@@ -72,15 +72,11 @@ g2m_score = np.asarray(cell_cycle_values["g2m_score"][:])
 phase = np.asarray(cell_cycle_values["phase"][:]).astype(str)
 ```
 
-Two markers in the bundled G2M list are absent from this assay.
-The warning is expected, and Scarf scores the cells with the remaining markers.
+Two markers in the bundled G2M list are absent from this assay; The warning is expected, and SCARF scores the cells with the remaining markers.
 
-The returned reference identifies the saved phases and scores. Keep it to load the same result
-later. Scoring requires a writable datastore.
+## Visualize cell-cycle phases
 
-## 3. Visualize cell-cycle phases
-
-Pass the result directly to the embedding plot to color cells by phase:
+Pass the result directly to the UMAP plot to color cells by phase:
 
 ```{code-cell}
 ds.plots.embedding(
@@ -101,7 +97,7 @@ pd.crosstab(analysis_run.cells.fetch("clusters"), phase, normalize="index")
 
 Rows are cluster-wise phase fractions among the cells captured by the run.
 
-## 4. Visualize phase-specific scores
+## Visualize phase-specific scores
 
 The S and G2M score arrays are stored in the same artifact.
 
