@@ -105,16 +105,22 @@ Scarf stores data as dense, compressed chunks in Zarr.
 `CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
 Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
 `mem_budget` bounds the memory the conversion plans for.
+The default count shards of this 89,796-peak assay do not fit `mem_budget="8G"`, so the import
+passes the smaller `policy` that its `MemoryError` names. Non-RNA assays write no `countsT`
+copy, so the smaller shards do not slow later `countsT` reads.
 Each assay gets the count dtype of its own counts over the selected barcodes, so an assay
 imports alike whichever other assays share the file.
 
 ```{code-cell} ipython3
+from scarf.storage.count_matrix import CountMatrixPolicy
+
 atac_store = output_dir / "pbmc_atac.zarr"
 reader = scarf.CrH5Reader(str(tenx_h5 / "data.h5"))
 scarf.CrToZarr(
     reader,
     zarr_loc=str(atac_store),
     mem_budget="8G",
+    policy=CountMatrixPolicy(unitBytes=500_000_000, chunkBytes=50_000_000),
 ).dump()
 ```
 

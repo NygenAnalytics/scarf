@@ -100,6 +100,8 @@ if not source_store.exists():
                 reader,
                 zarr_loc=str(staged_store),
                 nthreads=4,
+                # The default count layout of these 108,717 cells plans for about 5 GB.
+                mem_budget="6G",
             ).dump()
         finally:
             reader.h5.close()

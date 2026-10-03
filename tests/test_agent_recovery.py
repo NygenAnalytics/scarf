@@ -1,5 +1,6 @@
 """Recovery acceptance tests with scripted models and a controlled science boundary."""
 
+import importlib.metadata
 import json
 import shutil
 from copy import deepcopy
@@ -14,6 +15,7 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
+import scarf
 from scarf.agent import AnalysisConfig, RuntimeConfig, Study, analyze_rna, resume_rna
 from scarf.agent import api, evidence, workflow
 from scarf.agent.models import Candidate
@@ -426,6 +428,29 @@ def test_strict_context_question_resumes_with_its_original_question(
         if row["kind"] == "decisionAccepted" and row["stage"] == "context"
     ]
     assert len(accepted) == 2 and accepted[0]["decisionId"] != accepted[1]["decisionId"]
+
+
+def test_analysis_records_the_scarf_version_without_package_metadata(
+    science: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    def version(name: str) -> str:
+        # Scarf imported from source, as in the Modal docs image, has no
+        # distribution metadata, while its dependencies are installed.
+        if name == "scarf":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return importlib.metadata.version(name)
+
+    monkeypatch.setattr(api, "version", version)
+    result = _analyze(
+        science,
+        tmp_path,
+        _model([], context_question="Is this cohort restricted to immune cells?"),
+    )
+
+    assert result.status == "needsInput"
+    software = RunRecords(result.run_dir).manifest["software"]
+    assert software["scarf"] == scarf.__version__
+    assert software["pydantic"] == importlib.metadata.version("pydantic")
 
 
 def test_provider_replacement_keeps_lifetime_request_budget(

@@ -78,6 +78,9 @@ async def analyze_rna_async(
         raise ValueError("run_dir must be outside the numerical store")
     if model is None:
         raise ValueError("Supply a configured model or model identifier")
+    # __version__ also resolves when Scarf runs from source without installed
+    # distribution metadata, where importlib.metadata.version raises.
+    from .. import __version__
     from .workflow import run_workflow
 
     with run_lock(destination), source_lock(location):
@@ -93,7 +96,7 @@ async def analyze_rna_async(
                 "randomSeed": scientific.randomSeed,
                 "software": {
                     "python": sys.version.split()[0],
-                    "scarf": version("scarf"),
+                    "scarf": __version__,
                     "pydantic-ai-slim": version("pydantic-ai-slim"),
                     "pydantic": version("pydantic"),
                 },
