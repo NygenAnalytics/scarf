@@ -61,7 +61,7 @@ pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
 pd.Series({"source cells": int(source.sum()), "sink cells": int(sink.sum())})
 ```
 
-We can utilize the existing annotations to orient our graph to study the expression dynamics. Similarily as in the pseudotime tutorial, the source and pooled sinks each receive a total mass of one, with opposite signs.
+We can utilize the existing annotations to orient our graph to study the expression dynamics. Similarly as in the pseudotime tutorial, the source and pooled sinks each receive a total mass of one, with opposite signs.
 
 ## Group changing expression profiles
 
@@ -72,7 +72,7 @@ modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_feature
 ds.plots.pseudotime_heatmap(aggregation=modules_ref)
 ```
 
-The heatmap can be interpretated with the far left suggesting early on the pseudotime and the further right being later among the pseudotime. By default, each gene is scaled relative to its own variation, thus red indicates higher expression and blue lower expression for that specific gene; the colours do not show which gene has the greatest absolute expression!
+The heatmap can be interpreted with the far left suggesting early on the pseudotime and the further right being later among the pseudotime. By default, each gene is scaled relative to its own variation, thus red indicates higher expression and blue lower expression for that specific gene; the colors do not show which gene has the greatest absolute expression!
 
 ## Inspect a module's genes
 
@@ -95,11 +95,9 @@ module_id = module_genes["module"].min()
 module_genes.loc[module_genes["module"] == module_id, "gene"].head(20)
 ```
 
-
 ## Adjust smoothing only when needed
 
-A wide window can hide a brief expression peak; a narrow one can retain more noise.
-To explore a shorter window, repeat the call with one changed setting:
+A wide smoothing window (# of cells) can hide a brief expression peak, whereas a narrower window can retain more noise. To modify the smoothing window for your dataset, simply run the below:
 
 ```python
 modules_ref = ds.run_pseudotime_aggregation(
@@ -107,15 +105,12 @@ modules_ref = ds.run_pseudotime_aggregation(
 )
 ```
 
-`n_clusters` controls the requested number of modules. `chunk_size` controls the number
-of displayed pseudotime bins, not a memory batch size. Change one choice at a time and
-compare the profiles before interpreting a split or merged module.
+To modify the number of modules, add the hyperparameter `n_clusters`, which controls the requested number of modules. The default for `n_clusters` is 10. To control the number of pseudotime bins, pass in `chunk_size`, in which the default is 50. Change one choice at a time and compare the profiles before interpreting a split or merged module.
 
 ## Common mistakes and limitations
 
 - **Lineage dilution from pooling branched endpoints:** Pooling distinct terminal populations (e.g., Alpha, Beta, and Delta cells) into a single trajectory collapses multiple diverging paths into one final state. Averaging expression across mutually exclusive fates blurs branch-specific dynamics, causing lineage-restricted drivers (e.g., Arx vs. Pax4) to appear artificially muted, diluted, or conflicting along the visualized shared axis.
 - **Smoothing window artifacts and hyperparameter sensitivity:** The sliding window (window_size) creates a strict trade-off between technical noise reduction and temporal resolution. A window that is too wide oversmooths sharp, transient regulatory pulses (such as fleeting transcription factor spikes), whereas a window that is too narrow fits to stochastic dropout noise. Sample multiple different parameters to identify what best works for your question.
-- **Conflating relative kinetic shapes with expression magnitude and co-regulation:** The pseudotime heatmap standardizes each gene relative to its own variance, making low-abundance, noisy transcripts appear as visually pronounced as major lineage-defining effectors. Furthermore, sharing a kinetic expression curve along pseudotime reflects temporal correlation, not shared upstream regulation; genes within the same module do not necessarily share transcription factor motifs or common regulatory network
+- **Conflating relative kinetic shapes with expression magnitude and co-regulation:** The pseudotime heatmap standardizes each gene relative to its own variance, making low-abundance, noisy transcripts appear as visually pronounced as major lineage-defining effectors. Furthermore, sharing a kinetic expression curve along pseudotime reflects temporal correlation, not shared upstream regulation; genes within the same module do not necessarily share transcription factor motifs or common regulatory network.
 
-See {doc}`trajectory_validation` for broader checks and {doc}`fate_mapping` for multiple
-terminal outcomes.
+See {doc}`trajectory_validation` for broader checks on orientation choices, validity masks, and endpoint sensitivity, and {doc}`fate_mapping` for splitting each cell's outcome across multiple terminal fates instead of a single axis position.
