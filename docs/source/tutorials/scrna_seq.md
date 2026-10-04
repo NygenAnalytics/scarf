@@ -40,22 +40,16 @@ ds
 ```
 
 The prepared run contains the selected cells, clusters, UMAP coordinates, and marker results.
-Its name is `docs_default`, but it used dataset-specific filtering, 500 variable genes, and
-15 PCs. Those settings preserve the example we will interpret; they are not the current pipeline
-defaults.
 
 ```{code-cell} ipython3
 ds.plots.embedding(run=run, color_by="clusters")
 ```
 
-Look for the main groups and the smaller populations. Nearby cells have similar profiles in
-this view, but the size of a gap between clusters does not establish how different their cell
-types are. We will use marker expression to investigate that.
+We can visualize our existings clusters and distributions of "transcriptionally similar cells" in a 2 dimensional space. Look for the main groups and the smaller populations; A gap between clusters does not establish how different their cell types are. We will use marker expression to investigate this next
 
 ## Compare markers before naming the groups
 
-The panel below includes several genes for each broad lineage. In a dot plot, a larger dot means
-more cells express the gene; its colour shows the mean expression in the cluster.
+With our clusters visualized, we can now use several different genes as proxies for determing the broad lineage of each cluster. In a dot plot, a larger dot means more cells express the gene in that cluster, with its colour shows the mean expression in the cluster.
 
 ```{code-cell} ipython3
 marker_panel = {
@@ -73,7 +67,7 @@ identify cytotoxic populations, so compare them with the T-cell markers before c
 NK cells. LST1, S100A8, and FCGR3A help distinguish the monocyte populations.
 
 GZMB together with JCHAIN suggests a small pDC-like population. This is a provisional label:
-the {doc}`annotation` tutorial checks IL3RA and LILRA4 and examines competing interpretations.
+the {doc}`annotation` tutorial checks IL3RA and LILRA4 and examines competing interpretations, along with how to go into further depth to confirm annotations.
 
 For a gene with much lower expression than the others, it can help to scale each gene separately.
 The next plot changes only the colour scale: values are now relative within each gene, so colours
@@ -85,9 +79,7 @@ ds.plots.dotplot(features=marker_panel, groups=run['clusters'], standardize='fea
 
 ## Give the clusters broad names
 
-The marker evidence supports the following broad labels for this prepared result. Several
-clusters share a label because they belong to the same lineage. These cluster numbers are
-specific to this analysis and must not be copied to another dataset.
+With the dot plot giving us marker evidence as to what genes dominate expression inside a cluster, we can assign broad labels for the result. Several clusters share the same label because they belong to the same lineage. These cluster numbers are specific to this analysis.
 
 ```{code-cell} ipython3
 cell_type_by_cluster = {
@@ -121,7 +113,7 @@ labels, counts = np.unique(cell_types[analysis_cells], return_counts=True)
 ```
 
 This writes our labels to `pbmc_cell_type`; rerunning the cell replaces that column. The saved
-clusters remain available. Use their UMAP to display the new names:
+clusters remain available, and then we can use their UMAP to display the new names:
 
 ```{code-cell} ipython3
 ds.plots.embedding(layout=run["umap"], color_by="pbmc_cell_type")
