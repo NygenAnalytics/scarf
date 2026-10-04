@@ -15,7 +15,7 @@ kernelspec:
 
 Pseudotime analysis orders cells in comparison to a starting and end point, but ordering alone does not say what actual changes we observe along the way. For example, some genes climb or fall steadily from progenitor to terminus; others switch on briefly in the middle and off again. A correlation score catches the steady ones and misses the transient ones, because a rise-and-fall pattern has no overall trend to correlate with.
 
-Expression dynamics fills that gap by smoothing each gene's expression along the pseudotime ordering, then grouping genes with similar smoothed profiles into modules. Each module is one shared trajectory shape: early genes fading out, late genes turning on, intermediate genes peaking mid-path. Here, we reuse the pancreas ordering to build those modules.
+**Expression dynamics** fills that gap by smoothing each gene's expression along the pseudotime ordering, then grouping genes with similar smoothed profiles into modules. Each module is one shared trajectory shape: early genes fading out, late genes turning on, intermediate genes peaking mid-path. Here, we reuse the pancreas ordering to build those modules.
 
 # Follow gene expression along pseudotime
 
@@ -65,7 +65,7 @@ We can utilize the existing annotations to orient our graph to study the express
 
 ## Group changing expression profiles
 
-Scarf orders the valid cells, those with pseudotime scores inside the graph, then smooths each retained gene over a 200-cell rolling window successively across them. The smoothed trajectories are summarized into 50 ordered slots from early to late (relative based on the pseudotime), and the genes' smoothed profiles are then clustered into 10 modules, which we visualize with the heatmap below. 
+SCARF orders the valid cells, those with pseudotime scores inside the graph, then smooths each retained gene over a 200-cell rolling window successively across them. When we say smooths over the trajectories, we mean replacing each cell's own [noisy/sparse] measurement with the average of its 200-cell neighborhood along the ordering, so shared trends emerge while cell-to-cell jitter cancels out. The smoothed trajectories are summarized into 50 ordered slots from early to late (relative based on the pseudotime), and the genes' smoothed profiles are then clustered into 10 modules, which we visualize with the heatmap below.
 
 ```{code-cell}
 modules_ref = ds.run_pseudotime_aggregation(pseudotime_ref, features=all_features)
@@ -95,8 +95,6 @@ module_id = module_genes["module"].min()
 module_genes.loc[module_genes["module"] == module_id, "gene"].head(20)
 ```
 
-Check whether several genes support a shared process before naming the module. Follow
-up candidate genes with marker maps or other independent evidence.
 
 ## Adjust smoothing only when needed
 
