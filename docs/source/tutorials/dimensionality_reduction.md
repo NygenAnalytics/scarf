@@ -19,13 +19,9 @@ PCA compresses selected features into the coordinates used to find neighbours.
 UMAP, densMAP, and t-SNE then turn the resulting graph into a two-dimensional view.
 They are visual summaries, not alternative cluster assignments.
 
-```{raw} html
-<span id="clustering"></span>
-```
-
 Clustering guidance from the former combined page now lives in {doc}`clustering`.
 
-## 1. Standalone setup
+## Standalone setup
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -68,7 +64,7 @@ genes, and normalization fixed so we can explore what changing the number of PCs
 ds.plots.embedding(run=baseline, color_by="clusters")
 ```
 
-## 2. Compare PCA dimension counts
+## Compare PCA dimension counts
 
 Build each candidate from the same normalized data and cluster each graph by passing it explicitly.
 Retain the 15-component graph and initialization for the layout comparisons below.
