@@ -15,9 +15,9 @@ kernelspec:
 
 # Dimensionality reduction primer
 
-Single-cell data lives in thousands of gene dimensions, which can be neither drawn nor directly searched for neighbors. Dimensionality reduction compresses the selected features into a small coordinate set that preserves neighborhood structure; PCA builds those coordinates from the genes, and the neighbor graph is then built from them.
+Single-cell data lives in thousands of gene dimensions, which can be neither drawn nor directly searched for neighbors. Dimensionality reduction compresses the selected features into a small coordinate set that preserves neighborhood structure, principal component analysis (PCA) builds those coordinates from the genes, and the neighbor graph is then built from them.
 
-UMAP, densMAP, and t-SNE turn that graph into a two-dimensional picture. Layouts are visual summaries for the eye, not alternative cluster assignments: packing parameters and method choice change appearance without changing the underlying graph. Choosing how many PCA dimensions to keep is the consequential decision, since too few merge distinct populations while too many feed technical noise back in.
+UMAP, densMAP, and t-SNE then turn that lower dimension graph into a 2D image we can interpret. Layouts are simpyl visual summaries for the eye, and the parameters and method choice change appearance of visualization, without changing the underlying graph. Choosing how many PCA dimensions to keep is the consequential decision, since too few merge distinct populations while too many feed technical noise back in.
 
 Here, we compare PCA dimension counts, UMAP packing, and the three layout methods on the prepared PBMC analysis, judging each view by whether known populations stay visible rather than by how tidy it looks.
 
