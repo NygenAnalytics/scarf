@@ -11,7 +11,6 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (dimensionality_reduction_and_clustering)=
 
 # Choosing dimensionality reductions
@@ -146,7 +145,7 @@ The adjusted Rand index measures partition agreement without requiring matching 
 It does not identify the biologically correct dimension count. Inspect markers and QC metrics
 where the partitions disagree. See {doc}`clustering` for more on cluster evidence.
 
-## 3. Compare UMAP packing
+## Compare UMAP packing
 
 The layout below uses the explicit 15-component graph.
 Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
