@@ -2,8 +2,8 @@
 
 Check what the count matrix holds, inspect per-cell QC metrics, build immutable filtered cell
 selections, audit removals without author labels, and score doublets. Docs:
-`docs/source/tutorials/quality_control.md`, `docs/source/reference/api/datastore.md`,
-`docs/source/reference/api/pipeline.md`.
+<https://scarf.readthedocs.io/en/latest/tutorials/quality_control.html>, <https://scarf.readthedocs.io/en/latest/reference/api/datastore.html>,
+<https://scarf.readthedocs.io/en/latest/reference/api/pipeline.html>.
 
 ## When to use
 
@@ -128,23 +128,30 @@ by_cluster["markers"] = markers.reindex(by_cluster.index.astype(str)).to_numpy()
 print(by_cluster.to_string())
 
 panel = ["PPBP", "PF4", "JCHAIN", "MZB1", "HBB", "CSF3R", "FCGR3B", "MKI67", "TOP2A", "CD34",
-         "CD3E", "MS4A1", "LYZ", "CD14", "MALAT1"]  # human blood; adapt to the tissue
+         "CD3E", "MS4A1", "LYZ", "CD14", "MALAT1"]  # human blood; adapt genes and rules to tissue
+names = set(ds.RNA.feats.fetch_all("names"))  # mouse symbols differ (Ppbp, Hbb-bs); map Ensembl IDs
+print("panel genes not in this store:", [g for g in panel if g not in names])
+panel = [g for g in panel if g in names]  # an absent name raises KeyError in to_anndata
 ad = ds.to_anndata(feature_names=panel)  # raw counts of active cells, rows named by cell ids
 counts = pd.DataFrame(ad.X.toarray(), index=ad.obs_names, columns=panel)
 counts = counts.reindex(scaffold.cells.fetch("ids"))
-groups = {"platelet PPBP+PF4+": (counts.PPBP > 0) & (counts.PF4 > 0),
-          "plasma MZB1>=3 JCHAIN>=3": (counts.MZB1 >= 3) & (counts.JCHAIN >= 3),
-          "erythroid HBB>=10": counts.HBB >= 10,
-          "neutrophil CSF3R+FCGR3B+": (counts.CSF3R > 0) & (counts.FCGR3B > 0),
-          "cycling MKI67+TOP2A+": (counts.MKI67 > 0) & (counts.TOP2A > 0),
-          "progenitor CD34+": counts.CD34 > 0}
+rules = {"platelet PPBP+PF4+": {"PPBP": 1, "PF4": 1},  # minimum raw count of every gene
+         "plasma MZB1>=3 JCHAIN>=3": {"MZB1": 3, "JCHAIN": 3},
+         "erythroid HBB>=10": {"HBB": 10},
+         "neutrophil CSF3R+FCGR3B+": {"CSF3R": 1, "FCGR3B": 1},
+         "cycling MKI67+TOP2A+": {"MKI67": 1, "TOP2A": 1},
+         "progenitor CD34+": {"CD34": 1}}
+groups = {g: (counts[list(r)] >= pd.Series(r)).all(axis=1)
+          for g, r in rules.items() if set(r) <= set(panel)}  # a group missing a gene is skipped
 by_group = pd.DataFrame({g: kept[m.to_numpy()].mean() for g, m in groups.items()}).T
 print(by_group.assign(n=[int(m.sum()) for m in groups.values()]).round(2))
 
 debris = pd.DataFrame({"nFeatures": ds.cells.fetch_all("RNA_nFeatures")[in_run],
                        "percentMito": ds.cells.fetch_all("RNA_percentMito")[in_run],
-                       "MALAT1": counts["MALAT1"].to_numpy() > 0,
-                       "marker_positive": pd.DataFrame(groups).to_numpy().any(axis=1)})
+                       "marker_positive": pd.DataFrame(groups, index=counts.index)
+                       .any(axis=1).to_numpy()})
+if "MALAT1" in panel:
+    debris["MALAT1"] = counts["MALAT1"].to_numpy() > 0
 for name in candidates:  # rows: False = removed, True = kept
     print(name, debris.groupby(kept[name].to_numpy()).agg(["median", "mean"]).round(2), sep="\n")
 ```

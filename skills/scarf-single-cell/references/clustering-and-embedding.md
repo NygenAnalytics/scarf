@@ -2,8 +2,8 @@
 
 Partition a cell graph with Leiden or Paris, choose a partition with evidence, build UMAP or t-SNE
 layouts, and extract labels and coordinates as cell-aligned arrays. Docs:
-`docs/source/tutorials/clustering.md`, `docs/source/tutorials/dimensionality_reduction.md`,
-`docs/source/reference/api/datastore.md`, `docs/source/reference/api/integration.md`.
+<https://scarf.readthedocs.io/en/latest/tutorials/clustering.html>, <https://scarf.readthedocs.io/en/latest/tutorials/dimensionality_reduction.html>,
+<https://scarf.readthedocs.io/en/latest/reference/api/datastore.html>, <https://scarf.readthedocs.io/en/latest/reference/api/integration.html>.
 
 ## When to use
 

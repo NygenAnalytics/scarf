@@ -1,9 +1,9 @@
 # Data access
 
 Open, inspect, import, and connect to Scarf DataStores, including Cytebase remote and mounted
-stores. Docs: `docs/source/tutorials/data_organization.md`,
-`docs/source/tutorials/import_and_export.md`, `docs/source/tutorials/cytebase.md`,
-`docs/source/tutorials/remote_stores.md`, `docs/source/reference/api/{datastore,import_export,cytebase}.md`.
+stores. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/data_organization.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/import_and_export.html>, <https://scarf.readthedocs.io/en/latest/tutorials/cytebase.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/remote_stores.html>, <https://scarf.readthedocs.io/en/latest/reference/api/datastore.html>, `import_export.html`, `cytebase.html` (same folder).
 
 ## When to use
 
@@ -95,12 +95,20 @@ print(reader.assayFeats)
 scarf.MtxToZarr(reader, zarr_loc="mtx.zarr").dump()
 
 # H5AD: inspect first; selected obsm/obs values become artifacts, not live columns
+import h5py
+
 insp = scarf.inspect_h5ad("data.h5ad")
 print(insp.matrixKey, insp.matrixCandidates, insp.integerLike, insp.layers, insp.suggestedAssays)
-kw = dict(embedding_roles={"X_umap": "umap"}, cluster_keys=("clusters",))
+with h5py.File("data.h5ad", "r") as h5:  # pass only keys the file has; a missing one is a KeyError
+    obsm = set(h5["obsm"]) if "obsm" in h5 else set()
+    obs = h5["obs"]
+    obs_cols = set(obs) if isinstance(obs, h5py.Group) else set(obs.dtype.names)  # old files
+print(sorted(obsm), sorted(obs_cols))
+roles = {k: r for k, r in {"X_umap": "umap", "X_tsne": "tsne"}.items() if k in obsm}
+kw = dict(embedding_roles=roles, cluster_keys=tuple(c for c in ("clusters",) if c in obs_cols))
 reader = scarf.H5adReader.from_inspect(insp, **kw)
 res = scarf.H5adToZarr(reader, zarr_loc="h5ad.zarr").dump()
-print(res.embeddingArtifacts["X_umap"], res.clusterArtifacts["clusters"])
+print(dict(res.embeddingArtifacts), dict(res.clusterArtifacts))
 
 # Seurat RDS (an on-disk .rds; .h5seurat is not read)
 si = scarf.inspect_seurat("pbmc.rds")
@@ -115,8 +123,9 @@ for path in ("dir.zarr", "mtx.zarr", "h5ad.zarr", "seurat.zarr"):
 
 `CSVReader`/`CSVtoZarr` (small dense CSV) and `SparseToZarr` (SciPy CSR plus IDs) also exist.
 
-Every converter refuses this way (releases after 1.0.0rc18; earlier ones shrink the layout to
-fit), and the error is a `CountLayoutMemoryError`. Prefer a larger `mem_budget` when the host has
+Every converter refuses this way from 1.0.0rc18 on (1.0.0rc17 shrinks the layout to fit). The
+error is a `MemoryError`; releases after 1.0.0rc19 raise its subclass `CountLayoutMemoryError`, so
+catch `MemoryError`. Prefer a larger `mem_budget` when the host has
 the memory. Otherwise copy the policy numbers from the message exactly and record that choice:
 smaller layouts make every later gene-major read slower.
 

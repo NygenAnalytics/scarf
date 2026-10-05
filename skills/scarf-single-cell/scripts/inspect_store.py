@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Print a read-only first look at a Scarf store: size, runs, artifacts, counts, cell metadata.
 
 Usage:

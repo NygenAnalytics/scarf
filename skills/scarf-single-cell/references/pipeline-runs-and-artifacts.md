@@ -2,9 +2,9 @@
 
 Run the standard RNA recipe, reopen and audit runs, inspect and trace immutable artifacts, branch
 from a run with exact refs, and record the analysis for handoff. Docs:
-`docs/source/reference/api/pipeline.md`, `docs/source/reference/api/artifacts.md`,
-`docs/source/concepts/provenance.md`, `docs/source/tutorials/reuse_and_tracing.md`,
-`docs/source/analysis_with_agents.md`.
+<https://scarf.readthedocs.io/en/latest/reference/api/pipeline.html>, <https://scarf.readthedocs.io/en/latest/reference/api/artifacts.html>,
+<https://scarf.readthedocs.io/en/latest/concepts/provenance.html>, <https://scarf.readthedocs.io/en/latest/tutorials/reuse_and_tracing.html>,
+<https://scarf.readthedocs.io/en/latest/analysis_with_agents.html>.
 
 ## When to use
 
@@ -116,8 +116,8 @@ A stage error raises `PipelineExecutionError` (`run_id`, `stage`, cause in `__ca
 SIGINT, SIGHUP or `KeyboardInterrupt` stop at the next safe checkpoint (in testing, the running
 stage finished and kept its artifact) and record `status="interrupted"`. Rerun with the same
 label; completed artifacts are reused (interrupted during UMAP: rerun 10 s, 16 reused; 10x 5K
-PBMC docs dataset). Under `timeout`, put it inside `uv run` (`uv run timeout 1800 python job.py`);
-`timeout 1800 uv run ...` killed the run without the handler (performance-and-export.md).
+PBMC docs dataset). Run it as `timeout 1800 python job.py`; behind a wrapper such as `uv run`, put
+`timeout` inside it (`uv run timeout 1800 python job.py`), because `timeout 1800 uv run ...` killed the run without the handler (performance-and-export.md).
 
 ```python
 from scarf import PipelineExecutionError
@@ -130,7 +130,7 @@ except PipelineExecutionError as error:
 interrupted = ds.pipeline.list_runs(status="interrupted")
 ```
 
-A process killed mid-stage (SIGKILL, OOM, or that `timeout` outside `uv run`) leaves a record
+A process killed mid-stage (SIGKILL, OOM, or a `timeout` outside a `uv run` wrapper) leaves a record
 stuck at `status="running"` with `summary["uncleanIncomplete"]` true; it claimed no label, so a
 rerun with the label works. Check the process, not the status. Not executed (needs a hard-killed
 finalizer): if a process died after claiming its label, the label stays blocked. After confirming

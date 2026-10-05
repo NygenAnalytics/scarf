@@ -1,8 +1,8 @@
 # Plotting
 
 Draw, inspect and save Scarf figures headlessly, from a completed pipeline run or from explicit
-artifact refs. Docs: `docs/source/tutorials/plotting.md`,
-`docs/source/reference/api/plotting.md`, `docs/source/reference/api/datastore.md`.
+artifact refs. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/plotting.html>,
+<https://scarf.readthedocs.io/en/latest/reference/api/plotting.html>, <https://scarf.readthedocs.io/en/latest/reference/api/datastore.html>.
 
 ## When to use
 
@@ -48,7 +48,7 @@ columns. When author labels are held out, plot only labels you assigned.
 
 ### Save headlessly
 
-Run scripts as `MPLBACKEND=Agg uv run python script.py`, or call `matplotlib.use("Agg")` before
+Run scripts as `MPLBACKEND=Agg python script.py`, or call `matplotlib.use("Agg")` before
 importing pyplot. `save` infers the format (png, pdf, svg, tif) from the suffix, keeps the exact
 inch size, and uses a white background. The exact size can clip a legend outside the axes
 (`legend_loc="right"`, many categories): save those with `exact_size=False`, a tight crop.
