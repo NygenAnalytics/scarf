@@ -11,14 +11,17 @@ kernelspec:
   language: python
   name: python3
 ---
+# Clustering primer
+
+Cells that share neighbors on the graph get grouped into clusters. These neighbors that the cells share all contain similar transcriptomic profiles, thus why they end up nearby. However, a cluster is a mathematical partition, not a biological verdict. Clustering may mark a cell type, a transient state, or a technical artifact; Only marker evidence and stability checks ensure that its true biologically similar group. The `Leiden` clustering method draws boundaries on the neighbour graph by optimizing modularity at a chosen resolution, so turning the resolution knob merges rare populations at coarse settings and fractures homogeneous ones at fine settings, all on the same graph. Higher values for the leiden graph mean more communities, whereas smaller values indicate less, more broad communities.
+
+The `Paris` clustering method instead builds a hierarchy of nested merges, letting you cut adaptively or at a fixed cluster count.
+
+Here, we inspect a saved Leiden clustering on the prepared PBMC analysis, change the resolution while holding the graph fixed, and compare against the Paris hierarchy, judging every neighborhood by marker coherence and agreement rather than by count alone.
 
 # Clustering and cluster evidence
 
-Clustering groups cells with similar neighbours. A cluster may represent a cell type, a cell
-state, or technical variation, so it needs biological interpretation. We first inspect a saved
-clustering, then change the resolution while keeping the graph fixed.
-
-## 1. Open one graph
+## Open the existing graph
 
 ```{code-cell} ipython3
 from dataclasses import asdict
@@ -30,10 +33,8 @@ import pandas as pd
 
 import scarf
 
-# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
-# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
@@ -42,45 +43,35 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 Open the downloaded store and its saved analysis.
 
 ```{code-cell} ipython3
-# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
-# Open the saved clustering analysis.
 clustering_run = ds.pipeline.open(label="docs_default")
-# Keep the graph used by the saved analysis.
 graph = clustering_run["connectivity_map"]
-# Reuse the saved UMAP coordinates.
 umap = clustering_run["umap"]
-# Inspect the opened assays and their dimensions.
 ds
 ```
 
 The store carries an analysis saved as `docs_default`. Inspect its selected clusters first:
 
 ```{code-cell} ipython3
-# Inspect the prepared baseline clustering.
 ds.plots.embedding(run=clustering_run, color_by="clusters")
 ```
 
-This prepared example used Leiden resolution 0.5. The standalone method defaults to 1.0, and the
-standard pipeline can compare several resolutions. Cluster numbers are labels, not cell types.
+This prepared example used Leiden resolution 0.5, with the default of SCARF being 1.0. During standard analysis, it is critical that you sweep across several resolutions.
 We use the same graph and UMAP below so only the clustering changes.
 
-## 2. Sweep Leiden resolution
+## Sweep Leiden resolution
 
 ```{code-cell} ipython3
-# Vary the resolution while keeping the graph unchanged.
 leiden_refs = {
     0.3: ds.run_leiden_clustering(graph, resolution=0.3),
     0.5: clustering_run["leiden_0.5"],
     0.8: ds.run_leiden_clustering(graph, resolution=0.8),
 }
-# Load the labels for each resolution.
 leiden_values = {
     resolution: np.asarray(ds.load_artifact(ref)["values"][:])
     for resolution, ref in leiden_refs.items()
 }
 
-# Compare cluster sizes across the three Leiden resolutions.
 pd.DataFrame(
     {
         resolution: pd.Series(values).value_counts()
@@ -90,11 +81,8 @@ pd.DataFrame(
 ```
 
 ```{code-cell} ipython3
-# Create one plotting axis for each comparison panel.
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-# Draw each comparison on its own labeled axis.
 for axis, resolution in zip(axes, leiden_values, strict=True):
-    # Place this resolution on the common UMAP for comparison.
     ds.plots.embedding(
         layout=umap,
         color_by=leiden_refs[resolution],
@@ -102,22 +90,16 @@ for axis, resolution in zip(axes, leiden_values, strict=True):
         show_titles=False,
         show=False,
     )
-    # Label the panel with the quantity being compared.
     axis.set_title(f"Leiden {resolution}")
-# Adjust spacing so panel labels remain readable.
 figure.tight_layout()
-# Display the completed figure.
 figure
 ```
 
-Higher resolution usually produces more and smaller groups. Reject a split when it is driven by a
-technical covariate, has weak marker evidence, or disappears under a modest parameter change.
+Higher resolution usually produces more and smaller groups. Reject a split when it is driven by a technical covariate, has weak marker evidence, or disappears under a modest parameter change.
 
-The adjusted Rand index (ARI) compares partitions without requiring the cluster numbers to
-match. A value of one means the partitions agree. It does not tell us which partition is better:
+A metric to validate clustering is the adjusted Rand index (ARI), which compares partitions without requiring the cluster numbers to match. A value of one means the partitions agree, but it does not tell us which partition is better:
 
 ```{code-cell} ipython3
-# Compare partition agreement for every resolution pair.
 pd.Series(
     {
         f"{first} vs {second}": ds.metric_label_concordance(
@@ -129,24 +111,19 @@ pd.Series(
 )
 ```
 
-## 3. Inspect membership strength
+## Inspect membership strength
 
 Membership strength measures how strongly a cell connects to its assigned cluster.
 We use resolution 0.5 for this walkthrough.
 
 ```{code-cell} ipython3
-# Inspect the Leiden partition at resolution 0.5.
 chosen = leiden_refs[0.5]
-# Keep the labels for the partition being reviewed.
 chosen_values = leiden_values[0.5]
-# Measure each cell's connection to its assigned cluster.
 membership = ds.calc_membership_strength(chosen, graph)
-# Locate cells with weak or strong cluster membership.
 ds.plots.embedding(layout=umap, color_by=membership)
 ```
 
 ```{code-cell} ipython3
-# Show how the chosen clusters connect on this graph.
 ds.plots.cluster_connectivity(graph=graph, groups=chosen, layout=umap)
 ```
 
@@ -159,36 +136,26 @@ Marker search requires exact cluster and feature-selection refs and returns one 
 table artifact.
 
 ```{code-cell} ipython3
-# Keep the marker result for the selected clustering.
 markers = ds.run_marker_search(chosen, features=clustering_run["feature_universe"])
-# Count the cells in each selected cluster.
 sizes = pd.Series(chosen_values).value_counts()
-# Identify the most populated cluster.
 largest = sizes.index[0]
-# Identify the least populated cluster.
 smallest = sizes.index[-1]
 
-# Load markers for the largest cluster.
 largest_markers = ds.get_markers(marker=markers, group_id=largest)
-# Load markers for the smallest cluster.
 smallest_markers = ds.get_markers(marker=markers, group_id=smallest)
-# Identify the largest and smallest clusters being compared below.
 pd.Series({"largest cluster": largest, "smallest cluster": smallest})
 ```
 
 Markers for the largest cluster:
 
 ```{code-cell} ipython3
-# Inspect the leading markers for the largest cluster.
 marker_columns = ["feature_name", "score", "auc", "p_value", "p_value_adjusted"]
-# Preview these statistics for the ten leading markers.
 largest_markers[marker_columns].head(10)
 ```
 
 Markers for the smallest cluster:
 
 ```{code-cell} ipython3
-# Inspect the leading markers for the smallest cluster.
 smallest_markers[marker_columns].head(10)
 ```
 
@@ -205,9 +172,7 @@ artifact persists the scores, sampling policy, invalid-candidate reasons, tie or
 key:
 
 ```python
-# Keep the saved cluster-selection diagnostics.
 decision_ref = clustering_run["cluster_selection"]
-# Keep the clustering chosen by the pipeline.
 selected_cluster_ref = clustering_run["clusters"]
 ```
 
@@ -221,18 +186,14 @@ evidence.
 hierarchy diagnostics are needed.
 
 ```{code-cell} ipython3
-# Choose an adaptive cut of the Paris hierarchy.
 paris_auto = ds.run_paris_clustering(graph)
-# Load the Paris labels and hierarchy diagnostics.
 paris_result = ds.load_paris_clustering(paris_auto)
-# Inspect the size and persistence of each selected Paris group.
 pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
     ["label", "size", "persistence", "decision_margin", "forced"]
 ]
 ```
 
 ```{code-cell} ipython3
-# Show the hierarchy supporting the Paris partition.
 ds.plots.cluster_tree(graph=graph, clusters=paris_auto)
 ```
 
@@ -241,9 +202,7 @@ measures the preference for retaining it. A forced group satisfies a structural 
 not, by itself, strong biological evidence.
 
 ```{code-cell} ipython3
-# Cut the same hierarchy at the adaptive result's cluster count.
 paris_fixed = ds.run_paris_clustering(graph, n_clusters=paris_result.n_clusters)
-# Compare the adaptive Paris cut with fixed Paris and Leiden partitions.
 pd.Series(
     {
         "auto vs fixed ARI": ds.metric_label_concordance(paris_auto, paris_fixed),
@@ -251,3 +210,9 @@ pd.Series(
     }
 )
 ```
+
+## Important caveats to consider regarding clustering
+
+- **Conflating cell-level marker tests with replicate-aware differential expression:** Scarf's marker search performs one-versus-rest statistical tests treating individual cells as independent observations. These cell-level {math}`p`-values suffer from massive artificial inflation due to pseudo-replication and ignore donor-level variance; an astronomically low {math}`p`-value confirms cluster separation on the graph, not reproducible biological differential expression; Therefore, don't interpret these values as changes in gene expression.
+- **Discretizing continuous biological gradients (ignoring membership strength):** Graph partitioning algorithms like Leiden and Paris enforce discrete boundaries even across continuous developmental trajectories or cell-cycle axes. Failing to evaluate membership strength and cluster connectivity risks misinterpreting transitional intermediates with weak boundaries as distinct, terminal cell types.
+- **Over-relying on automated resolution selection and technical splits:** Automated heuristics (such as coordinate-based sampling scores) and high Leiden resolutions optimize mathematical graph modularity, not biological reality. Sweeping to higher resolutions frequently fractures populations along technical confounders, such as sequencing depth, mitochondrial fraction, or batch effects, or produces "forced" hierarchical cuts in Paris that lack stable marker persistence.
