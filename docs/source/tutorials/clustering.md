@@ -13,7 +13,7 @@ kernelspec:
 ---
 # Clustering primer
 
-Cells that share neighbors on the graph get grouped into clusters. These neighbors that the cells share all contain similar transcriptomic profiles, thus why they end up nearby. However, a cluster is a mathematical partition, not a biological verdict. Clustering may mark a cell type, a transient state, or a technical artifact; Only marker evidence and stability checks ensure that its true biologically similar group. The `Leiden` clustering method draws boundaries on the neighbour graph by optimizing modularity at a chosen resolution, so turning the resolution knob merges rare populations at coarse settings and fractures homogeneous ones at fine settings, all on the same graph. Higher values for the leiden graph mean more communities, whereas smaller values indicate less, more broad communities.
+Cells that share neighbors on the graph get grouped into clusters. These neighbors that the cells share all contain similar transcriptomic profiles, thus why they end up nearby. However, a cluster is a mathematical partition, not a biological verdict. Clustering may mark a cell type, a transient state, or a technical artifact; only marker evidence and stability checks ensure that it is a truly biologically similar group. The Leiden clustering method draws boundaries on the neighbor graph by optimizing modularity at a chosen resolution, so turning the resolution knob merges rare populations at coarse settings and fractures homogeneous ones at fine settings, all on the same graph. Higher values for the Leiden resolution mean more communities, whereas smaller values indicate fewer, broader communities.
 
 The `Paris` clustering method instead builds a hierarchy of nested merges, letting you cut adaptively or at a fixed cluster count.
 
@@ -23,7 +23,7 @@ Here, we inspect a saved Leiden clustering on the prepared PBMC analysis, change
 
 ## Open the existing graph
 
-```{code-cell} ipython3
+```{code-cell}
 from dataclasses import asdict
 from itertools import combinations
 
@@ -42,7 +42,7 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 
 Open the downloaded store and its saved analysis.
 
-```{code-cell} ipython3
+```{code-cell}
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 clustering_run = ds.pipeline.open(label="docs_default")
 graph = clustering_run["connectivity_map"]
@@ -52,7 +52,7 @@ ds
 
 The store carries an analysis saved as `docs_default`. Inspect its selected clusters first:
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.embedding(run=clustering_run, color_by="clusters")
 ```
 
@@ -61,7 +61,7 @@ We use the same graph and UMAP below so only the clustering changes.
 
 ## Sweep Leiden resolution
 
-```{code-cell} ipython3
+```{code-cell}
 leiden_refs = {
     0.3: ds.run_leiden_clustering(graph, resolution=0.3),
     0.5: clustering_run["leiden_0.5"],
@@ -80,7 +80,7 @@ pd.DataFrame(
 ).fillna(0).astype(int)
 ```
 
-```{code-cell} ipython3
+```{code-cell}
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
 for axis, resolution in zip(axes, leiden_values, strict=True):
     ds.plots.embedding(
@@ -99,7 +99,7 @@ Higher resolution usually produces more and smaller groups. Reject a split when 
 
 A metric to validate clustering is the adjusted Rand index (ARI), which compares partitions without requiring the cluster numbers to match. A value of one means the partitions agree, but it does not tell us which partition is better:
 
-```{code-cell} ipython3
+```{code-cell}
 pd.Series(
     {
         f"{first} vs {second}": ds.metric_label_concordance(
@@ -116,26 +116,24 @@ pd.Series(
 Membership strength measures how strongly a cell connects to its assigned cluster.
 We use resolution 0.5 for this walkthrough.
 
-```{code-cell} ipython3
+```{code-cell}
 chosen = leiden_refs[0.5]
 chosen_values = leiden_values[0.5]
 membership = ds.calc_membership_strength(chosen, graph)
 ds.plots.embedding(layout=umap, color_by=membership)
 ```
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.cluster_connectivity(graph=graph, groups=chosen, layout=umap)
 ```
 
-Low values throughout one cluster suggest a weak boundary. A narrow band of low values between
-otherwise coherent groups may represent continuous biology.
+Low values throughout one cluster suggest a weak boundary. A narrow band of low values between otherwise coherent groups may represent continuous biology.
 
-## 4. Review marker evidence
+## Review marker evidence
 
-Marker search requires exact cluster and feature-selection refs and returns one immutable marker
-table artifact.
+Marker search requires exact cluster and feature-selection refs and returns a final table to interpret.
 
-```{code-cell} ipython3
+```{code-cell}
 markers = ds.run_marker_search(chosen, features=clustering_run["feature_universe"])
 sizes = pd.Series(chosen_values).value_counts()
 largest = sizes.index[0]
@@ -148,44 +146,35 @@ pd.Series({"largest cluster": largest, "smallest cluster": smallest})
 
 Markers for the largest cluster:
 
-```{code-cell} ipython3
+```{code-cell}
 marker_columns = ["feature_name", "score", "auc", "p_value", "p_value_adjusted"]
 largest_markers[marker_columns].head(10)
 ```
 
 Markers for the smallest cluster:
 
-```{code-cell} ipython3
+```{code-cell}
 smallest_markers[marker_columns].head(10)
 ```
 
-The p-values are cell-level one-versus-rest marker tests with within-group adjustment. They are not
-replicate-aware differential expression. A defensible partition combines marker evidence, graph
-support, technical covariates, replicate coverage, and the study question.
+The p-values are cell-level one-versus-rest marker tests with within-group adjustment. They are not replicate-aware differential expression: you can't report the p-values as direct changes in gene expression.
 
-## 5. Pipeline cluster selection
+## Pipeline cluster selection
 
-When a pipeline run includes multiple Leiden candidates, it scores them with one deterministic
-shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates. Paris can still
-run as `clustering_run["paris"]`, but it is not an automatic winner. The `cluster_selection`
-artifact persists the scores, sampling policy, invalid-candidate reasons, tie order, and selected
-key:
+Sometimes you run the full pipeline instead of picking a resolution yourself, and it produces several Leiden candidates at once. Scarf does not just grab one silently, it scores every candidate on the same shared sample of at most 10,000 cells in PCA or Harmony coordinates, so the contest is fair and reruns give the same winner. Paris can enter the equation through `clustering_run["paris"]`. Everything about the decision is saved in the `cluster_selection` artifact, with the scores, the sampling policy, why candidate resolutions failed, where they tied, and the winning key resolution.
 
 ```python
 decision_ref = clustering_run["cluster_selection"]
 selected_cluster_ref = clustering_run["clusters"]
 ```
 
-This automatic choice is a reproducible baseline, not proof that the selected resolution is best
-for every biological question. Retain alternative refs when the decision needs domain-specific
-evidence.
+The winner is simply a reproducible starting point.
 
-## Optional: compare Paris cuts
+## Optional: compare Paris clusters
 
-`run_paris_clustering` returns a `cluster_cut` ref. Load the domain result explicitly when
-hierarchy diagnostics are needed.
+Leiden is not the only way to divide up the graph, as previously discussed at the beginning, Paris clustering is also a method. `run_paris_clustering` builds a hierarchy of nested merges and returns a `cluster_cut` ref; load the result explicitly when you need its diagnostics, and not just its labels.
 
-```{code-cell} ipython3
+```{code-cell}
 paris_auto = ds.run_paris_clustering(graph)
 paris_result = ds.load_paris_clustering(paris_auto)
 pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
@@ -193,15 +182,13 @@ pd.DataFrame([asdict(item) for item in paris_result.diagnostics])[
 ]
 ```
 
-```{code-cell} ipython3
+```{code-cell}
 ds.plots.cluster_tree(graph=graph, clusters=paris_auto)
 ```
 
-Persistence measures how long a selected branch survives in the hierarchy. The decision margin
-measures the preference for retaining it. A forced group satisfies a structural constraint and is
-not, by itself, strong biological evidence.
+Persistence measures how long a selected branch survives in the hierarchy, with long-lived branches as the sturdier claims. The decision margin measures how strongly the cut prefers keeping it. A forced group exists because a structural constraint demanded it, not because the data supported it, so it carries no biological weight on its own.
 
-```{code-cell} ipython3
+```{code-cell}
 paris_fixed = ds.run_paris_clustering(graph, n_clusters=paris_result.n_clusters)
 pd.Series(
     {
