@@ -11,10 +11,9 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (plotting_showcase)=
 
-# Plotting
+# Core plotting Features
 
 Start with a few common plots: an embedding, a marker summary, and a QC distribution.
 The later sections add options for particular questions. Most plots work with their defaults.
@@ -145,6 +144,8 @@ ds.plots.embedding(
 
 These choices affect the display, not the saved counts. Clipping the color range makes all values
 above the limit share the same color, so report that choice when presenting a figure.
+
+# Plotting Extensions
 
 ## Optional: focus on selected groups
 

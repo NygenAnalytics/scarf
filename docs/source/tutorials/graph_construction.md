@@ -52,8 +52,7 @@ run_cells = baseline.cells
 {"cells": cell_selection, "genes": hvg_ref}
 ```
 
-Each specific step returns a reference to its saved result. Pass it to the next method to keep the
-steps connected. We use 15 PCs to match the prepared example; `run_pca` defaults to 21.
+Each specific step returns a reference to its saved result; we pass each reference to the next step to keep everything connect. For this example, we use 15 PCs with `run_pca` , but in general, `run_pc` defaults to 21.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(cell_selection, hvg_ref)
@@ -61,7 +60,7 @@ pca = ds.run_pca(normalized, dims=15)
 pca
 ```
 
-Build the neighbor index from PCA, then turn neighbor distances into connectivity:
+Build the nearest neighbor index from PCA space, then turn neighbor distances into connectivity:
 
 ```{code-cell} ipython3
 ann_index = ds.build_ann_index(pca)
@@ -72,9 +71,7 @@ graph
 
 The default neighbour count is 11. We will change only that value in the comparison below.
 
-`load_graph` returns a sparse cell-by-cell connectivity matrix. Its default keeps the directed
-neighbour edges. For the diagnostics below, use `symmetric=True` to include a connection when
-either cell selects the other. This lets us count each cell's neighbours in either direction.
+The `load_graph` returns a sparse cell-by-cell connectivity matrix, and by default, it keeps the directed neighbour edges. For the diagnostics below, use `symmetric=True` to include a connection when either cell selects the other. This lets us count each cell's neighbours in either direction.
 
 ```{code-cell} ipython3
 loaded_graph = ds.load_graph(graph, symmetric=True)
@@ -112,16 +109,12 @@ degree_vs_qc = pd.DataFrame(
 degree_vs_qc.corr(numeric_only=True)
 ```
 
-The graph should include every active cell and have finite nonzero connectivities.
-A disconnected graph, many isolated cells, or degree structure driven by a QC metric warrants revisiting features, PCA dimensions, or `k`.
+The graph should include every active cell and have all the connectivties be non-zero.
+A disconnected graph, or many isolated cells is an issue, thus revisit the upstream quality control and feature selection to ensure the graph is fully connected.
 
-## 3. Use the graph for a layout and clustering
+## Use the graph for a layout and clustering
 
-`run_umap` and `run_tsne` require both the graph and its matching initialization.
-Leiden and Paris require the graph.
-Each returns an immutable artifact without adding cell-metadata columns. Use
-`load_paris_clustering(ref)` only when hierarchy diagnostics are needed.
-Resolution 0.5 matches the prepared PBMC analysis; Leiden's default is 1.0.
+Both `run_umap` and `run_tsne` require both the graph and its matching initialization, whereas Leiden and Paris clustering only require the graph.
 
 ```{code-cell} ipython3
 initialization = ds.build_embedding_initialization(pca)
@@ -131,10 +124,9 @@ cluster_values = np.asarray(ds.load_artifact(clusters)["values"][:])
 ds.plots.embedding(layout=umap, color_by=clusters)
 ```
 
-## 4. Branch by retaining both references
+## Branch by retaining both references
 
-Suppose the PCA and ANN index are expensive but two neighbour counts need to be compared.
-Reuse the same index and retain both returned graph references.
+Suppose the PCA and ANN index are expensive to recompute. To compare two neighbour counts, reuse the same index and query it with a different k. Only the neighbour and connectivity stages run again, thus saving computation and time.
 
 ```{code-cell} ipython3
 neighbors_k21 = ds.query_neighbors(ann_index, k=21)
@@ -142,8 +134,7 @@ graph_k21 = ds.build_connectivity_map(neighbors_k21)
 graph_k21 != graph
 ```
 
-Both branches remain complete, addressable artifacts.
-Downstream calls must receive one of them explicitly, so a parameter experiment cannot silently replace another branch.
+Both branches remain complete, addressable artifacts. Downstream calls must receive one of them explicitly, so a parameter experiment cannot silently replace another branch.
 
 Degree and edge weight both shift when every cell sees more neighbours:
 
@@ -162,8 +153,7 @@ pd.Series(
 splt.graph_qc(loaded_graph_k21)
 ```
 
-To analyse the side branch, pass its exact graph reference.
-Retain both returned refs so neither branch replaces the other.
+To analyse the side branch, pass its exact graph information;. 
 
 ```{code-cell} ipython3
 clusters_k21 = ds.run_leiden_clustering(graph_k21, resolution=0.5)
@@ -171,8 +161,7 @@ cluster_values_k21 = np.asarray(ds.load_artifact(clusters_k21)["values"][:])
 pd.Series(cluster_values_k21, name="cluster").value_counts().sort_index()
 ```
 
-Place both partitions on the shared `k=11` UMAP so changes in group boundaries are visible,
-then compare their assignments with a crosstab:
+Place both partitions on the shared `k=11` UMAP so changes in group boundaries are visible, andthen compare their cluster assignments with a crosstab:
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -201,19 +190,13 @@ pd.crosstab(
 )
 ```
 
-Cluster numbers can change even when the groups stay the same. Look for a row spread across
-several columns, or a column collecting several rows, to find splits or merges that depend on
-`k`. Review marker evidence before accepting those boundaries.
+Cluster numbers can change even when the the underlying groups stay similar, thus look for rows spread across several columns to find splits or merges (of clusters )that depend on `k`. Review marker gene evidence before accepting those boundaries.
 
-## 5. Recompute only what changed
+## Recompute only what changed
 
-Artifact identity includes the operation, scientific parameters, and upstream inputs.
-Calling an identical stage reuses its completed result.
-Changing `k` reuses normalization, PCA, and the ANN index but creates new neighbour and connectivity artifacts.
-Changing the cell or feature selection requires new downstream results. The saved results of
-the earlier analysis remain available.
+The benefit of SCARF is that we only need to recompute exactly what has changed, so a general rule is that if you change `k`, then you reuse the results from normalization, the PCA, and the ANN index; You do create a new neighbor and connectivity result however.
 
-Harmony fits between PCA and the ANN index:
+For example, say you need to run batch correction with harmony, then you would simply keep the existing PCA results, but then need to recompute the ANN index, and then new neighbor and connectivity maps. 
 
 ```python
 corrected = ds.run_harmony(pca, ["technical_batch"])
@@ -221,5 +204,3 @@ corrected_index = ds.build_ann_index(corrected)
 corrected_neighbors = ds.query_neighbors(corrected_index, k=21)
 corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
-
-Use {doc}`../concepts/provenance` to inspect complete lineage and {doc}`reuse_and_tracing` for reuse and invalidation patterns.
