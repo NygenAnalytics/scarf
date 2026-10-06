@@ -24,7 +24,7 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 - Save a custom cell selection
 - Choose an exit path for another analysis system
 
-## 1. Prepare a store
+## Import an existing store
 
 The prepared PBMC store supplies counts and a saved example run labeled `docs_default`.
 Open the downloaded store directly because the examples write custom artifacts and metadata, then

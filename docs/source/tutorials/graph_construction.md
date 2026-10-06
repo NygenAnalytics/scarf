@@ -13,11 +13,11 @@ kernelspec:
 ---
 (graph_construction_guide)=
 
- Build a neighbourhood graph stage by stage
+# Build a neighborhood graph stage by stage
 
-Embeddings, clustering, imputation, and trajectories use a graph to compute their results. : a graph. A graph is simply a set of nodes joined by edges. Here each node is one cell, and an edge joins two cells that look alike. The whole analysis therefore rests on a single question: which cells are similar enough to count as neighbours? SCARF answers that question with a K-nearest-neighbours (KNN) graph. Every cell is connected to its `k` (user specified) most similar cells, and those connections become the edges. Similarity is not measured on the raw count matrix, but is instead measured in a lower-dimensional space, such as PCA for RNA or LSI for ATAC, that is derived from the original data. Raw high-dimensional distances are dominated by noise and tend to concentrate on this noise, thus each cell looks about equally far from every other cell. The reduction keeps the directions that carry the strongest shared variation, and cells that share a cell state or lineage end up close together in that space.
+Embeddings, clustering, imputation, and trajectories use a graph to compute their results. A graph is simply a set of nodes joined by edges. Here each node is one cell, and an edge joins two cells that look alike. The whole analysis therefore rests on a single question: which cells are similar enough to count as neighbors? SCARF answers that question with a K-nearest-neighbors (KNN) graph. Every cell is connected to its `k` (user specified) most similar cells, and those connections become the edges. Similarity is not measured on the raw count matrix, but is instead measured in a lower-dimensional space, such as PCA for RNA or LSI for ATAC, that is derived from the original data. Raw high-dimensional distances are dominated by noise and tend to concentrate on this noise, thus each cell looks about equally far from every other cell. The reduction keeps the directions that carry the strongest shared variation, and cells that share a cell state or lineage end up close together in that space.
 
-Distance in the reduced space becomes connection strength. SCARF first builds an approximate neighbour index, which makes neighbour search efficient for large datasets, then queries `k` neighbours per cell and converts those neighbour distances into a weighted connectivity graph. This weighted graph, not the reduction itself, is what downstream methods utilize, with UMAP and t-SNE allowing for 2D visualization.
+Distance in the reduced space becomes connection strength. SCARF first builds an approximate neighbor index, which makes neighbor search efficient for large datasets, then queries `k` neighbors per cell and converts those neighbor distances into a weighted connectivity graph. This weighted graph, not the reduction itself, is what downstream methods utilize, with UMAP and t-SNE allowing for 2D visualization.
 
 ## Build the graph
 
@@ -52,7 +52,7 @@ run_cells = baseline.cells
 {"cells": cell_selection, "genes": hvg_ref}
 ```
 
-Each specific step returns a reference to its saved result; we pass each reference to the next step to keep everything connect. For this example, we use 15 PCs with `run_pca` , but in general, `run_pc` defaults to 21.
+Each specific step returns a reference to its saved result; we pass each reference to the next step to keep everything connected. For this example, we use 15 PCs with `run_pca`, but in general, `run_pca` defaults to 21.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(cell_selection, hvg_ref)
@@ -69,9 +69,9 @@ graph = ds.build_connectivity_map(neighbors)
 graph
 ```
 
-The default neighbour count is 11. We will change only that value in the comparison below.
+The default neighbor count is 11. We will change only that value in the comparison below.
 
-The `load_graph` returns a sparse cell-by-cell connectivity matrix, and by default, it keeps the directed neighbour edges. For the diagnostics below, use `symmetric=True` to include a connection when either cell selects the other. This lets us count each cell's neighbours in either direction.
+The `load_graph` returns a sparse cell-by-cell connectivity matrix, and by default, it keeps the directed neighbor edges. For the diagnostics below, use `symmetric=True` to include a connection when either cell selects the other. This lets us count each cell's neighbors in either direction.
 
 ```{code-cell} ipython3
 loaded_graph = ds.load_graph(graph, symmetric=True)
@@ -109,8 +109,8 @@ degree_vs_qc = pd.DataFrame(
 degree_vs_qc.corr(numeric_only=True)
 ```
 
-The graph should include every active cell and have all the connectivties be non-zero.
-A disconnected graph, or many isolated cells is an issue, thus revisit the upstream quality control and feature selection to ensure the graph is fully connected.
+The graph should include every active cell and have all the connectivities be non-zero.
+A disconnected graph, or many isolated cells are an issue, thus revisit the upstream quality control and feature selection to ensure the graph is fully connected.
 
 ## Use the graph for a layout and clustering
 
@@ -126,7 +126,7 @@ ds.plots.embedding(layout=umap, color_by=clusters)
 
 ## Branch by retaining both references
 
-Suppose the PCA and ANN index are expensive to recompute. To compare two neighbour counts, reuse the same index and query it with a different k. Only the neighbour and connectivity stages run again, thus saving computation and time.
+Suppose the PCA and ANN index are expensive to recompute. To compare two neighbor counts, reuse the same index and query it with a different k. Only the neighbor and connectivity stages run again, thus saving computation and time.
 
 ```{code-cell} ipython3
 neighbors_k21 = ds.query_neighbors(ann_index, k=21)
@@ -136,7 +136,7 @@ graph_k21 != graph
 
 Both branches remain complete, addressable artifacts. Downstream calls must receive one of them explicitly, so a parameter experiment cannot silently replace another branch.
 
-Degree and edge weight both shift when every cell sees more neighbours:
+Degree and edge weight both shift when every cell sees more neighbors:
 
 ```{code-cell} ipython3
 loaded_graph_k21 = ds.load_graph(graph_k21, symmetric=True)
@@ -153,7 +153,7 @@ pd.Series(
 splt.graph_qc(loaded_graph_k21)
 ```
 
-To analyse the side branch, pass its exact graph information;. 
+To analyze the side branch, pass its exact graph information.
 
 ```{code-cell} ipython3
 clusters_k21 = ds.run_leiden_clustering(graph_k21, resolution=0.5)
@@ -161,7 +161,7 @@ cluster_values_k21 = np.asarray(ds.load_artifact(clusters_k21)["values"][:])
 pd.Series(cluster_values_k21, name="cluster").value_counts().sort_index()
 ```
 
-Place both partitions on the shared `k=11` UMAP so changes in group boundaries are visible, andthen compare their cluster assignments with a crosstab:
+Place both partitions on the shared `k=11` UMAP so changes in group boundaries are visible, and then compare their cluster assignments with a crosstab:
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -190,13 +190,13 @@ pd.crosstab(
 )
 ```
 
-Cluster numbers can change even when the the underlying groups stay similar, thus look for rows spread across several columns to find splits or merges (of clusters )that depend on `k`. Review marker gene evidence before accepting those boundaries.
+Cluster numbers can change even when the underlying groups stay similar, thus look for rows spread across several columns to find splits or merges (of clusters) that depend on `k`. Review marker gene evidence before accepting those boundaries.
 
 ## Recompute only what changed
 
-The benefit of SCARF is that we only need to recompute exactly what has changed, so a general rule is that if you change `k`, then you reuse the results from normalization, the PCA, and the ANN index; You do create a new neighbor and connectivity result however.
+The benefit of SCARF is that we only need to recompute exactly what has changed, so a general rule is that if you change `k`, then you reuse the results from normalization, the PCA, and the ANN index; you do create a new neighbor and connectivity result however.
 
-For example, say you need to run batch correction with harmony, then you would simply keep the existing PCA results, but then need to recompute the ANN index, and then new neighbor and connectivity maps. 
+For example, say you need to run batch correction with Harmony, then you would simply keep the existing PCA results, but then need to recompute the ANN index, and then new neighbor and connectivity maps.
 
 ```python
 corrected = ds.run_harmony(pca, ["technical_batch"])
@@ -204,3 +204,5 @@ corrected_index = ds.build_ann_index(corrected)
 corrected_neighbors = ds.query_neighbors(corrected_index, k=21)
 corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
+
+Use {doc}`../concepts/provenance` to inspect complete lineage and {doc}`reuse_and_tracing` for reuse and invalidation patterns.
