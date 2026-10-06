@@ -15,19 +15,19 @@ kernelspec:
 
 # Remote stores and mounted analysis targets
 
-SCARF has a special feature, which is to analyze data on remote stores. Additionally, in SCARF, a mounted datastore lets you save an analysis separately from its counts; This means that if several people are sharing a common upstream file, or counts live in a common stroage, everyone can access it and take the analysis onto their own respective branches.
+SCARF has a special feature, which is to analyze data on remote stores. Additionally, in SCARF, a mounted datastore lets you save an analysis separately from its counts; this means that if several people are sharing a common upstream file, or counts live in a common storage, everyone can access it and take the analysis onto their own respective branches.
 
-To begin, we will first mount a downloaded dataset, then show how the same feature accepts a remote source. Only the local example is executed on this page (local, downloaded dataset). For a worked example that reads a public remote store, see {doc}`cytebase`; Working on a public remote store could entail downloading data from an atlas, regardless, refer to the referenced document.
+To begin, we will first mount a downloaded dataset, then show how the same feature accepts a remote source. Only the local example is executed on this page. For a worked example that reads a public remote store, see {doc}`cytebase`; working on a public remote store could entail downloading data from an atlas. Regardless, refer to the referenced document.
 
 ## Local example: download, then mount locally
 
 The defining property of a mounted datastore is the separation between its count source and its
 writable analysis target. The count source can be a local path or an object-store URI. The target
-stores copied metadata plus new artifacts (modifications we make), while count blocks continue to resolve from the source. This way, the original count blocks do not get modified.  Mounting does not by itself mean that either location is remote.
+stores copied metadata plus new artifacts (modifications we make), while count blocks continue to resolve from the source. This way, the original count blocks do not get modified. Mounting does not by itself mean that either location is remote.
 
-To mount a datastore, we use`mount_datastore`. With this, SCARF copies cell and feature metadata into the target. Mount validates and reads the primary stored `counts`for matrix identity. For RNA based assays, the matching gene matrix of counts must allready be transposed into the format of genes x cells, as if the matrix is present in cells x genes, SCARF will not automatically transpose for it. Thus, the matching source (downloaded dataset) must already have a copy of `countsT` for the analysis. Non-RNA assays don't require this transposed copy of the counts, thus this requirement is only specific to the RNA modality of any sequencing assay here.
+To mount a datastore, we use `mount_datastore`. With this, SCARF copies cell and feature metadata into the target. Mount validates and reads the primary stored `counts` for matrix identity. For RNA based assays, the matching gene matrix of counts must already be transposed into the format of genes x cells, if the matrix is present in cells x genes, SCARF will not automatically transpose it. Thus, the matching source (downloaded dataset) must already have a copy of `countsT` for the analysis. Non-RNA assays do not require this transposed copy of the counts. Thus, this requirement is only specific to the RNA modality of any sequencing assay here.
 
-Download the example to a temporary directory, then create a separate target for the analysis, that way our initial dataset doesn't get modified. For your own work, use persistent paths and keep the count source available.
+Download the example to a temporary directory, then create a separate target for the analysis. That way our initial dataset does not get modified. For your own work, use persistent paths and keep the count source available.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -90,9 +90,9 @@ reopened_run = reopened.pipeline.open(run_id=mounted_run.run_id)
 reopened_run.status
 ```
 
-The mount writes down the matrix shape, dtype, and source identity (as to to where the file came from). Reopen later and it checks that record: if the source (initial file) changed underneath, reopening fails instead of analyzing the wrong data. Metadata is copied once at mount time, so later edits to the source's metadata never flow directly into the target
+The mount writes down the matrix shape, dtype, and source identity (as to where the file came from). Reopen later and it checks that record: if the source (initial file) changed underneath, reopening fails instead of analyzing the wrong data. Metadata is copied once at mount time, so later edits to the source's metadata never flow directly into the target.
 
-The target also sees the source's (zarr folder) saved results, after its own: labels and embeddings that came with the source can be listed, loaded, traced, and fed into new steps, and a step matching saved provenance reuses the result instead of writing a copy. Everything new still lands in the target, and each pipeline run stays with the store that holds them. Results built on source artifacts need the source around, just like counts do; `python -m scarf.tools.repack_zarr` folds a mount into one self-contained store when you need to hand it off.
+The target also sees the source's (zarr folder) saved results, alongside its own: labels and embeddings that came with the source can be listed, loaded, traced, and fed into new steps, and a step matching saved provenance reuses the result instead of writing a copy. Everything new still lands in the target, and each pipeline run stays with the store that holds them. Results built on source artifacts need the source around, just like counts do; `python -m scarf.tools.repack_zarr` folds a mount into one self-contained store when you need to hand it off.
 
 ## Non-executed object-store templates
 
@@ -115,7 +115,7 @@ The source must remain available at the recorded URI whenever the target is open
 
 ### Open a datastore directly
 
-Pass an object-store URI as `zarr_loc` and provider options as `storage_options`. The S3 shape is a example here, and is not a tested public dataset:
+Pass an object-store URI as `zarr_loc` and provider options as `storage_options`. The S3 shape is an example here, and is not a tested public dataset:
 
 ```python
 import scarf
@@ -127,7 +127,7 @@ ds = scarf.DataStore(
 )
 ```
 
-For a writable remote store, use the `cloud`descriptor for newly written arrays. Existing arrays retain the layout chosen when they were created. Read credentials from the environment rather than embedding secrets in notebooks:
+For a writable remote store, use the `cloud` descriptor for newly written arrays. Existing arrays retain the layout chosen when they were created. Read credentials from the environment rather than embedding secrets in notebooks:
 
 ```python
 import os
@@ -144,16 +144,15 @@ remote_writable = scarf.DataStore(
 )
 ```
 
-Google Cloud Storage uses a `gs://` URI; Always pass the provider specific options to your environment based on what your group is using for the analysis, such as application-default credentials on the VM or an explicit token in `storage_options`.
+Google Cloud Storage uses a `gs://` URI; always pass the provider specific options to your environment based on what your group is using for the analysis, such as application-default credentials on the VM or an explicit token in `storage_options`.
 
 After opening a writable store, use the same analysis calls as for local data.
 
 ## Local scratch for reductions
 
-PCA fitting and score projection make multiple passes over normalized expression; The `local_cache` stages those normalized artifacts (changes) to local disk when the *store (folder/initial dataset)that holds it* is remote (object-storage URI or non-local backend). In simple terms, `local_cache` simply determines where the normalized changes itself live, and if that is on a remote store, then stage a copy locally; if the normalized changes already exist locally, then skip resaving an entirely new store.
+PCA fitting and score projection make multiple passes over normalized expression; the `local_cache` stages those normalized artifacts (changes) to local disk when the *store (folder/initial dataset) that holds it* is remote (object-storage URI or non-local backend). In simple terms, `local_cache` simply determines where the normalized changes itself live, and if that is on a remote store, then stage a copy locally; if the normalized changes already exist locally, then skip resaving an entirely new store.
 
 On a mounted target, the target folder holds the normalized artifacts it writes, while the source folder holds the ones the target reuses. So a local mount stages a normalized artifact it pulls from a remote source, and skips staging for one it wrote itself, even when the counts stream in remotely. Harmony, ANN, and neighbor queries only read already-reduced coordinates, so they never need this scratch space.
-
 
 | Value                | Behavior                                                                  |
 | ---------------------- | --------------------------------------------------------------------------- |
@@ -190,7 +189,7 @@ reduction = remote_writable.run_pca(
 
 ## Performance evidence and expectations
 
-Do not judge object-store speed from this page: everything executable here runs locally. A separate fixed workflow measured Scarf against S3-compatible storage in a recorded cloud environment, with timings, memory notes, and limits in {doc}`../concepts/benchmarks`. Those numbers do not compare remote against local storage.
+Do not judge object-store speed from this page: everything executable here runs locally. A separate fixed workflow measured SCARF against S3-compatible storage in a recorded cloud environment, with timings, memory notes, and limits in {doc}`../concepts/benchmarks`. Those numbers do not compare remote against local storage.
 
 Latency, request costs, credentials, and provider behavior all depend on your environment. When a local workflow fits those constraints better, downloading first is still on the table. Resource planning controls live in {doc}`../concepts/memory_and_execution`.
 

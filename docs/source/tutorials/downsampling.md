@@ -16,23 +16,11 @@ kernelspec:
 A large dataset is often easier to explore, or easier to pass to another tool, when you work with
 a smaller set of representative cells. Random subsampling is a poor way to do this: it can drop
 rare populations and thin out the structure you wanted to keep. SCARF's TopACeDo instead uses the neighbourhood graph, built as in {doc}`graph_construction`, together with a Paris clustering to
-choose cells that cover that structure and thus effectively downsample. It selects seed cells within each cluster and then adds the cells that connect those seeds through the graph. The selection is saved as an artifact, so the source data is never changed.
+choose cells that cover that structure and thus effectively downsample. It selects seed cells within each cluster and then adds the cells that connect those seeds through the graph. The selection is saved as an artifact, so the source data (initial dataset) is never changed.
 
-This page walks the full path: open the graph and the Paris cut the sampler requires, run the
-sampler, inspect what it selected, and export the chosen cells into a separate store. The sample
-is chosen to preserve topology, not to be statistically interchangeable; the caveats at the end
-state what it can and cannot support.
+## Open the initial dataset
 
-A smaller set of representative cells can make a large dataset easier to explore or pass to
-another tool. TopACeDo uses the neighbourhood graph and a Paris clustering to choose cells that
-cover its structure. It saves the selected cells as an artifact; it does not change the source data.
-
-## 1. Open the required artifacts
-
-TopACeDo requires a Paris cut from the same graph. The rebuilt PBMC store contains a completed
-example run labeled `docs_default` and a 15-cluster Paris cut built from its graph. Calling
-`run_paris_clustering` with that graph and cut size reuses the exact stored result. A Leiden
-partition or a cut from another graph is rejected.
+TopACeDo requires a Paris cut from the same graph, meaning to utilize it, you must have performed to proceed further. Running `run_paris_clustering` with that existing KNN graph is what gets you to that point.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -62,7 +50,7 @@ paris = ds.run_paris_clustering(graph, n_clusters=15)
 ds
 ```
 
-`paris` is an exact `cluster_cut` ref. Inspect its labels through the dedicated loader:
+Inspect the existing paris clustering. 
 
 ```{code-cell} ipython3
 paris_result = ds.load_paris_clustering(paris)
@@ -70,7 +58,7 @@ cluster_counts = pd.Series(paris_result.labels, name="cluster").value_counts()
 cluster_counts.sort_index().to_frame("cells")
 ```
 
-## 2. Choose representative cells
+## Choose the representative cells
 
 ```{code-cell} ipython3
 sampling = ds.run_topacedo_sampler(graph, paris)
@@ -80,9 +68,7 @@ sampled = np.asarray(sampling_data["sampled"][:], dtype=bool)
 ```
 
 The default 5% rate controls seed selection within each cluster, with a minimum number of
-seeds per cluster. The sampler then adds cells that connect those seeds through the graph.
-The final sample can therefore exceed 5%. Check the selected count above; this is not a
-request for an exact sample size.
+seeds per cluster. The sampler then adds cells that connect those seeds through the graph, thus the final sample can exceed the 5%.
 
 ```{code-cell} ipython3
 coordinates = np.asarray(ds.load_artifact(umap)["values"][:])
@@ -94,10 +80,9 @@ axes[1].set_title("TopACeDo sample")
 figure.tight_layout()
 ```
 
-Downsampling preserves graph coverage. It does not make the sample a statistically interchangeable
-replacement for the complete dataset.
+Downsampling preserves graph coverage, but does not serve as a statistically interchangeable replacement for the complete dataset.
 
-## 3. Export the selected cells
+## Export the selected cells
 
 The sampler mask follows the graph's compact cell-selection order. Map it back to physical row
 indices, then pass those rows directly to `SubsetZarr`. No temporary metadata column is needed.
@@ -127,12 +112,11 @@ subset = scarf.DataStore(str(subset_path))
 {"exported cells": subset.cells.N, "retained genes": subset.RNA.feats.N}
 ```
 
-`SubsetZarr` retains every feature in the listed assays. Use `to_anndata` when you need an in-memory
-handoff with both axes constrained.
+`SubsetZarr` retains every feature in the listed assays. Use `to_anndata` when you need an in-memory handoff with both axes constrained; doing an in-memory handoff, however, can be very computationall expensive.
 
-## 4. Inspect coverage and adjust the sample
+## Inspect the graph coverage and adjust the sample size
 
-Check how many cells were retained from each Paris cluster before choosing a different rate:
+Check how many cells were retained from each Paris cluster before choosing a different sampling rate:
 
 ```{code-cell} ipython3
 summary = pd.DataFrame({"cluster": paris_result.labels, "sampled": sampled})
@@ -141,11 +125,11 @@ summary.groupby("cluster")["sampled"].agg(cells="size", selected="sum")
 
 If you need a larger sample, pass `max_sampling_rate=0.1` to raise the maximum seed-selection
 rate to 10% per cluster. The minimum-per-cluster rule and added connecting cells still affect
-the final size. Compare coverage on the original layout after changing the rate.
+the final size. Compare coverage on the original layout after changing the rate to figure out what downsampling rate can effectively preserve your data.
 
-The artifact also contains seed cells, density estimates, shared-neighbour summaries, and the
+The result also contains seed cells, density estimates, shared-neighbour summaries, and the
 selected graph edges. These are available through `load_artifact` when you need to inspect how
-the sampler made its choices.
+the sampler made its choices, and if you need to compare them between different sampling rates.
 
 ## Important caveats to consider regarding downsampling
 
