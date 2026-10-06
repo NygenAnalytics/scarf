@@ -1,4 +1,23 @@
-"""Deploy the Cytebase Modal app to a chosen Modal environment and bucket."""
+"""Deploy the Cytebase Modal app to a chosen Modal environment and bucket.
+
+The target environment needs two Modal secrets: ``scarf-env`` with ``HF_TOKEN``
+and the bucket key, and ``cytebase-api`` with ``CYTEBASE_API_TOKEN``, at least
+32 visible ASCII characters without whitespace, which only the web function
+receives. The deployment fails while either is missing. Every environment
+needs both, including one whose operators never call the HTTP API and start
+work only with ``python -m scarf.cytebase.pipeline reset-run`` or the Modal
+SDK: the app deploys its web function with the workers, so ``modal deploy``
+requires the ``cytebase-api`` secret. Every request to the deployed HTTP API
+sends a workspace proxy auth token, created for example with
+``modal workspace proxy-tokens create``, in the ``Modal-Key`` and
+``Modal-Secret`` headers, and the API token in the ``Cytebase-Token`` header.
+A proxy token alone is valid for every proxy-authenticated endpoint of the
+workspace, so the app answers 401 without the API token. ``GET /jobs/{call_id}``
+reports only calls that this deployment's API started, until Modal expires the
+API's record of the call 7 days after the call started or was last polled. The
+``scarf.cytebase.pipeline.app`` module describes how to create the secret and
+which jobs the API reports.
+"""
 
 import argparse
 import os

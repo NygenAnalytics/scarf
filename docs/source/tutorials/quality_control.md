@@ -37,9 +37,12 @@ automatic filter, then shows when to choose your own thresholds.
 ## Standalone setup
 
 Quality control needs the population before filtering, so this page imports raw counts into a
-separate `quality_control.zarr` store. Running the setup again replaces that tutorial store.
-We set `min_features_per_cell=10` to retain low-feature cells for inspection before choosing
-stricter thresholds.
+separate `quality_control.zarr` store. Opening that store as a `DataStore` prepares it, and Scarf
+never overwrites a prepared store, so running the setup again raises `FileExistsError`. Delete
+`quality_control.zarr` before you run the setup again.
+We open the store with `min_features_per_cell=10`. This lenient floor removes from `I` only the
+cells with at most 10 detected features, so other low-quality cells stay available for inspection
+before we choose stricter thresholds.
 
 ```{code-cell} ipython3
 # Arrange and save Matplotlib figures.
@@ -95,8 +98,8 @@ qc_cell_selection = ds.snapshot_cell_selection("I")
 ds.plots.distribution(keys=qc_cols, cell_selection=qc_cell_selection)
 ```
 
-Each violin uses an immutable snapshot of `I`, so cells already below `min_features_per_cell` from
-open are excluded. Use the tails to set further cutoffs.
+Each violin uses an immutable snapshot of `I`, so the cells that the open removed, those with at
+most `min_features_per_cell` features, are excluded. Use the tails to set further cutoffs.
 
 ## 2. Start with automatic thresholds
 
@@ -226,8 +229,10 @@ See {doc}`feature_selection` for the default HVG blacklist and supported overrid
 
 ## 6. Doublet scores
 
-The pipeline builds a graph and clusters before calculating doublet scores. It does not remove
-cells automatically. Here we reuse the manual QC thresholds and the prepared PBMC example's
+The pipeline builds a graph and clusters before calculating doublet scores. Most simulated doublets
+pair cells from two different clusters (`heterotypic_fraction`, 0.8 by default), so scoring needs
+a clustering with at least two clusters. The pipeline does not remove cells automatically. Here we
+reuse the manual QC thresholds and the prepared PBMC example's
 500 genes, 15 PCs, and Leiden resolution 0.5. These are teaching-dataset settings, not the API
 defaults. We skip cell-cycle scoring, Paris, and markers because they are not needed for this check.
 
@@ -295,9 +300,11 @@ doublet_filtered = ds.select_cells(doublets, high=doublet_threshold, keep_bounds
 int(np.asarray(ds.load_artifact(doublet_filtered)["values"][:]).sum())
 ```
 
-`select_cells` accepts any numeric cell artifact with a one-dimensional `values` payload. `low`
-and `high` define the retained range. By default it composes with the source artifact's selection;
-`cell_selection=` can narrow that input further but cannot add cells absent from the source.
+`select_cells` reads the canonical array of a cell-aligned artifact kind, here `values` of the
+`doublet_score`, and refuses kinds that the table of cell-aligned kinds does not list
+({ref}`cell_aligned_kinds`). `low` and `high` define the retained range of numeric values. By
+default it composes with the source artifact's selection; `cell_selection=` can narrow that input
+further but cannot add cells absent from the source.
 
 ## 7. ATAC quality control
 

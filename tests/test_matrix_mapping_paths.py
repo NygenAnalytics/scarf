@@ -126,7 +126,9 @@ def test_aligned_stream_rejects_selected_cells_with_negative_library_sizes(
             ResourceBudget(16 * 1024**2, 1),
         )
 
-    with pytest.raises(ValueError, match="'RNA_nCounts' metadata must be finite"):
+    with pytest.raises(
+        ValueError, match="Query assay 'RNA_nCounts' holds negative or non-finite"
+    ):
         stream(np.arange(3))
     aligned = np.concatenate(
         [block.values for block in stream(np.array([0, 2])).iter_blocks()]
@@ -136,6 +138,33 @@ def test_aligned_stream_rejects_selected_cells_with_negative_library_sizes(
         aligned,
         10.0 * values[np.ix_([0, 2], [0, 1])] / values[[0, 2]].sum(axis=1)[:, None],
     )
+
+
+def test_aligned_stream_normalizes_bool_query_counts_as_zeros_and_ones(
+    tmp_path,
+) -> None:
+    detected = np.array(
+        [[True, False, True], [False, False, False], [True, True, True]]
+    )
+    reference_ids = np.array(["RNA0", "RNA2"])
+    zarr_loc = str(tmp_path / "bool.zarr")
+    write_count_store(zarr_loc, {"RNA": detected}, "bool")
+    query = DataStore(zarr_loc, default_assay="RNA", min_features_per_cell=0)
+    assert query.RNA.rawData.dtype == np.dtype(bool)
+    stream = AlignedFeatureStream(
+        query.RNA,
+        np.arange(3),
+        reference_ids,
+        np.zeros(len(reference_ids)),
+        _normalization(),
+        "zero",
+        ResourceBudget(16 * 1024**2, 1),
+    )
+    aligned = np.concatenate([block.values for block in stream.iter_blocks()])
+
+    # Each detected feature counts once, as uint8 counts of one would.
+    totals = np.maximum(detected.sum(axis=1), 1)[:, None]
+    np.testing.assert_allclose(aligned, 10.0 * detected[:, [0, 2]] / totals)
 
 
 def _ring_graph(n_cells: int) -> coo_matrix:
@@ -170,7 +199,12 @@ def test_umap_layout_uses_the_requested_threads_up_to_the_numba_pool(
     # whole pool must raise the count, not keep the caller's.
     numba.set_num_threads(1)
     try:
-        for requested in (1, pool, pool + 3):
+        for parallel, requested in (
+            (True, 1),
+            (True, pool),
+            (True, pool + 3),
+            (False, pool),
+        ):
             simplicial_set_embedding(
                 graph,
                 np.zeros((6, 2), dtype=np.float32),
@@ -182,7 +216,7 @@ def test_umap_layout_uses_the_requested_threads_up_to_the_numba_pool(
                 1.0,
                 5,
                 {},
-                False,
+                parallel,
                 requested,
                 False,
             )
@@ -191,8 +225,8 @@ def test_umap_layout_uses_the_requested_threads_up_to_the_numba_pool(
         numba.set_num_threads(previous)
 
     # Numba refuses more threads than its pool, so a larger request runs the
-    # layout on the whole pool.
-    assert observed == [1, pool, pool]
+    # layout on the whole pool, and a serial layout runs on one thread.
+    assert observed == [1, pool, pool, 1]
     assert restored == 1
 
 

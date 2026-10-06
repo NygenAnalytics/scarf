@@ -62,8 +62,8 @@ dataset_directory.mkdir(parents=True, exist_ok=True)
 # Locate the H5AD file to inspect.
 h5ad_path = dataset_directory / "binvignat_ra_pbmc.h5ad"
 
-# Show the local path used by this step.
-h5ad_path
+# Show the input filename used by this step.
+h5ad_path.name
 ```
 
 Download the file if it is not already present.
@@ -131,11 +131,12 @@ if not source_store.exists():
         # Move the completed input into its reusable local path.
         staged_store.replace(source_store)
 
-# Show the local path used by this step.
-source_store
+# Show the converted store's name.
+source_store.name
 ```
 
-Open the converted count store.
+Open the converted count store. `min_features_per_cell=0` drops only cells without detected
+features (none here), so every curated cell stays active.
 
 ```{code-cell}
 # Open the converted store with every curated cell retained.

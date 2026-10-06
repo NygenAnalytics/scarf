@@ -56,6 +56,13 @@ def mount_datastore(
     Returns:
         An open writable ``DataStore`` pointed at ``at``.
     """
+    from ..assay.classification import (
+        declared_assay_type,
+        is_rna_assay_type,
+        validate_assay_types,
+    )
+    from ..storage.stores import discard_mount_target
+
     if "zarr_loc" in datastore_options:
         raise TypeError("mount_datastore takes the target location through 'at'")
     zarr_mode = datastore_options.pop("zarr_mode", "r+")
@@ -64,6 +71,9 @@ def mount_datastore(
             f"A mounted datastore is writable and needs zarr_mode 'r+', got "
             f"{zarr_mode!r}. Reopen the target with DataStore to read it."
         )
+    _check_forwarded_options(
+        at, workspace=workspace, storage_options=storage_options, **datastore_options
+    )
 
     source_store = DataStore(
         source,
@@ -72,12 +82,20 @@ def mount_datastore(
         storage_options=storage_options,
         default_assay=datastore_options.get("default_assay"),
     )
+    # The target opens each assay as the type that its assay_types declares,
+    # or else as the source declares it, so those types decide which mounted
+    # counts need a transpose.
+    explicit = validate_assay_types(
+        datastore_options.get("assay_types"), source_store.assay_names
+    )
     required_transposes = frozenset(
         name
         for name in source_store.assay_names
-        if source_store._get_assay(name).requiresCountsT
+        if is_rna_assay_type(
+            explicit.get(name, declared_assay_type(source_store.get_assay(name)))
+        )
     )
-    create_matrix_source(
+    target = create_matrix_source(
         source,
         at,
         required_transposes=required_transposes,
@@ -85,12 +103,46 @@ def mount_datastore(
         storage_options=storage_options,
         profile=datastore_options.get("zarrProfile"),
     )
-    return DataStore(
+    try:
+        return DataStore(
+            at,
+            zarr_mode=zarr_mode,
+            workspace=workspace,
+            storage_options=storage_options,
+            **datastore_options,
+        )
+    except BaseException:
+        # This call created the target, so a failed first open leaves none.
+        discard_mount_target(target, at)
+        raise
+
+
+def _check_forwarded_options(
+    at: ZarrLocation,
+    *,
+    workspace: str | None,
+    storage_options: dict[str, Any] | None,
+    **datastore_options: Any,
+) -> None:
+    """Apply the checks that ``DataStore`` makes before it opens a store."""
+    import inspect
+
+    from ..storage.budget import resolve_budget
+    from .base_datastore import validate_min_features_per_cell
+
+    # An unknown or repeated option raises the TypeError that DataStore would.
+    inspect.signature(DataStore).bind(
         at,
-        zarr_mode=zarr_mode,
+        zarr_mode="r+",
         workspace=workspace,
         storage_options=storage_options,
         **datastore_options,
+    )
+    if "min_features_per_cell" in datastore_options:
+        validate_min_features_per_cell(datastore_options["min_features_per_cell"])
+    resolve_budget(
+        memory=datastore_options.get("mem_budget"),
+        workers=datastore_options.get("nthreads"),
     )
 
 
@@ -112,13 +164,13 @@ class DataStore(
 
     Args:
         zarr_loc: Path to Zarr file created using one of writer functions of Scarf.
-        assay_types: A dictionary with keys as assay names present in the Zarr file and values as either one of:
-                     'RNA', 'ADT', 'ATAC' or 'GeneActivity'.
+        assay_types: Mapping of assay names to preset types, such as 'RNA' or 'ATAC'.
         default_assay: Name of assay that should be considered as default. It is mandatory to provide this value
                        when DataStore loads a Zarr file for the first time.
-        min_features_per_cell: Writable opens remove from ``I`` every cell whose default-assay feature
-                               count is not greater than this value, unless the value exceeds the median
-                               count of the active cells.
+        min_features_per_cell: Writable opens remove from ``I`` every cell whose
+                               default-assay feature count is not greater than this
+                               value, unless that would remove at least half of the
+                               active cells.
         mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
                       The first writable open replaces any existing column with values computed from
                       this pattern, or ``^MT-`` when None. Later opens keep the stored values when

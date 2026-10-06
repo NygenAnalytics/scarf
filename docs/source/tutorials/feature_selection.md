@@ -164,7 +164,9 @@ diagnostics used for its plot. See {doc}`reuse_and_tracing` for details.
 
 The number of selected genes changes the PCA basis and can change neighbourhood structure.
 This comparison keeps all other graph choices fixed. The 500-gene branch comes directly from
-`docs_default`; only the 1,000-gene branch is new.
+`docs_default`; only the 1,000-gene branch is new. An earlier release built the baseline graph,
+before revision 2 of `build_connectivity_map` corrected the edge weights that the new branch uses,
+so the two branches also differ in those weights.
 
 ```{code-cell} ipython3
 # Select 1,000 genes on the same frozen cell population.

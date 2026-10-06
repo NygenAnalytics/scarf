@@ -15,17 +15,28 @@ from ..storage.types import as_zarr_group
 from ..utils.arguments import integer_argument
 from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
+from ..utils.moments import ColumnMoments, add_implicit_zeros, welford_add
 from .base import Assay
 from .normalization import (
+    NORMALIZATION_PARAM_NAMES,
     _feature_group_positions,
+    _feature_subset_source,
+    check_normalization_flags,
     lib_size_feature_stream_eligible,
+    library_size_divisors,
+    norm_clr,
+    norm_dummy,
     norm_lib_size,
     norm_lib_size_log,
+    norm_tf_idf,
+    reject_unknown_normalization_params,
+    uses_library_size_normalization,
 )
 
 # The Python objects that keep one band's partial feature statistics: three
-# array headers, the tuple that holds them, and its list slot.
-_BAND_PARTIAL_BYTES = 512
+# array headers, the ColumnMoments that holds two of them, the tuple that
+# holds the moments, and its list slot (about 530 bytes).
+_BAND_PARTIAL_BYTES = 640
 # Four int64 index arrays and one mask over the feature rows of a band.
 _BAND_ROW_INDEX_BYTES = 4 * 8 + 1
 
@@ -49,10 +60,17 @@ def _hvg_stats_gene_major_kernel(
     selected: np.ndarray,
     out_nz: np.ndarray,
     out_s1: np.ndarray,
-    out_s2: np.ndarray,
+    out_m2: np.ndarray,
     log_transform: bool = False,
 ) -> None:
-    """Accumulate lib-size HVG stats over selected cells in a raw block."""
+    """Write lib-size HVG statistics of the selected cells of a raw block.
+
+    For each gene with a destination, writes the number of positive values,
+    their sum, and their ``m2``, the sum of squared deviations from the mean
+    over every selected cell. Stored counts update a running mean and ``m2``,
+    and the cells without a count then join as zeros, so a gene whose values
+    are all equal gets an ``m2`` of exactly zero.
+    """
     n_genes = values.shape[0]
     n_selected = selected.shape[0]
     for g in range(n_genes):
@@ -61,7 +79,9 @@ def _hvg_stats_gene_major_kernel(
             continue
         c_nz = 0.0
         c_s1 = 0.0
-        c_s2 = 0.0
+        stored = 0
+        mean = 0.0
+        m2 = 0.0
         for i in range(n_selected):
             count = values[g, selected[i]]
             if count == 0:
@@ -72,10 +92,11 @@ def _hvg_stats_gene_major_kernel(
             if value > 0.0:
                 c_nz += 1.0
             c_s1 += value
-            c_s2 += value * value
-        out_nz[target] += c_nz
-        out_s1[target] += c_s1
-        out_s2[target] += c_s2
+            stored += 1
+            mean, m2 = welford_add(stored, mean, m2, value)
+        out_nz[target] = c_nz
+        out_s1[target] = c_s1
+        out_m2[target] = add_implicit_zeros(m2, mean, stored, n_selected)
 
 
 def _hvg_stats_gene_major(
@@ -85,11 +106,18 @@ def _hvg_stats_gene_major(
     dest: np.ndarray,
     out_nz: np.ndarray,
     out_s1: np.ndarray,
-    out_s2: np.ndarray,
+    out_m2: np.ndarray,
     selected: np.ndarray | None = None,
     log_transform: bool = False,
 ) -> None:
-    """Accumulate lib-size HVG stats for a gene-major count block."""
+    """Write lib-size HVG statistics of a gene-major count block.
+
+    ``selected`` holds the block columns of the cells to summarize, every
+    column by default, and ``inv`` their inverse library totals. Each gene
+    with a destination gets the number of positive values, their sum, and
+    their ``m2`` over the selected cells; ``ColumnMoments.merge`` combines
+    the sums and ``m2`` of different blocks.
+    """
     if selected is None:
         selected_cells = np.arange(int(values.shape[1]), dtype=np.int64)
     else:
@@ -102,9 +130,17 @@ def _hvg_stats_gene_major(
         selected_cells,
         out_nz,
         out_s1,
-        out_s2,
+        out_m2,
         log_transform,
     )
+
+
+def _merge_band_statistics(
+    first: tuple[np.ndarray, ColumnMoments],
+    second: tuple[np.ndarray, ColumnMoments],
+) -> tuple[np.ndarray, ColumnMoments]:
+    """Merge the detections and moments of two cell bands of a feature group."""
+    return first[0] + second[0], first[1].merge(second[1])
 
 
 class RNAassay(Assay):
@@ -166,7 +202,14 @@ class RNAassay(Assay):
         resident_bytes: int = 0,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
-        renormalize_subset = bool(norm_params.get("renormalize_subset", False))
+        reject_unknown_normalization_params(
+            norm_params, caller="iter_normed_feature_wise"
+        )
+        log_transform, renormalize_subset = check_normalization_flags(
+            self,
+            log_transform=norm_params.get("log_transform", False),
+            renormalize_subset=norm_params.get("renormalize_subset", False),
+        )
         if not lib_size_feature_stream_eligible(
             self, renormalize_subset=renormalize_subset
         ):
@@ -179,7 +222,8 @@ class RNAassay(Assay):
                 as_dataframe=as_dataframe,
                 scratch_itemsize=scratch_itemsize,
                 resident_bytes=resident_bytes,
-                **norm_params,
+                log_transform=log_transform,
+                renormalize_subset=renormalize_subset,
             )
             return
 
@@ -200,13 +244,12 @@ class RNAassay(Assay):
         assert sf is not None
         if feat_idx.size == 0:
             return
-        scalar = self._cell_count_totals(cell_idx)
-        log_transform = bool(norm_params.get("log_transform", False))
+        scalar_values = library_size_divisors(
+            self._cell_count_totals(cell_idx), source=self._totals_name, copy=False
+        )
         counts_t = self.rawDataT
         # An RNAassay cannot be constructed without a complete countsT.
         assert counts_t is not None
-        scalar_values = np.asarray(scalar, dtype=np.float64)
-        scalar_values[scalar_values == 0] = 1
         n_feats = int(counts_t.shape[0])
         dest_of = np.full(n_feats, -1, dtype=np.int64)
         dest_of[feat_idx] = np.arange(len(feat_idx), dtype=np.int64)
@@ -311,7 +354,9 @@ class RNAassay(Assay):
         renormalize_subset: bool,
         mirror: zarr.Array | None = None,
     ) -> None:
-        if not renormalize_subset:
+        # The subset writer computes library-size values from the counts
+        # itself, so every other normalizer is written from ``normed``.
+        if not (renormalize_subset and uses_library_size_normalization(self)):
             super()._write_normalized_payload(
                 cell_idx,
                 feat_idx,
@@ -325,6 +370,8 @@ class RNAassay(Assay):
         from .normalization import write_renorm_subset_to_zarr
 
         cell_idx, feat_idx = self._payload_indices(cell_idx, feat_idx)
+        # Normalized values can be graph coordinates, so the payload is
+        # written with a checked writer, as the generic payload is.
         write_renorm_subset_to_zarr(
             self,
             cell_idx,
@@ -335,6 +382,8 @@ class RNAassay(Assay):
             log_transform=log_transform,
             mirror=mirror,
             stats_group=as_zarr_group(self.z[location], name=location),
+            requireFinite=True,
+            operation="run_normalization",
         )
 
     def normed(
@@ -343,12 +392,11 @@ class RNAassay(Assay):
         feat_idx: np.ndarray | None = None,
         renormalize_subset: bool = False,
         log_transform: bool = False,
-        **kwargs: Any,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
-        class this method is optimized for scRNA-Seq data and takes additional
-        parameters that will be used by `norm_lib_size` (default normalization
+        class this method is optimized for scRNA-Seq data and supports
+        ``renormalize_subset`` with `norm_lib_size` (default normalization
         method for this class).
 
         Args:
@@ -360,40 +408,85 @@ class RNAassay(Assay):
             renormalize_subset: If true, normalize using only ``feat_idx`` rather
                                 than total expression across all features in a cell.
                                 (Default value: False)
-            log_transform: If True, then the normalized data is log-transformed (Default value: False).
-            **kwargs: kwargs have no effect here.
+            log_transform: If True, then the normalized data is log-transformed
+                           (Default value: False).
 
         Returns:
             A chunked array (delayed matrix) containing normalized data.
         """
         from ..storage.identity import read_dataset_fingerprint
 
+        log_transform, renormalize_subset = check_normalization_flags(
+            self,
+            log_transform=log_transform,
+            renormalize_subset=renormalize_subset,
+        )
+        method = self.normMethod
+        library_size = method is norm_lib_size or method is norm_lib_size_log
+        if library_size and self.sf is None:
+            raise ValueError(
+                "RNA library-size normalization requires a size factor (sf), got None"
+            )
         read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
-        method = norm_lib_size_log if log_transform else self.normMethod
         if renormalize_subset:
-            scalar = compute_with_progress(
-                counts.sum(axis=1, dtype=np.float64),
-                "Normalizing with feature subset",
-                self.nthreads,
+            scalar = np.asarray(
+                compute_with_progress(
+                    counts.sum(axis=1, dtype=np.float64),
+                    "Normalizing with feature subset",
+                    self.nthreads,
+                ),
+                dtype=np.float64,
             )
+            source = _feature_subset_source(self)
         else:
             scalar = self._cell_count_totals(cell_idx)
-        # Zero-total cells normalize to zero, as on every other path.
-        scalar[scalar == 0] = 1
+            source = self._totals_name
+        if library_size:
+            # Zero-total cells normalize to zero, as on every library-size
+            # path, and invalid totals raise.
+            scalar = library_size_divisors(scalar, source=source, copy=False)
+        else:
+            # Another normalization need not read the totals, so they are not
+            # checked; one that reads them finds a zero total replaced by 1.
+            scalar[scalar == 0] = 1
         # The method reads the totals from ``self.scalar`` while it builds the
         # lazy result, so concurrent calls must not interleave here.
         with self._normalization_lock:
             scalar_cache = self.scalar
             self.scalar = scalar
             try:
-                return method(self, counts)
+                values = method(self, counts)
             finally:
                 self.scalar = scalar_cache
+        if log_transform:
+            # NumPy logs uint8 in float16 and uint16 in float32, so the
+            # logarithms are taken in float64 for every value dtype.
+            values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
+        return values
+
+    def _normalization_flags(self) -> frozenset[str]:
+        """Return the normalization flags that ``normed`` applies.
+
+        ``normed`` hands every normalizer each cell's total in ``scalar`` and
+        can take ``log1p`` of its output. Library-size and custom normalizers
+        take both flags. ``norm_lib_size_log`` values are already logarithms,
+        so it takes only ``renormalize_subset``. ``norm_dummy`` reads no
+        totals, so it takes only ``log_transform``. CLR values are log ratios
+        and TF-IDF values are never logged, and neither reads the totals.
+        """
+        method = self.normMethod
+        if method is norm_lib_size_log:
+            return frozenset({"renormalize_subset"})
+        if method is norm_dummy:
+            return frozenset({"log_transform"})
+        if method is norm_clr or method is norm_tf_idf:
+            return frozenset()
+        return NORMALIZATION_PARAM_NAMES
 
     def _mean_normed_feature_groups(
         self,
@@ -419,8 +512,9 @@ class RNAassay(Assay):
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = self._cell_count_totals(cell_idx)
-        scalar[scalar == 0] = 1
+        scalar = library_size_divisors(
+            self._cell_count_totals(cell_idx), source=self._totals_name, copy=False
+        )
 
         union = np.unique(
             np.concatenate([np.asarray(v, dtype=int) for v in feature_groups.values()])
@@ -456,7 +550,7 @@ class RNAassay(Assay):
     ) -> dict[str, np.ndarray]:
         """Average library-size normalized ``union`` columns per group position.
 
-        ``scalar`` holds the nonzero total of each cell in ``cell_idx``.
+        ``scalar`` holds the library-size divisor of each cell in ``cell_idx``.
         ``resident_bytes`` counts the arrays the caller holds for the call,
         including ``scalar``, ``union``, and ``local_pos``. Cells are read in
         blocks of one on-disk row chunk.
@@ -527,8 +621,9 @@ class RNAassay(Assay):
         union, positions = _feature_group_positions(feature_groups)
         keyed = {str(index): position for index, position in enumerate(positions)}
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
-        totals = self._cell_count_totals(cell_idx)
-        totals[totals == 0] = 1
+        totals = library_size_divisors(
+            self._cell_count_totals(cell_idx), source=self._totals_name, copy=False
+        )
         resident_bytes = (
             totals.nbytes + union.nbytes + sum(value.nbytes for value in positions)
         )
@@ -554,9 +649,13 @@ class RNAassay(Assay):
     ) -> dict[str, np.ndarray]:
         """Per-feature library-size normalized stats via cell-band countsT.
 
-        Reads each feature group by physical cell band, accumulates counts,
-        sums, and squared sums in deterministic band order, and returns
-        ``normed_tot``, ``normed_n``, and ``sigmas`` matching ``norm_lib_size``.
+        Reads each feature group by physical cell band, computes each band's
+        detections, sums, and sums of squared deviations from the band mean
+        (``m2``), and merges the bands of a group in a fixed pairwise order
+        with ``ColumnMoments.merge``. Returns ``normed_tot``, ``normed_n``,
+        and ``sigmas``, the population variance ``m2 / n_cells``, matching
+        ``norm_lib_size``. A feature whose normalized values are all equal
+        has a variance of exactly zero when its band sums are exact.
         """
         import time
 
@@ -565,7 +664,7 @@ class RNAassay(Assay):
             persisted_read_group,
             selected_feature_chunk_starts,
         )
-        from ..utils.process import process_rss_mb
+        from ..utils.process import rss_text
 
         cell_idx = np.asarray(cell_idx)
         feat_idx = np.asarray(feat_idx)
@@ -574,17 +673,18 @@ class RNAassay(Assay):
                 "RNA library-size normalization requires a size factor (sf), got None"
             )
         sf = float(self.sf) if self.sf is not None else 1.0
-        inv_scalar = self._cell_count_totals(cell_idx)
-        inv_scalar[inv_scalar == 0] = 1
+        inv_scalar = library_size_divisors(
+            self._cell_count_totals(cell_idx), source=self._totals_name, copy=False
+        )
         np.reciprocal(inv_scalar, out=inv_scalar)
 
         n_features = len(feat_idx)
         n_cells = len(cell_idx)
         nz = np.zeros(n_features, dtype=np.float64)
         s1 = np.zeros(n_features, dtype=np.float64)
-        s2 = np.zeros(n_features, dtype=np.float64)
+        m2 = np.zeros(n_features, dtype=np.float64)
         if n_cells == 0 or n_features == 0:
-            return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
+            return {"normed_tot": s1, "normed_n": nz, "sigmas": m2}
 
         # An RNA assay opens only with a complete countsT.
         counts_t = self.rawDataT
@@ -612,7 +712,7 @@ class RNAassay(Assay):
             + dest_of.nbytes
             + nz.nbytes
             + s1.nbytes
-            + s2.nbytes
+            + m2.nbytes
             + n_bands
             * (3 * nz.itemsize * group_rows + len(group_starts) * _BAND_PARTIAL_BYTES)
             + self.resources.workers
@@ -624,23 +724,23 @@ class RNAassay(Assay):
 
         from collections import defaultdict
 
-        from ..utils.compute import add_stat_arrays, pairwise_merge_tree
+        from ..utils.compute import pairwise_merge_tree
 
         partials: dict[
             tuple[int, int],
-            list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+            list[tuple[int, np.ndarray, ColumnMoments]],
         ] = defaultdict(list)
 
         # Every feature group holds a selected feature, so every band does.
         def process_band(
             band: Any,
-        ) -> tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray]:
+        ) -> tuple[int, int, int, np.ndarray, ColumnMoments]:
             rows = band.featureRows()
             destinations = dest_of[band.featStart + rows]
             n_local = int(band.featEnd - band.featStart)
             local_nz = np.zeros(n_local, dtype=np.float64)
             local_s1 = np.zeros(n_local, dtype=np.float64)
-            local_s2 = np.zeros(n_local, dtype=np.float64)
+            local_m2 = np.zeros(n_local, dtype=np.float64)
             local_dest = np.where(destinations >= 0, rows, np.int64(-1))
             t_compute = time.perf_counter()
             _hvg_stats_gene_major(
@@ -650,7 +750,7 @@ class RNAassay(Assay):
                 local_dest,
                 local_nz,
                 local_s1,
-                local_s2,
+                local_m2,
                 selected=band.selectedLocal,
                 log_transform=log_transform,
             )
@@ -660,16 +760,15 @@ class RNAassay(Assay):
                 f"{band.featStart}:{band.featEnd} cells "
                 f"{band.cellStart}:{band.cellEnd}: "
                 f"read {band.readSec:.1f}s compute {compute_sec:.1f}s "
-                "rss {rss:.0f} MiB",
-                rss=process_rss_mb,
+                "rss {rss}",
+                rss=rss_text,
             )
             return (
                 int(band.unitIndex),
                 int(band.featStart),
                 int(band.featEnd),
                 local_nz,
-                local_s1,
-                local_s2,
+                ColumnMoments(len(band.selectedLocal), local_s1, local_m2),
             )
 
         consume_metrics: dict[str, object] = {}
@@ -689,22 +788,27 @@ class RNAassay(Assay):
         )
         try:
             for item in bands:
-                unit_index, feat_start, feat_end, local_nz, local_s1, local_s2 = item
+                unit_index, feat_start, feat_end, local_nz, local_moments = item
                 partials[(feat_start, feat_end)].append(
-                    (unit_index, local_nz, local_s1, local_s2)
+                    (unit_index, local_nz, local_moments)
                 )
             while partials:
                 (feat_start, feat_end), items = partials.popitem()
                 items.sort(key=lambda row: row[0])
-                merged = pairwise_merge_tree(
-                    [(row[1], row[2], row[3]) for row in items],
-                    add_stat_arrays,
+                detected, moments = pairwise_merge_tree(
+                    [(row[1], row[2]) for row in items],
+                    _merge_band_statistics,
                 )
+                if moments.count != n_cells:
+                    raise RuntimeError(
+                        f"Feature statistics of features {feat_start}:{feat_end} "
+                        f"covered {moments.count} of {n_cells} selected cells"
+                    )
                 destinations = dest_of[feat_start:feat_end]
                 keep = destinations >= 0
-                nz[destinations[keep]] = merged[0][keep]
-                s1[destinations[keep]] = merged[1][keep]
-                s2[destinations[keep]] = merged[2][keep]
+                nz[destinations[keep]] = detected[keep]
+                s1[destinations[keep]] = moments.total[keep]
+                m2[destinations[keep]] = moments.m2[keep]
         finally:
             logger.info(
                 f"({self.name}) feature stats execution "
@@ -714,9 +818,8 @@ class RNAassay(Assay):
                 f"computeSec={consume_metrics.get('computeSeconds')}s"
             )
 
-        mean = s1 / n_cells
-        sigmas = s2 / n_cells - np.square(mean)
-        return {"normed_tot": s1, "normed_n": nz, "sigmas": sigmas}
+        m2 /= n_cells
+        return {"normed_tot": s1, "normed_n": nz, "sigmas": m2}
 
     def _compute_feature_summary(
         self,
@@ -725,7 +828,14 @@ class RNAassay(Assay):
         *,
         log_transform: bool = False,
     ) -> dict[str, np.ndarray]:
-        """Compute sufficient feature statistics without persisting metadata."""
+        """Compute sufficient feature statistics without persisting metadata.
+
+        ``log_transform`` summarizes the values of
+        ``normed(log_transform=True)``.
+        """
+        log_transform, _ = check_normalization_flags(
+            self, log_transform=log_transform, renormalize_subset=False
+        )
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if len(cell_idx) == 0 or len(feat_idx) == 0:
@@ -735,13 +845,11 @@ class RNAassay(Assay):
                 "normed_n": zeros.copy(),
                 "sigmas": zeros.copy(),
             }
-        if self.normMethod is norm_lib_size:
+        if uses_library_size_normalization(self):
             return self._streaming_feature_stats(
                 cell_idx, feat_idx, log_transform=log_transform
             )
-        normed = self.normed(cell_idx, feat_idx)
-        if log_transform:
-            normed = cast(ChunkedArray, np.log1p(normed))
+        normed = self.normed(cell_idx, feat_idx, log_transform=log_transform)
         return {
             "normed_tot": np.asarray(
                 compute_with_progress(

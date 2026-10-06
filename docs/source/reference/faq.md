@@ -103,8 +103,8 @@ See {ref}`LISI metrics <lisi_metrics>`.
 tSNE and UMAP are complementary visualization tools.
 tSNE emphasizes local structure and can reveal fine-grained diversity.
 UMAP preserves more global structure, which helps when cluster relationships matter.
-We suggest tSNE for large (>50k cells) atlas-scale datasets because of its quick runtime.
-UMAP runtime can span hours on atlas-scale datasets.
+Scarf computes tSNE with the optional `sgtsnepi` package (see {ref}`Optional t-SNE <installation_tsne>`), which runs on one thread, so time a subset before running it on an atlas-scale dataset.
+UMAP is part of every installation and can run in parallel.
 In Scarf, UMAP and tSNE both require an explicit graph and initialization. Pass the same refs when
 you want the layouts to share those inputs.
 

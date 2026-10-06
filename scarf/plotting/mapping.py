@@ -3,7 +3,6 @@
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, Hashable, Literal
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -24,6 +23,7 @@ from ._figure import (
     normalize_axes_target,
 )
 from ..utils.arrays import sort_categories
+from ..utils.warnings import warn
 from ._style import (
     apply_figure_chrome,
     category_label,
@@ -810,7 +810,8 @@ def mapping_calibration(
     # A cell can pass a threshold only when its vote favored one label and it
     # meets every saved rule except the one on the swept metric.
     candidates = evidence["candidateLabel"].to_numpy(dtype=object)
-    eligible = ~np.asarray(pd.isna(candidates), dtype=bool)
+    has_candidate = ~np.asarray(pd.isna(candidates), dtype=bool)
+    eligible = has_candidate.copy()
     if metric != "voteFraction":
         eligible &= (
             evidence["voteFraction"].to_numpy(dtype=np.float64)
@@ -821,18 +822,29 @@ def mapping_calibration(
             evidence["nearestDistance"].to_numpy(dtype=np.float64)
             <= label_transfer.max_distance
         )
-    valid = pd.notna(known) & np.isfinite(metric_values)
-    values = metric_values[valid]
-    correct = candidates[valid] == known[valid]
-    correct_all = np.zeros(len(evidence), dtype=bool)
-    correct_all[valid] = correct
-    informative = eligible[valid]
-    if len(values) == 0:
+    # Every cell with a known label is evaluated, so coverage shares the
+    # denominator of the confusion matrix. A cell without a finite metric value
+    # has no evidence to threshold and is never retained.
+    evaluated = np.asarray(pd.notna(known), dtype=bool)
+    if not evaluated.any():
+        raise ValueError("known_labels must contain at least one known label")
+    finite = np.isfinite(metric_values)
+    if not (evaluated & finite).any():
         raise ValueError("No finite metric values with known labels")
-    _check_label_types(known[valid & eligible], candidates[valid & eligible])
+    compared = evaluated & has_candidate
+    _check_label_types(known[compared], candidates[compared])
+    correct_all = np.zeros(len(evidence), dtype=bool)
+    correct_all[compared] = candidates[compared] == known[compared]
+    n_evaluated = int(evaluated.sum())
+    retainable = evaluated & eligible & finite
+    values = metric_values[retainable]
+    correct = correct_all[retainable]
     if thresholds is None:
         resolved_thresholds = np.unique(
-            np.quantile(values, np.linspace(0, 1, n_thresholds))
+            np.quantile(
+                metric_values[evaluated & finite],
+                np.linspace(0, 1, n_thresholds),
+            )
         )
     else:
         resolved_thresholds = np.unique(np.asarray(thresholds, dtype=np.float64))
@@ -864,12 +876,11 @@ def mapping_calibration(
     rows: list[dict[str, float | int]] = []
     z_value = 1.959963984540054
     for threshold in resolved_thresholds:
-        passes = (
+        accepted = (
             values >= threshold
             if resolved_direction == "higher"
             else values <= threshold
         )
-        accepted = informative & passes
         n_accepted = int(accepted.sum())
         if n_accepted == 0:
             continue
@@ -887,12 +898,12 @@ def mapping_calibration(
         rows.append(
             {
                 "threshold": float(threshold),
-                "coverage": n_accepted / len(values),
+                "coverage": n_accepted / n_evaluated,
                 "accuracy": accuracy,
                 "accuracyLower": max(0.0, center - margin),
                 "accuracyUpper": min(1.0, center + margin),
                 "nAccepted": n_accepted,
-                "nEvaluated": len(values),
+                "nEvaluated": n_evaluated,
             }
         )
     calibration = pd.DataFrame(rows)
@@ -910,11 +921,10 @@ def mapping_calibration(
         ).any()
     ):
         if chosen_threshold is not None:
-            warnings.warn(
+            warn(
                 f"chosen_threshold={chosen_threshold:g} retained no mapped cells; "
                 "the threshold marker was omitted",
                 RuntimeWarning,
-                stacklevel=2,
             )
         marked_threshold = None
     with theme_context(theme):
@@ -989,12 +999,13 @@ def mapping_calibration(
         provenance=PlotProvenance(
             assay=transfer.assay,
             cell_key=None,
-            n_cells=int(valid.sum()),
+            n_cells=n_evaluated,
             renderer="matplotlib",
             notes=("mapping_calibration",),
             extras={
                 "label_transfer": _artifact_record(transfer),
                 "max_distance": label_transfer.max_distance,
+                "n_without_evidence": int((evaluated & ~finite).sum()),
                 "metric": metric,
                 "direction": resolved_direction,
                 "n_thresholds": len(resolved_thresholds),

@@ -1,9 +1,11 @@
 import argparse
 import os
+import platform
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from email.parser import Parser
+from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 
 
@@ -77,6 +79,7 @@ _RETIRED_MODULES = {
     "scarf/writers.py",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[1] / "scarf"
+_WORKFLOW_SCRIPT = Path(__file__).resolve().with_name("smoke_workflow.py")
 _REQUIRED_MODULES = {
     f"scarf/{path.relative_to(_SOURCE_ROOT).as_posix()}"
     for path in _SOURCE_ROOT.rglob("*.py")
@@ -261,48 +264,156 @@ for name in (
 """
 
 
+# Scarf is pure Python. Its one wheel installs on every platform, so it must
+# carry no native executable or library and nothing outside the import root.
+_PURE_TAG = "py3-none-any"
+_MACH_O_MAGIC = frozenset(
+    {
+        b"\xfe\xed\xfa\xce",
+        b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xcf\xfa\xed\xfe",
+        # Universal binaries, in both byte orders and both offset widths.
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }
+)
+
+
+def _native_format(data: bytes) -> str | None:
+    """Name the executable format whose magic bytes start ``data``, if any."""
+    if data.startswith(b"\x7fELF"):
+        return "ELF"
+    if data[:4] in _MACH_O_MAGIC:
+        return "Mach-O"
+    # A DOS header names the offset of the PE signature at byte 0x3C, so text
+    # that merely starts with "MZ" is not mistaken for a Windows binary.
+    if data.startswith(b"MZ") and len(data) >= 0x40:
+        offset = int.from_bytes(data[0x3C:0x40], "little")
+        if data[offset : offset + 4] == b"PE\0\0":
+            return "PE"
+    return None
+
+
+def _wheel_tag_problems(wheel: Path, archive: ZipFile) -> list[str]:
+    problems: list[str] = []
+    file_tag = "-".join(wheel.name.removesuffix(".whl").split("-")[-3:])
+    if file_tag != _PURE_TAG:
+        problems.append(f"file name tag {file_tag!r}, expected {_PURE_TAG!r}")
+    wheel_files = [
+        name
+        for name in archive.namelist()
+        if len(PurePosixPath(name).parts) == 2
+        and PurePosixPath(name).parts[0].endswith(".dist-info")
+        and PurePosixPath(name).name == "WHEEL"
+    ]
+    if len(wheel_files) != 1:
+        problems.append("the wheel must contain exactly one .dist-info/WHEEL file")
+        return problems
+    metadata = Parser().parsestr(archive.read(wheel_files[0]).decode("utf-8"))
+    tags = [str(tag).strip() for tag in metadata.get_all("Tag") or []]
+    if tags != [_PURE_TAG]:
+        problems.append(f"WHEEL tags {tags}, expected [{_PURE_TAG!r}]")
+    purelib = str(metadata.get("Root-Is-Purelib", "")).strip().lower()
+    if purelib != "true":
+        problems.append("WHEEL must declare Root-Is-Purelib: true")
+    return problems
+
+
 def validate_wheel_contents(wheel: Path) -> None:
+    """Check that ``wheel`` is the complete pure-Python Scarf wheel."""
     with ZipFile(wheel) as archive:
         names = set(archive.namelist())
-        script_entries = [
-            info
-            for info in archive.infolist()
-            if info.filename.endswith(".data/scripts/sgtsne")
-        ]
+        problems = _wheel_tag_problems(wheel, archive)
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            if PurePosixPath(info.filename).parts[0].endswith(".data"):
+                problems.append(
+                    f"{info.filename} is install-time data outside the import root"
+                )
+            with archive.open(info) as member:
+                native = _native_format(member.read())
+            if native is not None:
+                problems.append(f"{info.filename} is a native {native} binary")
     retired = sorted(_RETIRED_MODULES.intersection(names))
     missing = sorted(_REQUIRED_MODULES.difference(names))
     if retired:
-        raise RuntimeError(f"Wheel contains retired modules: {retired}")
+        problems.append(f"retired modules are present: {retired}")
     if missing:
-        raise RuntimeError(f"Wheel is missing required modules: {missing}")
-    if len(script_entries) != 1:
-        raise RuntimeError("Wheel must contain exactly one sgtsne script")
-    script_mode = (script_entries[0].external_attr >> 16) & 0o777
-    if script_mode != 0o755:
+        problems.append(f"required modules are missing: {missing}")
+    if problems:
         raise RuntimeError(
-            f"Wheel sgtsne script has mode {oct(script_mode)}, expected 0o755"
+            "\n".join(
+                ["Wheel contents violate the pure-Python contract:"]
+                + [f"- {problem}" for problem in problems]
+            )
         )
 
 
+def installs_tsne_extra() -> bool:
+    """Whether the smoke installs the tsne extra on this platform.
+
+    sgtsnepi publishes Linux x86_64 wheels for every supported Python, and the
+    test and docs extras install it there, so the smoke expects t-SNE on Linux
+    x86_64 and the installation guidance everywhere else.
+    """
+    return sys.platform == "linux" and platform.machine() == "x86_64"
+
+
+def _environment_python(environment: Path) -> Path:
+    if os.name == "nt":
+        return environment / "Scripts" / "python.exe"
+    return environment / "bin" / "python"
+
+
 def smoke_installed_wheel(wheel: Path) -> None:
+    """Install ``wheel`` into a clean environment, then import and use it.
+
+    The environment holds only the wheel, its dependencies, and on Linux
+    x86_64 the ``tsne`` extra. Its interpreter runs in isolated mode from a
+    scratch directory, so neither ``PYTHONPATH`` nor a source checkout can
+    stand in for the installed package.
+    """
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    with_tsne = installs_tsne_extra()
+    requirement = f"scarf[tsne] @ {wheel.as_uri()}" if with_tsne else str(wheel)
     env = os.environ.copy()
     env["HNSWLIB_NO_NATIVE"] = "1"
-    with tempfile.TemporaryDirectory(prefix="scarf-wheel-smoke-") as temp_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="scarf-wheel-smoke-", ignore_cleanup_errors=True
+    ) as temp_dir:
+        root = Path(temp_dir)
+        environment = root / "environment"
+        subprocess.run(
+            ["uv", "venv", "--python", python_version, str(environment)],
+            cwd=root,
+            env=env,
+            check=True,
+        )
+        python = _environment_python(environment)
+        subprocess.run(
+            ["uv", "pip", "install", "--python", str(python), requirement],
+            cwd=root,
+            env=env,
+            check=True,
+        )
+        subprocess.run(
+            [str(python), "-I", "-c", _SMOKE_CODE],
+            cwd=root,
+            env=env,
+            check=True,
+        )
         subprocess.run(
             [
-                "uv",
-                "run",
-                "--isolated",
-                "--python",
-                python_version,
-                "--with",
-                str(wheel),
-                "python",
-                "-c",
-                _SMOKE_CODE,
+                str(python),
+                "-I",
+                str(_WORKFLOW_SCRIPT),
+                "with-tsne" if with_tsne else "without-tsne",
             ],
-            cwd=temp_dir,
+            cwd=root,
             env=env,
             check=True,
         )

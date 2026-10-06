@@ -424,7 +424,17 @@ def test_add_melded_assay_rejects_invalid_inputs(store: DataStore, tmp_path) -> 
         )
     with pytest.raises(ValueError, match="element: RNA0 \\(position 0\\)"):
         store.add_melded_assay(external_bed_fn=str(bed), assay_label="melded")
+    # The type is checked before the BED file is read or the assay is staged.
+    with pytest.raises(
+        ValueError, match="assay_type 'GeneScore' of assay 'melded' is not a preset"
+    ):
+        store.add_melded_assay(
+            external_bed_fn=str(tmp_path / "absent.bed"),
+            assay_label="melded",
+            assay_type="GeneScore",
+        )
     assert "melded" not in store.assay_names
+    assert "melded" not in store.zw
 
 
 def test_make_bulk_rejects_other_group_sources(store: DataStore) -> None:

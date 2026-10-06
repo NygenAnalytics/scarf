@@ -108,13 +108,3 @@ def pairwise_merge_tree(values: Sequence[T], merge: Callable[[T, T], T]) -> T:
                 nxt.append(items[index])
         items = nxt
     return items[0]
-
-
-def add_stat_arrays(
-    left: tuple[np.ndarray, ...],
-    right: tuple[np.ndarray, ...],
-) -> tuple[np.ndarray, ...]:
-    """Add aligned accumulator arrays for a merge tree."""
-    if len(left) != len(right):
-        raise ValueError("stat tuples must have the same length")
-    return tuple(a + b for a, b in zip(left, right, strict=True))

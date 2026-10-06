@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -27,6 +27,10 @@ def vector_length(value: Any, object_path: str) -> int:
 
 def _raw_window(value: Any, start: int, stop: int, object_path: str) -> Any:
     read_block = getattr(value, "read_block", None)
+    if not callable(read_block) and isinstance(value, Mapping):
+        # A serialized vector is never a mapping. Slices are hashable since
+        # Python 3.12, so slicing a dict raises KeyError instead of TypeError.
+        raise MatrixSourceError(f"vector at {object_path} is a mapping, not a vector")
     try:
         return read_block(start, stop) if callable(read_block) else value[start:stop]
     except (IndexError, TypeError, ValueError) as error:

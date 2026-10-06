@@ -1,6 +1,5 @@
 ignore:
   - "tests/*"
-  - "setup.py"
 
 github_checks: false
 

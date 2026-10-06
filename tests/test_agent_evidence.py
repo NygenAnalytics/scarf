@@ -17,7 +17,13 @@ from scarf.agent.evidence import (
     prepare_context,
     verify_source,
 )
-from scarf.agent.models import AnalysisConfig, ContextDecision, RuntimeConfig, Study
+from scarf.agent.models import (
+    AnalysisConfig,
+    ContextDecision,
+    NeedsInput,
+    RuntimeConfig,
+    Study,
+)
 from scarf.writers import SparseToZarr
 
 
@@ -298,3 +304,78 @@ def test_reference_evidence_is_bounded_and_bound_on_resume(
     reference.write_text("Changed local evidence")
     with pytest.raises(ValueError, match="reference evidence changed"):
         verify_source(source, prepared, supplied, AnalysisConfig(), runtime())
+
+
+def _merged_source(base: Path) -> Path:
+    """Merge 48 cells with RNA and ADT and 16 cells with ADT only.
+
+    The merged RNA assay measured the cells of the first source only, so
+    its membership column ``RNA_I`` is False for the other 16 cells.
+    """
+    from scarf.merge import DataStoreMerge
+    from tests.storage_helpers import write_count_store
+
+    rng = np.random.default_rng(5)
+    write_count_store(
+        str(base / "full.zarr"),
+        {"RNA": _counts(), "ADT": rng.integers(1, 20, size=(48, 3))},
+        "uint32",
+    )
+    write_count_store(
+        str(base / "adt.zarr"), {"ADT": rng.integers(1, 20, size=(16, 3))}, "uint32"
+    )
+    sources = [
+        DataStore(
+            str(base / f"{name}.zarr"),
+            default_assay=assay,
+            min_features_per_cell=0,
+            nthreads=2,
+            mem_budget="256M",
+        )
+        for name, assay in (("full", "RNA"), ("adt", "ADT"))
+    ]
+    path = base / "merged.zarr"
+    DataStoreMerge(sources, str(path), ["full", "adt"], nthreads=2).dump()
+    DataStore(
+        str(path),
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        nthreads=2,
+        mem_budget="256M",
+    )
+    return path
+
+
+@pytest.mark.slow
+def test_inspection_asks_for_a_cell_key_of_measured_cells(tmp_path: Path) -> None:
+    """A merged store whose RNA assay measured some cells needs a cell key.
+
+    Every stage reads RNA over the cells of ``cellKey``, and the pipeline
+    refuses cells that RNA did not measure. Inspection asks for a cell key
+    before any model decision, instead of failing at the first pipeline run.
+    """
+    source = _merged_source(tmp_path)
+    before = _files(source)
+
+    with pytest.raises(NeedsInput) as raised:
+        inspect_source(source, study(), AnalysisConfig(), runtime())
+
+    assert raised.value.field == "cellKey"
+    question = raised.value.question
+    assert "16 of the 64 cells of cellKey 'I'" in question
+    assert "RNA_I" in question
+    assert (
+        "ds.cells.insert('RNA_measured', ds.cells.fetch_all('I') & "
+        "ds.cells.fetch_all('RNA_I'))"
+    ) in question
+    assert _files(source) == before
+
+    # The column that the question names makes the store analyzable.
+    store = DataStore(str(source), min_features_per_cell=-1, nthreads=2)
+    store.cells.insert(
+        "RNA_measured", store.cells.fetch_all("I") & store.cells.fetch_all("RNA_I")
+    )
+    prepared = inspect_source(
+        source, study(), AnalysisConfig(cellKey="RNA_measured"), runtime()
+    )
+    assert prepared["inputCells"] == prepared["retainedCells"] == 48

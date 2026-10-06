@@ -85,7 +85,8 @@ target_path = Path(mount_directory.name) / 'analysis.zarr'
 {"count source": str(source_path), "analysis target": str(target_path)}
 ```
 
-The target path must not already exist:
+The target path must be absent or an empty directory, and must not be, contain, or lie inside the
+source, or lie inside any other store:
 
 ```{code-cell} ipython3
 # Mount the count source into a separate writable target.

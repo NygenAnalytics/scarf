@@ -957,6 +957,23 @@ class PipelineAxisView:
             return selected
         return missing
 
+    def _selected_field(self, column: str) -> tuple[np.ndarray, np.ndarray | None]:
+        """Return one field's selected rows and the mask of its missing rows.
+
+        A missing row holds the field's stored placeholder; the mask is None
+        when the field links no missing mask. Every export of the field, as
+        a table column or into a file, reads it here. Row identity is
+        validated by the caller, once for all the fields it reads.
+        """
+        if column == "I":
+            return np.ones(self._selected_count(), dtype=bool), None
+        if column == "ids":
+            ids = np.asarray(self._live_table.fetch_all("ids"))
+            selected: np.ndarray = np.asarray(ids[self._selection_mask()])
+            return selected, None
+        descriptor = self._descriptor(column)
+        return self._selected_values(descriptor), self._selected_missing(descriptor)
+
     def to_pandas_dataframe(self, columns: Sequence[str]) -> pd.DataFrame:
         """Return selected rows for the requested frozen run fields."""
         if isinstance(columns, str | bytes) or not isinstance(columns, Sequence):
@@ -970,13 +987,12 @@ class PipelineAxisView:
         if unknown:
             raise KeyError(f"Pipeline run fields were not captured: {unknown!r}")
         self._validate_row_identity()
-        data: dict[str, Any] = {}
-        for column in requested:
-            values = self._fetch(column)
-            descriptor = self._descriptor_by_key.get(column)
-            missing = None if descriptor is None else self._selected_missing(descriptor)
-            data[column] = missing_frame_values(values, missing)
-        return pd.DataFrame(data)
+        return pd.DataFrame(
+            {
+                column: missing_frame_values(*self._selected_field(column))
+                for column in requested
+            }
+        )
 
     def head(self, n: int = 5) -> pd.DataFrame:
         """Return the first selected rows of every frozen run field."""

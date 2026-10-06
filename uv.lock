@@ -3900,8 +3900,6 @@ dependencies = [
     { name = "pandas" },
     { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "setuptools" },
-    { name = "sgtsnepi" },
     { name = "statsmodels" },
     { name = "threadpoolctl" },
     { name = "tqdm" },
@@ -3928,6 +3926,7 @@ docs = [
     { name = "myst-nb" },
     { name = "myst-parser" },
     { name = "nbclient" },
+    { name = "sgtsnepi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "sphinx" },
     { name = "sphinx-autodoc-typehints" },
     { name = "sphinx-book-theme" },
@@ -3954,7 +3953,11 @@ test = [
     { name = "pytest-xdist" },
     { name = "rdata" },
     { name = "scikit-network" },
+    { name = "sgtsnepi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "topacedo" },
+]
+tsne = [
+    { name = "sgtsnepi" },
 ]
 
 [package.dev-dependencies]
@@ -4024,8 +4027,9 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.15,!=1.17.0" },
     { name = "seaborn", marker = "extra == 'cytebase'", specifier = ">=0.13" },
     { name = "seaborn", marker = "extra == 'extra'", specifier = ">=0.13" },
-    { name = "setuptools", specifier = ">=61" },
-    { name = "sgtsnepi" },
+    { name = "sgtsnepi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'docs'", specifier = ">=0.7" },
+    { name = "sgtsnepi", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'test'", specifier = ">=0.7" },
+    { name = "sgtsnepi", marker = "extra == 'tsne'", specifier = ">=0.7" },
     { name = "sphinx", marker = "extra == 'docs'" },
     { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'" },
     { name = "sphinx-book-theme", marker = "extra == 'docs'" },
@@ -4043,7 +4047,7 @@ requires-dist = [
     { name = "zarr", specifier = ">=3.2.0" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
-provides-extras = ["cytebase", "agent", "extra", "test", "docs"]
+provides-extras = ["cytebase", "agent", "extra", "tsne", "test", "docs"]
 
 [package.metadata.requires-dev]
 cytebase = [
@@ -4252,15 +4256,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/24/34/b13340d5b4793ad5cd80118e0ebd484ac70250069110746da8026c34768c/session_info2-0.4.2.tar.gz", hash = "sha256:d85d730621d6f75df60e15dad21258f2750f04c0c0ee5958a7bf92342c039d76", size = 25385, upload-time = "2026-08-04T09:02:04.087Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/41/b5af3c12d874fcbdb45abd67500aff8030de0d350a5d6163da45378609c4/session_info2-0.4.2-py3-none-any.whl", hash = "sha256:dbf5f58769115651fad28e8ffc930b6a848a629a242ce2ecd730d12f5e3e9315", size = 17665, upload-time = "2026-08-04T09:02:02.9Z" },
-]
-
-[[package]]
-name = "setuptools"
-version = "84.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/6d/44/f5da03a8ef95d369145c5bb53050e7877c9f3d312e128605fd9504829143/setuptools-84.0.0.tar.gz", hash = "sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73", size = 1168449, upload-time = "2026-08-08T18:27:58.365Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl", hash = "sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670", size = 818216, upload-time = "2026-08-08T18:27:56.719Z" },
 ]
 
 [[package]]

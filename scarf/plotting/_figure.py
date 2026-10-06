@@ -13,9 +13,11 @@ import pandas as pd
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
 from ._style import (
+    LegendMarkerBoxes,
     continuous_norm,
     legend_side_columns,
     refresh_layout_point_sizes,
+    size_legend_layout,
     theme_context,
 )
 
@@ -419,17 +421,26 @@ _OUTSIDE_LEGEND_SLOTS = {
 _MAX_OUTSIDE_LEGENDS = max(_OUTSIDE_LEGEND_SLOTS)
 
 
-def _merged_legend_block(
-    blocks: Sequence[tuple[str | None, list[Any], list[str]]],
-) -> tuple[str | None, list[Any], list[str]]:
+# One outside legend: its title, handles, and labels.
+_LegendBlock = tuple[str | None, list[Any], list[str]]
+# A legend block with the handle boxes its markers need, such as the markers
+# of a size legend, or None for the theme's default boxes.
+_BoxedLegendBlock = tuple[str | None, list[Any], list[str], LegendMarkerBoxes | None]
+
+
+def _merged_legend_block(blocks: Sequence[_BoxedLegendBlock]) -> _BoxedLegendBlock:
+    """Merge blocks into one untitled block whose boxes hold every marker."""
     merged_handles: list[Any] = []
     merged_labels: list[str] = []
-    for title, handles, labels in blocks:
+    merged_boxes: LegendMarkerBoxes | None = None
+    for title, handles, labels, boxes in blocks:
         merged_handles.extend(handles)
         merged_labels.extend(
             f"{title}: {label}" if title else label for label in labels
         )
-    return None, merged_handles, merged_labels
+        if boxes is not None:
+            merged_boxes = boxes if merged_boxes is None else merged_boxes.merged(boxes)
+    return None, merged_handles, merged_labels, merged_boxes
 
 
 def _legend_blocks_overlap(figure: Any, legends: Sequence[Any]) -> bool:
@@ -447,9 +458,24 @@ def _legend_blocks_overlap(figure: Any, legends: Sequence[Any]) -> bool:
 
 def _place_legend_blocks(
     figure: Any,
-    blocks: Sequence[tuple[str | None, list[Any], list[str]]],
+    blocks: Sequence[_LegendBlock],
 ) -> None:
     """Draw outside legend blocks, merging them when separate blocks collide."""
+    _place_boxed_legend_blocks(
+        figure,
+        [(title, handles, labels, None) for title, handles, labels in blocks],
+    )
+
+
+def _place_boxed_legend_blocks(
+    figure: Any,
+    blocks: Sequence[_BoxedLegendBlock],
+) -> None:
+    """Draw outside legend blocks in the handle boxes their markers need.
+
+    Blocks that collide merge into one legend whose boxes hold the largest
+    marker of every block.
+    """
     if not blocks:
         return
     placed = list(blocks)
@@ -458,7 +484,7 @@ def _place_legend_blocks(
         keep.append(_merged_legend_block(placed[_MAX_OUTSIDE_LEGENDS - 1 :]))
         placed = keep
     legends: list[Any] = []
-    for slot, (title, handles, labels) in zip(
+    for slot, (title, handles, labels, boxes) in zip(
         _OUTSIDE_LEGEND_SLOTS[len(placed)], placed
     ):
         legends.append(
@@ -469,12 +495,13 @@ def _place_legend_blocks(
                 frameon=False,
                 loc=slot,
                 ncols=legend_side_columns(len(handles)),
+                **(boxes.legend_kwargs() if boxes is not None else {}),
             )
         )
     if _legend_blocks_overlap(figure, legends):
         for legend in legends:
             legend.remove()
-        title, handles, labels = _merged_legend_block(placed)
+        title, handles, labels, boxes = _merged_legend_block(placed)
         figure.legend(
             handles=handles,
             labels=labels,
@@ -482,6 +509,7 @@ def _place_legend_blocks(
             frameon=False,
             loc="outside right center",
             ncols=legend_side_columns(len(handles)),
+            **(boxes.legend_kwargs() if boxes is not None else {}),
         )
 
 
@@ -494,7 +522,7 @@ def _render_shared_legends(
     continuous_seen: set[tuple[Any, ...]] = set()
     size_seen: set[tuple[Any, ...]] = set()
     marker_seen: set[tuple[Any, ...]] = set()
-    blocks: list[tuple[str | None, list[Any], list[str]]] = []
+    blocks: list[_BoxedLegendBlock] = []
     for result in results:
         categorical = [
             scale for scale in result.scales if isinstance(scale, CategoricalScale)
@@ -544,7 +572,7 @@ def _render_shared_legends(
                     )
                     for value in order
                 ]
-                blocks.append((legend.label, handles, labels))
+                blocks.append((legend.label, handles, labels, None))
             elif legend.kind == "colorbar" and continuous:
                 color_scale = continuous[
                     min(continuous_scale_index, len(continuous) - 1)
@@ -621,19 +649,25 @@ def _render_shared_legends(
                     [size_scale.vmin, size_scale.vmax],
                 )
                 low, high = float(domain[0]), float(domain[1])
+                values = np.asarray(
+                    legend.extras.get("values", np.linspace(low, high, 4)),
+                    dtype=np.float64,
+                )
+                if values.ndim != 1 or not values.size:
+                    continue
                 size_key = (
                     legend.label,
                     low,
                     high,
+                    tuple(values.tolist()),
                     size_scale.size_min,
                     size_scale.size_max,
                 )
                 if size_key in size_seen:
                     continue
                 size_seen.add(size_key)
-                values = np.linspace(low, high, 4)
-                areas = size_scale.areas(values)
-                area_factor = min(1.0, 180.0 / max(float(areas.max()), 1.0))
+                # The shared legend draws the child's final areas exactly.
+                areas, boxes = size_legend_layout(size_scale, values)
                 handles = [
                     mpl.lines.Line2D(
                         [],
@@ -642,7 +676,7 @@ def _render_shared_legends(
                         linestyle="",
                         markerfacecolor="#bdbdbd",
                         markeredgecolor="#666666",
-                        markersize=float(np.sqrt(area * area_factor)),
+                        markersize=float(np.sqrt(area)),
                     )
                     for area in areas
                 ]
@@ -651,7 +685,7 @@ def _render_shared_legends(
                     if low >= 0 and high <= 1
                     else [f"{value:g}" for value in values]
                 )
-                blocks.append((legend.label, handles, labels))
+                blocks.append((legend.label, handles, labels, boxes))
             elif legend.kind == "marker":
                 marker_values = list(legend.extras.get("values", ()))
                 markers = list(legend.extras.get("markers", ()))
@@ -678,9 +712,14 @@ def _render_shared_legends(
                     for marker in markers
                 ]
                 blocks.append(
-                    (legend.label, handles, [str(value) for value in marker_values])
+                    (
+                        legend.label,
+                        handles,
+                        [str(value) for value in marker_values],
+                        None,
+                    )
                 )
-    _place_legend_blocks(figure, blocks)
+    _place_boxed_legend_blocks(figure, blocks)
 
 
 def _remove_child_legend_artists(figure: Any, axes: Sequence[Any]) -> None:

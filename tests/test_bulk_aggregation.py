@@ -64,7 +64,10 @@ def test_bulk_kernel_matches_grouped_counts(normalize, return_fraction):
         ([0], None, "group codes"),
         ([-1, 0], None, "group codes"),
         ([0, 2], None, "group codes"),
-        ([0, 1], [1.0], "normalization scalars"),
+        ([0, 1], [1.0], "normalization scalars must align"),
+        # Divisors map a zero total to 1 before they reach the aggregation.
+        ([0, 1], [1.0, 0.0], "scalars must be finite and positive"),
+        ([0, 1], [np.nan, 1.0], "scalars must be finite and positive"),
     ],
 )
 def test_bulk_rejects_misaligned_groups_and_scalars(codes, scalars, message):
@@ -151,7 +154,7 @@ def test_bulk_sum_keeps_large_integers_and_ignores_custom_normalizer(tmp_path, w
 
 
 @pytest.mark.parametrize("workers", [1, 4])
-def test_bulk_mean_uses_stored_totals_and_preserves_zero_total_behavior(
+def test_bulk_mean_uses_stored_totals_and_averages_zero_total_cells_as_zero(
     tmp_path, workers
 ):
     counts = np.array([[100, 10], [200, 20], [0, 0]], dtype=np.uint16)
@@ -160,6 +163,9 @@ def test_bulk_mean_uses_stored_totals_and_preserves_zero_total_behavior(
     store.zw["cellData"].create_array(
         "RNA_nCounts", data=np.array([220, 220, 0]), overwrite=True
     )
+    normalized = store.RNA.normed(
+        cell_idx=np.arange(3), feat_idx=np.arange(2)
+    ).compute()
     actual, fractions = store.make_bulk(
         "group",
         cell_selection=cells,
@@ -169,7 +175,12 @@ def test_bulk_mean_uses_stored_totals_and_preserves_zero_total_behavior(
     np.testing.assert_allclose(
         actual["a"], counts[0].astype(float) * store.RNA.sf / 220
     )
-    np.testing.assert_array_equal(actual["b"], 0)
+    # The cell without counts normalizes to zero and still counts toward the
+    # mean of its group, as in the average of ``normed``.
+    np.testing.assert_allclose(actual["b"], normalized[1:].mean(axis=0))
+    np.testing.assert_allclose(
+        actual["b"], counts[1].astype(float) * store.RNA.sf / 220 / 2
+    )
     np.testing.assert_array_equal(fractions["b"], 0.5)
 
 
@@ -267,6 +278,8 @@ def test_bulk_leaves_nan_none_and_blank_labels_out_of_every_group(tmp_path):
     np.testing.assert_array_equal(by_float["2.0"], counts[[3, 5]].sum(axis=0))
     assert list(by_text.columns) == ["a", "b"]
     np.testing.assert_array_equal(by_text["a"], counts[[0, 2]].sum(axis=0))
+    # Null values that name every label leave no group to read.
+    assert store.make_bulk("text_group", null_vals=["a", "b"], **options).empty
 
 
 def test_bulk_rejects_colliding_column_names(tmp_path):
@@ -276,6 +289,44 @@ def test_bulk_rejects_colliding_column_names(tmp_path):
 
     with pytest.raises(ValueError, match="'a_b_c' is produced by more than one"):
         store.make_bulk("group", cell_selection=cells, secondary_groups="secondary")
+
+
+def test_bulk_by_a_column_reads_the_live_cells_without_a_snapshot(tmp_path):
+    counts = np.arange(1, 25, dtype=np.uint16).reshape(6, 4)
+    store, cells = _bulk_store(tmp_path, counts)
+    store.cells.insert("group", np.array(["a", "a", "b", "b", "a", "b"]))
+    store.cells.insert("sub", np.array(["x", "y", "x", "y", "x", "y"]))
+    store.cells.insert("part", np.array([True, True, True, True, False, False]))
+    store.cells.insert("gap", np.array([True, False, True, True, True, True]))
+    labels = store.snapshot_cluster_labels("sub", cell_selection=cells)
+    part = store.snapshot_cluster_labels(
+        "sub", cell_selection=store.snapshot_cell_selection("part")
+    )
+    gap = store.snapshot_cluster_labels(
+        "sub", cell_selection=store.snapshot_cell_selection("gap")
+    )
+    store.cells.insert("I", np.arange(6) < 5, overwrite=True, force=True)
+    options = {"aggr_type": "sum", "remove_empty_features": False}
+
+    def files():
+        return {
+            str(file.relative_to(tmp_path)): file.read_bytes()
+            for file in sorted(tmp_path.rglob("*"))
+            if file.is_file()
+        }
+
+    before = files()
+    bulk = store.make_bulk("group", secondary_groups=labels, **options)
+
+    assert files() == before
+    assert list(bulk.columns) == ["a_x", "a_y", "b_x", "b_y"]
+    np.testing.assert_array_equal(bulk["a_x"], counts[[0, 4]].sum(axis=0))
+    np.testing.assert_array_equal(bulk["b_y"], counts[3])
+    # A sub-grouping artifact must hold every live cell, past its last cell
+    # or between two of its cells.
+    for partial in (part, gap):
+        with pytest.raises(ValueError, match="subset of the artifact cell selection"):
+            store.make_bulk("group", secondary_groups=partial, **options)
 
 
 def test_bulk_mean_fits_non_rna_normalization_once(tmp_path):
@@ -467,3 +518,39 @@ def test_bulk_sums_of_float_counts_are_exact_above_float32_precision():
 
     assert actual.dtype == np.float64
     assert actual[0, 0] == 2**24 + 3
+
+
+@pytest.mark.parametrize("aggregation", ["sum", "mean"])
+def test_bulk_aggregation_rejects_results_that_are_not_finite(aggregation):
+    # Feature 1 of group 1 overflows float64: its sum, or its normalized values.
+    counts = np.array([[1.0, 2.0, 3.0], [4.0, 1.5e308, 1.5e308]], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="feature 1 in group 'b' is not finite"):
+        aggregate_rna_groups(
+            _counts_t_with_plan(counts.T),
+            np.arange(3),
+            np.array([0, 1, 1]),
+            2,
+            scalars=np.ones(3) if aggregation == "mean" else None,
+            size_factor=1000,
+            return_fraction=False,
+            resources=ResourceBudget(16 * 1024**2, 1),
+            group_names=["a", "b"],
+        )
+
+
+def test_normalized_aggregation_names_the_group_of_a_non_finite_mean():
+    from scarf.features.aggregation import aggregate_normalized_groups
+    from scarf.matrix import ChunkedArray
+
+    values = np.ones((4, 3))
+    values[3, 2] = np.nan
+    with pytest.raises(ValueError, match="feature 2 in group 1 is not finite"):
+        aggregate_normalized_groups(
+            ChunkedArray.from_numpy(values), np.array([0, 0, -1, 1]), 2, nthreads=1
+        )
+    # Rows outside every group are fitted but not averaged.
+    means = aggregate_normalized_groups(
+        ChunkedArray.from_numpy(values), np.array([0, 0, 1, -1]), 2, nthreads=1
+    )
+    np.testing.assert_array_equal(means, np.ones((3, 2)))

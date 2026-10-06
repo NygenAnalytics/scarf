@@ -1,4 +1,5 @@
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -7,6 +8,7 @@ import zarr
 from scipy.sparse import csr_matrix, vstack
 
 from ...assay.base import raw_csr
+from ...features.values import measured_feature_means
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.arrays import create_zarr_dataset
 from ...storage.artifacts import (
@@ -26,44 +28,31 @@ from ...graph.feature_projection import (
 )
 from ...graph.kinds import require_graph_kind
 from ...metadata.arguments import (
+    MEMBERSHIP_STRENGTH_ALGORITHM_VERSION,
+    SMART_LABEL_ALGORITHM_VERSION,
     MembershipStrengthArguments,
     SmartLabelArguments,
 )
-from ...metadata.rows import read_metadata_missing_rows
+from ...metadata.membership import exported_membership, membership_declaration
+from ...metadata.rows import apply_missing_mask, read_metadata_missing_rows
 from ...metadata.selection import resolve_complete_labels
 from ...metadata.artifacts import (
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
+from ...metrics.graph import neighbor_label_agreement
 from ...utils.logging import logger
-from ...utils.compute import controlled_compute
 from ...storage.selections import (
     read_stored_selection_indices,
     validate_stored_selection_integrity,
 )
 
 if TYPE_CHECKING:
+    from ...writers.export import H5adExportPlan, H5adMatrix
     from ..mapping_datastore import MappingDatastore as _PresentationOperationsBase
-    from ..pipeline_run import PipelineRun
+    from ..pipeline_run import PipelineAxisView, PipelineRun
 else:
     _PresentationOperationsBase = object
-
-
-_MEMBERSHIP_BLOCK_EDGES = 1_048_576
-
-
-def _row_mode_counts(codes: np.ndarray) -> np.ndarray:
-    """Return how often the most frequent code occurs in each row."""
-    ordered = np.sort(codes, axis=1)
-    positions = np.broadcast_to(
-        np.arange(ordered.shape[1], dtype=np.int64),
-        ordered.shape,
-    )
-    run_starts = np.ones(ordered.shape, dtype=bool)
-    run_starts[:, 1:] = ordered[:, 1:] != ordered[:, :-1]
-    # Each position's run begins at the latest preceding run start.
-    run_origins = np.maximum.accumulate(np.where(run_starts, positions, 0), axis=1)
-    return np.asarray((positions - run_origins + 1).max(axis=1), dtype=np.int64)
 
 
 def _letter_suffix(position: int) -> str:
@@ -75,22 +64,139 @@ def _letter_suffix(position: int) -> str:
     return letters
 
 
-def _lift_frozen_umap_to_obsm(adata: Any) -> None:
+def _frozen_umap_fields(columns: Sequence[str]) -> list[str]:
+    """Return a run's frozen ``umap_<k>`` fields in component order.
+
+    A run export moves these fields from ``obs`` to ``obsm["X_umap"]``.
+    Fields whose component is not positive stay in ``obs``.
+    """
     umap_columns: dict[int, str] = {}
-    for column in adata.obs.columns:
+    for column in columns:
         prefix, separator, suffix = str(column).rpartition("_")
         if prefix == "umap" and separator and suffix.isdigit():
             component = int(suffix)
             if component > 0:
                 umap_columns[component] = str(column)
     if not umap_columns:
-        return
+        return []
     expected = list(range(1, max(umap_columns) + 1))
     if sorted(umap_columns) != expected:
         raise ValueError("Frozen UMAP fields must be consecutively numbered")
-    ordered_columns = [umap_columns[index] for index in expected]
-    adata.obsm["X_umap"] = adata.obs[ordered_columns].to_numpy(copy=True)
-    adata.obs.drop(columns=ordered_columns, inplace=True)
+    return [umap_columns[index] for index in expected]
+
+
+def _frozen_field(
+    view: "PipelineAxisView",
+    column: str,
+    rows: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read a frozen run field at its selected rows, or at ``rows`` of them."""
+    values, missing = view._selected_field(column)
+    if rows is None:
+        return values, missing
+    return values[rows], None if missing is None else missing[rows]
+
+
+def _frozen_coordinates(
+    view: "PipelineAxisView",
+    columns: tuple[str, ...],
+) -> np.ndarray:
+    """Stack frozen coordinate fields into a cells-by-components array."""
+    return np.column_stack(
+        [apply_missing_mask(*view._selected_field(column)) for column in columns]
+    )
+
+
+def _raw_count_blocks(
+    assay: Any,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
+) -> Iterator[np.ndarray]:
+    """Stream the raw counts of the selected cells and features by row block.
+
+    The export's conversion of each block to CSR is charged as resident.
+    """
+    from ...writers.export import h5ad_conversion_bytes, largest_block_rows
+
+    selected = assay.rawData[:, feat_idx][cell_idx, :]
+    blocks: Iterator[np.ndarray] = selected._stream_blocks(
+        nthreads=assay.nthreads,
+        msg=f"Exporting {assay.name} raw counts",
+        prefetch=None,
+        row_mask=None,
+        resident_bytes=h5ad_conversion_bytes(
+            selected.dtype, selected.shape[1], largest_block_rows(selected)
+        ),
+    )
+    return blocks
+
+
+def _raw_count_matrix(
+    assay: Any,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
+) -> "H5adMatrix":
+    """Plan the export of the raw counts of selected cells and features."""
+    from ...writers.export import H5adMatrix
+
+    return H5adMatrix(
+        shape=(len(cell_idx), len(feat_idx)),
+        dtype=np.dtype(assay.rawData.dtype),
+        blocks=partial(_raw_count_blocks, assay, cell_idx, feat_idx),
+    )
+
+
+def _stored_row_blocks(
+    data: zarr.Array,
+    nthreads: int,
+    resources: Any,
+    msg: str,
+) -> Iterator[np.ndarray]:
+    """Stream a stored dense matrix by row block, as stored.
+
+    The export's conversion of each block to CSR is charged as resident.
+    """
+    from ...matrix import ChunkedArray
+    from ...writers.export import h5ad_conversion_bytes, largest_block_rows
+
+    matrix = ChunkedArray(data, nthreads=nthreads, resources=resources)
+    blocks: Iterator[np.ndarray] = matrix._stream_blocks(
+        nthreads=None,
+        msg=msg,
+        prefetch=None,
+        row_mask=None,
+        resident_bytes=h5ad_conversion_bytes(
+            data.dtype, int(data.shape[1]), largest_block_rows(matrix)
+        ),
+    )
+    return blocks
+
+
+def _require_unique_layer_ids(selected_ids: np.ndarray) -> None:
+    if np.unique(selected_ids).size != selected_ids.size:
+        raise ValueError("Selected feature IDs must be unique when exporting layers")
+
+
+def _anndata_from_plan(anndata: Any, plan: "H5adExportPlan") -> Any:
+    """Materialize an export plan as an in-memory AnnData object.
+
+    ``obs`` and ``var`` are the tables of ``scarf.writers.export.h5ad_frame``,
+    so their categoricals are the ones that the file of the plan stores.
+    """
+    from ...writers.export import h5ad_frame, materialize_h5ad_matrix
+
+    n_obs, n_vars = plan.x.shape
+    adata = anndata(
+        materialize_h5ad_matrix(plan.x),
+        obs=h5ad_frame(plan.obs_index, plan.obs, n_obs),
+        var=h5ad_frame(plan.var_index, plan.var, n_vars),
+        uns=membership_declaration(dict(plan.membership)),
+    )
+    for name, read in plan.obsm.items():
+        adata.obsm[name] = read()
+    for name, layer in plan.layers.items():
+        adata.layers[name] = materialize_h5ad_matrix(layer, f"Layer {name!r}")
+    return adata
 
 
 class _PresentationOperationsMixin(_PresentationOperationsBase):
@@ -127,25 +233,26 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             feature_names: Feature names to export, in the requested order.
 
         Returns:
-            An AnnData object, or ``None`` when ``anndata`` is unavailable.
+            An AnnData object.
+
+        Raises:
+            ImportError: If ``anndata`` is not installed.
+            UnmeasuredCellsError: If normed or other-assay data has an unmeasured cell.
         """
         try:
             # noinspection PyPackageRequirements
             from anndata import AnnData  # type: ignore
-        except ImportError:
-            logger.error(
-                "Package anndata is not installed because its an optional dependency. "
-                "Install via `pip install anndata` or `conda install anndata -c conda-forge`"
-            )
-            return None
+        except ImportError as exc:
+            raise ImportError(
+                "DataStore.to_anndata requires anndata. "
+                "Install it with: pip install 'scarf[extra]'"
+            ) from exc
 
         if matrix not in ("raw", "normed"):
             raise ValueError("matrix must be either 'raw' or 'normed'")
         if feature_indexes is not None and feature_names is not None:
             raise ValueError("feature_indexes and feature_names are mutually exclusive")
 
-        run_cells = None
-        run_features = None
         if run is not None:
             from ..pipeline_run import PipelineRun
 
@@ -161,97 +268,99 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 raise ValueError(
                     "Run-aware export uses the frozen run feature selection"
                 )
-            assay = self._get_assay(run.assay)
-            run_cells = run.cells
-            run_features = run.features
-            cell_idx = np.flatnonzero(run_cells.fetch_all("I")).astype(
-                np.int64,
-                copy=False,
+            return _anndata_from_plan(
+                AnnData,
+                self._h5ad_run_plan(run, matrix=matrix, layers=layers),
             )
-            feat_idx = np.flatnonzero(run_features.fetch_all("I")).astype(
-                np.int64,
-                copy=False,
-            )
-            obs = (
-                run_cells.to_pandas_dataframe(run_cells.columns)
-                .reset_index(drop=True)
-                .set_index("ids")
-            )
-            var = (
-                run_features.to_pandas_dataframe(run_features.columns)
-                .rename(columns={"ids": "gene_ids"})
-                .set_index("gene_ids")
+
+        if cell_key is None:
+            cell_key = "I"
+        assay = self._get_assay(from_assay)
+
+        if feature_indexes is not None:
+            if isinstance(feature_indexes, str):
+                raise TypeError(
+                    "feature_indexes must be a sequence of integer feature indexes"
+                )
+            feat_idx = np.asarray(feature_indexes)
+            if feat_idx.ndim != 1:
+                raise ValueError("feature_indexes must be one-dimensional")
+            if feat_idx.size == 0:
+                feat_idx = np.empty(0, dtype=np.int64)
+            elif not np.issubdtype(feat_idx.dtype, np.integer):
+                raise TypeError("feature_indexes must contain only integers")
+            else:
+                feat_idx = feat_idx.astype(np.int64, copy=False)
+            if np.unique(feat_idx).size != feat_idx.size:
+                raise ValueError("feature_indexes must contain unique indexes")
+            if np.any(feat_idx < 0) or np.any(feat_idx >= assay.feats.N):
+                raise IndexError("feature_indexes contains an out-of-range index")
+        elif feature_names is not None:
+            if isinstance(feature_names, str):
+                raise TypeError(
+                    "feature_names must be a sequence of feature names, not a string"
+                )
+            requested_names = list(feature_names)
+            if not all(isinstance(name, str) for name in requested_names):
+                raise TypeError("feature_names must contain only strings")
+            if len(set(requested_names)) != len(requested_names):
+                raise ValueError("feature_names must contain unique names")
+            name_positions: dict[str, list[int]] = {}
+            for index, name in enumerate(assay.feats.fetch_all("names").astype(str)):
+                name_positions.setdefault(name, []).append(index)
+            missing = [name for name in requested_names if name not in name_positions]
+            if missing:
+                raise KeyError("Feature names not found: " + ", ".join(missing))
+            ambiguous = [
+                name for name in requested_names if len(name_positions[name]) != 1
+            ]
+            if ambiguous:
+                raise ValueError(
+                    "Feature names are not unique in the assay: " + ", ".join(ambiguous)
+                )
+            feat_idx = np.asarray(
+                [name_positions[name][0] for name in requested_names],
+                dtype=np.int64,
             )
         else:
-            if cell_key is None:
-                cell_key = "I"
-            assay = self._get_assay(from_assay)
+            feat_idx = np.arange(assay.feats.N, dtype=np.int64)
 
-            if feature_indexes is not None:
-                if isinstance(feature_indexes, str):
-                    raise TypeError(
-                        "feature_indexes must be a sequence of integer feature indexes"
-                    )
-                feat_idx = np.asarray(feature_indexes)
-                if feat_idx.ndim != 1:
-                    raise ValueError("feature_indexes must be one-dimensional")
-                if feat_idx.size == 0:
-                    feat_idx = np.empty(0, dtype=np.int64)
-                elif not np.issubdtype(feat_idx.dtype, np.integer):
-                    raise TypeError("feature_indexes must contain only integers")
-                else:
-                    feat_idx = feat_idx.astype(np.int64, copy=False)
-                if np.unique(feat_idx).size != feat_idx.size:
-                    raise ValueError("feature_indexes must contain unique indexes")
-                if np.any(feat_idx < 0) or np.any(feat_idx >= assay.feats.N):
-                    raise IndexError("feature_indexes contains an out-of-range index")
-            elif feature_names is not None:
-                if isinstance(feature_names, str):
-                    raise TypeError(
-                        "feature_names must be a sequence of feature names, not a string"
-                    )
-                requested_names = list(feature_names)
-                if not all(isinstance(name, str) for name in requested_names):
-                    raise TypeError("feature_names must contain only strings")
-                if len(set(requested_names)) != len(requested_names):
-                    raise ValueError("feature_names must contain unique names")
-                name_positions: dict[str, list[int]] = {}
-                for index, name in enumerate(
-                    assay.feats.fetch_all("names").astype(str)
-                ):
-                    name_positions.setdefault(name, []).append(index)
-                missing = [
-                    name for name in requested_names if name not in name_positions
-                ]
-                if missing:
-                    raise KeyError("Feature names not found: " + ", ".join(missing))
-                ambiguous = [
-                    name for name in requested_names if len(name_positions[name]) != 1
-                ]
-                if ambiguous:
-                    raise ValueError(
-                        "Feature names are not unique in the assay: "
-                        + ", ".join(ambiguous)
-                    )
-                feat_idx = np.asarray(
-                    [name_positions[name][0] for name in requested_names],
-                    dtype=np.int64,
+        cell_idx = self.cells.active_index(cell_key)
+        if matrix == "normed":
+            self._require_measured_cells(
+                assay.name, cell_key, operation="to_anndata", remedy="cell_key"
+            )
+        layer_features: dict[str, tuple[Any, np.ndarray]] = {}
+        if layers is not None:
+            selected_ids = assay.feats.fetch_all("ids").astype(str)[feat_idx]
+            _require_unique_layer_ids(selected_ids)
+            for layer, assay_name in layers.items():
+                layer_features[layer] = self._layer_features(
+                    layer, assay_name, selected_ids
                 )
-            else:
-                feat_idx = np.arange(assay.feats.N, dtype=np.int64)
-
-            cell_idx = self.cells.active_index(cell_key)
-            obs = (
-                self.cells.to_pandas_dataframe(self.cells.columns, key=cell_key)
-                .reset_index(drop=True)
-                .set_index("ids")
+                if layer_features[layer][0].name != assay.name:
+                    # Only the exported assay declares its membership.
+                    self._require_measured_cells(
+                        assay_name,
+                        cell_key,
+                        operation="to_anndata",
+                        remedy="cell_key",
+                    )
+        declared, omitted = exported_membership(self.cells, assay.name)
+        obs = (
+            self.cells.to_pandas_dataframe(
+                [column for column in self.cells.columns if column not in omitted],
+                key=cell_key,
             )
-            var = (
-                assay.feats.to_pandas_dataframe(assay.feats.columns)
-                .iloc[feat_idx]
-                .rename(columns={"ids": "gene_ids"})
-                .set_index("gene_ids")
-            )
+            .reset_index(drop=True)
+            .set_index("ids")
+        )
+        var = (
+            assay.feats.to_pandas_dataframe(assay.feats.columns)
+            .iloc[feat_idx]
+            .rename(columns={"ids": "gene_ids"})
+            .set_index("gene_ids")
+        )
 
         if matrix == "raw":
             x = raw_csr(assay, cell_idx, feat_idx)
@@ -263,56 +372,214 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 if blocks
                 else csr_matrix((len(cell_idx), len(feat_idx)))
             )
-        adata = AnnData(x, obs=obs, var=var)
-        if layers is not None:
-            if run_features is None:
-                selected_ids = assay.feats.fetch_all("ids").astype(str)[feat_idx]
-            else:
-                selected_ids = run_features.fetch("ids").astype(str)
-            if np.unique(selected_ids).size != selected_ids.size:
-                raise ValueError(
-                    "Selected feature IDs must be unique when exporting layers"
-                )
-            for layer, assay_name in layers.items():
-                layer_assay = self._get_assay(assay_name)
-                layer_id_positions: dict[str, list[int]] = {}
-                for index, feature_id in enumerate(
-                    layer_assay.feats.fetch_all("ids").astype(str)
-                ):
-                    layer_id_positions.setdefault(feature_id, []).append(index)
-                missing_ids = [
-                    feature_id
-                    for feature_id in selected_ids
-                    if feature_id not in layer_id_positions
-                ]
-                ambiguous_ids = [
-                    feature_id
-                    for feature_id in selected_ids
-                    if len(layer_id_positions.get(feature_id, ())) > 1
-                ]
-                if missing_ids or ambiguous_ids:
-                    details = []
-                    if missing_ids:
-                        details.append("missing: " + ", ".join(missing_ids))
-                    if ambiguous_ids:
-                        details.append("ambiguous: " + ", ".join(ambiguous_ids))
-                    raise ValueError(
-                        f"Layer {layer!r} cannot align selected feature IDs ("
-                        + "; ".join(details)
-                        + ")"
-                    )
-                layer_feat_idx = np.asarray(
-                    [layer_id_positions[feature_id][0] for feature_id in selected_ids],
-                    dtype=np.int64,
-                )
-                adata.layers[layer] = raw_csr(
-                    layer_assay,
-                    cell_idx,
-                    layer_feat_idx,
-                )
-        if run is not None:
-            _lift_frozen_umap_to_obsm(adata)
+        adata = AnnData(x, obs=obs, var=var, uns=membership_declaration(declared))
+        for layer, (layer_assay, layer_feat_idx) in layer_features.items():
+            adata.layers[layer] = raw_csr(layer_assay, cell_idx, layer_feat_idx)
         return adata
+
+    def _layer_features(
+        self,
+        layer: str,
+        assay_name: str,
+        selected_ids: np.ndarray,
+    ) -> tuple[Any, np.ndarray]:
+        """Return a layer's assay and its feature rows of ``selected_ids``."""
+        layer_assay = self._get_assay(assay_name)
+        positions: dict[str, list[int]] = {}
+        for index, feature_id in enumerate(
+            layer_assay.feats.fetch_all("ids").astype(str)
+        ):
+            positions.setdefault(feature_id, []).append(index)
+        missing_ids = [
+            feature_id for feature_id in selected_ids if feature_id not in positions
+        ]
+        ambiguous_ids = [
+            feature_id
+            for feature_id in selected_ids
+            if len(positions.get(feature_id, ())) > 1
+        ]
+        if missing_ids or ambiguous_ids:
+            details = []
+            if missing_ids:
+                details.append("missing: " + ", ".join(missing_ids))
+            if ambiguous_ids:
+                details.append("ambiguous: " + ", ".join(ambiguous_ids))
+            raise ValueError(
+                f"Layer {layer!r} cannot align selected feature IDs ("
+                + "; ".join(details)
+                + ")"
+            )
+        return layer_assay, np.asarray(
+            [positions[feature_id][0] for feature_id in selected_ids],
+            dtype=np.int64,
+        )
+
+    def _h5ad_run_plan(
+        self,
+        run: "PipelineRun",
+        *,
+        matrix: Literal["raw", "normed"],
+        layers: Mapping[str, str] | None = None,
+    ) -> "H5adExportPlan":
+        """Resolve which rows, columns, and values a run export holds.
+
+        ``to_anndata(run=...)`` materializes this plan and
+        ``scarf.writers.to_h5ad(..., run=...)`` streams it into a file, so
+        the two exports cannot differ. Rows are the run's cells. With
+        ``matrix="raw"``, columns are the run's feature universe and values
+        its raw counts; with ``"normed"``, columns are the features of the
+        run's ``normalized`` artifact, which must be exactly its highly
+        variable features, and values are that artifact's stored float32
+        values, read row band by row band. Cell and feature fields are the
+        run's frozen fields, with masked rows missing, encoded as
+        ``"categorical"`` columns: the plan decides which text fields are
+        categoricals and in what order their categories are, for the file
+        and for the object alike. Consecutive ``umap_<k>`` fields become
+        ``obsm["X_umap"]``. ``layers`` maps layer names to assays whose raw
+        counts are aligned to the exported features by ID.
+        """
+        from ...writers.export import H5adColumn, H5adExportPlan, H5adMatrix
+        from ..pipeline_run import PipelineRun
+
+        if matrix not in ("raw", "normed"):
+            raise ValueError("matrix must be either 'raw' or 'normed'")
+        if not isinstance(run, PipelineRun):
+            raise TypeError("run must be a PipelineRun")
+        if run._owner is not self:
+            raise ValueError("run must be opened from this datastore")
+        assay = self._get_assay(run.assay)
+        cells = run.cells
+        features = run.features
+        cell_idx = np.flatnonzero(cells.fetch_all("I")).astype(np.int64, copy=False)
+        universe = np.asarray(features.fetch_all("I"), dtype=bool)
+        # Exported rows among the selected rows of the feature view.
+        feature_rows: np.ndarray | None = None
+        if matrix == "raw":
+            universe_idx = np.flatnonzero(universe).astype(np.int64, copy=False)
+            x = _raw_count_matrix(assay, cell_idx, universe_idx)
+        else:
+            x, normalized_features = self._run_normalized_values(run)
+            if x.shape[0] != len(cell_idx):
+                raise ValueError(
+                    f"The normalized artifact of pipeline run {run.run_id} does "
+                    "not cover the run's cells"
+                )
+            if np.any(normalized_features & ~universe):
+                raise ValueError(
+                    f"The normalized artifact of pipeline run {run.run_id} holds "
+                    "features outside the run's feature universe"
+                )
+            feature_rows = np.flatnonzero(normalized_features[universe])
+
+        def frozen(
+            view: "PipelineAxisView",
+            column: str,
+            name: str | None = None,
+            rows: np.ndarray | None = None,
+        ) -> H5adColumn:
+            return H5adColumn(
+                column if name is None else name,
+                partial(_frozen_field, view, column, rows),
+                "categorical",
+            )
+
+        cell_fields = [column for column in cells.columns if column != "ids"]
+        umap = _frozen_umap_fields(cell_fields)
+        plan_layers: dict[str, H5adMatrix] = {}
+        if layers is not None:
+            selected_ids = np.asarray(_frozen_field(features, "ids", feature_rows)[0])
+            selected_ids = selected_ids.astype(str)
+            _require_unique_layer_ids(selected_ids)
+            for layer, assay_name in layers.items():
+                layer_assay, layer_feat_idx = self._layer_features(
+                    layer, assay_name, selected_ids
+                )
+                if layer_assay.name != assay.name:
+                    # A run export declares no membership, and the run checked
+                    # only its own assay over its cells.
+                    self._require_measured_cells(
+                        assay_name, cell_idx, operation="to_anndata", remedy="export"
+                    )
+                plan_layers[layer] = _raw_count_matrix(
+                    layer_assay, cell_idx, layer_feat_idx
+                )
+        return H5adExportPlan(
+            x=x,
+            obs_index=frozen(cells, "ids"),
+            obs=tuple(
+                frozen(cells, column) for column in cell_fields if column not in umap
+            ),
+            var_index=frozen(features, "ids", "gene_ids", feature_rows),
+            var=tuple(
+                frozen(features, column, rows=feature_rows)
+                for column in features.columns
+                if column != "ids"
+            ),
+            obsm=(
+                {"X_umap": partial(_frozen_coordinates, cells, tuple(umap))}
+                if umap
+                else {}
+            ),
+            layers=plan_layers,
+        )
+
+    def _run_normalized_values(
+        self,
+        run: "PipelineRun",
+    ) -> tuple["H5adMatrix", np.ndarray]:
+        """Plan the export of a run's normalized values.
+
+        Returns the values of the run's ``normalized`` artifact, streamed in
+        row bands as stored, and the mask of their features over the assay.
+        The artifact's cell selection must be the run's cell selection, and
+        its feature selection the run's highly variable features.
+        """
+        from ...assay.normalization import load_normalized_inputs
+        from ...writers.export import H5adMatrix
+
+        if "normalized" not in run:
+            raise ValueError(
+                f"Pipeline run {run.run_id} has no normalized output, so it has "
+                "no normalized values to export; export raw counts with "
+                "matrix='raw'"
+            )
+        normalized = run["normalized"]
+        if (
+            normalized.kind != "normalized"
+            or normalized.scope != "assay"
+            or normalized.assay != run.assay
+        ):
+            raise ValueError(
+                f"The normalized output of pipeline run {run.run_id} is not a "
+                f"normalized artifact of assay {run.assay!r}"
+            )
+        group, selections = load_normalized_inputs(self.zw, normalized)
+        if selections.cells.ref != run.cells._selection_ref:
+            raise ValueError(
+                f"The normalized artifact of pipeline run {run.run_id} does not "
+                "cover the run's cells"
+            )
+        if (
+            "highly_variable_features" not in run
+            or selections.features != run["highly_variable_features"]
+        ):
+            raise ValueError(
+                f"The normalized artifact of pipeline run {run.run_id} does not "
+                "cover the run's highly variable features"
+            )
+        data = as_zarr_array(group["data"], name="data")
+        values = H5adMatrix(
+            shape=(int(data.shape[0]), int(data.shape[1])),
+            dtype=np.dtype(np.float32),
+            blocks=partial(
+                _stored_row_blocks,
+                data,
+                self.nthreads,
+                self.resources,
+                f"Exporting {run.assay} normalized values",
+            ),
+        )
+        return values, np.asarray(selections.featureMask, dtype=bool)
 
     def show_zarr_tree(self, start: str = "/", depth: int = 2) -> None:
         """Prints the Zarr hierarchy of the DataStore.
@@ -343,8 +610,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
     ) -> ArtifactRef:
         """Store per-cell cluster membership strength as an artifact.
 
-        For each cell, computes the fraction of KNN neighbors sharing the most
-        common cluster label.
+        For each cell, computes the fraction of KNN neighbors sharing its own
+        cluster label.
 
         Args:
             clusters: Explicit axis-aligned cluster-label artifact over the
@@ -398,7 +665,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             connectivity_map=graph_ref,
             clusters=clusters,
             cell_selection=selection,
-            algorithm_version=2,
+            algorithm_version=MEMBERSHIP_STRENGTH_ALGORITHM_VERSION,
             decimals=3,
             invalidate_cache=invalidate_cache,
         )
@@ -427,29 +694,13 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
         if k < 1:
             raise ValueError("Graph must record at least one neighbour per cell")
-        # Integer codes keep NaN labels as one group, like value_counts(dropna=False).
+        # NaN labels share one integer code, so cells labelled NaN agree.
         cluster_codes, _uniques = pd.factorize(cluster_values, use_na_sentinel=False)
-        values = np.empty(n_cells, dtype=np.float64)
-        block_cells = max(1, _MEMBERSHIP_BLOCK_EDGES // k)
-        for start in range(0, n_cells, block_cells):
-            stop = min(start + block_cells, n_cells)
-            edge_rows = np.asarray(edges[start * k : stop * k]).reshape(
-                stop - start,
-                k,
-                2,
-            )
-            expected_sources = np.broadcast_to(
-                np.arange(start, stop, dtype=edge_rows.dtype)[:, None],
-                (stop - start, k),
-            )
-            if not np.array_equal(edge_rows[:, :, 0], expected_sources):
-                raise ValueError("Graph edges are not stored in cell-major order")
-            values[start:stop] = _row_mode_counts(cluster_codes[edge_rows[:, :, 1]]) / k
-        values = values.round(3)
+        values = neighbor_label_agreement(edges, cluster_codes, k=k)
         write_cell_data_artifact(
             self.zw,
             planned,
-            {"values": values},
+            {"values": values.round(arguments.decimals)},
         )
         return planned.ref
 
@@ -506,7 +757,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             values=to_relabel,
             base_labels=base_label,
             cell_selection=selection,
-            algorithm_version=3,
+            algorithm_version=SMART_LABEL_ALGORITHM_VERSION,
             suffix_style="lowercase_letter",
             invalidate_cache=invalidate_cache,
         )
@@ -792,10 +1043,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                         f"Plotting mean of {len(feature_indices)} features because "
                         f"{fill_by_value} is not unique."
                     )
-                color_values = controlled_compute(
-                    assay.normed(cell_indices, feature_indices).mean(axis=1),
-                    self.nthreads,
-                ).astype(np.float64)
+                # A cell that the assay did not measure has no fill value, and
+                # only measured cells are normalized, as display reads do.
+                color_values = measured_feature_means(
+                    assay, feature_indices, cell_indices, nthreads=self.nthreads
+                )
         return {
             "graph": subgraph,
             "clusters": clusters,

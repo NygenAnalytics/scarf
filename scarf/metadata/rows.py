@@ -59,9 +59,10 @@ def _read_array_rows(array: Any, rows: np.ndarray) -> np.ndarray:
 
 def array_row_selection_parts(array: Any) -> tuple[int, int]:
     """Return fixed and per-row bytes for one chunk-serial selection."""
-    itemsize = max(1, int(np.dtype(array.dtype).itemsize))
+    row_values = int(np.prod(tuple(array.shape)[1:], dtype=np.int64))
+    row_bytes = max(1, int(np.dtype(array.dtype).itemsize) * row_values)
     index_bytes = np.dtype(np.int64).itemsize
-    per_row = 3 * itemsize + _SELECTION_INDEX_ARRAYS * index_bytes
+    per_row = 3 * row_bytes + _SELECTION_INDEX_ARRAYS * index_bytes
     geometry = array_geometry(array)
     if geometry is None:
         return 0, int(per_row)
@@ -82,11 +83,12 @@ def read_array_rows_chunkwise(array: Any, rows: np.ndarray) -> np.ndarray:
         checked = checked_indices(indices, limit=int(array.shape[0]), name="rows")
         return _read_array_rows(array, checked)
 
+    row_shape = tuple(int(extent) for extent in array.shape[1:])
     blocks = partition_indices(geometry, 0, indices)
-    output = np.empty(indices.size, dtype=np.dtype(array.dtype))
+    output = np.empty((indices.size, *row_shape), dtype=np.dtype(array.dtype))
     for block in blocks:
         values = _read_array_rows(array, block.indices)
-        if values.shape != block.indices.shape:
+        if values.shape != (block.indices.size, *row_shape):
             raise ValueError("Metadata row selection returned an invalid shape")
         output[block.destinations] = values
     return output
@@ -165,7 +167,8 @@ def metadata_column_fingerprint(metadata: _RowReadableMetaData, column: str) -> 
     missing = metadata_missing_mask(metadata, column)
     digest.update(b"missing:none" if missing is None else b"missing:present")
     if missing is not None:
-        for start in range(0, len(missing), 65_536):
+        # Zarr arrays have no len(); the mask has one row per column row.
+        for start in range(0, int(missing.shape[0]), 65_536):
             digest.update(
                 np.asarray(missing[start : start + 65_536], dtype=bool).tobytes()
             )
@@ -205,11 +208,12 @@ def apply_missing_mask(
     """Show rows flagged by a linked missing mask as missing values.
 
     Nullable columns and artifacts store a placeholder in each masked row. By
-    default, masked numeric rows become NaN in a float64 copy, masked boolean
-    rows become False so that boolean filters exclude them, and other masked
-    rows become None in an object copy. With ``labels=True``, every masked row
-    becomes None in an object copy, so categorical labels keep their values.
-    ``values`` is returned unchanged when no row is masked.
+    default, masked integer and float rows become NaN in a float64 copy, masked
+    boolean rows become False so that boolean filters exclude them, masked
+    datetime and timedelta rows become NaT in a copy of their dtype, and other
+    masked rows become None in an object copy. With ``labels=True``, every
+    masked row becomes None in an object copy, so categorical labels keep their
+    values. ``values`` is returned unchanged when no row is masked.
     """
     array = np.asarray(values)
     if missing is None:
@@ -226,6 +230,9 @@ def apply_missing_mask(
     elif kind in {"f", "i", "u"}:
         output = array.astype(np.float64, copy=True)
         output[mask] = np.nan
+    elif kind in {"M", "m"}:
+        output = array.copy()
+        output[mask] = np.array("NaT", dtype=array.dtype)[()]
     else:
         output = array.astype(object, copy=True)
         output[mask] = None

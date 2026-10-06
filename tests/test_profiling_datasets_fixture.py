@@ -36,7 +36,11 @@ def test_write_fixture_h5ad_writes_a_reproducible_anndata_csr_file(
 
     path = tmp_path / "1000.h5ad"
     artifact = write_fixture_h5ad(path, nRows=100, nColumns=60, seed=1)
-    feature_names = ["MT-ND1" if i % 50 == 0 else f"GENE{i}" for i in range(60)]
+    # Every 50 features start with a mitochondrial and a ribosomal gene.
+    feature_names = [f"GENE{i}" for i in range(60)]
+    feature_names[0] = feature_names[50] = "MT-ND1"
+    feature_names[1] = "RPL1"
+    feature_names[51] = "RPS51"
 
     adata = ad.read_h5ad(path)
     matrix = adata.X

@@ -21,6 +21,14 @@ from a run with exact refs, and record the analysis for handoff. Docs:
 - Reuse is content-addressed: same operation, parameters and exact input refs returns the existing
   complete artifact. Changing anything creates a new artifact; upstream ones are reused.
   `invalidate_cache=True` on a granular method forces a fresh one.
+- Reuse also needs the operation revision of the running release. When a release fixes an
+  operation, its older artifacts are recomputed (one INFO log line names the replaced artifact and
+  the change; this needs `zarr_mode="r+"`), stay loadable, and show as `stale` in lineage;
+  `status.is_current` is `False`. Old refs stay valid and listed.
+- Results built on a superseded artifact keep `status.is_current` `True` (it judges only their own
+  revision), and are recomputed once their input is, because the recomputed input has a new ref.
+  Every connectivity map from before 1.0.0 is superseded, so the UMAP, t-SNE, clusterings, Paris,
+  doublets and markers built on it follow.
 - `ds.pipeline.run` writes artifacts plus a run record only. It never edits live `I` or adds
   metadata columns, and needs `zarr_mode="r+"` (the default); a read-only store raises
   `PermissionError`, though `open`, reports and plots still work.
@@ -30,7 +38,8 @@ from a run with exact refs, and record the analysis for handoff. Docs:
   on `status == "completed"`; otherwise they raise `RuntimeError`.
 - Labels are immutable. Only a completed run acquires its label. A completed label cannot be
   reused (`ValueError` before any work). Failed and interrupted runs reserve nothing.
-- There is no resume. A new run reuses every complete artifact from earlier attempts.
+- There is no resume. A new run reuses a complete artifact from an earlier attempt only when its
+  operation, parameters, inputs and operation revision match.
 - `run.cells` and `run.features` are frozen views of captured fields only. Live columns such as
   author labels are absent unless listed in `snapshot_columns` on the run.
 
@@ -61,7 +70,9 @@ run["clusters"] == run["leiden_0.5"]  # True on the 10x 5K PBMC docs dataset
 ### Reopen, list and report runs
 
 `open` needs exactly one of `label` or `run_id`; an unknown label raises `KeyError`. `list_runs`
-is newest first, all statuses unless filtered, `limit=20` by default.
+is newest first, all statuses unless filtered, `limit=20` by default. Runs saved by any earlier 1.x
+release reopen. `list_runs` skips a run that cannot be read, such as one a newer Scarf saved, with a
+warning naming it.
 
 ```python
 run = ds.pipeline.open(label="baseline")
@@ -76,11 +87,11 @@ print(run.report(format="markdown"))  # config, stage table, outputs, failure or
 
 ### Read frozen fields
 
-`run.cells.columns` here: `I, ids, names, s_score, g2m_score, cell_cycle_phase, umap_1, umap_2,
-leiden_*, paris, clusters, doublet_score`, then any `snapshot_columns`; filter and Harmony columns
-are not exposed. `run.features.columns`: `I, ids, names, highly_variable_features`. `fetch` returns
-analysed rows; `fetch_all` aligns to every stored cell (3,847 and 5,025 on the 10x 5K PBMC docs
-dataset, whose live `I` holds 3,948).
+`run.cells.columns` here: `I, ids, names`, then any `snapshot_columns`, then `s_score, g2m_score,
+cell_cycle_phase, umap_1, umap_2, leiden_*, paris, clusters, doublet_score`; filter and Harmony
+columns are not exposed. `run.features.columns`: `I, ids, names, highly_variable_features`. `fetch`
+returns analysed rows; `fetch_all` aligns to every stored cell (3,847 and 5,025 on the 10x 5K PBMC
+docs dataset, whose live `I` holds 3,948).
 
 ```python
 df = run.cells.to_pandas_dataframe(["umap_1", "umap_2", "clusters"])
@@ -146,6 +157,7 @@ status.parameters  # {'dims': 21, 'feat_scaling': True}
 status.inputs  # serialized refs: normalized, feature_scaling, pca_cell_selection
 status.input_ref("normalized") == run["normalized"]  # True
 status.execution_options, status.created_at_ns, status.scarf_version
+status.revision, status.current_revision, status.is_current  # 1, 1, True until a fix
 group = ds.load_artifact(run["pca"])  # zarr group: data, loadings, center
 group["data"].shape  # (analysed cells, 21)
 
@@ -221,10 +233,10 @@ scarf.ArtifactRef.from_dict(saved["refs"]["fineClusters"]) == fine_clusters  # T
 | Parameter | Default | Change when |
 | --- | --- | --- |
 | `label` | `None` | Always name runs you will reopen; pick a new name per variant. |
-| `cell_key` | `"I"` | A boolean column already defines the cohort. |
+| `cell_key` | `"I"` | A boolean column already defines the cohort. On a merged store whose RNA measured only some cells, the run raises `UnmeasuredCellsError` before any stage and never narrows the cells: pass a column of the cells of `I` that RNA measured, `ds.cells.insert("RNA_measured", ds.cells.fetch_all("I") & ds.cells.fetch_all("RNA_I"))`; `RNA_I` alone also holds cells that a filter removed from `I`. |
 | `filtering` | `True` (pooled MAD, 3 MADs, over `RNA_nCounts/nFeatures/percentMito/percentRibo`) | Data already filtered (`False`) or per-sample or manual bounds needed (mapping; see quality-control.md). |
 | `harmony_batch_columns` | `None` | Real batch columns exist; see integration-and-comparisons.md. |
-| `hvg_count` / `pca_dims` / `neighbors_k` | `1000` / `21` / `11` | A representation choice is under test. `pca_dims=0` skips PCA (output key `reduction`). |
+| `hvg_count` / `pca_dims` / `neighbors_k` | `1000` / `21` / `11` | A representation choice is under test. `pca_dims=0` skips PCA: the graph uses `run["normalized"]` (no `pca` output) and needs `doublets=False` and no Harmony. Its memory and time then scale with `hvg_count`: the ANN index holds about `4 * hvg_count + 8 * ann_m + 130` bytes per cell (4.5 GB at 1M cells and 1,000 HVGs) and raises `MemoryError` over `mem_budget`; on large data pass `params={"embedding_initialization": {"batch_size": ...}}` below the cell count for the streamed k-means fit. |
 | `umap` | `True` | `False` skips `embedding_initialization` and `umap`. |
 | `leiden` | `True` = `[0.5, 0.75, 1.0, 1.25]` | Other candidates: `{"partitions": [...]}`; pin with `params["leiden"]["selected"]`. |
 | `cell_cycle`, `paris` | `True` | Skip to save time (cell cycle is the slowest stage on remote counts). |
@@ -238,6 +250,9 @@ scarf.ArtifactRef.from_dict(saved["refs"]["fineClusters"]) == fine_clusters  # T
 - `run.status == "completed"` and the expected keys are present.
 - `run.report(format="markdown")`: stage statuses, wall seconds, created versus reused counts,
   resolved `filtering` config, and any failure or interruption section.
+- A run you reopen from an earlier release: `ds.lineage(run).to_markdown()` marks `stale` each
+  output that a later operation revision supersedes; running the configuration again recomputes it
+  and the results built on it.
 - Kept cells: `run.cells.fetch_all("I").sum()` versus the store total. Audit removed cells (by
   your own clusters or a marker panel, not held-out labels) before trusting clusters.
 - `decision["scores"]` from `cluster_selection`: silhouette is a provisional baseline, not ground

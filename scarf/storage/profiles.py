@@ -20,6 +20,11 @@ def is_local_zarr_path(location: ZarrLocation) -> bool:
     return isinstance(location, str) and not is_remote_zarr_location(location)
 
 
+def local_zarr_path(location: str) -> str:
+    """Return the path that a local path or ``file://`` URI names."""
+    return location.removeprefix("file://")
+
+
 def resolve_storage_profile(
     location: ZarrLocation,
     requested: StorageProfile | None = None,

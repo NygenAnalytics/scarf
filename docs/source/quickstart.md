@@ -41,9 +41,12 @@ run = ds.pipeline.run(label="baseline")
 ds.plots.embedding(run=run, color_by="clusters")
 ```
 
-Use a new output path for conversion: it replaces an existing store at that path. The pipeline
-uses Scarf's default settings for filtering, feature selection, PCA, neighbours, UMAP, clustering,
-and marker search. It also scores cell cycle and doublets. These settings are a starting point;
+Use a new or empty output path for conversion. A writer raises `FileExistsError` for a path that
+already holds data. Pass `overwrite=True` to replace an earlier conversion that no `DataStore` has
+opened; once opened, a store is prepared and is never replaced, so delete it yourself or choose
+another path. The pipeline uses Scarf's default settings for
+filtering, feature selection, PCA, neighbours, UMAP, clustering, and marker search. It also scores
+cell cycle and doublets. These settings are a starting point;
 review {doc}`tutorials/quality_control` and the marker evidence before interpreting a new dataset.
 
 `run` holds the results of this analysis. Keep it to make plots and read marker tables without

@@ -9,10 +9,11 @@ from ...assay import Assay, ATACassay, RNAassay, lib_size_feature_stream_eligibl
 from ...assay.normalization import (
     clr_values,
     inverse_document_frequency,
+    library_size_divisors,
     norm_clr,
     norm_dummy,
     norm_tf_idf,
-    reject_unknown_normalization_params,
+    resolve_normalization_params,
     tfidf_values,
 )
 from ...utils.arguments import integer_argument
@@ -111,9 +112,8 @@ def find_markers_by_rank(
         MemoryError: If the library-size kernel cannot rank one read group
             with one thread within the memory budget.
     """
-    reject_unknown_normalization_params(
-        norm_params,
-        caller="find_markers_by_rank",
+    norm_params = resolve_normalization_params(
+        assay, norm_params, caller="find_markers_by_rank"
     )
     groups = np.asarray(groups)
     cell_idx = np.asarray(cell_idx, dtype=np.int64)
@@ -237,27 +237,21 @@ def _rank_counts_t(
         size_factor = float(assay.sf)
         if norm_params.get("renormalize_subset", False):
             # The subset totals that ``normed`` divides by.
-            source = f"The tested features of {assay.name} hold"
-            totals = compute_with_progress(
-                assay.rawData[:, feature_index][cell_idx, :].sum(
-                    axis=1, dtype=np.float64
+            totals = library_size_divisors(
+                compute_with_progress(
+                    assay.rawData[:, feature_index][cell_idx, :].sum(
+                        axis=1, dtype=np.float64
+                    ),
+                    "Normalizing with feature subset",
+                    nthreads,
                 ),
-                "Normalizing with feature subset",
-                nthreads,
+                source=f"The tested-feature subset of {assay.name}",
             )
         else:
             column = assay.name + "_nCounts"
-            source = f"{column} holds"
-            totals = np.asarray(
-                assay.cells.fetch_all(column)[cell_idx],
-                dtype=np.float64,
+            totals = library_size_divisors(
+                assay.cells.fetch_all(column)[cell_idx], source=column
             )
-        if not (np.isfinite(totals) & (totals >= 0)).all():
-            raise ValueError(
-                f"{source} negative or non-finite totals of selected cells; "
-                "library-size normalization requires finite non-negative counts"
-            )
-        totals[totals == 0] = 1
         state_bytes = totals.nbytes
         threads, calls = _gene_major_schedule(
             counts_t,
@@ -290,6 +284,9 @@ def _rank_counts_t(
         # A read group's values, the copy of its selected raw rows, and the
         # dense kernel's scratch exist one read group at a time.
         value_bytes = _DENSE_VALUE_BYTES[adapter] + np.dtype(counts_t.dtype).itemsize
+        if adapter == "dummy" and log_transform:
+            # The float64 logarithms of the read group's values.
+            value_bytes += np.dtype(np.float64).itemsize
         compute_bytes = group_features * n_cells * value_bytes + (
             batch_rank_scratch_bytes(
                 n_cells=n_cells,
@@ -336,6 +333,10 @@ def _rank_counts_t(
             values = clr_values(raw.T)
         else:
             values = np.asarray(raw.T)
+            if log_transform:
+                # As ``normed(log_transform=True)`` takes them: in float64
+                # for every storage dtype.
+                values = np.log1p(values, dtype=np.float64)
         statistics[rows] = _batch_stats(
             values,
             codes,
@@ -514,9 +515,8 @@ def find_markers_by_regression(
     **norm_params: Any,
 ) -> pd.DataFrame:
     """Find features correlated with a continuous variable."""
-    reject_unknown_normalization_params(
-        norm_params,
-        caller="find_markers_by_regression",
+    norm_params = resolve_normalization_params(
+        assay, norm_params, caller="find_markers_by_regression"
     )
     cell_idx = np.asarray(cell_idx, dtype=np.int64)
     feat_idx = np.asarray(feat_idx, dtype=np.int64)

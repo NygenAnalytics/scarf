@@ -1207,6 +1207,11 @@ def test_explicit_assay_layer_overrides(tmp_path: Path) -> None:
             assay.counts.read_cells(0, 3).toarray(),
             [[1, 3, 0], [2, 4, 0], [0, 0, 0]],
         )
+        # Only the selected layer's cells, c1 and c2, are assay members.
+        assert not assay.cellMembership.allIncluded
+        np.testing.assert_array_equal(
+            assay.cellMembership.read_block(0, 3), [True, True, False]
+        )
         assert any(
             notice.code == "ignored_unselected_count_layer"
             and notice.objectPath == "assays/ADT/layers/counts.2"

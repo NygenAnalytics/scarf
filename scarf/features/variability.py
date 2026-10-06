@@ -1,16 +1,21 @@
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, cast
 
 import numpy as np
 import pandas as pd
 
+from ..utils.arguments import float_argument, integer_argument
 from ..utils.arrays import regex_match_mask, within_bounds
 from ..utils.logging import logger
 from .gene_families import GENE_FAMILY_PATTERNS
 
 __all__ = [
     "DEFAULT_HVG_BLACKLIST",
+    "HVG_OPTION_NAMES",
     "HVG_UBIQUITOUS_SLACK",
+    "HvgOptions",
     "fit_lowess",
+    "hvg_options",
+    "resolve_hvg_max_cells",
     "select_highly_variable_features",
 ]
 
@@ -147,22 +152,8 @@ def _fit_lowess_adaptive(
     n_bins: int,
     lowess_frac: float,
 ) -> np.ndarray:
+    """Fit the adaptive trend; ``fit_lowess`` has checked the arguments."""
     means, variances, valid = _trend_inputs(a, b)
-    if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
-        n_bins,
-        (int, np.integer),
-    ):
-        raise TypeError("n_bins must be an integer")
-    if n_bins < 1:
-        raise ValueError("n_bins must be greater than 0")
-    if isinstance(lowess_frac, (bool, np.bool_)) or not isinstance(
-        lowess_frac,
-        (int, float, np.integer, np.floating),
-    ):
-        raise TypeError("lowess_frac must be numeric")
-    if not np.isfinite(lowess_frac) or not 0 <= lowess_frac <= 1:
-        raise ValueError("lowess_frac must be between 0 and 1")
-
     corrected = np.zeros(means.shape, dtype=float)
     if not valid.any():
         return corrected
@@ -254,6 +245,24 @@ def _fit_lowess_adaptive(
     return corrected
 
 
+_BIN_STRATEGIES = ("adaptive", "fixed")
+
+
+def _lowess_frac(value: object) -> float:
+    """Return a checked ``lowess_frac`` as a float."""
+    resolved = float_argument(value, "lowess_frac")
+    if not 0 <= resolved <= 1:
+        raise ValueError("lowess_frac must be between 0 and 1")
+    return resolved
+
+
+def _bin_strategy(value: object) -> Literal["fixed", "adaptive"]:
+    """Return a checked ``bin_strategy`` as a Python string."""
+    if not isinstance(value, str) or value not in _BIN_STRATEGIES:
+        raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
+    return cast(Literal["fixed", "adaptive"], str(value))
+
+
 def fit_lowess(
     a: np.ndarray,
     b: np.ndarray,
@@ -272,15 +281,15 @@ def fit_lowess(
     Both strategies fit only genes whose mean and variance are finite and
     positive; every other gene receives zero.
     """
-    if bin_strategy == "adaptive":
+    n_bins = integer_argument(n_bins, "n_bins", minimum=1)
+    lowess_frac = _lowess_frac(lowess_frac)
+    if _bin_strategy(bin_strategy) == "adaptive":
         from threadpoolctl import threadpool_limits
 
         # The adaptive fit solves many tiny least-squares problems, where extra
         # BLAS threads cost far more in synchronization than they save.
         with threadpool_limits(limits=1, user_api="blas"):
             return _fit_lowess_adaptive(a, b, n_bins, lowess_frac)
-    if bin_strategy != "fixed":
-        raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
 
     from statsmodels.nonparametric.smoothers_lowess import lowess
 
@@ -317,6 +326,86 @@ def fit_lowess(
             fixed_var[idx] = np.e ** (stats.b[idx] - correction)
     corrected[valid] = [fixed_var[index] for index in range(len(stats))]
     return corrected
+
+
+# The ``select_hvgs`` keywords that ``hvg_options`` checks.
+HVG_OPTION_NAMES = (
+    "min_cells",
+    "top_n",
+    "n_bins",
+    "lowess_frac",
+    "keep_bounds",
+    "bin_strategy",
+)
+
+
+class HvgOptions(NamedTuple):
+    """Checked ``select_hvgs`` options, each as an HVG selection records it."""
+
+    min_cells: int
+    top_n: int
+    n_bins: int
+    lowess_frac: float
+    keep_bounds: bool
+    bin_strategy: Literal["fixed", "adaptive"]
+
+
+def hvg_options(
+    *,
+    min_cells: object,
+    top_n: object,
+    n_bins: object,
+    lowess_frac: object,
+    keep_bounds: object,
+    bin_strategy: object,
+) -> HvgOptions:
+    """Return the checked counts, trend options, and flag of ``select_hvgs``."""
+    checked_min_cells = integer_argument(min_cells, "min_cells", minimum=0)
+    checked_top_n = integer_argument(top_n, "top_n", minimum=1)
+    checked_n_bins = integer_argument(n_bins, "n_bins", minimum=1)
+    _lowess_frac(lowess_frac)
+    if not isinstance(keep_bounds, bool | np.bool_):
+        raise TypeError("keep_bounds must be a boolean")
+    return HvgOptions(
+        min_cells=checked_min_cells,
+        top_n=checked_top_n,
+        n_bins=checked_n_bins,
+        lowess_frac=cast(float, lowess_frac),
+        keep_bounds=bool(keep_bounds),
+        bin_strategy=_bin_strategy(bin_strategy),
+    )
+
+
+def resolve_hvg_max_cells(
+    max_cells: float | None,
+    *,
+    n_selected: int,
+    min_cells: int,
+) -> int | float:
+    """Return the detected-cell cutoff that HVG selection applies and records.
+
+    None selects the automatic cutoff and infinity sets no cutoff; any other
+    value is taken as an integer.
+    """
+    if max_cells is None:
+        candidate = n_selected - HVG_UBIQUITOUS_SLACK
+        if candidate <= min_cells:
+            logger.info(
+                "Skipping ubiquitous-gene HVG filter because too few cells are "
+                f"selected ({n_selected}); need more than "
+                f"{min_cells + HVG_UBIQUITOUS_SLACK} cells to apply "
+                f"max_cells = n_selected - {HVG_UBIQUITOUS_SLACK}."
+            )
+            return np.inf
+        logger.debug(
+            f"Setting `max_cells` to {candidate} "
+            f"(n_selected - {HVG_UBIQUITOUS_SLACK}). Genes detected in at "
+            "least this many cells are excluded as ubiquitous."
+        )
+        return int(candidate)
+    if max_cells == np.inf:
+        return np.inf
+    return int(max_cells)
 
 
 def _linear_threshold(value: float, unbounded_value: float) -> float:

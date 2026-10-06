@@ -1832,6 +1832,9 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
         start: int,
         stop: int,
     ) -> Iterator[tuple[int, int, int]]:
+        # A fragment inserts at start and end - 1. Insertions mode counts each
+        # insertion in its tile; fragments mode counts each tile that holds
+        # at least one, so only an end in the start's own tile is skipped.
         for chromosome_id in range(len(self.chromosomeLevels)):
             for block in self.fragments.iter_chromosome(chromosome_id):
                 for position in range(block.size):
@@ -1848,30 +1851,33 @@ class FragmentDerivedMatrixSource(BaseMatrixSource):
                         chromosome_id,
                         fragment_end,
                     )
-                    if start_region is not None:
-                        feature = self._tile_feature(
+                    start_feature = (
+                        None
+                        if start_region is None
+                        else self._tile_feature(
                             start_region,
                             fragment_start,
                             end=False,
                         )
-                        if self.logicalTranspose or start <= feature < stop:
-                            if self.logicalTranspose:
-                                yield cell_id - start, feature, 1
-                            else:
-                                yield feature - start, cell_id, 1
-                    if end_region is not None and (
-                        self.mode == "insertions" or end_region != start_region
-                    ):
-                        feature = self._tile_feature(
+                    )
+                    end_feature = (
+                        None
+                        if end_region is None
+                        else self._tile_feature(
                             end_region,
                             fragment_end,
                             end=True,
                         )
-                        if self.logicalTranspose or start <= feature < stop:
-                            if self.logicalTranspose:
-                                yield cell_id - start, feature, 1
-                            else:
-                                yield feature - start, cell_id, 1
+                    )
+                    if self.mode == "fragments" and end_feature == start_feature:
+                        end_feature = None
+                    for feature in (start_feature, end_feature):
+                        if feature is None:
+                            continue
+                        if self.logicalTranspose:
+                            yield cell_id - start, feature, 1
+                        elif start <= feature < stop:
+                            yield feature - start, cell_id, 1
 
     def _contributions(
         self,

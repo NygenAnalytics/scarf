@@ -209,11 +209,12 @@ cannot be guaranteed to honor them.
 
 `ds.pipeline.run()` is a persistent baseline workflow.
 It writes immutable artifacts and a durable run ledger, but does not change live `I` or metadata
-columns. It scores enabled Leiden resolutions in the same PCA or Harmony coordinates used to
-build the graph, persists the decision as `run["cluster_selection"]`, and exposes the selected
-Leiden candidate ref as `run["clusters"]`. Paris remains `run["paris"]` for diagnosis. Silhouette
-supplies a reproducible baseline, not validation or ground truth. The agent uses this pipeline
-for numerical execution, compares its measured alternatives, and pins its final chosen resolution.
+columns. It scores enabled Leiden resolutions in the same coordinates that built the graph (PCA or
+Harmony coordinates or, with `pca_dims=0`, the normalized values), persists the decision as
+`run["cluster_selection"]`, and exposes the selected Leiden candidate ref as `run["clusters"]`.
+Paris remains `run["paris"]` for diagnosis. Silhouette supplies a reproducible baseline, not
+validation or ground truth. The agent uses this pipeline for numerical execution, compares its
+measured alternatives, and pins its final chosen resolution.
 
 Use `run.cells` and `run.features` for frozen inspection. Keep presentation and storage mutation on
 the datastore: `ds.plots.embedding(run=run, ...)`, `ds.get_markers(marker=run["markers"], ...)`,

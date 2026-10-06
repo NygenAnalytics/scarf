@@ -45,6 +45,7 @@ class SparseToZarr:
             stay under automatic planning.
         assay_type: Preset assay type, such as ``RNA``, for an assay whose name
                     is not a preset. When None, the assay name decides the type.
+        overwrite: Replace an existing Scarf store that no ``DataStore`` has opened.
 
     The counts are stored in the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
@@ -53,11 +54,11 @@ class SparseToZarr:
     Raises:
         ValueError: Raised if number of input cell or feature IDs does not match
             the matrix, or if a count is NaN or infinite.
+        FileExistsError: If ``zarr_loc`` is not empty and may not be replaced.
 
     Attributes:
         mat: Input CSR matrix
-        fn: The file name for the Zarr hierarchy.
-        assayName: The Zarr hierarchy (array or group).
+        assayName: The name of the output assay.
         z: The Zarr hierarchy (array or group).
     """
 
@@ -77,6 +78,8 @@ class SparseToZarr:
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
         assay_type: str | None = None,
+        *,
+        overwrite: bool = False,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -84,10 +87,12 @@ class SparseToZarr:
             create_zarr_count_assay,
             validate_assay_name,
         )
-        from ..storage.stores import load_zarr
-        from .counts_t import validate_assay_type
+        from ..storage.destinations import create_destination
+        from ..assay.classification import validate_assay_type
 
-        validate_assay_type(assay_type)
+        validate_assay_type(
+            assay_type, assay="RNA" if assay_name is None else assay_name
+        )
         self.mat = csr_mat
         self.assayType = assay_type
         self.resources = resolve_budget(mem_budget, nthreads)
@@ -128,8 +133,10 @@ class SparseToZarr:
         storage_dtype = count_storage_dtype(self.mat.dtype, value_range)
         # A layout that does not fit fails here, before the destination exists.
         layout = self._fit_count_layout(storage_dtype, policy)
-
-        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
+        # The destination must be empty, or with overwrite an unprepared store.
+        self.z = create_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         _ = create_cell_data(
             root=self.z,
             workspace=self.workspace,

@@ -26,6 +26,7 @@ from ..storage.artifacts import (
     fingerprint_array,
     fingerprint_stored_arrays,
 )
+from ..storage.finite_values import requires_finite_values, write_finite_array
 from ..storage.selections import validate_cell_selection
 from ..storage.types import as_zarr_array, as_zarr_group
 from .selection import CellField, resolve_grouping, valid_category_mask
@@ -165,6 +166,7 @@ def plan_cell_data_artifact(
     required_attributes: tuple[str | AttributeRequirement, ...] = (),
     reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
 ) -> PlannedArtifact:
+    """Plan an artifact of arrays with one row per selected cell."""
     if cell_selection.kind != "cell_selection":
         raise ValueError("cell_selection must reference a cell-selection artifact")
     selected_count = int(validate_cell_selection(root, cell_selection).selected_count)
@@ -198,8 +200,11 @@ def write_cell_data_artifact(
     *,
     fingerprint_payload: bool = False,
 ) -> zarr.Group:
+    """Write and publish a planned cell-data artifact, or return the reused one."""
     if planned.reused:
         return reused_artifact_group(root, planned)
+    kind = planned.ref.kind
+    operation = str(planned.provenance["operation"])
     with artifact_transaction(root, planned) as group:
         for name, raw_values in arrays.items():
             values = np.asarray(raw_values)
@@ -227,7 +232,10 @@ def write_cell_data_artifact(
                     values.dtype,
                     values.shape,
                 )
-                output[...] = values
+                if requires_finite_values(kind, name, output.dtype):
+                    write_finite_array(output, values, operation=operation)
+                else:
+                    output[...] = values
         if fingerprint_payload:
             group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
                 group,

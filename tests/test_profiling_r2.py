@@ -130,3 +130,30 @@ def test_create_only_upload_never_replaces_an_object(tmp_path: Path, monkeypatch
     assert bytes(store.get("fixtures/10000.h5ad").bytes()) == b"fixture"
     delete_object("s3://bucket/fixtures/10000.h5ad")
     assert not [item for batch in store.list("fixtures") for item in batch]
+
+
+def test_delete_prefix_deletes_only_the_objects_of_one_store(monkeypatch):
+    from profiling.r2 import DeletedObjects, delete_prefix
+
+    store = MemoryStore()
+    monkeypatch.setattr(
+        "profiling.r2.open_r2_object",
+        lambda uri: (store, uri.removeprefix("s3://bucket/")),
+    )
+    removed = ["stores/tag/10.zarr/zarr.json", "stores/tag/10.zarr/RNA/counts/c/0/0"]
+    # Keys that share the store's text prefix but not its path segments.
+    kept = [
+        "stores/tag/10.zarr.json",
+        "stores/tag/10.zarr2/zarr.json",
+        "stores/tag/100.zarr/zarr.json",
+    ]
+    for key in removed + kept:
+        store.put(key, b"abc")
+
+    assert delete_prefix("s3://bucket/stores/tag/10.zarr") == DeletedObjects(
+        objectCount=2, totalBytes=6
+    )
+    assert sorted(item["path"] for batch in store.list() for item in batch) == kept
+    assert delete_prefix("s3://bucket/stores/tag/10.zarr/") == DeletedObjects(
+        objectCount=0, totalBytes=0
+    )

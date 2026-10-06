@@ -139,6 +139,12 @@ def _tree_color_series(
     *,
     force_ints_as_cats: bool,
 ) -> tuple[pd.Series, bool]:
+    """Return the fill values and whether they are categories.
+
+    The stored type alone decides the kind, so a single category stays a
+    category and a constant number keeps its value; continuous limits then
+    follow the shared color policy.
+    """
     stored_dtype = pd.Series(values).dtype
     categorical = (
         pd.api.types.is_bool_dtype(stored_dtype)
@@ -147,12 +153,6 @@ def _tree_color_series(
         or (pd.api.types.is_integer_dtype(stored_dtype) and force_ints_as_cats)
     )
     series = pd.Series(apply_missing_mask(values, missing, labels=categorical))
-    if series.nunique() == 1:
-        # One observed value colors every observed cell alike; missing cells
-        # stay missing, so a cluster without values still shows as missing.
-        return pd.Series(
-            np.where(series.notna(), 1.0, np.nan), index=series.index
-        ), False
     if categorical:
         return series.astype("category"), True
     return series.astype(np.float64), False

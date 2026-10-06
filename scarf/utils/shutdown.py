@@ -24,26 +24,36 @@ class ShutdownRequested(BaseException):
         super().__init__(request.reason)
 
 
+@dataclass(frozen=True, slots=True)
+class _Claim:
+    """The first shutdown request with the signal behavior it interrupted."""
+
+    request: ShutdownRequest
+    previous_handler: Any
+    frame: FrameType | None
+
+
+# The one key of a token's claims: the first request.
+_FIRST_REQUEST = "first"
+
+
 class ShutdownToken:
     """Thread-safe, runtime-neutral cooperative shutdown state."""
 
-    __slots__ = ("_event", "_frame", "_lock", "_previous", "_request")
+    __slots__ = ("_claims",)
 
     def __init__(self) -> None:
-        self._event = threading.Event()
-        self._frame: FrameType | None = None
-        self._lock = threading.Lock()
-        self._previous: Any = None
-        self._request: ShutdownRequest | None = None
+        # Holds at most the first request's claim, which is never replaced.
+        self._claims: dict[str, _Claim] = {}
 
     @property
     def requested(self) -> bool:
-        return self._event.is_set()
+        return _FIRST_REQUEST in self._claims
 
     @property
     def request_record(self) -> ShutdownRequest | None:
-        with self._lock:
-            return self._request
+        claim = self._claims.get(_FIRST_REQUEST)
+        return None if claim is None else claim.request
 
     def request(
         self,
@@ -63,36 +73,35 @@ class ShutdownToken:
                 signal_name = signal.Signals(signal_number).name
             except ValueError:
                 signal_name = f"SIGNAL_{signal_number}"
-        with self._lock:
-            if self._request is not None:
-                return False
-            self._request = ShutdownRequest(
+        claim = _Claim(
+            request=ShutdownRequest(
                 requested_at_ns=time.time_ns(),
                 reason=reason,
                 signal_number=signal_number,
                 signal_name=signal_name,
-            )
-            self._previous = previous_handler
-            self._frame = frame
-            self._event.set()
-            return True
+            ),
+            previous_handler=previous_handler,
+            frame=frame,
+        )
+        return self._claims.setdefault(_FIRST_REQUEST, claim) is claim
 
     def checkpoint(self) -> None:
-        request = self.request_record
-        if request is not None:
-            raise ShutdownRequested(request)
+        claim = self._claims.get(_FIRST_REQUEST)
+        if claim is not None:
+            raise ShutdownRequested(claim.request)
 
     def propagate(self) -> None:
         """Continue with the prior signal behavior after durable cleanup."""
 
-        request = self.request_record
-        if request is None:
+        claim = self._claims.get(_FIRST_REQUEST)
+        if claim is None:
             return
+        request = claim.request
         if request.signal_number is None:
             raise ShutdownRequested(request)
-        previous = self._previous
+        previous = claim.previous_handler
         if callable(previous):
-            previous(request.signal_number, self._frame)
+            previous(request.signal_number, claim.frame)
             raise ShutdownRequested(request)
         if previous == signal.SIG_IGN:
             raise ShutdownRequested(request)
@@ -149,30 +158,38 @@ class TemporarySignalGuard:
             for name in ("SIGTERM", "SIGINT", "SIGHUP")
             if (candidate := getattr(signal, name, None)) is not None
         )
-        for signum in candidates:
-            previous = signal.getsignal(signum)
-            # A handler installed outside Python reads as None and could not be
-            # restored, so that signal keeps its current handler.
-            if previous is None or previous == signal.SIG_IGN:
-                continue
+        try:
+            for signum in candidates:
+                previous = signal.getsignal(signum)
+                # A handler installed outside Python reads as None and could
+                # not be restored, so that signal keeps its current handler.
+                if previous is None or previous == signal.SIG_IGN:
+                    continue
 
-            def handler(
-                received: int,
-                frame: FrameType | None,
-                *,
-                prior: Any = previous,
-            ) -> None:
-                first = self._token.request(
-                    reason=f"received {signal.Signals(received).name}",
-                    signal_number=received,
-                    previous_handler=prior,
-                    frame=frame,
-                )
-                if not first:
-                    self._escalate(received, frame, prior)
+                def handler(
+                    received: int,
+                    frame: FrameType | None,
+                    *,
+                    prior: Any = previous,
+                ) -> None:
+                    first = self._token.request(
+                        reason=f"received {signal.Signals(received).name}",
+                        signal_number=received,
+                        previous_handler=prior,
+                        frame=frame,
+                    )
+                    if not first:
+                        self._escalate(received, frame, prior)
 
-            signal.signal(signum, handler)
-            self._installed[int(signum)] = previous
+                # Record the prior handler first, so that a handler installed
+                # just before an error is always put back.
+                self._installed[int(signum)] = previous
+                signal.signal(signum, handler)
+        except BaseException:
+            # A guard that fails to enter is never exited, so it puts back the
+            # handlers it had already replaced before the error propagates.
+            self._restore()
+            raise
         self.available = bool(self._installed)
         if not self.available:
             self.unavailable_reason = "no catchable termination signals are available"
@@ -188,7 +205,10 @@ class TemporarySignalGuard:
             return
         signal.raise_signal(signum)
 
-    def __exit__(self, *_exc: object) -> None:
+    def _restore(self) -> None:
         for signum, previous in self._installed.items():
             signal.signal(signum, previous)
         self._installed.clear()
+
+    def __exit__(self, *_exc: object) -> None:
+        self._restore()

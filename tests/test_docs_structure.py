@@ -148,7 +148,12 @@ def test_installation_uses_one_environment_for_install_and_runtime() -> None:
     contents = (_DOCS_SOURCE / "installation.md").read_text()
 
     assert "uv venv --python 3.12" in contents
-    assert 'python -c "import scarf; print(scarf.__version__)"' in contents
+    # Importing DataStore loads the modules that a bare import scarf defers.
+    assert (
+        'python -c "from scarf import DataStore; import scarf; '
+        'print(scarf.__version__)"' in contents
+    )
+    assert 'python -c "import scarf; print' not in contents
     assert "uv pip install jupyterlab\njupyter lab" in contents
     assert "uv run jupyter lab" not in contents
     assert "pywin32" not in contents

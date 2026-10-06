@@ -240,12 +240,17 @@ def test_query_neighbors_rejects_malformed_ann_lineage_before_loading() -> None:
 @pytest.mark.parametrize(
     ("parameters", "message"),
     [
-        ({"ann_metric": "l2", "parallel_threads": None}, "ann_ef search depth"),
+        ({"ann_metric": "l2", "ann_parallel": False}, "ann_ef search depth"),
         (
-            {"ann_metric": "l2", "ann_ef": True, "parallel_threads": None},
+            {"ann_metric": "l2", "ann_ef": True, "ann_parallel": False},
             "ann_ef search depth",
         ),
-        ({"ann_metric": "l2", "ann_ef": 50}, "parallel_threads record"),
+        # The query's thread count follows the recorded ann_parallel flag.
+        ({"ann_metric": "l2", "ann_ef": 50}, "ann_parallel record"),
+        (
+            {"ann_metric": "l2", "ann_ef": 50, "ann_parallel": 1},
+            "ann_parallel record",
+        ),
     ],
 )
 def test_query_neighbors_requires_recorded_ann_search_settings(

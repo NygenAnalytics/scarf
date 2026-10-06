@@ -1,6 +1,8 @@
 """Derived-assay creation: atomic publication, rollback, and grouped means."""
 
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +12,10 @@ import zarr
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
+from scarf.assay.classification import declared_assay_type
 from scarf.assay.normalization import iter_feature_group_means
 from scarf.datastore.datastore import DataStore
+from scarf.metadata.membership import membership_attributes
 from scarf.storage.count_matrix import CountMatrixPolicy
 from tests.storage_helpers import finalize_test_counts
 from scarf.storage.schema import (
@@ -24,6 +28,7 @@ from scarf.storage.schema import (
 )
 from scarf.tools.repack_zarr import repack_store
 from scarf.writers import SparseToZarr, create_zarr_count_assay
+from scarf.writers._store import write_membership_column
 
 # Four count shards of ten cells each, so one shard can fail on its own. The
 # counts store as uint8, one byte for each of the twelve features of a row.
@@ -36,13 +41,13 @@ def _counts(n_cells: int = 40, n_features: int = 12, seed: int = 7) -> np.ndarra
     return counts.astype(np.uint32)
 
 
-def _write_store(
+def _write_counts(
     path: Path,
     counts: np.ndarray,
     *,
     assay: str = "RNA",
     feature_ids: list[str] | None = None,
-) -> DataStore:
+) -> None:
     SparseToZarr(
         csr_matrix(counts),
         zarr_loc=str(path),
@@ -52,6 +57,16 @@ def _write_store(
         nthreads=1,
         policy=_SMALL_SHARDS,
     ).dump(batch_size=10)
+
+
+def _write_store(
+    path: Path,
+    counts: np.ndarray,
+    *,
+    assay: str = "RNA",
+    feature_ids: list[str] | None = None,
+) -> DataStore:
+    _write_counts(path, counts, assay=assay, feature_ids=feature_ids)
     return DataStore(str(path), default_assay=assay, min_features_per_cell=0)
 
 
@@ -219,6 +234,184 @@ def test_repack_refuses_interrupted_derived_assay(tmp_path):
     del context
 
 
+# Every fourth cell was not measured, so its counts are zero.
+_MEMBERS = np.arange(40) % 4 != 0
+
+
+def _partial_store(
+    path: Path, counts: np.ndarray, *, assay: str = "RNA", **options
+) -> DataStore:
+    """Write a store whose assay measured only the cells of ``_MEMBERS``.
+
+    The membership column is written as an import writes it.
+    """
+    counts = counts * _MEMBERS[:, None].astype(counts.dtype)
+    _write_counts(path, counts, assay=assay, **options)
+    write_membership_column(
+        zarr.open_group(str(path), mode="r+")["cellData"], assay, _MEMBERS
+    )
+    return DataStore(str(path), default_assay=assay, min_features_per_cell=-1)
+
+
+def _melded_inputs(tmp_path: Path) -> tuple[list[str], dict[str, object]]:
+    """Return peak IDs and the arguments of a melded gene-score assay."""
+    peaks = [
+        "chr1:100-200",
+        "chr1:250-350",
+        "chr1:400-500",
+        "chr2:100-200",
+        "chr2:300-400",
+        "chr2:600-700",
+    ]
+    bed = tmp_path / "genes.bed"
+    pd.DataFrame(
+        [
+            ("chr1", 120, 300, "gene_a", "GENE_A", "+"),
+            ("chr1", 420, 480, "gene_b", "GENE_B", "+"),
+            ("chr2", 150, 650, "gene_c", "GENE_C", "+"),
+        ]
+    ).to_csv(bed, sep="\t", header=False, index=False)
+    arguments = {
+        "from_assay": "ATAC",
+        "external_bed_fn": str(bed),
+        "assay_label": "GeneScores",
+        "assay_type": "RNA",
+        "renormalization": False,
+    }
+    return peaks, arguments
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("partial", [True, False])
+def test_derived_assays_measure_the_cells_of_their_source_assay(tmp_path, partial):
+    write = _partial_store if partial else _write_store
+    grouped = write(tmp_path / "rna.zarr", _counts())
+    grouped.RNA.feats.insert("module", np.repeat([1, 2, 3], 4), overwrite=True)
+    peaks, arguments = _melded_inputs(tmp_path)
+    melded = write(
+        tmp_path / "atac.zarr", _counts(n_features=6), assay="ATAC", feature_ids=peaks
+    )
+
+    grouped.add_grouped_assay("module", assay_label="MODULES")
+    melded.add_melded_assay(**arguments)
+
+    for store, label in ((grouped, "MODULES"), (melded, "GeneScores")):
+        reopened = DataStore(store.zarr_loc, zarr_mode="r")
+        column = f"{label}_I"
+        if not partial:
+            # A source that measured every cell gives an assay that does too.
+            assert column not in reopened.cells.columns
+            continue
+        np.testing.assert_array_equal(reopened.cells.fetch_all(column), _MEMBERS)
+        attributes = reopened.cells._get_array(column).attrs.asdict()
+        assert attributes == membership_attributes(label)
+        # The cells outside the source assay hold none of the derived counts.
+        assert not _stored_counts(reopened, label)[~_MEMBERS].any()
+
+
+@pytest.mark.parametrize("writer", ["subset", "merge", "mount"])
+def test_writers_refuse_a_source_with_a_pending_derived_assay(tmp_path, writer):
+    from scarf.datastore.datastore import mount_datastore
+    from scarf.merge import DataStoreMerge
+    from scarf.writers import SubsetZarr
+
+    path = tmp_path / "rna.zarr"
+    store = _write_store(path, _counts())
+    store.RNA.feats.insert("module", np.repeat([1, 2], 6), overwrite=True)
+    # A hard kill inside the transaction never runs its cleanup; keep the
+    # context alive so garbage collection does not run it either.
+    context = derived_assay_transaction(
+        store.z, "MODULES", None, operation="add_grouped_assay"
+    )
+    context.__enter__().create_counts(
+        store.cells.N, ["group_1"], ["group_1"], np.float64
+    )
+    destination = tmp_path / "out.zarr"
+    operation, subject = {
+        "subset": ("subset", "The source store"),
+        "merge": ("merged", "Source 'first'"),
+        "mount": ("mounted", "The source store"),
+    }[writer]
+    message = (
+        rf"^{subject} holds a pending derived assay and cannot be {operation}\. "
+        r"Assay 'MODULES' is pending: .*discard_interrupted_assay\('MODULES'\)"
+    )
+    # Before, subset, merge, and mount copied the pending assay's membership
+    # column with the cell metadata as finished data.
+    with pytest.raises(ValueError, match=message):
+        if writer == "subset":
+            SubsetZarr(str(destination), [store.RNA], cell_idx=np.arange(4), nthreads=1)
+        elif writer == "merge":
+            DataStoreMerge(
+                [store, store], str(destination), ["first", "second"], nthreads=1
+            ).plan()
+        else:
+            mount_datastore(str(path), at=str(destination), min_features_per_cell=0)
+    assert not destination.exists()
+    assert pending_assays(zarr.open_group(str(path), mode="r")) == [
+        ("MODULES", None, "add_grouped_assay")
+    ]
+
+
+def test_an_interrupted_derived_assay_is_discarded_with_its_membership(tmp_path):
+    path = tmp_path / "rna.zarr"
+    store = _partial_store(path, _counts())
+    store.RNA.feats.insert("module", np.repeat([1, 2], 6), overwrite=True)
+    # A hard kill inside the transaction never runs its cleanup; keep the
+    # context alive so garbage collection does not run it either.
+    context = derived_assay_transaction(
+        store.z, "MODULES", None, operation="add_grouped_assay", membership="RNA_I"
+    )
+    transaction = context.__enter__()
+    transaction.create_counts(store.cells.N, ["group_1"], ["group_1"], np.float64)
+
+    reopened = DataStore(str(path), min_features_per_cell=-1)
+    np.testing.assert_array_equal(reopened.cells.fetch_all("MODULES_I"), _MEMBERS)
+    # The pending assay owns the column, so it cannot be rewritten or dropped.
+    with pytest.raises(ValueError, match="reserved for the membership of assay"):
+        reopened.cells.insert("MODULES_I", ~_MEMBERS, overwrite=True)
+    with pytest.raises(ValueError, match="records which cells assay 'MODULES'"):
+        reopened.cells.drop("MODULES_I")
+
+    reopened.discard_interrupted_assay("MODULES")
+    assert "MODULES_I" not in reopened.cells.columns
+    reopened.add_grouped_assay("module", assay_label="MODULES")
+    np.testing.assert_array_equal(reopened.cells.fetch_all("MODULES_I"), _MEMBERS)
+    # Registering the assay leaves I unchanged, although the cells outside
+    # _MEMBERS have no RNA counts.
+    assert reopened.cells.fetch_all("I").all()
+    assert DataStore(str(path), min_features_per_cell=-1).cells.fetch_all("I").all()
+    del context
+
+
+def test_an_interrupted_membership_write_keeps_its_pending_assay(tmp_path, monkeypatch):
+    """A membership write that Ctrl-C stopped may still land, so the name stays held.
+
+    Before, cleanup removed the pending assay at once, and a retry of the same
+    name could receive the late requests of the interrupted write: the retried
+    assay then held its own counts beside the first attempt's membership.
+    """
+    import scarf.storage.schema as schema
+
+    path = tmp_path / "rna.zarr"
+    store = _partial_store(path, _counts())
+    store.RNA.feats.insert("module", np.repeat([1, 2], 6), overwrite=True)
+
+    def stopped(*_args, **_kwargs):
+        raise KeyboardInterrupt("stopped while writing the membership column")
+
+    monkeypatch.setattr(schema, "create_streamed_metadata_column", stopped)
+    with pytest.raises(KeyboardInterrupt):
+        store.add_grouped_assay("module", assay_label="MODULES")
+    monkeypatch.undo()
+    assert pending_assays(zarr.open_group(str(path), mode="r")) == [
+        ("MODULES", None, "add_grouped_assay")
+    ]
+    store.discard_interrupted_assay("MODULES")
+    store.add_grouped_assay("module", assay_label="MODULES")
+    np.testing.assert_array_equal(store.cells.fetch_all("MODULES_I"), _MEMBERS)
+
+
 def test_repack_refuses_unfinalized_writer_counts(tmp_path):
     path = tmp_path / "rna.zarr"
     _write_store(path, _counts())
@@ -249,11 +442,11 @@ def _memory_root(workspace: str | None = None) -> zarr.Group:
     return root
 
 
-def test_derived_assay_transaction_discards_on_keyboard_interrupt():
+def test_derived_assay_transaction_keeps_the_pending_assay_on_keyboard_interrupt():
     root = _memory_root("ws")
     root["ws"].attrs["assayTypes"] = {"OTHER": "RNA"}
 
-    with pytest.raises(KeyboardInterrupt):
+    with _warnings() as warnings, pytest.raises(KeyboardInterrupt):
         with derived_assay_transaction(
             root, "SCORES", "ws", operation="add_melded_assay"
         ) as transaction:
@@ -264,9 +457,62 @@ def test_derived_assay_transaction_discards_on_keyboard_interrupt():
             counts[:] = 1.0
             raise KeyboardInterrupt
 
+    # An interrupted write may still land, so the pending assay stays.
+    assert pending_assays(root) == [("SCORES", "ws", "add_melded_assay")]
+    assert len(warnings) == 1
+    assert "discard_interrupted_assay('SCORES')" in warnings[0]
+    assert discard_pending_assay(root, "SCORES", "ws") is True
     assert "SCORES" not in root["ws"]
     assert "SCORES" not in root["matrices"]
     assert root["ws"].attrs["assayTypes"] == {"OTHER": "RNA"}
+
+
+def test_derived_assay_transaction_owns_the_membership_column_it_copies():
+    root = _memory_root("ws")
+    cells = root["ws/cellData"]
+    members = np.array([True, False, True])
+    write_membership_column(cells, "OTHER", members)
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        with derived_assay_transaction(
+            root, "SCORES", "ws", operation="add_melded_assay", membership="OTHER_I"
+        ) as transaction:
+            transaction.create_counts(3, ["f0"], ["f0"], np.float64)
+            # The copy is written with the pending assay, attributes first.
+            assert cells["SCORES_I"][:].tolist() == members.tolist()
+            assert cells["SCORES_I"].attrs.asdict() == membership_attributes("SCORES")
+            raise RuntimeError("body failed")
+    assert "SCORES_I" not in cells
+    assert "SCORES" not in root["ws"]
+
+    with derived_assay_transaction(
+        root, "SCORES", "ws", operation="add_melded_assay", membership="OTHER_I"
+    ) as transaction:
+        _finalized(transaction.create_counts(3, ["f0"], ["f0"], np.float64), 1.0)
+    assert root["ws/SCORES"].attrs["is_assay"] is True
+    assert cells["SCORES_I"][:].tolist() == members.tolist()
+    np.testing.assert_array_equal(cells["OTHER_I"][:], members)
+
+    # A column that holds the membership name of a new assay blocks it.
+    write_membership_column(cells, "NEXT", members)
+    with pytest.raises(ValueError, match="Cell column 'NEXT_I' already exists"):
+        with derived_assay_transaction(root, "NEXT", "ws", operation="op"):
+            pass
+    assert "NEXT" not in root["ws"]
+    assert cells["NEXT_I"].attrs.asdict() == membership_attributes("NEXT")
+
+
+def test_discard_keeps_a_column_that_is_not_the_pending_assays_membership():
+    root = _memory_root()
+    context = derived_assay_transaction(root, "SCORES", None, operation="op")
+    context.__enter__().create_counts(3, ["f0"], ["f0"], np.float64)
+    # A writer outside Scarf added a plain column with the membership name.
+    root["cellData"].create_array("SCORES_I", data=np.array([True, False, True]))
+
+    assert discard_pending_assay(root, "SCORES", None) is True
+    assert "SCORES" not in root
+    assert root["cellData/SCORES_I"][:].tolist() == [True, False, True]
+    del context
 
 
 def test_derived_assay_transaction_publishes_only_finalized_counts():
@@ -296,6 +542,12 @@ def test_derived_assay_transaction_publishes_only_finalized_counts():
     with pytest.raises(ValueError, match="not an interrupted derived assay"):
         discard_pending_assay(root, "SCORES", None)
     assert "SCORES" in root
+    # An array at an assay's path is not a pending assay either.
+    root.create_array("ARRAY", data=np.zeros(3))
+    with pytest.raises(ValueError, match="not an interrupted derived assay"):
+        discard_pending_assay(root, "ARRAY", None)
+    assert discard_pending_assay(root, "ARRAY", None, missing_ok=True) is False
+    assert "ARRAY" in root
 
 
 def test_empty_derived_assay_transaction_leaves_no_assay():
@@ -363,9 +615,202 @@ def test_pending_assay_names_its_discard_path():
     root = _memory_root("ws1")
     context = derived_assay_transaction(root, "SCORES", "ws1", operation="op")
     context.__enter__().create_counts(3, ["f0"], ["f0"], np.float64)
-    with pytest.raises(ValueError, match=r"opened with workspace='ws1'"):
+    with pytest.raises(
+        ValueError,
+        match=r"Assay 'SCORES' of workspace 'ws1' is pending.*workspace='ws1'",
+    ):
         validate_new_assay(root, "SCORES", "ws1")
     del context
+
+
+def _finalized(counts: zarr.Array, value: float) -> None:
+    counts[:] = value
+    finalize_test_counts(counts)
+
+
+def test_a_failed_writer_never_removes_another_writers_assay():
+    root = _memory_root("ws")
+
+    with derived_assay_transaction(
+        root, "SCORES", "ws", operation="add_grouped_assay"
+    ) as first:
+        with pytest.raises(ValueError) as raised:
+            with derived_assay_transaction(
+                root, "SCORES", "ws", operation="add_grouped_assay"
+            ) as second:
+                # Both writers checked the free name before either created it.
+                counts = first.create_counts(3, ["f0"], ["f0"], np.float64)
+                second.create_counts(3, ["f1"], ["f1"], np.float64)
+        # The second writer neither removed the first one's assay nor called
+        # it interrupted.
+        assert pending_assays(root) == [("SCORES", "ws", "add_grouped_assay")]
+        assert "another process may still be running add_grouped_assay" in str(
+            raised.value
+        )
+        _finalized(counts, 1.0)
+
+    attrs = dict(root["ws/SCORES"].attrs)
+    assert attrs["is_assay"] is True
+    assert PENDING_ASSAY_ATTR not in attrs
+    np.testing.assert_array_equal(root["matrices/SCORES/counts"][:], np.ones((3, 1)))
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, OSError])
+def test_an_interrupted_publication_leaves_the_assay_pending(monkeypatch, stop):
+    root = _memory_root()
+    original = zarr.Group.update_attributes
+
+    def interrupted(group: zarr.Group, attributes: dict) -> zarr.Group:
+        if attributes.get("is_assay") is True:
+            # Ctrl-C, or a lost acknowledgement, stops the caller while Zarr's
+            # I/O thread may still run the write.
+            raise stop
+        return original(group, attributes)
+
+    try:
+        with pytest.raises(stop):
+            with derived_assay_transaction(
+                root, "SCORES", None, operation="add_grouped_assay"
+            ) as transaction:
+                counts = transaction.create_counts(3, ["f0"], ["f0"], np.float64)
+                _finalized(counts, 2.0)
+                monkeypatch.setattr(zarr.Group, "update_attributes", interrupted)
+    finally:
+        monkeypatch.undo()
+
+    # The publication may still land, so the complete counts stay in place.
+    assert pending_assays(root) == [("SCORES", None, "add_grouped_assay")]
+    assert root["SCORES/counts"].attrs["complete"] is True
+    # An operator who confirmed that no process is writing it removes it.
+    assert discard_pending_assay(root, "SCORES", None)
+    assert "SCORES" not in root
+
+
+def test_derived_assay_publishes_on_a_store_without_atomic_creates(tmp_path):
+    from zarr.storage import FsspecStore
+
+    store = FsspecStore.from_url(f"memory://scarf-derived/{tmp_path.name}")
+    root = zarr.open_group(store=store, mode="w")
+
+    with derived_assay_transaction(
+        root, "SCORES", None, operation="add_grouped_assay"
+    ) as transaction:
+        _finalized(transaction.create_counts(3, ["f0"], ["f0"], np.float64), 1.0)
+
+    assert root["SCORES"].attrs["is_assay"] is True
+    np.testing.assert_array_equal(root["SCORES/counts"][:], np.ones((3, 1)))
+
+
+def _workspaces_root(*workspaces: str) -> zarr.Group:
+    """Return a store whose workspaces share one ``matrices`` group."""
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_group("matrices")
+    for workspace in workspaces:
+        root.create_group(workspace)
+        create_cell_data(
+            root,
+            workspace,
+            ids=np.array(["c0", "c1", "c2"]),
+            names=np.array(["c0", "c1", "c2"]),
+        )
+    return root
+
+
+@contextmanager
+def _warnings() -> Iterator[list[str]]:
+    from scarf.utils import logger
+
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        yield messages
+    finally:
+        logger.remove(sink)
+
+
+def _derive(root: zarr.Group, workspace: str, value: float) -> None:
+    with derived_assay_transaction(
+        root, "SCORES", workspace, operation="add_grouped_assay"
+    ) as transaction:
+        _finalized(transaction.create_counts(3, ["f0"], ["f0"], np.float64), value)
+
+
+def test_a_name_pending_in_one_workspace_is_taken_in_every_workspace():
+    root = _workspaces_root("ws1", "ws2")
+    # A write in ws2 was interrupted before it created its matrix group.
+    root.create_group(
+        "ws2/SCORES",
+        attributes={PENDING_ASSAY_ATTR: "add_grouped_assay", "prepared": False},
+    )
+
+    # Discarding it deletes matrices/SCORES, so ws1 must not publish there.
+    with pytest.raises(ValueError, match=r"opened with workspace='ws2'"):
+        _derive(root, "ws1", 1.0)
+    assert "SCORES" not in root["ws1"] and "SCORES" not in root["matrices"]
+
+    assert discard_pending_assay(root, "SCORES", "ws2") is True
+    _derive(root, "ws1", 1.0)
+    assert root["ws1/SCORES"].attrs["is_assay"] is True
+
+
+def test_a_failed_writer_keeps_a_matrix_group_it_did_not_create(monkeypatch):
+    from zarr.errors import ContainsGroupError
+
+    from scarf.storage import schema
+
+    root = _workspaces_root("ws1", "ws2")
+    _derive(root, "ws1", 1.0)
+    # The ws2 writer checked the free name before ws1 published SCORES.
+    monkeypatch.setattr(schema, "validate_new_assay", lambda *_args: None)
+
+    with pytest.raises(ContainsGroupError):
+        _derive(root, "ws2", 2.0)
+
+    assert "SCORES" not in root["ws2"]
+    assert root["ws1/SCORES"].attrs["is_assay"] is True
+    np.testing.assert_array_equal(root["matrices/SCORES/counts"][:], np.ones((3, 1)))
+
+
+def test_derived_assays_of_a_workspace_publish_their_matrices(tmp_path):
+    path = tmp_path / "ws.zarr"
+    peaks, arguments = _melded_inputs(tmp_path)
+    SparseToZarr(
+        csr_matrix(_counts(n_features=6)),
+        zarr_loc=str(path),
+        cell_ids=[f"c{i}" for i in range(40)],
+        feature_ids=peaks,
+        assay_name="ATAC",
+        workspace="ws1",
+        nthreads=1,
+        policy=_SMALL_SHARDS,
+    ).dump(batch_size=10)
+    store = DataStore(
+        str(path), workspace="ws1", default_assay="ATAC", min_features_per_cell=0
+    )
+    store.ATAC.feats.insert("module", np.repeat([1, 2], 3), overwrite=True)
+
+    store.add_melded_assay(**{**arguments, "assay_type": "GeneActivity"})
+    store.add_grouped_assay("module", from_assay="ATAC", assay_label="MODULES")
+
+    # Every assay of the session carries its type, including the gene scores
+    # that were rebuilt when the grouped assay was registered.
+    types = {"ATAC": "ATAC", "MODULES": "Assay", "GeneScores": "GeneActivity"}
+    assert {
+        name: declared_assay_type(store.get_assay(name)) for name in store.assay_names
+    } == types
+    root = zarr.open_group(str(path), mode="r")
+    assert root["ws1"].attrs["assayTypes"] == types
+    for name in ("MODULES", "GeneScores"):
+        assert root[f"ws1/{name}"].attrs["is_assay"] is True
+        for group in (root[f"ws1/{name}"], root[f"matrices/{name}"]):
+            assert PENDING_ASSAY_ATTR not in group.attrs
+    # RNA-class gene scores keep countsT beside their counts in the matrix group.
+    assert root["matrices/GeneScores/countsT"].attrs["complete"] is True
+    assert pending_assays(root) == []
+    reopened = DataStore(str(path), workspace="ws1", zarr_mode="r")
+    assert {"MODULES", "GeneScores"} <= set(reopened.assay_names)
 
 
 def test_grouped_assay_uses_one_read_and_matches_per_group_means(tmp_path):

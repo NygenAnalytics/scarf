@@ -190,6 +190,14 @@ class CustomReductionArguments(OperationArguments):
     invalidate_cache: bool = execution(False)
 
 
+# The algorithm_version that every Harmony correction records, a frozen
+# recorded constant (see "Legacy version parameters" in
+# docs/source/developers/operation_revisions.md). Corrections of earlier
+# releases record it too, so they differ from a request only in the operation
+# revision, and planning reports them as superseded matches.
+HARMONY_ALGORITHM_VERSION = "centroid_snapshot_v2"
+
+
 @dataclass(frozen=True, slots=True)
 class HarmonyArguments(OperationArguments):
     operation: ClassVar[str] = "run_harmony"
@@ -199,6 +207,7 @@ class HarmonyArguments(OperationArguments):
     batch_snapshot: ArtifactRef = artifact_input()
     batch_columns: tuple[str, ...] = parameter()
     harmony_parameters: Mapping[str, Any] = parameter()
+    # Always HARMONY_ALGORITHM_VERSION.
     algorithm_version: str = parameter()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
@@ -223,9 +232,23 @@ class AnnIndexArguments(OperationArguments):
     ann_m: int = parameter()
     rand_state: int = parameter()
     ann_parallel: bool = parameter()
-    parallel_threads: int | None = parameter()
+    # Parallel insertion on several threads can build a different index on
+    # every run, whatever the thread count, so only ann_parallel identifies an
+    # index and the thread count is the execution option nthreads. Earlier releases recorded a
+    # parallel build's thread count here; it stays recorded as None, the value
+    # that serial indexes have always recorded, so their identities stay
+    # unchanged.
+    parallel_threads: None = parameter()
+    nthreads: int = execution()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
+
+    def __post_init__(self) -> None:
+        if self.parallel_threads is not None:
+            raise ValueError(
+                "parallel_threads is recorded as None; pass the thread count "
+                "as nthreads"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +260,8 @@ class NeighborQueryArguments(OperationArguments):
     coordinates: ArtifactRef = artifact_input()
     k: int = parameter()
     distance_metric: str = parameter()
+    # Queries of a fixed index return the same neighbors on any thread count.
+    nthreads: int = execution()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
 
@@ -262,6 +287,12 @@ class ConnectivityMapArguments(OperationArguments):
         object.__setattr__(self, "bandwidth", bandwidth)
 
 
+# The algorithm_version that every embedding initialization records, a frozen
+# recorded constant (see "Legacy version parameters" in
+# docs/source/developers/operation_revisions.md).
+EMBEDDING_INITIALIZATION_ALGORITHM_VERSION = "minibatch_kmeans_v3"
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingInitializationArguments(OperationArguments):
     operation: ClassVar[str] = "build_embedding_initialization"
@@ -273,5 +304,5 @@ class EmbeddingInitializationArguments(OperationArguments):
     batch_size: int = parameter()
     kmeans_sampling: float = parameter(0.1)
     kmeans_batch_size: int = parameter(10_000)
-    algorithm_version: str = parameter("minibatch_kmeans_v3")
+    algorithm_version: str = parameter(EMBEDDING_INITIALIZATION_ALGORITHM_VERSION)
     invalidate_cache: bool = execution(False)

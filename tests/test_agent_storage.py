@@ -397,7 +397,8 @@ def test_relocated_store_keeps_immutable_summary_and_original_history_locator(
 ) -> None:
     publish_result(completed.result)
     stored = completed.result.compact_result
-    destination = tmp_path / "relocated" / "source.zarr"
+    # Zarr would read a string path as a URL and end it at '#'.
+    destination = tmp_path / "relocated#1" / "source.zarr"
     destination.parent.mkdir()
     shutil.move(completed.source, destination)
     relocated = open_analysis(completed.records.path, source=destination)

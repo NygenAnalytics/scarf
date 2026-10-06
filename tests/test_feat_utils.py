@@ -60,6 +60,28 @@ def test_fit_lowess_fixed_regression():
     np.testing.assert_allclose(corrected, expected, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"n_bins": 0}, "n_bins must be at least 1"),
+        ({"lowess_frac": 1.5}, "lowess_frac must be between 0 and 1"),
+    ],
+)
+def test_fit_lowess_checks_the_trend_arguments_of_the_fixed_strategy(
+    arguments, message
+):
+    means = np.geomspace(1, 100, 30)
+    variances = means**1.4
+
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        fit_lowess(
+            means,
+            variances,
+            **{"n_bins": 8, "lowess_frac": 0.6, **arguments},
+            bin_strategy="fixed",
+        )
+
+
 def test_fit_lowess_rejects_unconverged_adaptive_fit(monkeypatch):
     import scipy.optimize
 
@@ -337,8 +359,9 @@ def test_fit_lowess_adaptive_handles_small_and_invalid_inputs():
             lowess_frac=2.0,
             bin_strategy="adaptive",
         )
+    # The shared float_argument validator names a real number.
     for not_numeric in ("0.1", True):
-        with pytest.raises(TypeError, match="lowess_frac must be numeric"):
+        with pytest.raises(TypeError, match="lowess_frac must be a real number"):
             fit_lowess(
                 mean_expr,
                 variance,

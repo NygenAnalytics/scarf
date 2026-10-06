@@ -1,3 +1,6 @@
+import tracemalloc
+import weakref
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,6 +14,7 @@ from scarf.neighbors.stages import (
     KMeansInitializationStage,
     NeighborQueryStage,
     ReductionTransform,
+    kmeans_fit_memory,
 )
 
 
@@ -657,6 +661,9 @@ def test_harmony_stage_returns_supplied_corrections_without_reading() -> None:
         ({"kmeans_batch_size": True}, TypeError, "must be a positive integer"),
         ({"kmeans_batch_size": 2.5}, TypeError, "must be a positive integer"),
         ({"kmeans_batch_size": 0}, ValueError, "must be a positive integer"),
+        ({"batch_size": True}, TypeError, "^batch_size must be a positive integer"),
+        ({"batch_size": 2.5}, TypeError, "^batch_size must be a positive integer"),
+        ({"batch_size": 0}, ValueError, "^batch_size must be a positive integer"),
     ],
 )
 def test_kmeans_initialization_rejects_invalid_options(options, error, message) -> None:
@@ -666,11 +673,10 @@ def test_kmeans_initialization_rejects_invalid_options(options, error, message) 
         KMeansInitializationStage.fit(
             stream=stream,
             n_rows=8,
-            batch_size=4,
             n_clusters=2,
             rand_state=4466,
             nthreads=1,
-            **options,
+            **{"batch_size": 4, **options},
         )
     assert stream.calls == 0
 
@@ -688,7 +694,8 @@ _KMEANS_BLOCKS = [_KMEANS_VALUES[:4], _KMEANS_VALUES[4:]]
     [
         ([[]], "coordinate source is empty"),
         ([[np.arange(4.0)]], "blocks must be two-dimensional"),
-        ([[_KMEANS_VALUES, _KMEANS_VALUES[:1]]], "rows after a complete block"),
+        # A batch size below the row count streams even one complete block.
+        ([[_KMEANS_VALUES, _KMEANS_VALUES[:1]]], "has too many rows"),
         # Sampling pass.
         ([[_KMEANS_VALUES[:4], _KMEANS_VALUES[4:, :1]]], "dimensions changed"),
         (
@@ -718,7 +725,7 @@ _KMEANS_BLOCKS = [_KMEANS_VALUES[:4], _KMEANS_VALUES[4:]]
     ids=[
         "empty",
         "one_dimensional",
-        "rows_after_complete_block",
+        "streamed_rows_after_complete_block",
         "sampling_columns_changed",
         "sampling_dtype_changed",
         "sampling_too_many_rows",
@@ -745,6 +752,80 @@ def test_kmeans_initialization_rejects_inconsistent_coordinate_passes(
         )
 
 
+@pytest.mark.parametrize(
+    ("blocks", "message"),
+    [
+        ([_KMEANS_VALUES, _KMEANS_VALUES[:1]], "rows after a complete block"),
+        ([_KMEANS_VALUES[:4], _KMEANS_VALUES[4:, :1]], "dimensions changed"),
+        (
+            [_KMEANS_VALUES[:4], _KMEANS_VALUES[4:].astype(np.float32)],
+            "dimensions changed",
+        ),
+        (_KMEANS_BLOCKS + [_KMEANS_VALUES[:2]], "has too many rows"),
+        ([_KMEANS_VALUES[:4], _KMEANS_VALUES[4:6]], "contains 6 rows, expected 8"),
+    ],
+    ids=[
+        "rows_after_complete_block",
+        "columns_changed",
+        "dtype_changed",
+        "too_many_rows",
+        "too_few_rows",
+    ],
+)
+def test_in_memory_kmeans_rejects_inconsistent_blocks(blocks, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        KMeansInitializationStage.fit(
+            stream=_ListStream(blocks),
+            n_rows=8,
+            batch_size=8,
+            n_clusters=2,
+            rand_state=4466,
+            nthreads=1,
+        )
+
+
+def test_kmeans_fit_mode_follows_the_batch_size_not_the_stream_blocks() -> None:
+    rng = np.random.default_rng(1)
+    values = np.vstack(
+        [rng.normal(loc=center, size=(40, 3)) for center in (0.0, 5.0, 10.0)]
+    )
+    n_rows = values.shape[0]
+
+    def fit(block_size: int, batch_size: int):
+        stream, data = _coordinate_stream(values, block_size=block_size)
+        result = KMeansInitializationStage.fit(
+            stream=stream,
+            n_rows=n_rows,
+            batch_size=batch_size,
+            n_clusters=3,
+            rand_state=4466,
+            nthreads=1,
+            kmeans_sampling=0.5,
+            kmeans_batch_size=16,
+        )
+        return result, data.read_count
+
+    # A batch size that covers every row fits them in memory, in one pass,
+    # however the stream splits them into blocks.
+    in_memory, in_memory_reads = fit(n_rows, n_rows)
+    gathered, gathered_reads = fit(25, n_rows)
+    assert (in_memory_reads, gathered_reads) == (1, 5)
+    assert in_memory.model.n_steps_ > 1
+    np.testing.assert_array_equal(
+        gathered.model.cluster_centers_, in_memory.model.cluster_centers_
+    )
+    np.testing.assert_array_equal(gathered.labels, in_memory.labels)
+    # A smaller batch size streams sampling, fitting, and labelling passes,
+    # even over one block that holds every row.
+    streamed, streamed_reads = fit(25, 60)
+    one_block, one_block_reads = fit(n_rows, 60)
+    assert (streamed_reads, one_block_reads) == (15, 3)
+    np.testing.assert_array_equal(
+        one_block.model.cluster_centers_, streamed.model.cluster_centers_
+    )
+    np.testing.assert_array_equal(one_block.labels, streamed.labels)
+
+
 def test_kmeans_initialization_streams_three_consistent_passes() -> None:
     stream = _ListStream(_KMEANS_BLOCKS)
 
@@ -768,3 +849,202 @@ def test_kmeans_initialization_streams_three_consistent_passes() -> None:
         _KMEANS_VALUES[:, None] - result.model.cluster_centers_[None], axis=2
     )
     np.testing.assert_array_equal(result.labels, distances.argmin(axis=1))
+
+
+class _ReleaseCheckingStream:
+    """A coordinate source that yields a fresh copy of each row block.
+
+    Before each read after the first of a pass, it records whether the block
+    it yielded before is still alive. A read plan reserves only the blocks in
+    flight, so a consumer that still holds the previous block exceeds it.
+    """
+
+    def __init__(self, values: np.ndarray, block_rows: int) -> None:
+        self.values = values
+        self.block_rows = block_rows
+        self.held: list[bool] = []
+
+    def iter_coordinate_blocks(self, message: str):
+        previous = None
+        for start in range(0, self.values.shape[0], self.block_rows):
+            if previous is not None:
+                self.held.append(previous() is not None)
+            block = self.values[start : start + self.block_rows].copy()
+            previous = weakref.ref(block)
+            yield block
+            del block
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "reads"),
+    [(120, 2), (40, 6)],
+    ids=["in_memory", "streamed"],
+)
+def test_kmeans_fit_holds_no_block_while_its_stream_reads_the_next(
+    batch_size: int, reads: int
+) -> None:
+    values = np.random.default_rng(2).normal(size=(120, 3))
+    stream = _ReleaseCheckingStream(values, block_rows=40)
+
+    KMeansInitializationStage.fit(
+        stream=stream,
+        n_rows=120,
+        batch_size=batch_size,
+        n_clusters=3,
+        rand_state=4466,
+        nthreads=1,
+    )
+
+    # Three blocks per pass: the in-memory fit gathers them in one pass, and
+    # the streamed fit reads them in three.
+    assert stream.held == [False] * reads
+
+
+def test_ann_index_holds_no_block_while_its_stream_reads_the_next() -> None:
+    values = np.random.default_rng(3).normal(size=(90, 4)).astype(np.float32)
+    stream = _ReleaseCheckingStream(values, block_rows=30)
+
+    AnnIndexStage.fit(
+        coordinates=stream,
+        metric="l2",
+        dims=4,
+        n_cells=90,
+        ef_construction=20,
+        ef=20,
+        m=4,
+        rand_state=1,
+        nthreads=1,
+    )
+
+    assert stream.held == [False, False]
+
+
+def test_harmony_stage_holds_no_block_while_its_stream_reads_the_next(
+    monkeypatch,
+) -> None:
+    values = np.random.default_rng(4).normal(size=(90, 3))
+    stream = _ReleaseCheckingStream(values, block_rows=30)
+
+    def fit(uncorrected: np.ndarray, batches: pd.DataFrame, **_options):
+        return HarmonyResult(
+            original=uncorrected,
+            corrected=uncorrected,
+            assignments=np.ones((1, uncorrected.shape[1])),
+            centroids=np.zeros((3, 1)),
+            sigma=np.ones(1),
+            ridge=np.eye(2),
+            batch_columns=("batch",),
+            batch_levels=(("a", "b"),),
+            parameters={},
+        )
+
+    monkeypatch.setattr("scarf.neighbors.stages.fit_harmony", fit)
+    stage = BatchCorrectionStage(
+        stream=stream,
+        n_cells=90,
+        dims=3,
+        batch_size=30,
+        batches=pd.DataFrame({"batch": ["a", "b"] * 45}),
+        parameters={},
+        corrected_data=None,
+        nthreads=1,
+    )
+
+    np.testing.assert_array_equal(stage.ensure_corrected().compute(), values)
+    assert stream.held == [False, False]
+
+
+def test_kmeans_fit_memory_counts_what_each_mode_holds() -> None:
+    options = {
+        "n_rows": 200_000,
+        "dims": 2,
+        "dtype": np.float32,
+        "n_clusters": 50,
+        "block_rows": 2_000,
+        "kmeans_sampling": 0.001,
+        "kmeans_batch_size": 1_000,
+    }
+    streamed = kmeans_fit_memory(batch_size=2_000, nthreads=1, **options)
+    # The labelling pass holds one uint32 label per cell while it reads.
+    assert streamed.streamResidentBytes >= 200_000 * 4
+    # Each thread holds its own distances and centroid sums.
+    threads = kmeans_fit_memory(batch_size=2_000, nthreads=2, **options)
+    assert threads.peakBytes > streamed.peakBytes
+    # An in-memory fit gathers every row while its stream reads the blocks.
+    in_memory = kmeans_fit_memory(batch_size=200_000, nthreads=1, **options)
+    assert in_memory.streamResidentBytes >= 200_000 * 2 * 4
+
+
+def _fit_kmeans(values: np.ndarray, *, batch_size: int, **options):
+    # Blocks of a numpy-backed stream are views of the values, so a trace of
+    # the fit holds only what the fit allocates, as a stream's plan reserves
+    # its own blocks.
+    stream = ChunkedCoordinateStream(
+        ChunkedArray.from_numpy(values, block_size=2_000, nthreads=1), 1
+    )
+    return KMeansInitializationStage.fit(
+        stream=stream,
+        n_rows=values.shape[0],
+        batch_size=batch_size,
+        n_clusters=50,
+        rand_state=4466,
+        nthreads=1,
+        kmeans_batch_size=1_000,
+        **options,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("dtype", "dims", "batch_size", "sampling"),
+    [
+        (np.float32, 10, 20_000, 0.1),
+        (np.float64, 20, 20_000, 0.1),
+        (np.float16, 10, 20_000, 0.1),
+        (np.float32, 10, 2_000, 0.5),
+        (np.float64, 20, 2_000, 0.5),
+        (np.float16, 10, 2_000, 0.5),
+    ],
+    ids=[
+        "in_memory_float32",
+        "in_memory_float64",
+        "in_memory_float16",
+        "streamed_float32",
+        "streamed_float64",
+        "streamed_float16",
+    ],
+)
+def test_kmeans_fit_memory_bounds_the_traced_peak(
+    dtype, dims: int, batch_size: int, sampling: float
+) -> None:
+    n_rows = 20_000
+    values = np.random.default_rng(5).normal(size=(n_rows, dims)).astype(dtype)
+    memory = kmeans_fit_memory(
+        n_rows=n_rows,
+        dims=dims,
+        dtype=values.dtype,
+        batch_size=batch_size,
+        n_clusters=50,
+        block_rows=2_000,
+        nthreads=1,
+        kmeans_sampling=sampling,
+        kmeans_batch_size=1_000,
+    )
+    # Import scikit-learn and create its thread-pool controller before the
+    # trace, which would otherwise count them.
+    small = values[:2_000]
+    for warm_batch_size in (2_000, 500):
+        _fit_kmeans(small, batch_size=warm_batch_size, kmeans_sampling=sampling)
+
+    tracemalloc.start()
+    try:
+        _fit_kmeans(values, batch_size=batch_size, kmeans_sampling=sampling)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # The estimate also counts scikit-learn's per-thread buffers, which the
+    # trace misses, and an allowance for the fit's Python objects. It leaves
+    # out the transient with which each read pass sets thread limits, about
+    # 0.6 MB here, which these shapes outgrow.
+    assert peak <= memory.peakBytes <= 2 * peak

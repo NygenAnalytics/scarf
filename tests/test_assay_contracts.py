@@ -48,9 +48,12 @@ _PUBLIC_CLASS_METHODS = {
     ADTassay: ("__init__",),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "045ac1edc448b0ef88037663d347adbfe34d70d32d281ea974179ce23f5928f7",
-    RNAassay: "74fc5e54bc871c516fa8adca9cd8bcdec92bbcba94c118965b933159b2ef19ac",
-    ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
+    # Assay.__init__ takes the keyword-only assay_type that DataStore resolves.
+    # Every normed takes log_transform and renormalize_subset and no other
+    # keyword, and rejects a flag that its normalizer cannot apply.
+    Assay: "9c6d1ae9648091434545b621134c0692f103486fd7a8c6fc95e44272d0d7201a",
+    RNAassay: "2cb72b69b3adae784772ca3e133108a1a319945eb5638a632209d2bb617d0659",
+    ATACassay: "4988c1fd2cf71ed68a91275905a278b52b67d700008723bda34d01bb99cbcecd",
     ADTassay: "393df3ce24ede0e7affeba88c1970e1a77f0fac31adc07276be28dd40f1c1c4a",
 }
 _MODULE_FUNCTIONS = (
@@ -450,7 +453,7 @@ def test_base_assay_score_features_covers_generic_normalization(
     assay = SimpleNamespace(
         feats=feats,
         _get_cell_idx=lambda _cell_key: np.array([0, 1]),
-        normed=lambda *, cell_idx, feat_idx: DeferredMatrix(feat_idx),
+        normed=lambda *, cell_idx, feat_idx, log_transform: DeferredMatrix(feat_idx),
     )
     assay._score_feature_indices = lambda *args, **kwargs: Assay._score_feature_indices(
         assay, *args, **kwargs
@@ -484,24 +487,30 @@ def test_rna_gene_major_kernel_accumulates_selected_cells():
     destinations = np.array([0, -1, 1], dtype=np.int64)
     selected = np.array([0, 2], dtype=np.int64)
     inverse_scalars = np.array([0.5, 0.25])
-    nonzero = np.zeros(2)
-    totals = np.zeros(2)
-    squares = np.zeros(2)
 
-    _hvg_stats_gene_major_kernel.py_func(
-        values,
-        inverse_scalars,
-        2.0,
-        destinations,
-        selected,
-        nonzero,
-        totals,
-        squares,
-    )
+    for kernel in (
+        _hvg_stats_gene_major_kernel.py_func,
+        _hvg_stats_gene_major_kernel,
+    ):
+        nonzero = np.zeros(2)
+        totals = np.zeros(2)
+        deviations = np.zeros(2)
+        kernel(
+            values,
+            inverse_scalars,
+            2.0,
+            destinations,
+            selected,
+            nonzero,
+            totals,
+            deviations,
+        )
 
-    np.testing.assert_array_equal(nonzero, np.array([2.0, 1.0]))
-    np.testing.assert_allclose(totals, np.array([2.0, 3.0]))
-    np.testing.assert_allclose(squares, np.array([2.0, 9.0]))
+        np.testing.assert_array_equal(nonzero, np.array([2.0, 1.0]))
+        np.testing.assert_array_equal(totals, np.array([2.0, 3.0]))
+        # Gene 0 normalizes to 1.0 in both selected cells, so its sum of
+        # squared deviations is exactly zero; gene 2 holds 3.0 and a zero.
+        np.testing.assert_array_equal(deviations, np.array([0.0, 4.5]))
 
 
 def test_rna_gene_major_kernel_log_transform_matches_log1p():
@@ -520,13 +529,15 @@ def test_rna_gene_major_kernel_log_transform_matches_log1p():
     inverse_scalars = np.array([0.5, 0.25])
     logged = np.log1p(2.0 * values[[0, 2]][:, selected] * inverse_scalars)
 
+    centered = logged - logged.mean(axis=1, keepdims=True)
+
     for kernel in (
         _hvg_stats_gene_major_kernel.py_func,
         _hvg_stats_gene_major_kernel,
     ):
         nonzero = np.zeros(2)
         totals = np.zeros(2)
-        squares = np.zeros(2)
+        deviations = np.zeros(2)
         kernel(
             values,
             inverse_scalars,
@@ -535,13 +546,14 @@ def test_rna_gene_major_kernel_log_transform_matches_log1p():
             selected,
             nonzero,
             totals,
-            squares,
+            deviations,
             True,
         )
 
         np.testing.assert_array_equal(nonzero, np.array([2.0, 1.0]))
         np.testing.assert_allclose(totals, logged.sum(axis=1))
-        np.testing.assert_allclose(squares, np.square(logged).sum(axis=1))
+        np.testing.assert_allclose(deviations, np.square(centered).sum(axis=1))
+        assert deviations[0] == 0.0
 
 
 def test_rna_requires_zarr_v3_counts_t():

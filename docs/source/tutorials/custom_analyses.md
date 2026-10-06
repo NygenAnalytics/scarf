@@ -154,7 +154,8 @@ The summary checks that every streamed cell received a detection count.
 ## 4. Create custom selections
 
 A boolean cell column can become a `cell_key`.
-Use `fill_value=False` when the new key is defined only for currently active cells.
+Use `fill_value=False` when the new key is defined only for currently active cells: the inactive
+cells then hold `False`. Without it they are recorded as missing, which a key never selects either.
 Here we keep cells above the lowest quarter of graph strength as an example of making a selection.
 This is an illustration of the API, not a recommended quality-control filter:
 

@@ -90,7 +90,7 @@ def test_rna_feature_statistics_count_only_positive_values_as_detected() -> None
     values = np.array([[2, -3, 1], [-1, 0, -2]], dtype=np.int32)
     detected = np.zeros(2)
     totals = np.zeros(2)
-    squares = np.zeros(2)
+    deviations = np.zeros(2)
 
     _hvg_stats_gene_major_kernel.py_func(
         values,
@@ -100,13 +100,90 @@ def test_rna_feature_statistics_count_only_positive_values_as_detected() -> None
         np.arange(3, dtype=np.int64),
         detected,
         totals,
-        squares,
+        deviations,
     )
 
-    # Negative stored values add to the sums but are not detections.
+    # Negative stored values add to the sums and deviations but are not
+    # detections. The second gene's mean of -1 includes its zero.
     np.testing.assert_array_equal(detected, [2.0, 0.0])
     np.testing.assert_array_equal(totals, [0.0, -3.0])
-    np.testing.assert_array_equal(squares, [14.0, 5.0])
+    np.testing.assert_array_equal(deviations, [14.0, 2.0])
+
+
+def test_rna_gene_major_kernel_gives_equal_values_zero_deviation() -> None:
+    # 3,000 / 7 is not a float64 integer, so squared sums of these equal
+    # values do not cancel exactly.
+    values = np.array([[3] * 9, [3, 0, 3, 3, 0, 3, 3, 3, 0]], dtype=np.uint16)
+    deviations = np.zeros(2)
+
+    _hvg_stats_gene_major_kernel(
+        values,
+        np.full(9, 1 / 7),
+        1000.0,
+        np.array([0, 1], dtype=np.int64),
+        np.arange(9, dtype=np.int64),
+        np.zeros(2),
+        np.zeros(2),
+        deviations,
+    )
+
+    assert deviations[0] == 0.0
+    normalized = 1000.0 * values[1] / 7
+    np.testing.assert_allclose(
+        deviations[1], np.square(normalized - normalized.mean()).sum(), rtol=1e-14
+    )
+
+
+def test_constant_features_have_zero_variance_and_unit_pca_scale(
+    tmp_path, monkeypatch
+) -> None:
+    from scarf.storage.artifacts import artifact_group, inspect_artifact
+
+    rng = np.random.default_rng(3)
+    n_cells = 10_007
+    first, second = rng.integers(0, 5, size=(2, n_cells))
+    # Every cell holds 11 counts, 3 of them in the first feature, so that
+    # feature normalizes to the same value in every cell. Squared sums of
+    # these values leave a variance of about 3e-8 before the log transform,
+    # and of 2e-12 after it, which made the PCA scale about 1.5e-6.
+    counts = np.column_stack(
+        [np.full(n_cells, 3), first, 4 - first, second, 4 - second]
+    )
+    store = _open(_write(tmp_path, counts))
+
+    stats = store.RNA._streaming_feature_stats(np.arange(n_cells), np.arange(5))
+    # NumPy's own two-pass variance of the constant feature is about 1e-21.
+    assert stats["sigmas"][0] == 0.0
+    expected = 1000.0 * counts[:, 1:] / 11
+    np.testing.assert_allclose(stats["sigmas"][1:], expected.var(axis=0), rtol=1e-12)
+
+    normalized = store.run_normalization(
+        store.snapshot_cell_selection(), store.select_all_features(from_assay="RNA")
+    )
+    group = artifact_group(store.zw, normalized)
+    data = np.asarray(group["data"][:], dtype=np.float64)
+    assert np.unique(data[:, 0]).size == 1
+    assert group["feature_m2"][0] == 0.0
+    np.testing.assert_allclose(
+        group["feature_m2"][:],
+        np.square(data - data.mean(axis=0)).sum(axis=0),
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(group["feature_sum"][:], data.sum(axis=0), rtol=1e-12)
+
+    def stream(*_args, **_kwargs):
+        raise AssertionError("scaling must read the stored moments")
+
+    monkeypatch.setattr(ChunkedArray, "mean_and_std", stream)
+    pca = store.run_pca(normalized, dims=2, local_cache=False)
+    scaling = artifact_group(
+        store.zw, inspect_artifact(store.zw, pca).input_ref("feature_scaling")
+    )
+    assert scaling["scale"][0] == 1.0
+    assert scaling["mean"][0] == data[0, 0]
+    np.testing.assert_allclose(
+        scaling["scale"][1:], data[:, 1:].std(axis=0), rtol=1e-12
+    )
 
 
 def test_read_only_store_without_a_saved_size_factor_uses_the_default(

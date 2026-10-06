@@ -482,12 +482,7 @@ def test_readonly_summary_of_assays_without_rna_or_recorded_types(
     from scarf.datastore.summary import summarize_zarr_readonly
 
     location = tmp_path / "no-rna.zarr"
-    # Assay types written by another tool as a list carry no per-assay type.
-    _write_assay_layout(
-        location,
-        {"HTO": 0, "ADT": 3},
-        root_attrs={"assayTypes": ["ADT", "HTO"]},
-    )
+    _write_assay_layout(location, {"HTO": 0, "ADT": 3})
     before = _file_snapshot(location)
 
     summary = summarize_zarr_readonly(str(location))
@@ -495,12 +490,58 @@ def test_readonly_summary_of_assays_without_rna_or_recorded_types(
     # Without RNA or a stored default, the first assay in name order is used.
     assert summary.default_assay == "ADT"
     assert (summary.total_cells, summary.active_cells) == (3, 2)
+    # Updated: types resolve as a DataStore open resolves them, so an assay
+    # without a recorded type takes the preset of its name, not 'Assay'.
     assert [
         (assay.name, assay.assay_type, assay.total_features, assay.active_features)
         for assay in summary.assays
-    ] == [("ADT", "Assay", 3, 2), ("HTO", "Assay", 0, 0)]
+    ] == [("ADT", "ADT", 3, 2), ("HTO", "HTO", 0, 0)]
     assert summary.assays[1].feature_columns == ("I", "ids", "names")
     assert _file_snapshot(location) == before
+
+    # Assay types written by another tool as a list carry no per-assay type,
+    # so a DataStore open, and now the summary too, rejects the record.
+    listed = tmp_path / "listed.zarr"
+    _write_assay_layout(
+        listed, {"HTO": 0, "ADT": 3}, root_attrs={"assayTypes": ["ADT", "HTO"]}
+    )
+    with pytest.raises(ValueError, match="which is not a mapping from assay name"):
+        summarize_zarr_readonly(str(listed))
+
+
+def test_summary_reports_the_type_that_each_assay_resolved(tmp_path: Path) -> None:
+    from scarf.datastore.summary import summarize_zarr_readonly
+
+    location = tmp_path / "adt.zarr"
+    SparseToZarr(
+        csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.uint16)),
+        str(location),
+        cell_ids=["cell-1", "cell-2"],
+        feature_ids=["protein-1", "protein-2"],
+        assay_name="ADT",
+        mem_budget=64 * 1024 * 1024,
+        nthreads=1,
+    ).dump()
+    DataStore(str(location), default_assay="ADT", min_features_per_cell=0, nthreads=1)
+    # The record lacks the assay, as in a store that another tool wrote. A
+    # read-only open cannot record the type that it resolves from the name.
+    root = zarr.open_group(str(location), mode="r+")
+    root.attrs.put(
+        {
+            key: value
+            for key, value in root.attrs.asdict().items()
+            if key != "assayTypes"
+        }
+    )
+
+    datastore = DataStore(str(location), zarr_mode="r", nthreads=1)
+
+    assert datastore.get_assay("ADT").assayType == "ADT"
+    # Before, the summary reported the record with a fallback, 'Assay'.
+    for summary in (datastore.summary(), summarize_zarr_readonly(str(location))):
+        assert [(assay.name, assay.assay_type) for assay in summary.assays] == [
+            ("ADT", "ADT")
+        ]
 
 
 @pytest.mark.parametrize(

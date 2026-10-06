@@ -3,6 +3,7 @@ from typing import Any
 
 import zarr
 
+from ..metadata.rows import metadata_column_fingerprint
 from ..storage.budget import resolve_budget
 from ..storage.count_matrix import (
     CountMatrixPolicy,
@@ -16,7 +17,10 @@ from ..storage.identity import (
 )
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import ZarrArraySpec, _group_zarr_format, count_array_spec
-from ..storage.metadata_keys import validate_metadata_column_name
+from ..storage.metadata_keys import (
+    assay_membership_column,
+    validate_metadata_column_name,
+)
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -24,6 +28,7 @@ from ..storage.profiles import (
 )
 from ..storage.schema import validate_assay_name, validate_workspace_name
 from ..storage.sharding import preflight_counts_t_spec, row_band_task_count
+from ..storage.destinations import refuse_pending_assays
 from ..storage.stores import (
     MATRIX_SOURCE_ATTR,
     load_zarr,
@@ -35,6 +40,8 @@ from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.logging import logger
 from .features import FeatureKey, align_features, resolve_merge_dtype
 from .metadata import (
+    SOURCE_LACKS_ASSAY,
+    SOURCE_MEASURES_ALL,
     CellMetadataPlan,
     _cell_data_path,
     admit_cell_metadata_plan,
@@ -237,6 +244,10 @@ class DataStoreMerge:
         self._alignments: dict[str, Any] = {}
         # A source without an assay is None in that assay's source list.
         self._assaySources: dict[str, list[Any | None]] = {}
+        # The one type that every source holding an assay declares for it.
+        self._assayTypes: dict[str, str] = {}
+        # Each source's membership state of every merged assay.
+        self._sourceMembership: dict[str, list[str]] = {}
         self._metadataPlan: CellMetadataPlan | None = None
         # The count layout of each assay that a planned dump writes.
         self._countLayouts: dict[str, CountMatrixPolicy] = {}
@@ -287,81 +298,162 @@ class DataStoreMerge:
             sizes.append(min(chunk_rows))
         return sizes
 
-    def _membership_by_source(self) -> dict[str, set[str]]:
-        return {
-            name: set(ds.assay_names)
-            for ds, name in zip(self.datasets, self.names, strict=True)
-        }
-
     def _prepare_sources(self) -> None:
         if self._rowPlan is not None:
             return
-        self._rowPlan = build_row_plan(
-            self._source_cell_counts(),
-            self._row_chunk_sizes(),
-            self.names,
-            seed=self.seed,
-        )
-        for assay_name in self.uniqueAssays:
-            sources: list[Any | None] = []
+        try:
             for ds, name in zip(self.datasets, self.names, strict=True):
-                if assay_name in ds.assay_names:
-                    assay = ds.get_assay(assay_name)
-                    raw_rows, raw_features = map(int, assay.rawData.shape)
-                    source_cells = int(ds.cells.N)
-                    source_features = int(assay.feats.N)
-                    if raw_rows != source_cells:
-                        raise ValueError(
-                            f"Source {name!r} assay {assay_name!r} rawData has "
-                            f"{raw_rows} rows, but source cells has "
-                            f"{source_cells}"
-                        )
-                    if raw_features != source_features:
-                        raise ValueError(
-                            f"Source {name!r} assay {assay_name!r} rawData has "
-                            f"{raw_features} columns, but assay features has "
-                            f"{source_features}"
-                        )
-                    sources.append(assay)
-                else:
-                    if self.missingAssayPolicy == "error":
-                        raise ValueError(
-                            f"Source {name!r} is missing assay {assay_name!r}"
-                        )
-                    logger.warning(
-                        f"Source {name!r} is missing assay {assay_name!r}; "
-                        "writing zeros and marking assay membership false"
-                    )
-                    sources.append(None)
-            self._assaySources[assay_name] = sources
-            self._alignments[assay_name] = align_features(
-                sources, self.names, key=self.featureKey
+                refuse_pending_assays(
+                    ds.z, operation="merged", subject=f"Source {name!r}"
+                )
+            self._rowPlan = build_row_plan(
+                self._source_cell_counts(),
+                self._row_chunk_sizes(),
+                self.names,
+                seed=self.seed,
             )
+            for assay_name in self.uniqueAssays:
+                sources = self._assay_sources(assay_name)
+                self._assaySources[assay_name] = sources
+                self._assayTypes[assay_name] = self._agreed_assay_type(
+                    assay_name, sources
+                )
+                self._alignments[assay_name] = align_features(
+                    sources, self.names, key=self.featureKey
+                )
+            self._sourceMembership = self._source_membership()
+        except BaseException:
+            # A failed preparation leaves no partial state for a later call.
+            self._reset_prepared_state()
+            raise
 
-    def _resolve_assay_type(self, assay_name: str, sources: list[Any | None]) -> str:
-        from ..assay.base import Assay
-        from ..assay.classification import (
-            preset_assay_types,
-            resolve_persisted_assay_type,
+    def _assay_sources(self, assay_name: str) -> list[Any | None]:
+        """Return each source's assay, or None for a source without it."""
+        sources: list[Any | None] = []
+        for ds, name in zip(self.datasets, self.names, strict=True):
+            if assay_name in ds.assay_names:
+                assay = ds.get_assay(assay_name)
+                raw_rows, raw_features = map(int, assay.rawData.shape)
+                source_cells = int(ds.cells.N)
+                source_features = int(assay.feats.N)
+                if raw_rows != source_cells:
+                    raise ValueError(
+                        f"Source {name!r} assay {assay_name!r} rawData has "
+                        f"{raw_rows} rows, but source cells has "
+                        f"{source_cells}"
+                    )
+                if raw_features != source_features:
+                    raise ValueError(
+                        f"Source {name!r} assay {assay_name!r} rawData has "
+                        f"{raw_features} columns, but assay features has "
+                        f"{source_features}"
+                    )
+                sources.append(assay)
+            else:
+                if self.missingAssayPolicy == "error":
+                    raise ValueError(f"Source {name!r} is missing assay {assay_name!r}")
+                logger.warning(
+                    f"Source {name!r} is missing assay {assay_name!r}; "
+                    "writing zeros and marking assay membership false"
+                )
+                sources.append(None)
+        return sources
+
+    def _agreed_assay_type(self, assay_name: str, sources: list[Any | None]) -> str:
+        """Return the assay type that every source holding the assay declares.
+
+        The merged assay records this declaration, so a type such as ``HTO``
+        or ``GeneActivity`` is kept rather than reduced to the preset of its
+        assay class.
+
+        Raises:
+            ValueError: If two sources declare different types for the assay.
+        """
+        from ..assay.classification import declared_assay_type
+
+        declared = {
+            name: declared_assay_type(source)
+            for name, source in zip(self.names, sources, strict=True)
+            if source is not None
+        }
+        if len(set(declared.values())) > 1:
+            parts = [
+                f"{name!r} declares {assay_type!r}"
+                for name, assay_type in declared.items()
+            ]
+            listed = ", ".join(parts[:-1]) + " and " + parts[-1]
+            raise ValueError(
+                f"Sources declare different types for assay {assay_name!r}: "
+                f"{listed}. A merged assay keeps the single type that its "
+                "sources declare. Reopen each source whose declaration is wrong "
+                f"with zarr_mode='r+' and assay_types={{{assay_name!r}: <type>}} "
+                "so that every source declares the same type, then merge again."
+            )
+        return next(iter(declared.values()))
+
+    def _source_membership(self) -> dict[str, list[str]]:
+        """Return each source's membership state of every merged assay.
+
+        A state is ``"missing"`` when the source lacks the assay, ``"all"``
+        when the source measures every cell with it, and otherwise the name of
+        the source's membership column, whose values the merged column keeps.
+
+        Raises:
+            ValueError: If a source's membership column is malformed, or if a
+                cell that it marks as not measured has counts of the assay.
+        """
+        from ..metadata.membership import (
+            count_unmeasured_cells_with_counts,
+            resolve_assay_membership,
         )
 
-        presets = preset_assay_types()
-        for source in sources:
-            if isinstance(source, Assay):
-                # The merged assay keeps the assay class, and so the
-                # normalization, of its sources.
-                for type_name in ("RNA", "ATAC", "ADT"):
-                    if isinstance(source, presets[type_name]):
-                        return type_name
-                return "Assay"
-        return resolve_persisted_assay_type(assay_name)
+        membership: dict[str, list[str]] = {}
+        for assay_name in self.uniqueAssays:
+            states: list[str] = []
+            for ds, name, source in zip(
+                self.datasets,
+                self.names,
+                self._assaySources[assay_name],
+                strict=True,
+            ):
+                if source is None:
+                    states.append(SOURCE_LACKS_ASSAY)
+                    continue
+                column = resolve_assay_membership(ds.cells, assay_name)
+                if column is None:
+                    states.append(SOURCE_MEASURES_ALL)
+                    continue
+                unmeasured = count_unmeasured_cells_with_counts(
+                    ds.cells, assay_name, column
+                )
+                if unmeasured:
+                    raise ValueError(
+                        f"Source {name!r} has {assay_name} counts in {unmeasured} "
+                        f"of the cells that its column {column!r} marks as not "
+                        f"measured by assay {assay_name!r}. A cell outside an "
+                        "assay has none of its counts, so the membership column "
+                        "and the counts of this source disagree; import the "
+                        "source again."
+                    )
+                states.append(column)
+            membership[assay_name] = states
+        return membership
 
-    def _should_write_counts_t(
-        self, assay_name: str, sources: list[Any | None]
-    ) -> bool:
+    def _membership_columns(self) -> list[frozenset[str]]:
+        """Return each source's membership columns of the merged assays."""
+        return [
+            frozenset(
+                states[index]
+                for states in self._sourceMembership.values()
+                if states[index] not in {SOURCE_LACKS_ASSAY, SOURCE_MEASURES_ALL}
+            )
+            for index in range(len(self.datasets))
+        ]
+
+    def _should_write_counts_t(self, assay_name: str) -> bool:
         from ..assay.classification import is_rna_assay_type
 
-        type_name = self._resolve_assay_type(assay_name, sources)
+        type_name = self._assayTypes[assay_name]
         if is_rna_assay_type(type_name):
             logger.debug(f"countsT enabled for assay {assay_name} typed as {type_name}")
             return True
@@ -397,6 +489,17 @@ class DataStoreMerge:
                 for assay_name in self.uniqueAssays
             },
             "assays": list(self.uniqueAssays),
+            "assayTypes": dict(self._assayTypes),
+            # A resume must merge the same per-cell assay membership.
+            "sourceMembership": {
+                assay_name: [
+                    state
+                    if state in {SOURCE_LACKS_ASSAY, SOURCE_MEASURES_ALL}
+                    else metadata_column_fingerprint(ds.cells, state)
+                    for ds, state in zip(self.datasets, states, strict=True)
+                ]
+                for assay_name, states in self._sourceMembership.items()
+            },
             "seed": self.seed,
             "prependText": self.prependText,
             "resetCellFilter": self.resetCellFilter,
@@ -806,19 +909,29 @@ class DataStoreMerge:
                 prepend_text=self.prependText,
                 reset_cell_filter=self.resetCellFilter,
                 source_column=self.sourceColumn,
-                membership_assays=self.uniqueAssays,
+                membership=self._sourceMembership,
                 block_rows=preferred_rows,
                 scan_rows=scan_rows,
+                # Columns derived from a source's assays are not merged. Its
+                # membership columns are merged only as membership, and those
+                # of the assays that the merge leaves out are left out too.
                 excluded_columns=[
-                    frozenset().union(
+                    membership_columns.union(
                         *(
                             generated_cell_columns(
                                 name, ds.get_assay(name)._percent_features()
                             )
                             for name in ds.assay_names
-                        )
+                        ),
+                        (
+                            assay_membership_column(name)
+                            for name in ds.assay_names
+                            if name not in self.uniqueAssays
+                        ),
                     )
-                    for ds in self.datasets
+                    for ds, membership_columns in zip(
+                        self.datasets, self._membership_columns(), strict=True
+                    )
                 ],
             )
         assert self._metadataPlan is not None
@@ -847,14 +960,14 @@ class DataStoreMerge:
             kept_layouts[assay_name] = self.policy or self._completed_counts_policy(
                 existing, assay_name
             )
-            write_t = self._should_write_counts_t(assay_name, sources)
+            write_t = self._should_write_counts_t(assay_name)
             chunks, shards, tasks = self._counts_geometry(
                 self._count_spec(alignment.nFeats, dtype, kept_layouts[assay_name])
             )
             preliminary_plans.append(
                 AssayMergePlan(
                     assayName=assay_name,
-                    assayType=self._resolve_assay_type(assay_name, sources),
+                    assayType=self._assayTypes[assay_name],
                     sourcePresent=present,
                     missingSources=missing,
                     nFeatures=alignment.nFeats,
@@ -1132,7 +1245,7 @@ class DataStoreMerge:
                 profile=self.profile,
                 reset_cell_filter=self.resetCellFilter,
                 source_column=self.sourceColumn,
-                membership_by_source=self._membership_by_source(),
+                membership=self._sourceMembership,
             )
             components.append(ComponentResult("cellData", cell_action))
         else:
@@ -1256,5 +1369,7 @@ class DataStoreMerge:
         self._rowPlan = None
         self._alignments.clear()
         self._assaySources.clear()
+        self._assayTypes.clear()
+        self._sourceMembership = {}
         self._metadataPlan = None
         self._countLayouts = {}

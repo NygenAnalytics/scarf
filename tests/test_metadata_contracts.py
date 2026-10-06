@@ -17,6 +17,7 @@ from scarf.metadata.selection import (
     FeatureRef,
     NamedCellArtifact,
     NormalizationSpec,
+    cell_value_array,
     grouping_value_name,
     resolve_cell_aligned_artifact,
     resolve_complete_labels,
@@ -34,6 +35,7 @@ from scarf.metadata.queries import (
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.rows import (
     apply_missing_mask,
+    array_row_selection_parts,
     iter_metadata_column_blocks,
     metadata_missing_mask,
     read_metadata_missing_rows,
@@ -42,6 +44,7 @@ from scarf.metadata.rows import (
 )
 from scarf.metadata.table import MetaData as implementation_metadata
 from scarf.storage import ArtifactRef
+from scarf.storage.errors import ArtifactResolutionError
 from tests.signature_contracts import signature_digest
 
 
@@ -49,7 +52,7 @@ _METHODS = {
     "__init__",
     "__repr__",
     "_column_names",
-    "_fill_to_index",
+    "_expand_to_rows",
     "_get_array",
     "_get_size",
     "_save",
@@ -99,9 +102,11 @@ def _metadata_fixture() -> metadata.MetaData:
 
 
 def test_metadata_facade_exports_canonical_objects():
-    assert metadata.__all__ == ["MetaData", "MetaDataRowBlock"]
+    assert metadata.__all__ == ["CellValues", "MetaData", "MetaDataRowBlock"]
+    assert metadata.CellValues is selection.CellValues
     assert metadata.MetaData is implementation_metadata
     assert metadata.MetaDataRowBlock is implementation_row_block
+    assert metadata.CellValues.__module__ == "scarf.metadata"
     assert metadata.MetaData.__module__ == "scarf.metadata"
     assert metadata.MetaDataRowBlock.__module__ == "scarf.metadata"
 
@@ -111,7 +116,7 @@ def test_metadata_method_ownership_and_signatures_remain_stable():
     methods = {name: getattr(metadata.MetaData, name) for name in _METHODS}
 
     assert signature_digest(methods) == (
-        "7a60ae131135bc959cbc4443f91307a33616740779a0a5d50d3f9b2341152508"
+        "85c8760f6875db7c709191cf13f871f3ace951cfa8cb0dd21b0a49f58c217352"
     )
 
 
@@ -349,6 +354,12 @@ def test_chunkwise_metadata_rows_preserve_order_and_decode_one_chunk():
             selected = np.asarray(request[0])
         assert np.unique(selected // array.chunks[0]).size == 1
 
+    # The bytes charged per row cover every value of a two-dimensional row.
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    narrow = group.create_array("narrow", shape=(6,), dtype="f8", chunks=(2,))
+    wide = group.create_array("wide", shape=(6, 4), dtype="f8", chunks=(2, 4))
+    assert array_row_selection_parts(wide)[1] > array_row_selection_parts(narrow)[1]
+
 
 def test_metadata_column_blocks_respect_source_chunk_boundaries():
     class ArrayMetadata:
@@ -432,6 +443,16 @@ def test_metadata_selection_value_contracts_reject_ambiguous_inputs():
         FeatureRef("gene", by="label")
     with pytest.raises(ValueError, match="reduction must be"):
         FeatureRef("gene", reduction="median")
+    for value in (1.9, np.float64(2.0), True, np.bool_(True), "1", np.array(1)):
+        with pytest.raises(TypeError, match="FeatureRef value must be an integer"):
+            FeatureRef(value, by="index")
+    index_ref = FeatureRef(np.int64(1), by="index")
+    assert type(index_ref.value) is int and index_ref == FeatureRef(1, by="index")
+    for by in ("name", "id"):
+        for value in (1, np.int64(1), None, b"gene"):
+            with pytest.raises(TypeError, match="FeatureRef value must be a string"):
+                FeatureRef(value, by=by)
+    assert type(FeatureRef(np.str_("gene"), by="id").value) is str
     with pytest.raises(ValueError, match="non-empty name"):
         NamedCellArtifact("", _artifact("cluster_labels", "a"))
     with pytest.raises(ValueError, match="surrounding whitespace"):
@@ -440,6 +461,18 @@ def test_metadata_selection_value_contracts_reject_ambiguous_inputs():
         NamedCellArtifact("labels", object())
     with pytest.raises(ValueError, match="categorical cell labels"):
         grouping_value_name("embedding")
+    with pytest.raises(ValueError, match="categorical cell labels"):
+        grouping_value_name("connectivity_map")
+    assert grouping_value_name("cluster_cut") == "labels"
+    assert grouping_value_name("sampling") == "sampled"
+    assert cell_value_array("cell_cycle") == ("phase", True)
+    assert cell_value_array("cell_cycle", "s_score") == ("s_score", False)
+    with pytest.raises(ValueError, match="no per-cell array 'values'"):
+        cell_value_array("cell_cycle", "values")
+    with pytest.raises(ValueError, match="'normalized' is not a cell-aligned"):
+        cell_value_array("normalized", "data")
+    with pytest.raises(TypeError, match="value must be a string or None"):
+        cell_value_array("cell_cycle", b"phase")
     with pytest.raises(ValueError, match="transform"):
         NormalizationSpec(transform="sqrt")
 
@@ -455,6 +488,14 @@ def test_cell_aligned_artifact_validation_reports_each_broken_contract(monkeypat
         resolve_cell_aligned_artifact(None, artifact, expected_kind="cell_cycle")
     with pytest.raises(ValueError, match="value_name must be"):
         resolve_cell_aligned_artifact(None, artifact, value_name="")
+    with pytest.raises(ValueError, match="ndim must be"):
+        resolve_cell_aligned_artifact(None, artifact, ndim=0)
+    # The table names every value array: a listed kind reads only its per-cell
+    # arrays, and an unlisted kind has no canonical array to fall back to.
+    with pytest.raises(ValueError, match="no per-cell array 'labels'"):
+        resolve_cell_aligned_artifact(None, artifact, value_name="labels")
+    with pytest.raises(ValueError, match="'cell_selection' is not a cell-aligned"):
+        resolve_cell_aligned_artifact(None, source)
 
     monkeypatch.setattr(
         selection,
@@ -464,19 +505,40 @@ def test_cell_aligned_artifact_validation_reports_each_broken_contract(monkeypat
     with pytest.raises(ValueError, match="unavailable or incomplete"):
         resolve_cell_aligned_artifact(None, artifact)
 
+    # The recorded cell selection is read with the one strict input reader.
     status = SimpleNamespace(exists=True, complete=True, inputs={})
     monkeypatch.setattr(selection, "inspect_artifact", lambda *_: status)
-    with pytest.raises(ValueError, match="no cell-selection input"):
+    with pytest.raises(
+        ArtifactResolutionError, match="cluster_labels artifact has no 'cell_selection'"
+    ) as missing:
         resolve_cell_aligned_artifact(None, artifact)
+    assert missing.value.code == "corrupt_payload"
 
     status.inputs = {"cell_selection": {"type": "wrong"}}
-    with pytest.raises(ValueError, match="cell selection is malformed"):
+    with pytest.raises(ArtifactResolutionError, match="malformed 'cell_selection'"):
         resolve_cell_aligned_artifact(None, artifact)
 
     status.inputs = {"cell_selection": source.to_dict()}
-    monkeypatch.setattr(selection, "_selection_indices", lambda *_: np.array([1, 3]))
     with pytest.raises(TypeError, match="cell_selection must be"):
         resolve_cell_aligned_artifact(None, artifact, cell_selection=object())
+
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {})
+    with pytest.raises(ValueError, match="no 'values' value array"):
+        resolve_cell_aligned_artifact(None, artifact)
+
+    # The selection's cells are counted, not read, to check the array's
+    # shape and to admit the read before any cell row is read.
+    monkeypatch.setattr(selection, "_selection_count", lambda *_: 2)
+    bad_array = SimpleNamespace(ndim=1, shape=(3,))
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": bad_array})
+    monkeypatch.setattr(selection, "as_zarr_array", lambda value, **_: value)
+    with pytest.raises(ValueError, match="one value per source-selected cell"):
+        resolve_cell_aligned_artifact(None, artifact)
+    with pytest.raises(ValueError, match="one row per source-selected cell"):
+        resolve_cell_aligned_artifact(None, artifact, ndim=None)
+
+    good_array = SimpleNamespace(ndim=1, shape=(2,), attrs={})
+    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": good_array})
 
     def out_of_bounds(_root, ref):
         return np.array([1, 3]) if ref == source else np.array([5])
@@ -492,19 +554,9 @@ def test_cell_aligned_artifact_validation_reports_each_broken_contract(monkeypat
     with pytest.raises(ValueError, match="must be a subset"):
         resolve_cell_aligned_artifact(None, artifact, cell_selection=target)
 
+    # The linked mask is resolved before any value is read, so that the
+    # memory admission counts it.
     monkeypatch.setattr(selection, "_selection_indices", lambda *_: np.array([1, 3]))
-    monkeypatch.setattr(selection, "artifact_group", lambda *_: {})
-    with pytest.raises(ValueError, match="no 'values' value array"):
-        resolve_cell_aligned_artifact(None, artifact)
-
-    bad_array = SimpleNamespace(ndim=1, shape=(3,))
-    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": bad_array})
-    monkeypatch.setattr(selection, "as_zarr_array", lambda value, **_: value)
-    with pytest.raises(ValueError, match="one value per source-selected cell"):
-        resolve_cell_aligned_artifact(None, artifact)
-
-    good_array = SimpleNamespace(ndim=1, shape=(2,))
-    monkeypatch.setattr(selection, "artifact_group", lambda *_: {"values": good_array})
     monkeypatch.setattr(
         selection,
         "read_array_rows_chunkwise",
@@ -576,16 +628,24 @@ def test_metadata_table_fill_and_error_contracts():
 
     with pytest.raises(ValueError, match="Expected shape"):
         table._save("value", np.arange(2))
+    with pytest.raises(ValueError, match="missing mask is of shape"):
+        table._save("value", np.arange(4), np.zeros(3, dtype=bool))
 
-    np.testing.assert_array_equal(
-        table._fill_to_index([5, 6], np.nan, "I"), [5, 0, 6, 0]
-    )
-    with pytest.raises(ValueError, match="integer value"):
-        table._fill_to_index(np.array([-2, -1]), np.nan, "I")
-    with pytest.raises(ValueError, match="integer value"):
-        table._fill_to_index(np.array([1, 2]), "bad", "I")
+    # Rows that the key leaves out hold a placeholder and are flagged missing,
+    # whatever the sign of the supplied integers.
+    for supplied, expected in (([5, 6], [5, 0, 6, 0]), ([-2, -1], [-2, 0, -1, 0])):
+        values, missing = table._expand_to_rows(supplied, "I", name="x")
+        np.testing.assert_array_equal(values, expected)
+        np.testing.assert_array_equal(missing, [False, True, False, True])
+    # An explicit fill is a real value that must fit the dtype.
+    values, missing = table._expand_to_rows(np.array([-2, -1]), "I", -9, name="x")
+    np.testing.assert_array_equal(values, [-2, -9, -1, -9])
+    assert not missing.any()
+    for fill in (np.nan, "bad"):
+        with pytest.raises(ValueError, match="fill_value .* does not fit"):
+            table._expand_to_rows(np.array([1, 2]), "I", fill, name="x")
     with pytest.raises(ValueError, match="incorrect length"):
-        table._fill_to_index(np.array([1]), 0, "I")
+        table._expand_to_rows(np.array([1]), "I", 0, name="x")
 
     with pytest.raises(TypeError, match="value_targets"):
         table.get_index_by("a", "ids")
@@ -681,8 +741,13 @@ def test_insert_keeps_an_explicit_boolean_fill_value():
     table.insert("drop_rows", np.array([True, False, False]))
 
     np.testing.assert_array_equal(table.fetch_all("keep"), [True, True, False, False])
+    assert metadata_missing_mask(table, "keep") is None
+    # Without a fill, the row outside the key holds False and is flagged missing.
     np.testing.assert_array_equal(
         table.fetch_all("drop_rows"), [True, False, False, False]
+    )
+    np.testing.assert_array_equal(
+        metadata_missing_mask(table, "drop_rows")[:], [False, True, False, False]
     )
 
 
@@ -712,11 +777,13 @@ def test_insert_rejects_zarr_path_separators_before_writing(name):
 
 
 @pytest.mark.parametrize("name", ["r/k", "r\\k"], ids=["slash", "backslash"])
-def test_reset_key_rejects_zarr_path_separators_before_writing(name):
+def test_key_writes_reject_zarr_path_separators_before_writing(name):
     table = _metadata_fixture()
 
     with pytest.raises(ValueError, match="path separators; use 'r_k' instead"):
         table.reset_key(name)
+    with pytest.raises(ValueError, match="path separators; use 'r_k' instead"):
+        table.update_key(np.ones(4, dtype=bool), name)
 
     assert set(table._group.keys()) == {"I", "ids", "names", "score"}
 

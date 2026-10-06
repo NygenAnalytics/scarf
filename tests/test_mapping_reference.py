@@ -416,6 +416,9 @@ def test_symphony_mapping_reference_has_conditional_state_and_read_only_reload(
     assert reference.symphony_state.n_clusters == 3
     assert reference.metadata["batch_columns"] == ["mapping_batch"]
     assert reference.metadata["harmony_parameters"]["nclust"] == 3
+    # The first selected cell is in batch b, but Harmony encodes the plain
+    # labels in sorted order and the reference copies that order.
+    assert reference.metadata["batch_levels"] == [["a", "b"]]
     # Harmony stores centroids as dimensions by clusters; the reference keeps
     # them as clusters by dimensions, like its other centroid arrays.
     harmony = artifact_group(datastore.zw, mapping_source.correction)
@@ -551,6 +554,39 @@ def test_symphony_mapping_reference_load_requires_recorded_batch_metadata(
 
     with pytest.raises(ValueError, match="Re-run run_harmony"):
         datastore.get_mapping_reference(reference_ref)
+
+
+def test_symphony_mapping_reference_of_an_earlier_harmony_record_still_loads(
+    mapping_source,
+    reference_store,
+):
+    datastore = reference_store
+    # Record the correction as releases before 1.0.0 did: without a revision,
+    # and with the levels in order of first appearance among the selected
+    # cells. Those releases recorded the same parameters, the frozen
+    # algorithm_version included.
+    correction = artifact_group(datastore.zw, mapping_source.correction)
+    provenance = {
+        key: value
+        for key, value in correction.attrs["provenance"].items()
+        if key != "revision"
+    }
+    assert provenance["parameters"]["algorithm_version"] == "centroid_snapshot_v2"
+    correction.attrs["provenance"] = provenance
+    correction.attrs["batch_levels"] = [["b", "a"]]
+    status = datastore.inspect_artifact(mapping_source.correction)
+    assert status.revision == 1
+    assert not status.is_current
+
+    reference = datastore.get_mapping_reference(
+        datastore.build_mapping_reference(mapping_source.symphony_neighbors)
+    )
+
+    # A reference keeps the record of its own correction, so a superseded
+    # correction still builds and loads its reference.
+    assert reference.batch_correction == mapping_source.correction
+    assert reference.metadata["batch_levels"] == [["b", "a"]]
+    assert reference.metadata["harmony_parameters"] == {"nclust": 3}
 
 
 def test_loaded_mapping_reference_is_deeply_immutable(

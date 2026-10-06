@@ -25,6 +25,7 @@ from scarf.datastore._pipeline_fields import (
 from scarf.datastore._pipeline_ledger import PipelineEventEmitter
 from scarf.datastore.pipeline_accessor import PipelineEvent
 from scarf.storage.artifact_writer import finish_artifact, plan_artifact, start_artifact
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_group,
@@ -126,6 +127,8 @@ class _ClusterSelectionStore:
     def __init__(self, root: Any) -> None:
         self.zw = root
         self.memoryBytes = 64 * 1024 * 1024
+        self.resources = ResourceBudget(self.memoryBytes, 1)
+        self.nthreads = 1
 
 
 def test_pipeline_field_display_summaries_read_stored_chunks() -> None:
@@ -1508,7 +1511,7 @@ def test_cluster_selection_adapter_rejects_detached_lineage() -> None:
     )
     with pytest.raises(
         ValueError,
-        match="assay-scoped PCA reduction or Harmony",
+        match="assay-scoped PCA reduction, Harmony batch-correction, or normalized",
     ):
         run_cluster_selection(
             store,
@@ -1755,6 +1758,60 @@ def test_cluster_selection_scores_harmony_coordinates_not_pca(
             cell_selection=lineage["cell_selection"],
             candidates=(("clusters", labels),),
         )
+
+
+def test_cluster_selection_admits_its_coordinate_read_before_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scarf.metrics.cluster_selection as selection_metrics
+    from scarf.matrix import ChunkedArray
+    from scarf.storage.artifacts import list_artifacts
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    store = _ClusterSelectionStore(root)
+    rng = np.random.default_rng(5)
+    coordinates = np.vstack(
+        [rng.normal(0, 0.1, (30, 2)), rng.normal(5, 0.1, (30, 2))]
+    ).astype(np.float32)
+    lineage = _cluster_selection_lineage(root, n_cells=60, coordinates=coordinates)
+    labels = _cluster_labels(
+        root,
+        values=np.repeat([0, 1], 30).astype(np.int32),
+        cell_selection=lineage["cell_selection"],
+        graph=lineage["connectivity_map"],
+    )
+    reads: list[object] = []
+    read_rows = selection_metrics.read_matrix_rows
+
+    def recorded(data, row_indices):
+        reads.append(data)
+        return read_rows(data, row_indices)
+
+    monkeypatch.setattr(selection_metrics, "read_matrix_rows", recorded)
+    # The silhouette's working memory alone is a quarter of the 64 MiB the
+    # store reports, which this operation limit cannot hold.
+    store.resources = ResourceBudget(1024 * 1024, 1)
+
+    with pytest.raises(MemoryError) as caught:
+        _select_clusters(store, lineage, (("clusters", labels),))
+
+    message = str(caught.value)
+    assert "score 60 sampled cells with 2 dimensions" in message
+    assert "operation limit is 1048576 bytes" in message
+    assert reads == []
+    assert (
+        list_artifacts(root, scope="assay", assay="RNA", kind="cluster_selection") == []
+    )
+
+    # Within the budget, the rows are read in budgeted blocks of the stored
+    # coordinates, not with one unplanned Zarr selection.
+    store.resources = ResourceBudget(store.memoryBytes, 1)
+    _decision, selected_key, _selected = _select_clusters(
+        store, lineage, (("clusters", labels),)
+    )
+    assert selected_key == "clusters"
+    assert len(reads) == 1 and isinstance(reads[0], ChunkedArray)
+    assert reads[0]._resources is store.resources
 
 
 def test_rich_pipeline_views_plots_and_markers_remain_frozen_after_live_i_drift(

@@ -6,11 +6,11 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations import trajectory as trajectory_operations
-from scarf.datastore._operations.features import (
+from scarf.features.statistical import (
     _statistical_normalization,
-    _statistical_storage_columns,
+    distinct_label_keys,
+    statistical_storage_columns,
 )
-from scarf.features.statistical import distinct_label_keys
 from scarf.graph import distances as graph_distances
 from scarf.metadata.selection import NamedCellArtifact
 from scarf.quality_control.filtering import validate_named_cell_artifacts
@@ -45,7 +45,7 @@ def _connectivity_payload(
 
 def test_statistical_helpers_reject_unknown_contract_values() -> None:
     with pytest.raises(ValueError, match="Unknown statistical test method"):
-        _statistical_storage_columns("permutation")
+        statistical_storage_columns("permutation")
     with pytest.raises(ValueError, match="normalization.source"):
         _statistical_normalization(SimpleNamespace(source="scaled", transform="none"))
     with pytest.raises(ValueError, match="normalization.transform"):

@@ -28,6 +28,9 @@ These prepared stores contain cells with author-provided cell-type labels.
 Their `I` columns mark the cells that passed quality control.
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import pandas as pd
 
 import scarf
@@ -62,8 +65,9 @@ ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
 Confirm assay type, cell counts, and feature counts before merging. `DataStoreMerge` validates the
-feature axes; matching gene symbols alone do not establish compatible genome builds or
-quantification conventions.
+feature axes and requires every source to declare the same assay type, which the merged assay
+keeps; matching gene symbols alone do not establish compatible genome builds or quantification
+conventions.
 
 ```{code-cell} ipython3
 # Compare assay types and cell and feature counts before merging.
@@ -86,30 +90,39 @@ pd.DataFrame(
 `names` supplies the source labels, `source_column` names their metadata column, and `prepend_text`
 keeps imported metadata names distinct from columns authored in the merged store.
 `reset_cell_filter=False` preserves the source quality-control selections.
+A merge never replaces a store that a `DataStore` has opened, even with `overwrite=True`, so this
+example writes into a new temporary folder each time it runs.
 
 ```{code-cell} ipython3
-# Choose a separate path for the merged counts.
-merged_path = "scarf_datasets/kang_dataset_merging.zarr"
+# Keep the merged example in a temporary folder.
+merge_directory = TemporaryDirectory()
+# Choose a new path for the merged counts.
+merged_path = Path(merge_directory.name) / "kang_dataset_merging.zarr"
 # Write the prepared counts and metadata to the new store.
 scarf.DataStoreMerge(
     datasets=[ds_ctrl, ds_stim],
-    zarr_path=merged_path,
+    zarr_path=str(merged_path),
     names=["ctrl", "stim"],
     assays=["RNA"],
     prepend_text="orig",
     reset_cell_filter=False,
     source_column="sample_id",
-    overwrite=True,
 ).dump()
 
 # Open the completed merge to inspect its cells and features.
-merged = scarf.DataStore(merged_path, nthreads=4)
+merged = scarf.DataStore(str(merged_path), nthreads=4)
 # Check the merged cell and feature dimensions.
 merged
 ```
 
 `sample_id` records the source label.
 Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
+`RNA_I` marks the cells that the merged RNA assay measured; every cell here comes from an RNA
+source, so it is True for all of them. When a source lacks an assay, or measured only some of its
+cells with it, the merged `<assay>_I` column keeps that per-cell membership. Operations that read
+that assay's values then refuse the cells it did not measure, whose counts are zero-filled, and
+`merged.select_measured_cells("<assay>", cell_selection=...)` keeps the measured ones; here it
+returns the selection unchanged, because RNA measured every cell.
 
 The merged active population contains labelled cells from both sources.
 

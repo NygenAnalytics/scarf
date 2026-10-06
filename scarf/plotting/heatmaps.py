@@ -7,14 +7,15 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
-from ..assay import ATACassay
+from ..assay.normalization import resolve_normalization_params
 from ..features.markers.table import load_marker_table
-from ..metadata.selection import GROUPING_VALUE_NAMES
+from ..metadata.membership import measured_rows
+from ..metadata.selection import grouping_value_name
 from ..storage.artifacts import ArtifactRef, artifact_path
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array, as_zarr_group
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance
-from ._data import _artifact_input
+from ._data import _artifact_input, unmeasured_extras
 from ._deps import require_matplotlib, require_seaborn
 from ._figure import (
     LegendSpec,
@@ -28,6 +29,7 @@ from ._heatmap_utils import (
     draw_annotation_strips,
     normalize_annotations,
     order_heatmap,
+    validate_linkage,
 )
 from ..utils.arguments import integer_argument
 from ..utils.arrays import sort_categories
@@ -42,11 +44,21 @@ from ._style import (
 
 
 def _marker_log_transform(assay: Any, value: bool | None) -> bool:
-    if value is None:
-        return not isinstance(assay, ATACassay)
-    if not isinstance(value, (bool, np.bool_)):
+    """Resolve ``log_transform`` for the assay's configured normalizer.
+
+    None logs the values of ``norm_lib_size``, whose scale Scarf knows, and
+    leaves every other normalizer's values as they are. True also logs the
+    values of ``norm_dummy`` and of custom normalizers, and raises
+    ``ValueError`` for a normalizer that cannot be logged.
+    """
+    if value is not None and not isinstance(value, (bool, np.bool_)):
         raise TypeError("log_transform must be a boolean or None")
-    return bool(value)
+    return resolve_normalization_params(
+        assay,
+        {"log_transform": value},
+        caller="marker_heatmap",
+        default=True,
+    )["log_transform"]
 
 
 def _place_clustermap_annotation_legend(
@@ -163,7 +175,7 @@ def _prepare_marker_heatmap(
         store.zw[artifact_path(clusters_ref)],
         name=clusters_ref.artifact_id,
     )
-    cluster_value_name = GROUPING_VALUE_NAMES.get(clusters_ref.kind, "values")
+    cluster_value_name = grouping_value_name(clusters_ref.kind)
     groups = np.asarray(
         as_zarr_array(
             cluster_group[cluster_value_name],
@@ -208,6 +220,16 @@ def _prepare_marker_heatmap(
         raise ValueError("ERROR: Marker list is empty for all the groups")
     feature_index = np.asarray(sorted(set(feature_indices)), dtype=int)
     resolved_log_transform = _marker_log_transform(assay, log_transform)
+    # A cell that the assay did not measure, such as one of a marker search
+    # that an earlier release ran over a merged store, has no value: it is
+    # left out of the normalization and of its group's mean, as display reads
+    # leave it out. Membership comes from the assay's own cell table.
+    measured = measured_rows(assay.cells, assay.name, cell_index)
+    unmeasured: dict[str, int] = {}
+    if measured is not None:
+        unmeasured[assay.name] = int(np.count_nonzero(~measured))
+        cell_index = cell_index[measured]
+        groups = groups[measured]
     normalized = assay.normed(
         cell_idx=cell_index,
         feat_idx=feature_index,
@@ -268,6 +290,7 @@ def _prepare_marker_heatmap(
         "clusters_ref": clusters_ref,
         "cell_selection": selection_ref,
         "n_cells": len(cell_index),
+        "unmeasured_cells": unmeasured,
     }
 
 
@@ -314,6 +337,7 @@ def marker_heatmap(
     cluster_columns = bool(heatmap_kwargs.pop("col_cluster", cluster_columns))
     cluster_method = str(heatmap_kwargs.pop("method", cluster_method))
     cluster_metric = str(heatmap_kwargs.pop("metric", cluster_metric))
+    validate_linkage(cluster_method, cluster_metric)
     if "row_linkage" in heatmap_kwargs or "col_linkage" in heatmap_kwargs:
         raise ValueError(
             "Pass clustering controls through cluster_rows, cluster_columns, "
@@ -543,18 +567,21 @@ def marker_heatmap(
         vcenter=resolved_color_scale.vcenter,
         missing_color=resolved_color_scale.missing_color,
     )
+    # The tables name their axes by role, as matrixplot's do. The drawn
+    # matrix keeps unnamed axes, because seaborn labels the heatmap's axes
+    # with their names.
     tables = {
-        "matrix": displayed_matrix.copy(),
+        "matrix": displayed_matrix.rename_axis(index="feature", columns="group"),
         "markers": cast(pd.DataFrame, prepared["markers"]).copy(),
     }
     if not row_annotation_values.empty:
         tables["row_annotations"] = row_annotation_values.reindex(
-            displayed_matrix.index
-        )
+            list(displayed_matrix.index)
+        ).rename_axis("feature")
     if not column_annotation_values.empty:
         tables["column_annotations"] = column_annotation_values.reindex(
-            displayed_matrix.columns
-        )
+            list(displayed_matrix.columns)
+        ).rename_axis("group")
     result = PlotResult(
         figure=figure,
         axes=axes,
@@ -605,6 +632,7 @@ def marker_heatmap(
                 "cluster_metric": cluster_metric,
                 "row_annotations": list(row_annotation_values.columns),
                 "column_annotations": list(column_annotation_values.columns),
+                **unmeasured_extras(cast(dict[str, int], prepared["unmeasured_cells"])),
             },
         ),
         owns_figure=owns_figure,

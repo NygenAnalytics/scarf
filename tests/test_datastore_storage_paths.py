@@ -354,7 +354,7 @@ def test_default_assay_is_required_when_ambiguous_and_must_exist(
     assert "defaultAssay" not in zarr.open_group(location, mode="r").attrs
 
 
-def test_unrecognized_assay_types_open_and_persist_as_generic_assays(
+def test_unrecognized_assay_types_are_rejected_before_any_write(
     tmp_path: Path,
 ) -> None:
     location = _write_store(
@@ -364,9 +364,25 @@ def test_unrecognized_assay_types_open_and_persist_as_generic_assays(
     # A store written without recorded assay types, as other tools write them.
     del zarr.open_group(location, mode="r+").attrs["assayTypes"]
 
-    with _captured_warnings() as messages:
-        datastore = _open(location, assay_types={"Spatial": "Imaging"})
+    def recorded_attributes() -> dict[str, Any]:
+        return dict(zarr.open_group(location, mode="r").attrs)
 
+    before = recorded_attributes()
+    with pytest.raises(
+        ValueError,
+        match=r"assay_type 'Imaging' of assay 'Spatial' is not a preset"
+        r".*'Assay' for a generic assay",
+    ):
+        _open(location, assay_types={"Spatial": "Imaging"})
+    with pytest.raises(
+        ValueError, match=r"assay_types names assays that are not in the store: 'Image'"
+    ):
+        _open(location, assay_types={"Image": "RNA"})
+    assert recorded_attributes() == before
+
+    # Only an assay without any declaration falls back to the generic class.
+    with _captured_warnings() as messages:
+        datastore = _open(location, assay_types={"Spatial": "Assay"})
     assert isinstance(datastore.RNA, RNAassay)
     assert type(datastore.Spatial) is Assay
     assert type(datastore.Protein) is Assay
@@ -375,11 +391,25 @@ def test_unrecognized_assay_types_open_and_persist_as_generic_assays(
         "Spatial": "Assay",
         "Protein": "Assay",
     }
-    assert any("Imaging is not a recognized assay type" in text for text in messages)
     assert any("Protein was set as a generic Assay" in text for text in messages)
+    assert not any("Spatial was set as a generic Assay" in text for text in messages)
     reopened = _open(location)
     assert type(reopened.Spatial) is Assay
     assert type(reopened.Protein) is Assay
+
+    # An unrecognized recorded type names its remedy, and an explicit preset
+    # replaces it.
+    recorded = {"RNA": "RNA", "Spatial": "Imaging", "Protein": "Assay"}
+    zarr.open_group(location, mode="r+").attrs["assayTypes"] = recorded
+    with pytest.raises(
+        ValueError,
+        match=r"Assay 'Spatial' is recorded in assayTypes as 'Imaging'.*"
+        r"zarr_mode='r\+' and assay_types=\{'Spatial': ",
+    ):
+        _open(location)
+    assert zarr.open_group(location, mode="r").attrs["assayTypes"] == recorded
+    datastore = _open(location, assay_types={"Spatial": "ADT"})
+    assert datastore.zw.attrs["assayTypes"] == {**recorded, "Spatial": "ADT"}
 
 
 def test_load_artifact_distinguishes_missing_and_incomplete_artifacts(

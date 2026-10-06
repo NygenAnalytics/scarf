@@ -47,8 +47,10 @@ run = ds.pipeline.open(label="docs_default")
 ds
 ```
 
-The prepared run contains the selected cells, clusters, UMAP coordinates, and marker results.
-Its name is `docs_default`, but it used dataset-specific filtering, 500 variable genes, and
+The prepared run contains the selected cells, clusters, and UMAP coordinates. An earlier release
+wrote its marker tables, which `get_markers` refuses; rank markers for its clusters with
+`ds.run_marker_search(run["clusters"], features=run["feature_universe"])`, as {doc}`annotation`
+does. Its name is `docs_default`, but it used dataset-specific filtering, 500 variable genes, and
 15 PCs. Those settings preserve the example we will interpret; they are not the current pipeline
 defaults.
 

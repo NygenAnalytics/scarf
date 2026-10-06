@@ -11,6 +11,7 @@ from ..storage.pipeline_runs import (
     PipelinePlanRecord,
     PipelineStageMetrics,
     PipelineStageOutputRecord,
+    bounded_record_text,
     fail_pipeline_run_record,
     finish_pipeline_stage_record,
     interrupt_pipeline_run_record,
@@ -89,7 +90,7 @@ def interruption_record(
         request = error.request
         return PipelineInterruptionRecord(
             kind="signal" if request.signal_number is not None else "shutdown_request",
-            message=request.reason,
+            message=bounded_record_text(request.reason),
             requested_at_ns=request.requested_at_ns,
             signal_number=request.signal_number,
             signal_name=request.signal_name,
@@ -97,13 +98,13 @@ def interruption_record(
     if isinstance(error, KeyboardInterrupt):
         return PipelineInterruptionRecord(
             kind="keyboard_interrupt",
-            message=str(error) or "keyboard interrupt",
+            message=bounded_record_text(str(error) or "keyboard interrupt"),
             requested_at_ns=time.time_ns(),
         )
     if isinstance(error, asyncio.CancelledError):
         return PipelineInterruptionRecord(
             kind="asyncio_cancelled",
-            message=str(error) or "async operation cancelled",
+            message=bounded_record_text(str(error) or "async operation cancelled"),
             requested_at_ns=time.time_ns(),
         )
     return None

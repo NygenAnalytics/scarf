@@ -38,6 +38,35 @@ def _explicit_order(
     return order
 
 
+# SciPy's hierarchical clustering methods; the last three need Euclidean data.
+_LINKAGE_METHODS = (
+    "single",
+    "complete",
+    "average",
+    "weighted",
+    "centroid",
+    "median",
+    "ward",
+)
+_EUCLIDEAN_LINKAGE_METHODS = frozenset({"centroid", "median", "ward"})
+
+
+def validate_linkage(method: str, metric: str) -> None:
+    """Reject a clustering method that is undefined for the distance metric."""
+    if method not in _LINKAGE_METHODS:
+        raise ValueError(
+            "cluster_method must be one of "
+            + ", ".join(repr(name) for name in _LINKAGE_METHODS)
+            + f", not {method!r}"
+        )
+    if method in _EUCLIDEAN_LINKAGE_METHODS and metric != "euclidean":
+        raise ValueError(
+            f"cluster_method={method!r} requires cluster_metric='euclidean', "
+            f"not {metric!r}. Use cluster_method='average' or 'complete' with "
+            f"{metric!r} distances"
+        )
+
+
 def _finite_linkage_values(values: np.ndarray) -> np.ndarray:
     data = np.asarray(values, dtype=np.float64).copy()
     if np.isfinite(data).all():
@@ -59,6 +88,7 @@ def _linkage(values: np.ndarray, *, method: str, metric: str) -> np.ndarray:
     from scipy.cluster.hierarchy import linkage
     from scipy.spatial.distance import pdist
 
+    validate_linkage(method, metric)
     data = np.asarray(values, dtype=np.float64)
     if np.isinf(data).any():
         raise ValueError("Heatmap clustering requires finite values")

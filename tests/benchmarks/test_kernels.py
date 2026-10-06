@@ -74,10 +74,12 @@ def test_hvg_gene_major_statistics(bench) -> None:
         totals = counts.sum(axis=1, dtype=np.float64)
         totals[totals == 0] = 1
         values = inputs.SIZE_FACTOR * counts / totals[:, None]
-        nonzero, total, squares = outputs
+        nonzero, total, deviations = outputs
         np.testing.assert_array_equal(nonzero, (counts > 0).sum(axis=0))
         np.testing.assert_allclose(total, values.sum(axis=0), rtol=1e-10)
-        np.testing.assert_allclose(squares, (values**2).sum(axis=0), rtol=1e-10)
+        np.testing.assert_allclose(
+            deviations, values.var(axis=0) * n_cells, rtol=1e-10, atol=1e-9
+        )
 
     bench("hvg.gene_major_statistics", make, CELLS, check=check)
 

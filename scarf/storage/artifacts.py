@@ -12,9 +12,15 @@ from typing import Any
 import numpy as np
 import zarr
 
+from ..utils.logging import logger
 from .arrays import _decode_metadata_values, text_dtype
 from .errors import ArtifactErrorContextValue, ArtifactResolutionError
 from .geometry import array_geometry
+from .operation_revisions import (
+    OperationRevision,
+    applicable_revisions,
+    effective_revision,
+)
 from .partition import scan_band
 from .refs import (
     ARTIFACT_KINDS as ARTIFACT_KINDS,
@@ -283,7 +289,10 @@ def fingerprint_text_blocks(
     builder.begin_array("values", (n_values,), dtype)
     offset = 0
     for block in blocks():
-        values = np.asarray(_decode_metadata_values(block)).astype(dtype)
+        # Values that already hold the text dtype are hashed as read, so a
+        # band of row identifiers is held once.
+        values = np.asarray(_decode_metadata_values(block)).astype(dtype, copy=False)
+        del block
         if values.size:
             builder.update_array_block("values", (offset,), values)
             offset += len(values)
@@ -358,18 +367,29 @@ def serialize_artifact_value(value: Any) -> Any:
     return value
 
 
+def _validate_revision(revision: Any) -> int:
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError(f"revision must be a positive integer, got {revision!r}")
+    return revision
+
+
 def make_provenance(
     *,
     operation: str,
     parameters: Mapping[str, Any],
     inputs: Mapping[str, Any],
+    revision: int = 1,
 ) -> dict[str, Any]:
+    """Return canonical provenance: operation, parameters, inputs, and revision."""
     _validate_name(operation, "operation")
+    _validate_revision(revision)
     provenance = {
         "operation": operation,
         "parameters": serialize_artifact_value(parameters),
         "inputs": serialize_artifact_value(inputs),
     }
+    if revision > 1:
+        provenance["revision"] = revision
     canonical_bytes(provenance)
     return provenance
 
@@ -454,6 +474,55 @@ class ArtifactStatus:
             return None
         value = self.provenance.get("inputs")
         return dict(value) if isinstance(value, Mapping) else None
+
+    @property
+    def revision(self) -> int | None:
+        """The operation revision the artifact records, or None if unknown."""
+        if self.provenance is None:
+            return None
+        if "revision" not in self.provenance:
+            return 1
+        value = self.provenance["revision"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+            return None
+        return value
+
+    @property
+    def current_revision(self) -> int | None:
+        """The revision this Scarf release records for the same provenance."""
+        operation, parameters, inputs = self.operation, self.parameters, self.inputs
+        if operation is None or parameters is None or inputs is None:
+            return None
+        return effective_revision(operation, self.ref.kind, parameters, inputs)
+
+    @property
+    def is_current(self) -> bool:
+        """Whether the artifact records the revision this release records.
+
+        Only the artifact's own revision is judged, never its inputs.
+        """
+        revision = self.revision
+        return revision is not None and revision == self.current_revision
+
+    @property
+    def superseded_by(self) -> tuple[OperationRevision, ...]:
+        """Released revisions newer than the recorded one that apply, oldest first."""
+        revision = self.revision
+        operation, parameters, inputs = self.operation, self.parameters, self.inputs
+        if (
+            revision is None
+            or operation is None
+            or parameters is None
+            or inputs is None
+        ):
+            return ()
+        return tuple(
+            entry
+            for entry in applicable_revisions(
+                operation, self.ref.kind, parameters, inputs
+            )
+            if entry.revision > revision
+        )
 
     def input_ref(self, name: str) -> ArtifactRef:
         """Return the exact artifact reference recorded as input ``name``.
@@ -677,6 +746,10 @@ def _artifact_groups(
     return found
 
 
+def _without_revision(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in provenance.items() if key != "revision"}
+
+
 def reusable_artifact_groups(
     root: zarr.Group,
     *,
@@ -686,17 +759,23 @@ def reusable_artifact_groups(
     assay: str | None = None,
     invalidate_cache: bool = False,
 ) -> list[tuple[ArtifactRef, zarr.Group]]:
-    """Complete artifacts with exactly this provenance, newest first, with groups."""
+    """Complete artifacts with exactly this provenance, newest first, with groups.
+
+    Without one, the newest artifact that differs only in its revision is logged.
+    """
     if invalidate_cache:
         return []
     requested = make_provenance(
         operation=str(provenance["operation"]),
         parameters=provenance["parameters"],
         inputs=provenance["inputs"],
+        revision=provenance.get("revision", 1),
     )
+    revision = requested.pop("revision", 1)
     requested_hash = provenance_hash(requested)
     requested_bytes = canonical_bytes(requested)
     reusable: list[tuple[int, ArtifactRef, zarr.Group]] = []
+    superseded: list[tuple[int, ArtifactRef, ArtifactStatus]] = []
     for ref, group in _artifact_groups(root, scope=scope, assay=assay, kind=kind):
         try:
             status = _artifact_status(group, ref, artifact_path(ref))
@@ -704,12 +783,27 @@ def reusable_artifact_groups(
             continue
         if not status.complete or status.provenance is None:
             continue
-        if provenance_hash(status.provenance) != requested_hash:
+        stored = _without_revision(status.provenance)
+        if provenance_hash(stored) != requested_hash:
             continue
-        if canonical_bytes(status.provenance) == requested_bytes:
+        if canonical_bytes(stored) != requested_bytes:
+            continue
+        if status.revision == revision:
             reusable.append((status.created_at_ns or 0, ref, group))
+        else:
+            superseded.append((status.created_at_ns or 0, ref, status))
     reusable.sort(
         key=lambda item: (item[0], item[1].artifact_id),
         reverse=True,
     )
+    if superseded and not reusable:
+        _, ref, status = max(
+            superseded, key=lambda item: (item[0], item[1].artifact_id)
+        )
+        changes = "; ".join(entry.change for entry in status.superseded_by)
+        logger.info(
+            f"Recomputing {requested['operation']}: artifact {ref.artifact_id[:12]} "
+            f"is revision {status.revision}, current {revision}"
+            + (f": {changes}" if changes else "")
+        )
     return [(ref, group) for _, ref, group in reusable]

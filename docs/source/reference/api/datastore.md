@@ -4,7 +4,7 @@
 It inherits graph, mapping, and assay helpers from the classes below.
 Use this page for analyst-facing methods and consult the inheritance appendix when extending Scarf.
 A `DataStore` is not designed for concurrent use from several threads; call its methods from one
-thread at a time.
+thread at a time. Write a store from one process at a time.
 
 Graph-construction methods are documented on {doc}`graph_construction`.
 Artifact and run inspection, including the metadata-only `DataStore.summary()`, is documented on {doc}`artifacts`.
@@ -34,7 +34,7 @@ See {doc}`../../tutorials/remote_stores`.
     :exclude-members: run_normalization, run_pca, run_lsi, run_custom_reduction,
         run_harmony, build_embedding_initialization, build_ann_index, query_neighbors,
         build_connectivity_map, load_graph, list_artifacts, inspect_artifact, load_artifact,
-        lineage, summary, resolve_features, snapshot_cell_selection,
+        load_cell_values, lineage, summary, resolve_features, snapshot_cell_selection,
         build_mapping_reference, get_mapping_reference, run_mapping,
         get_mapping_result, get_mapping_score, run_label_transfer,
         get_label_transfer,
@@ -61,8 +61,12 @@ Feature producers return immutable {py:class}`~scarf.ArtifactRef` values. Use
 `select_all_features(from_assay=...)` creates or reuses the canonical immutable all-feature
 selection for granular workflows. It does not write a live feature metadata column.
 `snapshot_cell_selection(cell_key)` captures the explicit immutable cell input for granular graph
-construction. `run_normalization(cell_selection, features)` requires both exact refs. Direct marker,
-WAGGR, AUCell, and pseudotime feature analyses likewise require exact refs.
+construction. `run_normalization(cell_selection, features)` requires both exact refs. It saves the
+values of the assay's `normed` with its configured `normMethod`. A `log_transform` or
+`renormalize_subset` left as None is True for the RNA library-size normalizers that apply it, and
+False for every other normalizer, whose scale Scarf cannot know; a flag that the normalizer cannot
+apply raises `ValueError` when True ({doc}`assays`).
+Direct marker, WAGGR, AUCell, and pseudotime feature analyses likewise require exact refs.
 Graph-derived methods require a graph ref and project feature selections through its named lineage edges.
 They do not accept a separate feature selection.
 
@@ -95,17 +99,32 @@ Artifact inputs derive their cell selection from lineage; `cell_selection=` can 
 selection explicitly. A metadata column without `cell_selection=` snapshots the live `I` column.
 `secondary_groups=` provides an optional nested grouping without writing artifact labels to a cell
 column. Mean profiles fit the assay normalization once over every selected cell, so ATAC document
-frequency and ADT CLR geometric means are shared by all groups. Cells whose group or sub-group label
-is recorded as missing join no group, as values in `null_vals` do. Group values that would produce
-the same column name raise an error. `add_grouped_assay(groups, assay_label=...)` similarly accepts a
+frequency and ADT CLR geometric means are shared by all groups. Each mean averages the group's rows
+of the assay's `normed` values, so a cell without counts adds zeros and still counts toward its
+group's size. A mean or floating-point sum that is not finite, such as one from a custom
+normalization that returns NaN, raises `ValueError` naming the group and the feature index. RNA
+means also raise `ValueError` when a selected cell's `<assay>_nCounts` total is negative or not
+finite. Cells whose group or sub-group label is recorded as missing join no group, as values in
+`null_vals` do. Group values that would produce the same column name raise an error.
+`add_grouped_assay(groups, assay_label=...)` similarly accepts a
 pseudotime-aggregation ref or an explicit feature metadata column when constructing a new assay.
 An aggregation ref groups only the features it clustered, and missing metadata values never form a
-group.
+group. The source normalization is fitted on the cells that the source assay measured, and other
+cells get zero means.
 
 `add_grouped_assay` and `add_melded_assay` make the new assay visible only after its counts are
-complete. A failed or interrupted write removes the partial assay. A process killed during the
-write leaves a pending assay that opening ignores, that repacking refuses, and that blocks the
-name until `discard_interrupted_assay(assay_label)` removes it.
+complete. A write that fails with an error removes the partial assay. A pending assay stays when
+the write is interrupted, as by `KeyboardInterrupt`, when the process is killed, or when the final
+write that publishes the assay fails, because that write is never undone. Opening ignores a pending
+assay, repacking refuses it, and it blocks its name in every workspace; after confirming that no
+process is writing it, remove it with `discard_interrupted_assay(assay_label)`.
+
+The new assay has a row for every cell and measures the cells that its source assay measured. When
+the source records them in its membership column `<source>_I`, the new assay's `<assay_label>_I` is
+a copy, written with the assay and removed with a failed or discarded one; a source without the
+column gives an assay without one, which measures every cell ({ref}`assay_membership`). A cell
+column that already has the name `<assay_label>_I` makes both methods raise `ValueError` before
+they compute anything.
 
 {py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` defaults to `method="mad"`
 over the pooled selection. Supplying `sample_column` estimates MAD bounds separately per sample.
@@ -118,10 +137,12 @@ metric is recorded as missing in a nullable column or artifact never passes a fi
 inform automatic bounds. MAD filtering rejects missing sample labels among active cells. Automatic
 bounds reject non-finite metric values, such as the undefined percentages of zero-count cells, and
 every filter raises when no cell remains.
-{py:meth}`scarf.datastore.datastore.DataStore.select_cells` thresholds the numeric `values` payload
-of an exact cell artifact, or retains categorical values with `include=[...]`, and composes the
-result with its stored source selection. Categorical label artifacts are read from their canonical
-label array, such as `phase` of a cell-cycle artifact or `labels` of a Paris cut. An explicit
+{py:meth}`scarf.datastore.datastore.DataStore.select_cells` thresholds the numeric values of an
+exact cell-aligned artifact, or retains categorical values with `include=[...]`, and composes the
+result with its stored source selection. It reads the kind's canonical array
+({ref}`cell_aligned_kinds`), such as `values` of a quality metric, `phase` of a cell-cycle
+artifact, `labels` of a Paris cut, `pseudotime` of a pseudotime artifact, or `sampled` of a
+TopACeDo sampling, and refuses a kind that is not cell-aligned. An explicit
 `cell_selection=` may narrow, but never widen, that source selection. Cells whose value the
 artifact records as missing are never selected, and a selection that retains no cell raises.
 Doublet detection, `run_marker_search`, `calc_membership_strength`, and `smart_label` reject label
@@ -174,8 +195,73 @@ Nullable metadata columns keep a stored placeholder in each row that their linke
 flags. `cells.fetch` and `cells.fetch_all` return stored values, placeholders included.
 `cells.to_pandas_dataframe`, `cells.head`, `get_cell_vals`, plots, and exports show those rows as
 missing: numeric columns become float64 with `NaN`, and other columns hold a missing value.
-`get_imputed` and `scarf.metrics.silhouette_scoring` reject a live column with a missing value among
-the cells they use.
+`sift` and `multi_sift` never select them. `get_imputed` and `scarf.metrics.silhouette_scoring`
+reject a live column with a missing value among the cells they use.
+
+{py:meth}`scarf.metadata.MetaData.insert` writes such a column. Values given only for the rows that
+`key` selects (`"I"` by default) leave the other rows missing, holding empty text, `NaN`, 0,
+`False`, or `NaT`; values for every row keep every row. `None`, `NaN`, `pd.NA`, and `NaT` among
+object, categorical, nullable, or string values are missing too, and those values are typed as
+imports type them: bool, int64, float64, complex128, or else text; object integers outside the int64
+range raise `ValueError`. An explicit `fill_value` is stored as a real value without a mask and must
+fit the values: text for text, which widens the column, a bool for a Boolean column, an integer
+within range for integers, a real number that is not a bool for floating-point values, and a
+datetime without a time zone or a timedelta that the unit of datetime or timedelta values holds
+exactly; anything else raises `ValueError` before the store changes. `I`, `ids`, and `names` never
+hold a missing value. A boolean column with masked rows selects the same cells as one filled with
+`False`, so selections snapshotted from it keep their identity, while metadata snapshots and
+filters over it record its mask. Replacing a column reads the previous column, its attributes, and
+its mask first; if writing the new column fails or is interrupted, the previous one is written back
+before the error propagates. When that also fails, a note on the error names the column.
+
+The cell table reserves the membership column `<assay>_I` of every assay of the store, which only
+imports, merges, and derived assays write ({ref}`assay_membership`). `insert`, with or without
+`overwrite`, `update_key`, and `reset_key` raise `ValueError` for that name whether or not the
+column exists, and `drop` raises for a column that carries the membership role, because a store
+without it counts every cell as measured. A plain column of that name without the role, which
+an earlier release could leave, can be dropped.
+
+A cell that an assay did not measure holds zero counts of the assay, which are no measurement, so
+an operation that reads the assay's values refuses it. Normalization, `integrate_assays`, HVG and
+detected-feature selection, WAGGR, AUCell, marker search, `make_bulk`, the feature keys of
+`run_statistical_testing`, prevalent peaks, cell-cycle scoring, feature percentages, HTO
+demultiplexing, doublet detection, pseudotime markers and aggregation, the feature names of
+`get_imputed`, `run_mapping` of the query assay, `to_anndata(matrix="normed")` without a run, and
+`pipeline.run` check their cells against the membership column after their own argument and
+assay-type checks and before they reuse or write anything, on a read-only store too, and raise
+{py:exc}`~scarf.metadata.membership.UnmeasuredCellsError`, a `ValueError` that names the
+operation, the assay, the column, and how many of the selected cells the assay did not measure.
+`make_bulk` checks the cells whose counts it reads: the cells of its bulk columns, or every selected
+cell for a mean that fits the assay's normalization over them, as ATAC and ADT means do; for a
+metadata grouping without `cell_selection`, it finds them from the live `I` column before it
+snapshots `I`. Quality control reads the assay of each metric that it filters on:
+`auto_filter_cells`, `filter_cells` on such a column, and the filtering stage of `pipeline.run`
+refuse unmeasured cells too. A cell
+column is a metric of the assay whose preparation wrote it, `<assay>_nCounts`,
+`<assay>_nFeatures`, or a percentage column that the assay records in its `percentFeatures`
+attribute, such as `RNA_percentMito`; a `quality_metric` artifact of an assay is a metric of that
+assay; other columns read no assay. Operations that read only other results or metadata (such as
+PCA, graphs, clustering, and `snapshot_cluster_labels`) and derived assays do not check. Exports
+that declare membership, `to_h5ad` and `to_anndata` without layers, keep unmeasured cells; `to_mtx`
+and a `to_anndata` layer of another assay cannot declare it and refuse them.
+{py:meth}`~scarf.datastore.datastore.DataStore.select_measured_cells` keeps the measured cells of
+a selection: pass its result as `cell_selection`, which `make_bulk`, `run_statistical_testing`,
+and the QC filters also take directly, build graphs over it, or freeze labels over it with
+`snapshot_cluster_labels(labels, cell_selection=...)`. A pipeline run and normalized export take a
+`cell_key` column instead: one True only for the cells of `I` that the assay measured, such as
+`ds.cells.insert("RNA_measured", ds.cells.fetch_all("I") & ds.cells.fetch_all("RNA_I"))`; the
+membership column alone also holds cells that a filter removed from `I`. `select_measured_cells`
+returns the input selection itself when the assay measured every selected cell, so fully measured
+stores keep their identities. Plots and `get_cell_vals` show the feature values of unmeasured cells
+as missing, NaN, instead of zero, and normalize only the measured cells, so that a normalizer
+fitted over the cells it reads, such as ATAC TF-IDF, gives a measured cell the value of a read of
+the measured cells alone. Results that earlier releases computed over unmeasured cells are not
+detected or repaired; they stay listable, loadable, and traceable, and running such a pipeline
+configuration again raises before any stage.
+
+```{eval-rst}
+.. autoexception:: scarf.metadata.membership.UnmeasuredCellsError
+```
 
 Saved {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` calls return the exact immutable marker-table reference.
 Pass that reference as `get_markers(marker=ref)` to select the exact feature-specific result.
@@ -185,10 +271,27 @@ natural order, so `"1_2"` precedes `"1_10"` and `"2_T"` precedes `"B cell"`.
 `export_markers_to_csv` uses the same column order. An unknown `group_id` raises an error.
 Fresh marker results include score, expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and Benjamini-Hochberg values adjusted within each one-versus-rest group over tested features.
 These are cell-level marker statistics, not replicate-aware differential expression.
+`fold_change` is the group's `mean` divided by `mean_rest`, the means of the values that the
+search ranks. It is `inf` for a feature that no other cell expresses, so such features sort above
+every finite ratio, and `NaN` when both means are 0 or either is negative, as signed counts can
+give. Every other statistic is finite. The ranked values are the assay's normalized values, such
+as library-size normalized RNA counts, log-scale with `log_transform=True`, CLR values of ADT
+counts, which are log-scale too, or TF-IDF values of ATAC counts. No pseudocount is added, and
+fold changes compare only within one assay and normalization. Marker tables record this policy in
+their `fold_change_policy` metadata. Tables written by earlier releases, which stored 100.1 for a
+feature that no other cell expresses and 0 for one that no cell expresses, are revision 1 of
+`run_marker_search` ({doc}`artifacts`): they are not reused, `run_marker_search` logs which stored
+table it recomputes, and `get_markers`, `export_markers_to_csv`, and `marker_heatmap` raise
+`ValueError` for them; recompute them with `run_marker_search`.
 Marker search reads raw counts of any storage dtype. Library-size markers require finite
 non-negative counts and cell totals: a negative or non-finite normalized value of a tested feature,
 or total of a selected cell (its `<assay>_nCounts` value, or with `renormalize_subset=True` its sum
 over the tested features), raises `ValueError` before anything is written.
+Every marker, pseudotime-marker, and pseudotime-aggregation search ranks or correlates the values
+of the assay's `normed` with its configured `normMethod`. Their `log_transform` and
+`renormalize_subset` default to False; `log_transform=True` takes `log1p` of the normalizer's own
+output, and a flag that the normalizer cannot apply, such as `log_transform=True` with ADT CLR or
+ATAC TF-IDF, raises `ValueError` ({doc}`assays`). The artifact records the resolved flags.
 
 {py:meth}`scarf.datastore.datastore.DataStore.run_pseudotime_marker_search` leaves untested features with `r_value` 0.0 and `NaN` for `p_value` and `p_value_adjusted`, and adjusts p-values over tested features only.
 

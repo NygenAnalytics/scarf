@@ -192,13 +192,16 @@ def _missing(group: zarr.Group, column_name: str) -> np.ndarray:
     return np.asarray(group[column.attrs["missing_mask"]][:], dtype=bool)
 
 
-def _new_writer(reader: SeuratReader, destination: MemoryStore) -> SeuratToZarr:
+def _new_writer(
+    reader: SeuratReader, destination: MemoryStore, *, overwrite: bool = False
+) -> SeuratToZarr:
     return SeuratToZarr(
         reader,
         destination,
         mem_budget="64M",
         nthreads=1,
         policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
+        overwrite=overwrite,
     )
 
 
@@ -696,6 +699,14 @@ def test_writer_preserves_reduction_names_without_normalized_name_constraints(
             "membership columns conflict with cell metadata",
             id="assay-membership",
         ),
+        # RNA measures every cell, so the import writes no RNA_I; the name is
+        # still reserved, since a merge would read the column as membership.
+        pytest.param(
+            "RNA_I",
+            "membership columns conflict with cell metadata: RNA_I. Scarf "
+            "reserves the cell column '<assay>_I' of every imported assay",
+            id="full-assay-membership",
+        ),
     ],
 )
 def test_writer_rejects_conflicting_metadata_before_mutating_destination(
@@ -776,6 +787,13 @@ def test_layer_override_controls_converted_assay_counts(tmp_path: Path) -> None:
         root["ADT/counts"][:],
         [[1, 3, 0], [2, 4, 0], [0, 0, 0]],
     )
+    # counts.1 measures c1 and c2. c3, which only the unselected counts.2
+    # measures, is not an assay member.
+    column = root["cellData/ADT_I"]
+    np.testing.assert_array_equal(column[:], [True, True, False])
+    assert column.attrs["role"] == "assay_membership"
+    assert column.attrs["assay"] == "ADT"
+    assert "RNA_I" not in root["cellData"]
     assert any(
         notice.code == "ignored_unselected_count_layer"
         and notice.objectPath == "assays/ADT/layers/counts.2"
@@ -818,7 +836,9 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
     tmp_path: Path,
 ) -> None:
     source = _write_fixture(tmp_path / "dense-budget.rds")
-    destination = _destination_with_sentinel()
+    # The destination is empty: one that holds content is refused before the
+    # counts are read, so the budget is checked against an empty one.
+    destination = MemoryStore()
 
     with SeuratReader(source, assays=["RNA"], reductions=[]) as reader:
         with pytest.raises(
@@ -833,7 +853,7 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
                 policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
             )
 
-    _assert_destination_untouched(destination)
+    assert dict(destination._store_dict) == {}
 
 
 def test_source_preparation_budget_excludes_resident_count_summary(
@@ -972,7 +992,11 @@ def test_failed_conversion_stays_incomplete_and_retry_replaces_partial_output(
             )
 
         monkeypatch.setattr(counts, "read_cells", original_read)
-        _new_writer(reader, destination).dump(batch_size=1)
+        # The interrupted import is an unprepared store, which a retry
+        # replaces only with overwrite=True.
+        with pytest.raises(FileExistsError, match="no DataStore has opened"):
+            _new_writer(reader, destination)
+        _new_writer(reader, destination, overwrite=True).dump(batch_size=1)
 
     recovered = zarr.open_group(store=destination, mode="r")
     assert recovered.attrs["complete"] is True

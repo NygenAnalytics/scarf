@@ -49,8 +49,8 @@ ds = scarf.DataStore(f"{dataset}/data.zarr")
 run = ds.pipeline.open(label="docs_default")
 # Keep the exact clustering result.
 clusters = run["clusters"]
-# Keep the marker result for the selected clustering.
-markers = run["markers"]
+# Rank markers for the saved clusters over every gene that the run analyzed.
+markers = ds.run_marker_search(clusters, features=run["feature_universe"])
 # Read the cluster labels in the run's cell order.
 cluster_values = run.cells.fetch("clusters").astype(str)
 # Inspect the opened assays and their dimensions.
@@ -58,7 +58,8 @@ ds
 ```
 
 This is the same prepared result as the RNA tutorial. Cluster numbers and labels below belong
-to this result; a new analysis may produce different clusters.
+to this result; a new analysis may produce different clusters. The marker table compares each
+saved cluster with the other analyzed cells, as the run's own `run["markers"]` does.
 
 ## 1. Read the marker evidence
 
@@ -85,13 +86,20 @@ Each row compares expression in this cluster with the rest of the analyzed cells
 | Column | How to read it |
 | --- | --- |
 | `frac_exp` | Fraction of cells with detected expression, from 0 to 1. A value of 0.8 means 80% of the cluster. |
-| `fold_change` | Mean expression in the cluster relative to the other cells. Check detection too: a few cells can drive a large difference. |
+| `fold_change` | Mean expression in the cluster divided by the mean in the other cells. It is `inf` for a gene that no other cell expresses and `NaN` for a gene that no cell expresses. Check detection too: a few cells can drive a large difference. |
 | `auc` | Values above 0.5 favour higher expression in this cluster; below 0.5 favour the other cells. A value near 0.5 gives little separation. |
 | `score` | A relative specificity score based on expression ranks across clusters. It is not a detection fraction or a probability of cell identity. |
 | `p_value_adjusted` | A two-sided Mann-Whitney p-value with Benjamini-Hochberg correction within the cluster's tested genes. It does not account for biological replication. |
 
 A low specificity score does not establish that a gene is absent. Read `frac_exp` for detection
 and compare it with `frac_exp_rest` when evaluating negative evidence.
+
+`fold_change` is a ratio of the means of the values that the marker search ranks: here,
+library-size normalized counts. Sorted from high to low, genes that only this cluster expresses
+come first with `inf`, however faint, and genes that no cell expresses come last with `NaN`. With
+`log_transform=True`, or for an ADT assay normalized with CLR, the ranked values are on a log
+scale, so the ratio compares log-scale means and is not a fold change in expression. Compare fold
+changes only between results of the same assay and normalization.
 
 ## 2. Assign initial cell types
 

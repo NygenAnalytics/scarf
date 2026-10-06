@@ -24,6 +24,7 @@ from zarr.storage import (
 from .artifacts import parse_artifact_ref, require_complete_artifact
 from .refs import ArtifactRef
 from .types import as_zarr_group
+from ..utils.logging import logger
 
 
 PIPELINE_RUNS_PATH = "pipeline/runs"
@@ -249,6 +250,19 @@ def _raise_type(message: str) -> Any:
     raise TypeError(message)
 
 
+_RECORD_TEXT_LIMIT = 512
+_TRUNCATION_MARKER = "..."
+
+
+def bounded_record_text(text: str) -> str:
+    """Return ``text`` cut to 512 characters for a durable pipeline record."""
+
+    if len(text) <= _RECORD_TEXT_LIMIT:
+        return text
+    kept = _RECORD_TEXT_LIMIT - len(_TRUNCATION_MARKER)
+    return f"{text[:kept]}{_TRUNCATION_MARKER}"
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineErrorRecord:
     type: str
@@ -260,16 +274,15 @@ class PipelineErrorRecord:
             raise TypeError("error message must be a string")
         if len(self.type) > 128:
             raise ValueError("error type must be at most 128 characters")
-        if len(self.message) > 512:
-            raise ValueError("error message must be at most 512 characters")
+        if len(self.message) > _RECORD_TEXT_LIMIT:
+            raise ValueError(
+                f"error message must be at most {_RECORD_TEXT_LIMIT} characters"
+            )
 
     @classmethod
     def from_exception(cls, error: BaseException) -> "PipelineErrorRecord":
         error_type = type(error).__name__[:128] or "Exception"
-        message = str(error)
-        if len(message) > 512:
-            message = f"{message[:509]}..."
-        return cls(type=error_type, message=message)
+        return cls(type=error_type, message=bounded_record_text(str(error)))
 
     def to_dict(self) -> dict[str, str]:
         return {"type": self.type, "message": self.message}
@@ -306,7 +319,7 @@ class PipelineInterruptionRecord:
         _validate_nullable_string(self.signal_name, "interruption signal_name")
         if (self.signal_number is None) != (self.signal_name is None):
             raise ValueError("interruption signal number and name must appear together")
-        if len(self.kind) > 128 or len(self.message) > 512:
+        if len(self.kind) > 128 or len(self.message) > _RECORD_TEXT_LIMIT:
             raise ValueError("interruption kind or message is too long")
 
     def to_dict(self) -> dict[str, int | str | None]:
@@ -1494,7 +1507,7 @@ def complete_pipeline_run_record(
                 run_id=run.run_id,
                 error=PipelineErrorRecord(
                     type=error_type,
-                    message=str(exc)[:512],
+                    message=bounded_record_text(str(exc)),
                 ),
                 finished_at_ns=finished_at_ns,
             )
@@ -1588,15 +1601,26 @@ def _runs_group(root: zarr.Group) -> zarr.Group | None:
 
 
 def _valid_pipeline_run_records(root: zarr.Group) -> list[PipelineRunRecord]:
+    """Return every readable run record and warn about the others.
+
+    A torn, malformed, or newer-release child never hides healthy runs. The
+    warning names each skipped child and why it could not be read.
+    """
     group = _runs_group(root)
     if group is None:
         return []
     records = []
+    skipped = []
     for run_id in group.group_keys():
         try:
             records.append(load_pipeline_run_record(root, run_id))
-        except (KeyError, TypeError, ValueError):
-            continue
+        except (KeyError, TypeError, ValueError) as error:
+            skipped.append(f"{run_id} ({error})")
+    if skipped:
+        logger.warning(
+            f"Skipped {len(skipped)} unreadable pipeline run record(s); open one "
+            f"by run_id for its error: {'; '.join(skipped)}"
+        )
     return records
 
 
@@ -1707,7 +1731,8 @@ def ensure_pipeline_label_claimable(root: zarr.Group, label: str) -> None:
         return
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"Pipeline label {label!r} has an invalid claim-owner record"
+            f"Pipeline label {label!r} has an invalid claim-owner record "
+            f"{owner_id}: {exc}"
         ) from exc
     if owner.requested_label != label:
         raise ValueError(

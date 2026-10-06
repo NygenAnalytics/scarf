@@ -18,8 +18,7 @@ import pandas as pd
 import zarr
 
 from ..metadata.selection import (
-    GROUPING_VALUE_NAMES,
-    grouping_value_name,
+    CELL_VALUE_NAMES,
     resolve_cell_aligned_artifact,
     valid_category_mask,
 )
@@ -156,7 +155,8 @@ def read_reference_labels(
     if isinstance(source, str):
         values, valid = reference._fetch_cell_labels(source)
     else:
-        if source.kind not in GROUPING_VALUE_NAMES:
+        spec = CELL_VALUE_NAMES.get(source.kind)
+        if spec is None or not spec.categorical:
             raise ValueError(
                 "reference_labels artifacts must hold cell labels, such as "
                 f"cluster_labels, cluster_cut, or smart_label, not {source.kind!r}"
@@ -165,7 +165,7 @@ def read_reference_labels(
             reference.datastore.zw,
             source,
             cell_selection=reference.cell_selection,
-            value_name=grouping_value_name(source.kind),
+            value_name=spec.name,
             expected_kind=source.kind,
         )
         values = resolved.values
@@ -633,7 +633,7 @@ def write_label_transfer(
 ) -> ArtifactRef:
     """Write a planned label transfer from contiguous blocks and complete it.
 
-    If writing fails, the incomplete artifact is removed.
+    If writing fails before publication, the incomplete artifact is removed.
     """
     if plan.reused:
         raise ValueError("A reused label transfer is loaded, not written")

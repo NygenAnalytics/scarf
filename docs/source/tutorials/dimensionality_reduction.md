@@ -73,6 +73,9 @@ ds.plots.embedding(run=baseline, color_by="clusters")
 
 Build each candidate from the same normalized data and cluster each graph by passing it explicitly.
 Retain the 15-component graph and initialization for the layout comparisons below.
+The 15-component graph and clusters come from the saved analysis, which an earlier release built
+before revision 2 of `build_connectivity_map` corrected the edge weights; the 10- and
+30-component graphs use the corrected weights, so the comparison also includes that change.
 
 ```{code-cell} ipython3
 # Compare three PCA dimension counts.
@@ -215,7 +218,7 @@ densMAP adds a density-preservation objective.
 Relative packing can differ from UMAP; plot area is still not a direct estimate of cell frequency.
 
 Scarf's t-SNE consumes the same neighbourhood graph.
-Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (`darwin`) and Windows are unsupported.
+Computing a new embedding needs the optional `sgtsnepi` package from the `tsne` extra (see {ref}`Optional t-SNE <installation_tsne>`); reusing a saved embedding does not.
 
 ```{code-cell} ipython3
 # Fit t-SNE to that graph without requesting iteration logs.

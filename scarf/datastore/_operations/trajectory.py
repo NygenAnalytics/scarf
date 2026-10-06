@@ -8,7 +8,10 @@ import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ...assay import Assay
-from ...assay.normalization import reject_unknown_normalization_params
+from ...assay.normalization import (
+    reject_unknown_normalization_params,
+    resolve_normalization_params,
+)
 from ...features.values import ResolvedFeature, iter_normalized_feature_blocks
 from ...graph.feature_projection import (
     graph_cell_selection,
@@ -252,13 +255,15 @@ class _PseudotimeFeatureRecord:
     pseudotime_result: PseudotimeScoreResult
 
 
-def _default_normalization(norm_params: dict[str, Any]) -> dict[str, Any]:
-    """Apply the unlogged, whole-library defaults of pseudotime feature analyses."""
-    return {
-        **norm_params,
-        "log_transform": norm_params.get("log_transform", False),
-        "renormalize_subset": norm_params.get("renormalize_subset", False),
-    }
+def _default_normalization(
+    assay: Assay, norm_params: dict[str, Any], caller: str
+) -> dict[str, Any]:
+    """Apply the unlogged, whole-library defaults of pseudotime feature analyses.
+
+    A flag that the assay's normalizer cannot apply raises ``ValueError``
+    when it is True.
+    """
+    return resolve_normalization_params(assay, norm_params, caller=caller)
 
 
 def _normalization_guard(
@@ -496,6 +501,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             A vector for one name, or a cells-by-features array for several
             names.
 
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a cell of the operator.
         """
         single_feature = isinstance(feature_name, str)
         if isinstance(feature_name, str):
@@ -552,6 +559,10 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         )
         resolved: list[ResolvedFeature] = []
         if feature_slots and assay_name is not None:
+            # Feature names read the assay; metadata columns read no assay.
+            self._require_measured_cells(
+                assay_name, cell_indices, operation="get_imputed", remedy="graph"
+            )
             assay = self._get_assay(assay_name)
             feature_names = assay.feats.fetch_all("names")
             feature_ids = assay.feats.fetch_all("ids")
@@ -1509,6 +1520,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
 
         Returns:
             Reference to the immutable pseudotime-marker artifact.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a valid pseudotime cell.
         """
         from ...features.markers import find_markers_by_regression
 
@@ -1526,7 +1540,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         identity = _FrozenFeatureIdentity.capture(assay)
         validated_parameters = _validate_marker_parameters(
             {
-                "normalization": _default_normalization(norm_params),
+                "normalization": _default_normalization(
+                    assay, norm_params, "run_pseudotime_marker_search"
+                ),
                 "normalization_method": callable_identity(assay.normMethod),
                 "size_factor": getattr(assay, "sf", None),
                 "association_method": "pearson",
@@ -1544,6 +1560,12 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             "Pseudotime marker search",
         )
         axes = self._pseudotime_feature_cells(assay, pseudotime, features)
+        self._require_measured_cells(
+            assay.name,
+            axes.cell_indices,
+            operation="run_pseudotime_marker_search",
+            remedy="graph",
+        )
         feature_index = axes.feature_indices
         logger.info(
             f"Pseudotime markers: correlating features "
@@ -1734,6 +1756,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
 
         Returns:
             Reference to the immutable pseudotime-aggregation artifact.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a valid pseudotime cell.
         """
         from ...trajectory.feature_dynamics import knn_clustering
 
@@ -1751,7 +1776,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         identity = _FrozenFeatureIdentity.capture(assay)
         validated_parameters = _validate_aggregation_parameters(
             {
-                "normalization": _default_normalization(norm_params),
+                "normalization": _default_normalization(
+                    assay, norm_params, "run_pseudotime_aggregation"
+                ),
                 "normalization_method": callable_identity(assay.normMethod),
                 "size_factor": getattr(assay, "sf", None),
                 "min_exp": min_exp,
@@ -1786,6 +1813,12 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             )
         if n_clusters > len(axes.feature_indices):
             raise ValueError("n_clusters cannot exceed the selected feature count")
+        self._require_measured_cells(
+            assay.name,
+            axes.cell_indices,
+            operation="run_pseudotime_aggregation",
+            remedy="graph",
+        )
         (
             cell_ordering,
             cell_indices,

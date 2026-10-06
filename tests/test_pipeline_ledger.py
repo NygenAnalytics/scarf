@@ -1,19 +1,31 @@
 """Pipeline stages run one at a time and end with exactly one durable outcome."""
 
+import asyncio
+
 import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.datastore._pipeline_ledger import PipelineEvent, RunLedger
+from scarf.datastore._pipeline_ledger import (
+    PipelineEvent,
+    RunLedger,
+    interruption_record,
+)
 from scarf.datastore.pipeline_run import PipelineExecutionError
 from scarf.storage.pipeline_runs import (
+    bounded_record_text,
     create_pipeline_run_record,
     finish_pipeline_stage_record,
     load_pipeline_run_record,
     load_pipeline_stage_records,
     start_pipeline_stage_record,
 )
-from scarf.utils.shutdown import ShutdownRequested, ShutdownToken, shutdown_scope
+from scarf.utils.shutdown import (
+    ShutdownRequest,
+    ShutdownRequested,
+    ShutdownToken,
+    shutdown_scope,
+)
 from tests.test_pipeline_contract_edge_coverage import _metrics
 
 
@@ -131,3 +143,64 @@ def test_stages_start_only_after_every_earlier_stage_succeeded() -> None:
     )
     with pytest.raises(ValueError, match="sequentially"):
         start_pipeline_stage_record(root, run_id=run.run_id, ordinal=3, stage="d")
+
+
+_LONG_TEXT = "stop: " + "x" * 600
+_BOUNDED_TEXT = _LONG_TEXT[:509] + "..."
+
+
+def _long_interruptions() -> list[tuple[BaseException, str]]:
+    return [
+        (
+            ShutdownRequested(
+                ShutdownRequest(
+                    requested_at_ns=1,
+                    reason=_LONG_TEXT,
+                    signal_number=15,
+                    signal_name="SIGTERM",
+                )
+            ),
+            "signal",
+        ),
+        (KeyboardInterrupt(_LONG_TEXT), "keyboard_interrupt"),
+        (asyncio.CancelledError(_LONG_TEXT), "asyncio_cancelled"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    _long_interruptions(),
+    ids=["signal", "keyboard_interrupt", "asyncio_cancelled"],
+)
+def test_long_interruption_messages_are_truncated_and_recorded(
+    error: BaseException, kind: str
+) -> None:
+    record = interruption_record(error)
+    assert record is not None
+    assert (record.kind, record.message) == (kind, _BOUNDED_TEXT)
+    assert len(record.message) == 512
+    # A message of exactly the bound is kept whole.
+    assert bounded_record_text(_LONG_TEXT[:512]) == _LONG_TEXT[:512]
+
+    root, ledger, events = _ledger("first")
+
+    def first_stage() -> tuple[()]:
+        raise error
+
+    with pytest.raises(type(error)) as caught:
+        ledger.run("first", first_stage)
+
+    # The caller sees the original interruption with its full message.
+    assert caught.value is error
+    run = load_pipeline_run_record(root, ledger.run_id)
+    assert (run.status, run.complete) == ("interrupted", True)
+    assert run.interruption is not None
+    assert (run.interruption.kind, run.interruption.message) == (kind, _BOUNDED_TEXT)
+    (stage,) = load_pipeline_stage_records(root, ledger.run_id)
+    assert (stage.status, stage.complete) == ("interrupted", True)
+    assert stage.interruption is not None
+    assert stage.interruption.message == _BOUNDED_TEXT
+    assert [event.kind for event in events][-2:] == [
+        "stage_interrupted",
+        "pipeline_interrupted",
+    ]

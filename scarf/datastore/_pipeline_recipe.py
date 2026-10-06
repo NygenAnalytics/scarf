@@ -1,5 +1,6 @@
+import inspect
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from types import MappingProxyType
@@ -9,9 +10,69 @@ import numpy as np
 
 from ..assay import RNAassay
 from ..clustering.leiden import canonical_resolution
+from ..embeddings import sgtsne
 from ..features.gene_reference import species_registry
+from ..features.variability import HVG_OPTION_NAMES, hvg_options
+from ..graph.arguments import graph_flag
+from ..metadata.membership import require_measured_cells
 from ..quality_control.filtering import validate_filter_bounds
 from ..utils.arguments import integer_argument
+from ..utils.logging import logger
+from ._operations.embeddings import _EmbeddingOperationsMixin
+from ._operations.features import _FeatureOperationsMixin
+from ._operations.graph import _GraphOperationsMixin
+from ._operations.quality_control import _QualityControlOperationsMixin
+
+
+def _keyword_default(method: Callable[..., Any], keyword: str) -> Any:
+    """Return the default of one keyword of a stage's public method."""
+    default = inspect.signature(method).parameters[keyword].default
+    if default is inspect.Parameter.empty:
+        raise TypeError(f"{method.__qualname__}() has no default for {keyword!r}")
+    return default
+
+
+# The run's shortcut arguments set these stage settings, and each defaults to
+# the default of the keyword it sets, so a run that sets neither uses the
+# method's default.
+HVG_COUNT_DEFAULT: int = _keyword_default(_FeatureOperationsMixin.select_hvgs, "top_n")
+PCA_DIMS_DEFAULT: int = _keyword_default(_GraphOperationsMixin.run_pca, "dims")
+NEIGHBORS_K_DEFAULT: int = _keyword_default(_GraphOperationsMixin.query_neighbors, "k")
+# The select_hvgs options that hvg settings omit; the pipeline checks a setting
+# together with these, as select_hvgs checks its keywords.
+_HVG_OPTION_DEFAULTS: Mapping[str, Any] = MappingProxyType(
+    {
+        name: _keyword_default(_FeatureOperationsMixin.select_hvgs, name)
+        for name in HVG_OPTION_NAMES
+    }
+)
+# The embedding dimensions, and so the run fields, of settings that omit them.
+_UMAP_DIMS_DEFAULT: int = _keyword_default(
+    _EmbeddingOperationsMixin.run_umap, "umap_dims"
+)
+_TSNE_DIMS_DEFAULT: int = _keyword_default(
+    _EmbeddingOperationsMixin.run_tsne, "tsne_dims"
+)
+# The numeric run_tsne settings, which sgtsne_settings checks, at the
+# run_tsne defaults that tsne settings omit; the pipeline checks a setting
+# together with these, as run_tsne checks its keywords.
+_TSNE_SETTING_DEFAULTS: Mapping[str, Any] = MappingProxyType(
+    {
+        name: _keyword_default(_EmbeddingOperationsMixin.run_tsne, name)
+        for name in inspect.signature(sgtsne.sgtsne_settings).parameters
+    }
+)
+# The run_tsne and run_umap keywords that graph_flag checks.
+_EMBEDDING_GRAPH_FLAGS = ("symmetric_graph", "graph_upper_only")
+# Automatic filtering applies the rules of ``auto_filter_cells``, so its
+# options default to that method's defaults. MAD filtering keeps the default
+# quantiles, and Gaussian filtering keeps the default MAD options.
+_FILTER_DEFAULTS: Mapping[str, Any] = MappingProxyType(
+    {
+        name: _keyword_default(_QualityControlOperationsMixin.auto_filter_cells, name)
+        for name in ("min_p", "max_p", "n_mads", "min_cells_per_sample")
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +182,9 @@ def _resolve_leiden(
 
 # Keyword arguments that ``params`` may forward to each stage. The pipeline
 # supplies the artifacts a stage consumes, so only its settings appear here.
+# A setting means exactly what the same keyword means on the stage's public
+# method, and omitting it uses that method's default. Leiden ``partitions``
+# and ``selected`` configure the recipe's candidates instead.
 _STAGE_PARAMETERS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         "cell_cycle": frozenset(
@@ -203,7 +267,6 @@ _STAGE_PARAMETERS: Mapping[str, frozenset[str]] = MappingProxyType(
                 "early_iter",
                 "alpha",
                 "box_h",
-                "parallel",
             }
         ),
         "leiden": frozenset(
@@ -259,7 +322,10 @@ def _parameter_value(value: Any, name: str) -> Any:
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError(f"{name} must be finite; omit it to use the default")
+            raise ValueError(
+                f"{name} must be finite; stage settings are JSON values and "
+                "never infinity or NaN"
+            )
         return value
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
@@ -318,6 +384,28 @@ def _resolve_params(
                     f"Unknown {stage} parameters {unknown!r}; allowed: "
                     f"{sorted(allowed)!r}"
                 )
+            if stage == "hvg":
+                # The checks of select_hvgs, before a run record exists.
+                hvg_options(
+                    **{
+                        name: value.get(name, default)
+                        for name, default in _HVG_OPTION_DEFAULTS.items()
+                    }
+                )
+            elif stage in {"tsne", "umap"}:
+                # The checks of run_tsne and of the run_umap graph flags. The
+                # stages run late, so an invalid setting would otherwise fail
+                # only after the stages before them.
+                for flag in _EMBEDDING_GRAPH_FLAGS:
+                    if flag in value:
+                        graph_flag(value[flag], flag)
+                if stage == "tsne":
+                    sgtsne.sgtsne_settings(
+                        **{
+                            name: value.get(name, default)
+                            for name, default in _TSNE_SETTING_DEFAULTS.items()
+                        }
+                    )
             sections[stage] = {
                 key: _parameter_value(item, f"{name}[{key!r}]")
                 for key, item in value.items()
@@ -325,6 +413,23 @@ def _resolve_params(
         else:
             raise TypeError(f"{name} must be a mapping or bool")
     return sections, species
+
+
+def _warn_without_sgtsnepi() -> None:
+    """Warn, before a run starts, when its t-SNE stage cannot compute.
+
+    The run is not refused: the stage reuses a matching embedding that the
+    store holds without importing ``sgtsnepi``, and only a new embedding
+    needs it.
+    """
+    try:
+        sgtsne.require_sgtsnepi()
+    except ImportError as error:
+        logger.warning(
+            "This run enables t-SNE, and its t-SNE stage can only reuse an "
+            "embedding that the store already holds; computing a new one fails "
+            f"at that stage, after the earlier stages. {error}"
+        )
 
 
 def _default_filter_columns(store: Any, assay: str) -> tuple[str, ...]:
@@ -417,8 +522,8 @@ def _resolve_filtering(
     unknown = set(options) - allowed
     if unknown:
         raise ValueError(f"Unknown automatic filtering options: {sorted(unknown)!r}")
-    min_p = _finite_real(options.get("min_p", 0.01), "min_p")
-    max_p = _finite_real(options.get("max_p", 0.99), "max_p")
+    min_p = _finite_real(options.get("min_p", _FILTER_DEFAULTS["min_p"]), "min_p")
+    max_p = _finite_real(options.get("max_p", _FILTER_DEFAULTS["max_p"]), "max_p")
     if not 0 < min_p < max_p < 1:
         raise ValueError("Automatic filtering requires 0 < min_p < max_p < 1")
     sample_column = options.get("sample_column")
@@ -428,15 +533,17 @@ def _resolve_filtering(
         raise TypeError("sample_column must be a non-empty string or None")
     if sample_column is not None and sample_column not in store.cells.columns:
         raise KeyError(f"Sample column {sample_column!r} was not found")
-    n_mads = _finite_real(options.get("n_mads", 3.0), "n_mads")
+    n_mads = _finite_real(options.get("n_mads", _FILTER_DEFAULTS["n_mads"]), "n_mads")
     if n_mads <= 0:
         raise ValueError("n_mads must be finite and positive")
     min_cells = integer_argument(
-        options.get("min_cells_per_sample", 20),
+        options.get("min_cells_per_sample", _FILTER_DEFAULTS["min_cells_per_sample"]),
         "min_cells_per_sample",
         minimum=2,
     )
-    if method == "mad" and (min_p != 0.01 or max_p != 0.99):
+    if method == "mad" and (
+        min_p != _FILTER_DEFAULTS["min_p"] or max_p != _FILTER_DEFAULTS["max_p"]
+    ):
         raise ValueError(
             "min_p and max_p cannot be changed with method='mad'; "
             "use method='gaussian' for quantile bounds"
@@ -444,7 +551,10 @@ def _resolve_filtering(
     if method == "gaussian":
         if sample_column is not None:
             raise ValueError("Gaussian filtering does not support a sample source")
-        if n_mads != 3.0 or min_cells != 20:
+        if (
+            n_mads != _FILTER_DEFAULTS["n_mads"]
+            or min_cells != _FILTER_DEFAULTS["min_cells_per_sample"]
+        ):
             raise ValueError(
                 "n_mads and min_cells_per_sample apply only to method='mad'"
             )
@@ -494,6 +604,15 @@ def resolve_pipeline_recipe(
         raise KeyError(f"Cell selection column {cell_key!r} was not found")
     if np.dtype(store.cells.get_dtype(cell_key)) != np.dtype(bool):
         raise TypeError("cell_key must identify a boolean metadata column")
+    # Every stage reads the assay over these cells, so the run refuses cells
+    # that it did not measure before any stage runs; it never narrows them.
+    require_measured_cells(
+        store.cells,
+        assay_name,
+        cell_key,
+        operation="pipeline.run",
+        remedy="cell_key",
+    )
     for flag, name in (
         (umap, "umap"),
         (cell_cycle, "cell_cycle"),
@@ -565,11 +684,13 @@ def resolve_pipeline_recipe(
             raise ValueError("params['harmony'] needs batch_columns")
         harmony_batch_columns = harmony_params.pop("batch_columns")
     hvg_params = settings("hvg")
-    hvg_count = setting(hvg_params, "top_n", "hvg_count", hvg_count, 1000)
+    hvg_count = setting(hvg_params, "top_n", "hvg_count", hvg_count, HVG_COUNT_DEFAULT)
     pca_params = settings("pca")
-    pca_dims = setting(pca_params, "dims", "pca_dims", pca_dims, 21)
+    pca_dims = setting(pca_params, "dims", "pca_dims", pca_dims, PCA_DIMS_DEFAULT)
     neighbor_params = settings("neighbors")
-    neighbors_k = setting(neighbor_params, "k", "neighbors_k", neighbors_k, 11)
+    neighbors_k = setting(
+        neighbor_params, "k", "neighbors_k", neighbors_k, NEIGHBORS_K_DEFAULT
+    )
     pca_dims = integer_argument(pca_dims, "pca_dims", minimum=0)
     if pca_dims == 0 and pca_params:
         raise ValueError("PCA settings need dims above 0; dims=0 skips PCA")
@@ -597,10 +718,10 @@ def resolve_pipeline_recipe(
     if not partitions and membership_strength:
         raise ValueError("membership_strength requires at least one Leiden candidate")
     umap_dims = integer_argument(
-        umap_params.get("umap_dims", 2), "umap_dims", minimum=1
+        umap_params.get("umap_dims", _UMAP_DIMS_DEFAULT), "umap_dims", minimum=1
     )
     tsne_dims = integer_argument(
-        tsne_params.get("tsne_dims", 2), "tsne_dims", minimum=1
+        tsne_params.get("tsne_dims", _TSNE_DIMS_DEFAULT), "tsne_dims", minimum=1
     )
     snapshots = _column_sequence(snapshot_columns, "snapshot_columns")
     result_fields = {
@@ -640,8 +761,35 @@ def resolve_pipeline_recipe(
     ]
     if missing_harmony:
         raise KeyError(f"Harmony columns were not found: {missing_harmony!r}")
+    # Without PCA the graph is built on the normalized values themselves. The
+    # stages that need reduced coordinates are refused here, before the run
+    # record exists, never skipped on the run's behalf.
+    if pca_dims == 0 and harmony_columns:
+        raise ValueError(
+            "pca_dims=0 builds the graph on normalized values, which Harmony "
+            "cannot correct; set pca_dims above 0 or omit harmony_batch_columns"
+        )
+    if pca_dims == 0 and doublets:
+        raise ValueError(
+            "pca_dims=0 builds the graph on normalized values, but doublet "
+            "scoring needs a PCA graph; pass doublets=False or set pca_dims "
+            "above 0"
+        )
     filtering_config = _resolve_filtering(store, assay_name, filtering)
     filter_columns = tuple(filtering_config.get("attrs", ()))
+    if filter_columns:
+        # A QC metric reads the assay whose preparation wrote it, as
+        # auto_filter_cells reads it, so every other assay whose metric the
+        # run filters on must have measured the cells of cell_key too.
+        for metric_assay in store._metric_assays(filter_columns, ()):
+            if metric_assay != assay_name:
+                require_measured_cells(
+                    store.cells,
+                    metric_assay,
+                    cell_key,
+                    operation="pipeline.run",
+                    remedy="cell_key",
+                )
     sample_column = filtering_config.get("sampleColumn")
     if isinstance(sample_column, str):
         filter_columns = (*filter_columns, sample_column)
@@ -670,6 +818,9 @@ def resolve_pipeline_recipe(
         "doublets",
         "markers",
     )
+    if tsne:
+        # Once the recipe is valid, so the warning precedes every stage.
+        _warn_without_sgtsnepi()
     return ResolvedPipelineRecipe(
         assay=assay_name,
         label=label,

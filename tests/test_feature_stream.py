@@ -1000,10 +1000,10 @@ def test_hvg_stats_mask_matches_gathered_cells() -> None:
     dest = np.array([0, -1, 1, 2], dtype=np.int64)
     gathered_nz = np.zeros(3, dtype=np.float64)
     gathered_s1 = np.zeros(3, dtype=np.float64)
-    gathered_s2 = np.zeros(3, dtype=np.float64)
+    gathered_m2 = np.zeros(3, dtype=np.float64)
     masked_nz = np.zeros(3, dtype=np.float64)
     masked_s1 = np.zeros(3, dtype=np.float64)
-    masked_s2 = np.zeros(3, dtype=np.float64)
+    masked_m2 = np.zeros(3, dtype=np.float64)
     _hvg_stats_gene_major(
         values[:, selected],
         inv,
@@ -1011,7 +1011,7 @@ def test_hvg_stats_mask_matches_gathered_cells() -> None:
         dest,
         gathered_nz,
         gathered_s1,
-        gathered_s2,
+        gathered_m2,
     )
     _hvg_stats_gene_major(
         values,
@@ -1020,12 +1020,16 @@ def test_hvg_stats_mask_matches_gathered_cells() -> None:
         dest,
         masked_nz,
         masked_s1,
-        masked_s2,
+        masked_m2,
         selected=selected,
     )
-    np.testing.assert_allclose(masked_nz, gathered_nz)
-    np.testing.assert_allclose(masked_s1, gathered_s1)
-    np.testing.assert_allclose(masked_s2, gathered_s2)
+    np.testing.assert_array_equal(masked_nz, gathered_nz)
+    np.testing.assert_array_equal(masked_s1, gathered_s1)
+    np.testing.assert_array_equal(masked_m2, gathered_m2)
+    normalized = 1000.0 * values[:, selected] * inv
+    np.testing.assert_allclose(
+        masked_m2, normalized[[0, 2, 3]].var(axis=1) * len(selected), rtol=1e-12
+    )
 
 
 def test_early_close_joins_the_producer_and_surfaces_its_failure() -> None:

@@ -456,6 +456,108 @@ def test_marker_search_validates_refs_before_reading(
         )
 
 
+def _scaled_by_totals(assay, counts):
+    """A custom RNA normalizer that reads the totals ``normed`` hands it."""
+    return 50.0 * counts / assay.scalar.reshape(-1, 1)
+
+
+def _logged_scaled_by_totals(assay, counts):
+    """``_scaled_by_totals`` that takes ``log1p`` of its own output."""
+    return np.log1p(_scaled_by_totals(assay, counts))
+
+
+def test_marker_search_logs_the_configured_normalizer(
+    datastore,
+    pseudotime_scoring,
+    few_features,
+    monkeypatch,
+):
+    from scarf.assay.normalization import norm_clr, norm_dummy
+
+    monkeypatch.setattr(datastore.RNA, "normMethod", _scaled_by_totals)
+    ref = datastore.run_pseudotime_marker_search(
+        pseudotime_scoring,
+        features=few_features,
+        min_cells=1,
+        log_transform=True,
+    )
+
+    status = datastore.inspect_artifact(ref)
+    # Earlier releases correlated library-size logarithms for this record.
+    assert status.revision == 2
+    assert status.parameters["normalization"] == {
+        "log_transform": True,
+        "renormalize_subset": False,
+    }
+    # A flag of None means its default, as an omitted flag does.
+    assert (
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring,
+            features=few_features,
+            min_cells=1,
+            log_transform=True,
+            renormalize_subset=None,
+        )
+        == ref
+    )
+    tested = datastore.load_pseudotime_markers(ref).table.dropna(subset=["r_value"])
+    np.testing.assert_allclose(
+        tested.r_value.to_numpy(),
+        _pearson_markers(
+            datastore,
+            pseudotime_scoring,
+            tested.feature_index.to_numpy(),
+            {"size_factor": 50.0, "log_transform": True},
+        ),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    # CLR values are already log ratios, and norm_dummy reads no totals.
+    monkeypatch.setattr(datastore.RNA, "normMethod", norm_clr)
+    with pytest.raises(ValueError, match="does not support log_transform"):
+        datastore.run_pseudotime_marker_search(
+            pseudotime_scoring, features=few_features, log_transform=True
+        )
+    monkeypatch.setattr(datastore.RNA, "normMethod", norm_dummy)
+    with pytest.raises(ValueError, match="does not support renormalize_subset"):
+        datastore.run_pseudotime_aggregation(
+            pseudotime_scoring, features=few_features, renormalize_subset=True
+        )
+
+
+@pytest.mark.slow
+def test_aggregation_logs_the_configured_normalizer(
+    datastore,
+    pseudotime_scoring,
+    few_features,
+    monkeypatch,
+):
+    arguments = {
+        "features": few_features,
+        "n_clusters": 3,
+        "n_neighbours": 5,
+        "window_size": 50,
+        "chunk_size": 10,
+    }
+    monkeypatch.setattr(datastore.RNA, "normMethod", _scaled_by_totals)
+    logged = datastore.run_pseudotime_aggregation(
+        pseudotime_scoring, log_transform=True, **arguments
+    )
+    # Earlier releases aggregated library-size logarithms for this record.
+    assert datastore.inspect_artifact(logged).revision == 2
+
+    # The same values from a normalizer that logs its own output.
+    monkeypatch.setattr(datastore.RNA, "normMethod", _logged_scaled_by_totals)
+    direct = datastore.run_pseudotime_aggregation(pseudotime_scoring, **arguments)
+    assert datastore.inspect_artifact(direct).revision == 1
+    np.testing.assert_allclose(
+        np.asarray(datastore.load_pseudotime_aggregation(logged).data),
+        np.asarray(datastore.load_pseudotime_aggregation(direct).data),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_marker_loader_rejects_each_tampered_record(
     datastore,
     pseudotime_markers,

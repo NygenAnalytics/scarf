@@ -866,8 +866,10 @@ def test_native_projection_rejects_unsupported_neighbor_coordinates(
     connectivity, neighbors, coordinates = _native_chain(
         root, "RNA", cell_selection=cells
     )
-    normalized = _input(root, coordinates, "normalized")
-    _replace_input(root, neighbors, "coordinates", normalized)
+    features = _input(
+        root, _input(root, coordinates, "normalized"), "feature_selection"
+    )
+    _replace_input(root, neighbors, "coordinates", features)
 
     with pytest.raises(
         ArtifactResolutionError, match="unsupported artifact kind"
@@ -875,7 +877,29 @@ def test_native_projection_rejects_unsupported_neighbor_coordinates(
         resolve_native_graph_inputs(root, connectivity)
 
     assert caught.value.code == "unsupported_graph_kind"
-    assert caught.value.context["actual_kind"] == "normalized"
+    assert caught.value.context["actual_kind"] == "feature_selection"
+
+
+def test_native_projection_follows_neighbors_on_normalized_values(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    features = _feature_selection(root, "RNA")
+    connectivity, neighbors, coordinates = _native_chain(
+        root, "RNA", cell_selection=cells, feature_selection=features
+    )
+    normalized = _input(root, coordinates, "normalized")
+    ann_index = _input(root, neighbors, "ann_index")
+    _replace_input(root, ann_index, "coordinates", normalized)
+    _replace_input(root, neighbors, "coordinates", normalized)
+
+    ancestry = resolve_native_graph_inputs(root, connectivity)
+
+    # A graph on normalized values has no reduction.
+    assert ancestry.coordinates == ancestry.normalized == normalized
+    assert ancestry.reduction is None
+    assert ancestry.cell_selection == cells
+    assert ancestry.feature_selection == features
 
 
 def test_coordinate_resolution_requires_assay_scoped_supported_coordinates(
@@ -893,10 +917,25 @@ def test_coordinate_resolution_requires_assay_scoped_supported_coordinates(
         resolve_coordinate_inputs(root, unscoped)
     assert caught.value.code == "wrong_scope"
 
+    # Normalized values are coordinates without a reduction.
     normalized = _input(root, coordinates, "normalized")
+    lineage = resolve_coordinate_inputs(root, normalized)
+    assert (lineage.coordinates, lineage.reduction, lineage.normalized) == (
+        normalized,
+        None,
+        normalized,
+    )
+    assert lineage.cell_selection == cells
+
+    features = _input(root, normalized, "feature_selection")
     with pytest.raises(ArtifactResolutionError, match="Coordinates must be") as caught:
-        resolve_coordinate_inputs(root, normalized)
+        resolve_coordinate_inputs(root, features)
     assert caught.value.code == "unsupported_graph_kind"
+
+    root[artifact_path(normalized)].attrs["complete"] = False
+    with pytest.raises(ArtifactResolutionError) as caught:
+        resolve_coordinate_inputs(root, normalized)
+    assert caught.value.code == "incomplete_artifact"
 
 
 @pytest.mark.parametrize(

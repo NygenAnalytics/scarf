@@ -217,6 +217,17 @@ class TestNumpySemantics:
         assert mean.shape == std.shape == (3,)
         assert np.isnan(mean).all() and np.isnan(std).all()
 
+    def test_zero_row_means_and_variances_take_the_float64_accumulator(self):
+        values = np.arange(12, dtype=np.float32).reshape(4, 3)
+        empty = ChunkedArray.from_numpy(values, block_size=2)[
+            np.array([], dtype=np.int64), :
+        ]
+        for op in ("mean", "var"):
+            columns = getattr(empty, op)(axis=0).compute()
+            assert columns.dtype == np.float64 and np.isnan(columns).all()
+            assert getattr(empty, op)(axis=1).compute().dtype == np.float64
+            assert np.isnan(getattr(empty, op)().compute())
+
     def test_sum_accumulates_in_a_requested_dtype(self):
         # Above 2**24 float32 holds only even integers, so its own sums round
         # the odd totals that a float64 accumulator keeps.
@@ -306,6 +317,60 @@ class TestNumpySemantics:
         assert np.shares_memory(np.asarray(reduction), reduction.compute())
 
 
+class TestStreamedMoments:
+    """Means and variances neither overflow nor cancel, whatever the blocks."""
+
+    @pytest.mark.parametrize("block_size", [1, 3])
+    def test_integer_means_do_not_overflow(self, block_size):
+        for values in (
+            np.array([[2**63], [2**63]], dtype=np.uint64),
+            np.full((3, 1), 2**62, dtype=np.int64),
+        ):
+            ca = ChunkedArray.from_numpy(values, block_size=block_size)
+            for axis in (0, None):
+                actual = ca.mean(axis=axis).compute()
+                assert actual.dtype == np.float64
+                np.testing.assert_array_equal(actual, values.mean(axis=axis))
+
+    @pytest.mark.parametrize("block_size", [1, 3])
+    def test_variances_of_large_offsets_do_not_cancel(self, block_size):
+        for column in ([1e9, 1e9 + 1], [1e8, 1e8 + 1, 1e8 + 2, 1e8 + 3]):
+            values = np.asarray(column).reshape(-1, 1)
+            ca = ChunkedArray.from_numpy(values, block_size=block_size)
+            assert ca.var(axis=0).compute()[0] == values.var()
+            assert ca.var().compute() == values.var()
+            mean, std = ca.mean_and_std()
+            assert mean[0] == values.mean()
+            assert std[0] == values.std()
+
+    @pytest.mark.parametrize("block_size", [3_000, 10_007])
+    def test_constant_float32_columns_have_zero_variance(self, block_size):
+        row = np.random.default_rng(0).random(50, dtype=np.float32) * 100
+        values = np.repeat(row[None, :], 10_007, axis=0)
+        ca = ChunkedArray.from_numpy(values, block_size=block_size)
+
+        np.testing.assert_array_equal(ca.var(axis=0).compute(), np.zeros(50))
+        np.testing.assert_array_equal(ca.mean(axis=0).compute(), row.astype(float))
+        mean, std = ca.mean_and_std()
+        np.testing.assert_array_equal(mean, row.astype(float))
+        np.testing.assert_array_equal(std, np.zeros(50))
+        np.testing.assert_allclose(
+            ca.var().compute(), values.astype(float).var(), rtol=1e-12
+        )
+
+    @pytest.mark.parametrize("dtype", [bool, np.float32])
+    def test_means_and_variances_are_float64_on_every_axis(self, dtype):
+        values = (np.arange(35).reshape(7, 5) % 6 / 7).astype(dtype)
+        ca = ChunkedArray.from_numpy(values, block_size=3)
+        widened = values.astype(np.float64)
+        for axis in (0, 1, None):
+            mean = ca.mean(axis=axis).compute()
+            var = ca.var(axis=axis).compute()
+            assert mean.dtype == var.dtype == np.float64
+            np.testing.assert_allclose(mean, widened.mean(axis=axis), rtol=1e-15)
+            np.testing.assert_allclose(var, widened.var(axis=axis), rtol=1e-13)
+
+
 class TestPublicApiCompat:
     """Mirror the rawData/normed usage documented in the vignettes."""
 
@@ -361,3 +426,22 @@ class TestPublicApiCompat:
         counts = assay.matrixGroup["counts"].get_orthogonal_selection((cells, features))
         expected = np.log2(counts / counts.sum(axis=1, keepdims=True) * 1000 + 1)
         np.testing.assert_allclose(out, expected)
+
+
+def test_a_scalar_variance_holds_no_array_per_column():
+    """A scalar variance pools each block into one column.
+
+    Before, it built three float64 arrays per block with an entry per column,
+    24 MB for one row of a million columns, beyond what its reduction reserved.
+    """
+    import tracemalloc
+
+    ca = ChunkedArray.from_numpy(np.ones((1, 1_000_000), dtype=np.uint8), block_size=1)
+    ca.var().compute()
+    tracemalloc.start()
+    try:
+        assert ca.var().compute() == 0.0
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 4 * 2**20

@@ -310,6 +310,9 @@ query population maps to another reference label. Inspect such swaps before acce
 
 Because known labels are available, `mapping_calibration` shows how label accuracy trades off against retained coverage as the vote threshold rises.
 It applies each threshold to the candidate labels saved with the transfer, so nothing is recomputed.
+Coverage is the share of cells with a known label that a threshold keeps. Cells that abstained
+without evidence stay in that share and are never kept, so the curve counts the same cells as the
+confusion matrix.
 The red marker is the transfer's own `threshold_fraction`.
 Higher thresholds keep fewer cells. Use this curve to check whether the retained labels are
 also more accurate in this dataset.

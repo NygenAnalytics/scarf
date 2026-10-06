@@ -98,8 +98,13 @@ def _write_group_statistics(
     """Write one feature's groups-by-statistics row from its group sums.
 
     ``rank_g`` and ``drank_g`` hold each group's average-rank and dense-rank
-    sums, and ``tie_total`` the feature's rank tie term. Column 6 holds the
-    continuity- and tie-corrected Mann-Whitney z statistic.
+    sums, and ``tie_total`` the feature's rank tie term. Column 5 holds the
+    fold change under ``MARKER_FOLD_CHANGE_POLICY`` of
+    :mod:`scarf.features.markers.table`: the group mean over the rest mean
+    when both are non-negative and the rest mean is positive, +inf when only
+    the group mean is positive, and NaN when both means are 0 or either is
+    negative. Column 6 holds the continuity- and tie-corrected Mann-Whitney
+    z statistic.
     """
     n_groups = group_counts.shape[0]
     total_sum = 0.0
@@ -122,10 +127,18 @@ def _write_group_statistics(
         mean_rest = (total_sum - sum_g[x]) / rest if rest > 0 else 0.0
         fraction = nz_g[x] / count if count > 0 else 0.0
         fraction_rest = (total_nz - nz_g[x]) / rest if rest > 0 else 0.0
-        if mean_rest == 0.0:
-            fold_change = 0.0 if mean == 0.0 else 100.1
-        else:
+        # Every branch assigns its value, so no case divides by zero, which
+        # raises in compiled code.
+        if mean < 0.0 or mean_rest < 0.0:
+            # Signed values give a ratio with no fold-change reading.
+            fold_change = np.nan
+        elif mean_rest > 0.0:
             fold_change = mean / mean_rest
+        elif mean > 0.0:
+            # The feature is absent from every other cell.
+            fold_change = np.inf
+        else:
+            fold_change = np.nan
         score = rank_values[x] / rank_total if rank_total > 0 else 0.0
         n1 = count
         n2 = rest
@@ -560,7 +573,9 @@ def _batch_stats(
 ) -> np.ndarray:
     """Run the dense marker kernel over cells-by-features normalized values.
 
-    Column 6 of the result holds the Mann-Whitney z statistic.
+    Column 5 of the result holds the fold change, which is +inf or NaN where
+    a ratio of the means is undefined, and column 6 the Mann-Whitney z
+    statistic.
     """
     values = np.asarray(data)
     if values.ndim != 2:

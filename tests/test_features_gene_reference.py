@@ -320,6 +320,58 @@ def test_pick_gff3_name_rejects_listing_without_top_level_file() -> None:
         gene_reference_module._pick_gff3_name(listing)
 
 
+# Top-level GFF3 files of Ensembl: the fly and the rat file of releases 105 to
+# 112 have assemblies that contain dots.
+_TOP_LEVEL_GFF3 = {
+    "homo_sapiens": "Homo_sapiens.GRCh38.115.gff3.gz",
+    "rattus_norvegicus_mratbn7": "Rattus_norvegicus.mRatBN7.2.112.gff3.gz",
+    "drosophila_melanogaster": "Drosophila_melanogaster.BDGP6.54.115.gff3.gz",
+}
+
+
+def _ensembl_listing(top_level: str) -> str:
+    """List a species directory as Ensembl does, around one top-level file."""
+    stem = top_level.removesuffix(".gff3.gz")
+    names = [
+        "CHECKSUMS",
+        "README",
+        f"{stem}.abinitio.gff3.gz",
+        f"{stem}.chr.gff3.gz",
+        f"{stem}.chr_patch_hapl_scaff.gff3.gz",
+        # Numeric chromosome names follow the release, so a dotted assembly
+        # could otherwise read them as the release.
+        f"{stem}.chromosome.1.gff3.gz",
+        f"{stem}.chromosome.4.gff3.gz",
+        f"{stem}.chromosome.2L.gff3.gz",
+        f"{stem}.chromosome.MT.gff3.gz",
+        f"{stem}.chromosome.KI270728.1.gff3.gz",
+        top_level,
+    ]
+    return "\n".join(f'<a href="{name}">{name}</a>' for name in names)
+
+
+@pytest.mark.parametrize("species", sorted(_TOP_LEVEL_GFF3))
+def test_pick_gff3_name_finds_the_top_level_file(species: str) -> None:
+    top_level = _TOP_LEVEL_GFF3[species]
+    release = top_level.removesuffix(".gff3.gz").rsplit(".", 1)[1]
+
+    assert gene_reference_module._pick_gff3_name(_ensembl_listing(top_level)) == (
+        top_level,
+        release,
+    )
+
+
+@pytest.mark.parametrize("species", sorted(_TOP_LEVEL_GFF3))
+def test_pick_gff3_name_ignores_partial_and_ab_initio_files(species: str) -> None:
+    top_level = _TOP_LEVEL_GFF3[species]
+    listing = _ensembl_listing(top_level).replace(
+        f'<a href="{top_level}">{top_level}</a>', ""
+    )
+
+    with pytest.raises(FileNotFoundError, match="no top-level Ensembl GFF3 file"):
+        gene_reference_module._pick_gff3_name(listing)
+
+
 def test_directory_listing_uses_request_headers_and_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

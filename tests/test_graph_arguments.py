@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import fields
 
 import numpy as np
@@ -20,6 +21,11 @@ from scarf.graph.arguments import (
     artifact_input,
     execution,
     parameter,
+)
+from scarf.metadata.arguments import (
+    MarkerTableArguments,
+    MembershipStrengthArguments,
+    SmartLabelArguments,
 )
 from scarf.storage.artifact_writer import finish_artifact, start_artifact
 from scarf.storage.artifacts import ArtifactRef, make_provenance, provenance_hash
@@ -155,6 +161,7 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
         coordinates=_ref("batch_correction", "4"),
         k=15,
         distance_metric="l2",
+        nthreads=4,
         batch_size=100,
     )
     connectivity = ConnectivityMapArguments(
@@ -166,6 +173,8 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
     assert harmony.to_record().parameters["batch_columns"] == ["donor", "sample"]
     assert scaling.to_record().parameters == {"enabled": True}
     assert neighbors.to_record().inputs["ann_index"]["kind"] == "ann_index"
+    # Queries of a fixed index return the same neighbors on any thread count.
+    assert neighbors.to_record().parameters == {"k": 15, "distance_metric": "l2"}
     assert connectivity.to_record().parameters == {
         "local_connectivity": 1.0,
         "bandwidth": 1.5,
@@ -266,16 +275,128 @@ def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
     serial = AnnIndexArguments(
         ann_parallel=False,
         parallel_threads=None,
+        nthreads=1,
         **common,
     )
     parallel = AnnIndexArguments(
         ann_parallel=True,
-        parallel_threads=4,
+        parallel_threads=None,
+        nthreads=4,
+        **common,
+    )
+    other_machine = AnnIndexArguments(
+        ann_parallel=True,
+        parallel_threads=None,
+        nthreads=2,
         **common,
     )
 
     assert _identity(serial) != _identity(parallel)
-    assert parallel.to_record().parameters["ann_parallel"] is True
+    record = parallel.to_record()
+    assert record.parameters["ann_parallel"] is True
+    # Parallel insertion is not reproducible for any thread count, so the
+    # count is an execution option and parallel_threads stays None, the value
+    # that serial indexes have always recorded.
+    assert record.parameters["parallel_threads"] is None
+    assert record.execution_options["nthreads"] == 4
+    assert _identity(other_machine) == _identity(parallel)
+    # The identity that serial indexes recorded before thread counts became
+    # execution options.
+    assert _identity(serial) == (
+        "8ac0ffe491183fbd4def307427ab2b4aece8ad2acac50cffc8cc3e040be27537"
+    )
+    with pytest.raises(ValueError, match="parallel_threads"):
+        AnnIndexArguments(
+            ann_parallel=True,
+            parallel_threads=4,  # type: ignore[arg-type]
+            nthreads=4,
+            **common,
+        )
+
+
+def _harmony_arguments() -> HarmonyArguments:
+    return HarmonyArguments(
+        reduction=_ref("reduction", "1"),
+        batch_snapshot=_ref("metadata_snapshot", "2", scope="datastore"),
+        batch_columns=("donor", "sample"),
+        harmony_parameters={"theta": 2.0},
+        algorithm_version="centroid_snapshot_v2",
+        batch_size=100,
+    )
+
+
+def _membership_arguments() -> MembershipStrengthArguments:
+    return MembershipStrengthArguments(
+        connectivity_map=_ref("connectivity_map", "3"),
+        clusters=_ref("cluster_labels", "4"),
+        cell_selection=_ref("cell_selection", "5", scope="datastore"),
+        algorithm_version=2,
+        decimals=3,
+        invalidate_cache=False,
+    )
+
+
+def _smart_label_arguments() -> SmartLabelArguments:
+    return SmartLabelArguments(
+        values=_ref("cluster_labels", "6", scope="datastore"),
+        base_labels=_ref("cluster_labels", "7", scope="datastore"),
+        cell_selection=_ref("cell_selection", "5", scope="datastore"),
+        algorithm_version=3,
+        suffix_style="lowercase_letter",
+        invalidate_cache=False,
+    )
+
+
+def _marker_table_arguments() -> MarkerTableArguments:
+    return MarkerTableArguments(
+        cell_selection=_ref("cell_selection", "5", scope="datastore"),
+        feature_selection=_ref("feature_selection", "8"),
+        clusters=_ref("cluster_labels", "4"),
+        normalization={"log_transform": False, "renormalize_subset": False},
+        normalization_method={"module": "scarf.assay", "qualname": "norm_lib_size"},
+        size_factor=1000.0,
+        method="mannwhitneyu",
+        alternative="two-sided",
+        tie_correction=True,
+        continuity_correction=True,
+        adjustment_method="fdr_bh",
+        adjustment_scope="within_group_all_tested_features",
+        nthreads=1,
+        invalidate_cache=False,
+    )
+
+
+# The provenance hashes, without the operation revision, that releases before
+# 1.0.0 recorded for these arguments. Planning reports a stored artifact as a
+# superseded match, or reuses it when its operation has no revision, only
+# while the request records exactly these parameters and inputs.
+@pytest.mark.parametrize(
+    ("build", "identity"),
+    [
+        (
+            _harmony_arguments,
+            "789fe696b123c56b3a55053382460d5c7a71513cee39cddf0fbe4007d5a2d780",
+        ),
+        (
+            _membership_arguments,
+            "15219e8795dccccc4cac50fce5d2b177b847154cf0361df89af0bdf912b667c7",
+        ),
+        (
+            _smart_label_arguments,
+            "af764e26a143a20bd1763edaf480435add6e71b849a27bfaad224a46fa006d98",
+        ),
+        (
+            _marker_table_arguments,
+            "458256f8b774f214833ca93d8d998bf483cc13d8deb79919490285c4035c2d9b",
+        ),
+    ],
+    ids=["run_harmony", "calc_membership_strength", "smart_label", "run_marker_search"],
+)
+def test_arguments_record_the_identities_of_earlier_releases(
+    build: Callable[[], OperationArguments],
+    identity: str,
+) -> None:
+    assert _identity(build()) == identity
 
 
 def test_dynamic_callable_requires_explicit_identity() -> None:

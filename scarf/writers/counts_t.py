@@ -8,7 +8,7 @@ import zarr
 from ..assay.classification import (
     default_feature_sets,
     is_rna_assay_type,
-    preset_assay_types,
+    recorded_assay_types,
     resolve_persisted_assay_type,
 )
 from ..storage.budget import ResourceBudget, resolve_budget
@@ -26,25 +26,6 @@ def _workspace_root(z: zarr.Group, workspace: str | None) -> zarr.Group:
     return as_zarr_group(z[workspace], name=workspace)
 
 
-def validate_assay_type(assay_type: str | None) -> None:
-    """Reject an explicit assay type that is not a known preset.
-
-    Args:
-        assay_type: Preset type requested by an import writer, or None.
-
-    Raises:
-        ValueError: If ``assay_type`` is not a preset such as ``RNA``.
-    """
-    if assay_type is None:
-        return
-    presets = preset_assay_types()
-    if assay_type not in presets:
-        raise ValueError(
-            f"assay_type {assay_type!r} is not a preset; use one of "
-            + ", ".join(sorted(presets))
-        )
-
-
 def seed_assay_type(
     z: zarr.Group,
     assay_name: str,
@@ -57,12 +38,12 @@ def seed_assay_type(
         z: Root Zarr group.
         assay_name: Assay group name.
         workspace: Workspace name. None uses the legacy layout.
-        assay_type: Preset type to store. Unrecognized values become ``Assay``.
+        assay_type: Preset type to store. Unrecognized values raise ``ValueError``.
     """
     type_name = resolve_persisted_assay_type(assay_name, assay_type)
     root = _workspace_root(z, workspace)
-    raw = root.attrs.get("assayTypes", {})
-    types = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    recorded = recorded_assay_types(root.attrs.get("assayTypes"))
+    types = {name: str(value) for name, value in recorded.items()}
     if types.get(assay_name) == type_name:
         return
     types[assay_name] = type_name

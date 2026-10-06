@@ -41,9 +41,11 @@ These calls do not create module-load cycles.
 - `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage
   profiles, materialization, ANN persistence, selection snapshots, run/stage records, Zarr runtime
   guards, and artifact lineage reports.
+  It also owns the operation revision registry (`storage/operation_revisions.py`, see {doc}`operation_revisions`), the finite-value contract of artifact arrays (`storage/finite_values.py`), and the writer destination contract (`storage/destinations.py`).
 - `matrix/` owns the lazy blockwise matrix abstraction used over NumPy and Zarr arrays.
   Its arithmetic, indexing, and reduction behavior keeps it separate from low-level storage mechanics.
 - `utils/` owns generic array, argument validation, compute, logging, process, and progress helpers.
+  It also owns streamed column moments (`utils/moments.py`) and the one warning helper (`utils/warnings.py`), which points each warning at the caller's code.
   Zarr-specific helpers belong in `storage`, not `utils`.
 
 Facade aliases do not change implementation ownership.
@@ -54,8 +56,10 @@ Facade aliases do not change implementation ownership.
 - `metadata/` owns Zarr-backed metadata tables, row streaming, and table queries.
   It is shared by datastore cell metadata and assay feature metadata, so neither `datastore`, `assay`, nor `storage` owns it.
   Shared value-selection contracts also live here so domain, orchestration, and presentation code can use one typed contract without reversing dependencies.
+  These include the nullable value contract of metadata columns (`metadata/encoding.py`), the assay-membership contract (`metadata/membership.py`), and `CELL_VALUE_NAMES`, the table of cell-aligned artifact kinds, with the reader that aligns their rows to cells (`metadata/selection.py`).
 - `assay/` owns normalization, blockwise feature-summary computation, and the RNA, ATAC, and ADT assay types.
   `DataStore` owns planning and persistence of feature-summary artifacts; a bare `Assay.score_features` remains computation-only.
+  `assay/normalization.py` owns the normalizer flag policy: each assay class declares the flags that its `normed` applies, and callers resolve flags through `applicable_normalization_flags` and `default_normalization_flags` instead of per-assay branches.
 - `graph/` owns graph feature projection through named artifact inputs and rejects encoded-path inputs.
   Analysis execution follows explicit artifact references and must not resolve inputs by parsing
   encoded paths or choosing an implicit result.
@@ -71,9 +75,10 @@ They must not import those packages at module load time.
   the narrow storage adapter for imported coordinate artifacts.
 - `clustering/` owns Leiden clustering and PARIS hierarchy operations.
 - `trajectory/` owns pseudotime scoring, feature-profile aggregation, feature module clustering, and pseudotime result records.
-- `metrics/` owns LISI, silhouette, graph, concordance, and integration scores.
-- `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, GFF parsing, genomic intervals, coordinate-based feature construction, and the name-based gene-family registry.
+- `metrics/` owns LISI, silhouette, graph, concordance, and integration scores, including the neighbor label agreement that membership strength stores.
+- `features/` owns variability selection, LOWESS trend fitting, feature scoring, enrichment, rank and regression marker searches, group-wise statistical tests, bulk aggregation, GFF parsing, genomic intervals, coordinate-based feature construction, and the name-based gene-family registry.
   It also owns presentation-independent feature resolution and normalized value fetching used by datastore workflows and plots.
+  `features/statistical.py` owns the statistical design of `run_statistical_testing`, and `features/aggregation.py` the bulk profiles of `make_bulk`; the datastore methods keep grouping resolution, value reads, artifact planning, and persistence.
 - `quality_control/` owns filtering, HTO demultiplexing, doublet processing, cell-cycle assignment, and the default cell-cycle gene references.
 - `mapping/` owns reference artifacts, feature alignment, confidence, Symphony-style correction, label transfer, and mapping results.
 
@@ -121,7 +126,7 @@ integration_metrics
 presentation
 ```
 
-Shared helpers under the same package include `enrichment_store` and `paris_persistence`.
+Shared helpers under the same package include `enrichment_store`, `paris_persistence`, and `statistical_store`, which owns the layout, reuse check, writer, and reader of stored statistical-test results.
 Operation mixins have no runtime inheritance from datastore facades, no `__init__`, and no runtime imports of sibling operation mixins.
 `TYPE_CHECKING` imports of siblings are allowed.
 Reusable algorithms must be placed in their domain package before being exposed through a datastore method.
@@ -186,6 +191,18 @@ This keeps reload behavior deterministic for tests and interactive work.
 Private facade exports used by repository tests are patch seams, not additions to the documented user API.
 New production code should import its canonical implementation directly unless it intentionally needs a public patch seam.
 
+### Invalidation policy
+
+Operation revisions are the one explicit mechanism that stops Scarf from reusing stored results.
+`storage/operation_revisions.py` gives each operation that has revisions an append-only tuple
+of them; an operation that is not listed is at revision 1. Planning records a revision in
+provenance only when it is 2 or more, so an operation without revisions keeps its identities. A
+stored artifact that differs from a request only in its revision is superseded: it is never
+reused, it stays listable, loadable, and traceable, and lineage reports mark it `stale`. Changing
+recorded parameters or inputs is not an invalidation mechanism, and version parameters that
+predate the registry stay frozen recorded constants. {doc}`operation_revisions` holds the decision
+ladder.
+
 ### Breaking-release compatibility policy
 
 This release intentionally has no compatibility bridge for the previous live-analysis contract.
@@ -204,9 +221,9 @@ The complete hard-break inventory is:
   marker columns. Callers use artifact loaders, frozen run views, and plotting adapters instead.
 - Public result records use their current artifact-based constructors. Older positional layouts
   and field sets are unsupported.
-- Pipeline run and stage records are strict, exact, and unversioned. Adding, removing, or renaming
-  a persisted field in a later release is an accepted hard break. Unknown or incomplete document
-  shapes fail closed.
+- Pipeline run, stage, and label-claim records have exact fields. Within 1.x a release may only
+  add fields and must still read records without them, so a run of any 1.x release reopens in
+  every later 1.x release.
 - Pipeline stages run strictly in sequence. UMAP no longer runs on a worker thread beside the
   Leiden, Paris, cluster-selection, and membership-strength stages; outputs and artifact
   identities are unchanged. Durable stage records now attribute wall time and sampled memory to
@@ -217,8 +234,9 @@ The complete hard-break inventory is:
   overlap still read. `scarf.utils.background` is removed.
 - `DataStore.pipeline.run` takes a `params` mapping of per-stage settings. Every run records two
   more stages, `membership_strength` and `tsne`, skipped unless requested, and its configuration
-  records `params`, `species`, `tsne`, `membershipStrength`, and the Leiden `selected`
-  resolution. `pca_dims=0` skips PCA.
+  records `params`, `species`, `tsne`, `membershipStrength`, and the Leiden `selected` resolution.
+  `pca_dims=0` skips PCA and builds the graph on the normalized artifact (see the `pca_dims=0`
+  entry).
 - Mapping references and query projections use only their current exact-lineage contracts.
 - Label transfer is a saved artifact. `get_target_classes` and `get_target_label_evidence` are
   removed. `run_label_transfer` freezes the reference labels it reads, from a reference column or a
@@ -242,10 +260,10 @@ The complete hard-break inventory is:
   Their former `label_colname` keywords and column- or array-based concordance inputs are
   unsupported.
 - Derived assays are published atomically. `add_grouped_assay` and `add_melded_assay` stage the
-  assay under a `scarf:pending_assay` marker and remove it on failure. Counts written by
-  `create_zarr_count_assay` carry `complete=False` until they are finalized. A pending group left
-  by a hard kill blocks its name, and repack refuses it, until
-  `DataStore.discard_interrupted_assay` removes it.
+  assay under a `scarf:pending_assay` marker and remove what they created when an error stops them.
+  Counts written by `create_zarr_count_assay` carry `complete=False` until they are finalized. A
+  pending group left by a hard kill, an interruption, or a failed publication write blocks its name
+  in every workspace, and repack refuses it, until `DataStore.discard_interrupted_assay` removes it.
 - Mounted targets resolve their source's artifacts read only. From this release on, every mount,
   including mounts created by earlier release candidates, lists, loads, traces, and reuses the
   complete artifacts of its identity-checked source after its own, so a recipe that matches saved
@@ -306,8 +324,8 @@ The complete hard-break inventory is:
   `p_value_method`; identities of other tests are unchanged. Saved Mann-Whitney results without
   `p_value_method` fail to load with a request to recompute. A `StudyDesign`
   pairing column applies only to the paired Wilcoxon test.
-- densMAP embeddings symmetrize neighbor distances and record `densmap_algorithm_version`, so
-  earlier densMAP artifacts are not reused.
+- densMAP embeddings symmetrize neighbor distances, so earlier densMAP artifacts are not reused.
+  Their identities no longer record `densmap_algorithm_version` (see the densMAP identity entry).
 - `run_umap` records float parameters as floats and integer parameters as Python integers, so
   `min_dist=1` and `min_dist=1.0` identify the same embedding. The defaults `min_dist=1` and
   `negative_sample_rate=5` were recorded as integers, so every saved UMAP embedding recomputes on
@@ -335,7 +353,8 @@ The complete hard-break inventory is:
   `data_is_reduced` keyword. `silhouette_scoring` requires the keyword-only `distance_metric` and
   compares rows as given.
 - `run_fate_mapping` treats `solver_tol` as an absolute bound on the largest Bellman residual of
-  each solved sink column. Existing fate artifacts remain valid and are reused.
+  each solved sink column. Existing fate artifacts remain valid; this change alone does not stop
+  their reuse.
 - `scarf.neighbors.diffusion_operator` is removed; it formed a powered operator with no memory
   bound. `bounded_diffusion_operator` is the only powered builder, and
   `neighbors.diffusion.transition_matrix` returns the graph-sized single step. The removal
@@ -383,18 +402,19 @@ The complete hard-break inventory is:
   score, have different identities and are recomputed on request. `load_pseudotime_markers`,
   `load_pseudotime_aggregation`, and loading or building a mapping reference reject such records and
   ask for a recompute. Artifacts that earlier release candidates computed from float32 counts keep
-  their identities although current values differ: subset-renormalized library-size values by at
-  most one float32 ulp (a few ulps for non-integral counts or subset totals above 2**24), CLR values
-  by the error of their float32 log sums (typically 3e-5 relative at 8,000 cells and 8e-4 at
-  200,000), whole-library library-size values only for non-integral counts or counts whose float32
-  product with the size factor is inexact (above 134,217 at the default size factor of 1000),
-  feature percentages and subset-renormalized TF-IDF values only for non-integral counts or totals
-  above 2**24, and every result derived from them. Pseudotime markers and aggregations that stream
-  library-size values without subset renormalization compute them in float64 instead of float32 on
-  every store, so their results change at float32 resolution while their identities stay the same.
-  Statistical tests compare the fingerprints of their values and recompute by themselves; recompute
-  the other artifacts with `invalidate_cache=True`. Stores written by unreleased development builds
-  are unsupported.
+  their identities (unless another entry changes them, as for default ADT normalization) although
+  current values differ: subset-renormalized library-size values by at most one float32 ulp (a few
+  ulps for non-integral counts or subset totals above 2**24), CLR values by the error of their
+  float32 log sums (typically 3e-5 relative at 8,000 cells and 8e-4 at 200,000), whole-library
+  library-size values only for non-integral counts or counts whose float32 product with the size
+  factor is inexact (above 134,217 at the default size factor of 1000), feature percentages and
+  subset-renormalized TF-IDF values only for non-integral counts or totals above 2**24, and every
+  result derived from them. Pseudotime markers and aggregations that stream library-size values
+  without subset renormalization compute them in float64 instead of float32 on every store, so their
+  results change at float32 resolution while their identities stay the same. Statistical tests
+  compare the fingerprints of their values and recompute by themselves; recompute the other
+  artifacts with `invalidate_cache=True`. Stores written by unreleased development builds are
+  unsupported.
 - Library-size marker search ranks raw counts of every storage dtype with one zero-aware kernel,
   with or without `renormalize_subset`, so float, signed, and unsigned stores no longer take
   different kernels, and subset-renormalized searches no longer rank unrounded float64 `normed`
@@ -406,9 +426,9 @@ The complete hard-break inventory is:
   float64 group sizes instead of float32, so p-values and their adjusted values change in their low
   digits once a group's size times its complement's exceeds 2**24 (two groups of about 4,100 cells;
   about 1e-4 relative at a million cells), and the two groups of a two-group search now get equal
-  p-values. Marker tables keep their identities, layout, and attributes, but library-size statistics
-  now come from float64 values rounded once to float32 instead of float32 arithmetic, so values can
-  move at the fifth decimal; recompute earlier tables with `invalidate_cache=True`.
+  p-values. Library-size statistics now come from float64 values rounded once to float32 instead of
+  float32 arithmetic, so values can move at the fifth decimal; earlier tables are superseded anyway
+  by `run_marker_search` revision 2 (see the marker `fold_change` entry).
   `scarf.features.find_markers_by_rank` returns a `RankMarkerResult` of the sorted group ids, their
   sizes, the ascending feature index, and the features-by-groups rank statistics instead of one
   DataFrame per group, and raises `IndexError` for a cell or feature index past the end of `countsT`
@@ -439,7 +459,9 @@ The complete hard-break inventory is:
   depending on the number of cells) now give their correlation instead of r = 0 with p = 1, or NaN,
   and a regressor whose squared deviations underflowed (below about 1e-160) is tested instead of
   reported as untested. Two-cell searches report r of exactly 1 or -1 instead of a least-squares
-  value that could round below one. Pseudotime marker identities are unchanged.
+  value that could round below one. Pseudotime marker identities are unchanged. It treats a feature
+  as constant, and untested, when its values span at most float64 epsilon times their largest
+  magnitude; the rule was an absolute span of epsilon.
 - Row-block streams over a sharded array reserve what Zarr holds while it reads a block: a
   shard-level copy of the selection, the compressed bytes of every chunk the block touches in a
   shard, charged at their decoded size, and the one chunk decoded at a time, next to the block and
@@ -586,25 +608,26 @@ The complete hard-break inventory is:
   for a batch of another width. A CSV file that changes after the reader's pass reports this
   ValueError, which `CSVtoZarr.dump` now documents.
 - Stored contracts are strict. ANN indexes carry their complete metadata record including
-  `byte_length`; `query_neighbors` requires recorded `ann_ef` and `parallel_threads`; mapping
-  references require `ann_ef`; building and loading a Symphony mapping reference require recorded
-  Harmony `batch_levels`, `batch_columns`, and `harmony_parameters`. HVG selections record
+  `byte_length`; `query_neighbors` requires recorded `ann_ef` and `ann_parallel`; mapping references
+  require `ann_ef`; building and loading a Symphony mapping reference require recorded Harmony
+  `batch_levels`, `batch_columns`, and `harmony_parameters`. HVG selections record
   `blacklist_fingerprint` and, for adaptive binning, `variance_estimator` and `variance_quantile`.
-  Statistical-test artifacts missing any recorded attribute fail to load. Earlier artifacts
-  without these records fail to load or are rebuilt.
+  Statistical-test artifacts missing any recorded attribute fail to load. Earlier artifacts without
+  these records fail to load or are rebuilt.
 - Metadata copies, column clearing, and run snapshots accept only the canonical
   `__scarf_missing__<name>` link and reject multi-dimensional columns. Copies and snapshots store
   text as unicode and text fingerprints decode bytes as UTF-8, so identities over byte-string
   columns change. `MetaData.columns` lists `I`, `ids`, `names`, then the other columns sorted.
-  `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and
-  `insert` keeps an explicit boolean `fill_value`. `MetaData.get_index_by` matches values that
-  are not text by their text and always returns int64 indices. `MetaData.insert` rejects names
-  that are empty, `.` or `..`, contain `/` or `\`, because Zarr would nest them into groups, or
-  start with the `__scarf_missing__` mask prefix; `reset_key` and `update_key` apply the same
-  rule. A lookup of a name with a separator suggests the `_` spelling that imports store, and a
-  lookup of an empty, `.` or `..` name raises `KeyError`. A cell or feature table that holds
-  such a nested group from an earlier import raises an error that asks for the source to be
-  re-imported on every read, write, and drop of that name; stores are not migrated.
+  `MetaData.sift`, `multi_sift`, and covariate partitions treat masked rows as missing, and `insert`
+  stores an explicit `fill_value` as a real value without a mask (see the partial-insert entry
+  below). `MetaData.get_index_by` matches values that are not text by their text and always returns
+  int64 indices. `MetaData.insert` rejects names that are empty, `.` or `..`, contain `/` or `\`,
+  because Zarr would nest them into groups, or start with the `__scarf_missing__` mask prefix;
+  `reset_key` and `update_key` apply the same rule. A lookup of a name with a separator suggests the
+  `_` spelling that imports store, and a lookup of an empty, `.` or `..` name raises `KeyError`. A
+  cell or feature table that holds such a nested group from an earlier import raises an error that
+  asks for the source to be re-imported on every read, write, and drop of that name; stores are not
+  migrated.
 - Storage operations raise a single task failure as itself and a cooperative shutdown as
   `ShutdownRequested`, not as an exception group. A pipeline stage whose exception group holds
   `KeyboardInterrupt` or `ShutdownRequested` is recorded as interrupted and raises that
@@ -616,10 +639,11 @@ The complete hard-break inventory is:
   cluster-selection inputs, plots, and pipeline run records. Query projections validate
   `cell_selection` with the stored-selection validator, and connectivity-map payloads follow the
   neighbor dimension rules, so `n_cells` above 2**32 - 1 is rejected.
-- A failed or interrupted artifact write deletes its incomplete slot, so `list_artifacts` no
-  longer shows orphaned incomplete artifacts after an error. `ProjectionWriter.abort` deletes the
-  unfinished projection instead of leaving it incomplete. Starting any artifact on a read-only
-  store raises `PermissionError` before writing, so `run_harmony` and
+- A failed or interrupted artifact write deletes its incomplete slot when the failure comes before
+  the write that marks the artifact complete, so `list_artifacts` no longer shows orphaned
+  incomplete artifacts after an error; once that publication write is issued nothing is deleted.
+  `ProjectionWriter.abort` deletes an unfinished projection before its publication write. Starting
+  any artifact on a read-only store raises `PermissionError` before writing, so `run_harmony` and
   `run_pseudotime_scoring(ss_vec=...)` no longer surface the Zarr read-only `ValueError`.
 - Gene families: `scarf.features.gene_families` is the one registry of name-based families, and
   `ribosomal` always means RPS, RPL, MRPS, and MRPL. `DEFAULT_PERCENT_PATTERNS` moves there from
@@ -638,14 +662,15 @@ The complete hard-break inventory is:
   genes use CENPU, PIMREG, and JPT1 (mouse Cenpu, Pimreg, Jpt1); parameter tuning's native
   doublet graphs use the candidate ANN seed.
 - Results that change while identities stay the same, so earlier artifacts are reused and must be
-  recomputed with `invalidate_cache=True`: Dunn tie corrections are exact for tie groups above
-  about two million values; Welch reports `n1 + n2 - 2` degrees of freedom when neither group
-  varies; fixed-strategy `fit_lowess` returns zero for genes without a positive finite mean and
-  variance; graph artifacts built from NumPy boolean `symmetric_graph` flags may be
-  unsymmetrized; `run_feature_percentage` gives NaN for a cell without counts.
-- Integer arguments share one validator: NumPy integers are accepted, integer-like objects such
-  as 0-d arrays are rejected, and messages read `<name> must be an integer` or
-  `<name> must be at least N`.
+  recomputed with `invalidate_cache=True`: Dunn tie corrections are exact for tie groups above about
+  two million values; Welch reports `n1 + n2 - 2` degrees of freedom when neither group varies;
+  fixed-strategy `fit_lowess` returns zero for genes without a positive finite mean and variance;
+  graph artifacts built from NumPy boolean `symmetric_graph` flags may be unsymmetrized;
+  `run_feature_percentage` gives NaN for a cell without counts.
+  {ref}`stable_identity_result_changes` lists these and the later such changes by release.
+- Integer arguments share one validator: NumPy integers are accepted, integer-like objects such as
+  0-d arrays are rejected, and messages read `<name> must be an integer` or `<name> must be at least
+  N`. It also validates `DataStore(min_features_per_cell=...)` and `FeatureRef(value, by="index")`.
 - Paris fits raise each merge to at least its child heights, so hierarchies of tied graphs
   validate, and straight and fixed cuts number equal-size clusters by hierarchy node order.
   `load_paris_clustering` rejects cuts that do not name their hierarchy.
@@ -683,29 +708,32 @@ The complete hard-break inventory is:
   refuse it. Results and artifact identities do not change.
 - `run_waggr` raises the same `ValueError`s with clearer messages. A selected cell total that is
   negative or not finite now reads `<assay>_nCounts holds negative or non-finite totals of selected
-  cells; WAGGR library-size normalization requires finite non-negative counts`; before, it said only
-  that the normalization scalars must be finite. An RNA assay whose `sf` is `None` now reads `WAGGR
+  cells; library-size normalization requires finite non-negative counts`; before, it said only that
+  the normalization scalars must be finite. An RNA assay whose `sf` is `None` now reads `WAGGR
   requires a finite positive size factor` instead of claiming a non-default normalization. Results
   and artifact identities do not change.
 - `run_lsi` with the streaming solver reduces its block so that both the fit and the coordinate
-  write fit the memory budget; budgets that logged a reduction and then raised `MemoryError`
-  finish with smaller blocks. The block size is an execution option, so identities do not change.
-  UMAP's layout runs on `min(nthreads, NUMBA_NUM_THREADS)` Numba threads even when the calling
-  thread had fewer, and `Assay.score_features` no longer warns for an empty CLR cell selection.
+  write fit the memory budget; budgets that logged a reduction and then raised `MemoryError` finish
+  with smaller blocks. The block size is an execution option, so identities do not change. A
+  parallel UMAP layout runs on `min(nthreads, NUMBA_NUM_THREADS)` Numba threads even when the
+  calling thread had fewer, a serial one on one thread, and `Assay.score_features` no longer warns
+  for an empty CLR cell selection.
 - `DataStoreMerge` refuses destinations that alias, contain, or lie inside a source or that
   already hold content, and creates destinations with mode "w-". Source names cannot contain
   `__`. `overwrite=True` refuses destinations with a prepared assay and clears `defaultAssay`.
   Manifests record `sourceCountFingerprints`, so merges interrupted before this release restart
   with `overwrite=True`. Differing unordered cell-column `levels` are unioned; other differing
   attributes are dropped with a warning.
-- `DataStoreMerge` records the preset of each source assay's class: `RNA` for RNA-class assays,
-  `ATAC` for ATAC, `ADT` for ADT-class assays such as HTO, and `Assay` otherwise. Merged ADT and
-  ATAC assays therefore open as `ADTassay` and `ATACassay` and keep CLR and TF-IDF normalization;
-  before, every non-RNA source assay was recorded as the generic `Assay`. `plan()` reports a
-  destination whose prepared assay has incomplete counts as blocked (`canDump=False`, "A damaged
-  prepared assay requires a fresh destination"), the refusal that `dump()` already raised, instead
-  of planning a resume. A merged matrix group counts as complete only when its `complete` attribute
-  is `true`, as every other merge component does.
+- `DataStoreMerge` records, for each merged assay, the type that every source declares, so `HTO`
+  stays `HTO`, `GeneActivity` stays `GeneActivity`, and `CRISPR` stays `CRISPR`; sources that
+  declare different types for one assay raise `ValueError` before anything is written. Merged ADT
+  and ATAC assays therefore open as `ADTassay` and `ATACassay` and keep CLR and TF-IDF
+  normalization; before, every non-RNA source assay was recorded as the generic `Assay`. The
+  manifest records `assayTypes`, so a merge interrupted under an earlier build restarts with
+  `overwrite=True`. `plan()` reports a destination whose prepared assay has incomplete counts as
+  blocked (`canDump=False`, "A damaged prepared assay requires a fresh destination"), the refusal
+  that `dump()` already raised, instead of planning a resume. A merged matrix group counts as
+  complete only when its `complete` attribute is `true`, as every other merge component does.
 - Imports: H5AD import stores missing categorical, nullable, and string values under linked
   masks and keeps nullable booleans as booleans. `inspect_h5ad` reads group-encoded AnnData
   indexes and prefers an ID column such as `gene_ids`, and reads a one-element `uns` text dataset
@@ -781,14 +809,16 @@ The complete hard-break inventory is:
   listing keeps a nested group visible when resolved names do not cover all of it, so the reader
   reports it, and leaves datasets with more than one dimension out of the planned names. A 10x
   feature-reference column that is empty for every feature is not planned.
-- Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root`
-  (default: the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts
-  containing R `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names
-  stored in sidecars. Factor metadata keeps empty levels. Transposed BPCells nodes, MergeFragments
-  peak counts, and RegionSelect boundaries follow BPCells, so re-imported counts can differ.
-  HDF5 sidecars in H5AD layout need `encoding-type` or `h5sparse_format` and take axis names only
-  from the index named by `_index`; other HDF5 sparse groups ignore `sparse_layout` and `layout`
-  attributes.
+- Seurat: `SeuratReader` and `inspect_seurat` resolve sidecars only inside `sidecar_root` (default:
+  the `.rds` directory), and stream sources need it for sidecar-backed layers. Counts containing R
+  `NA` raise `missing_count_value`. Dimnames and LogMap identifiers override names stored in
+  sidecars. Factor metadata keeps empty levels. Transposed BPCells nodes, MergeFragments peak
+  counts, and RegionSelect boundaries follow BPCells, so re-imported counts can differ. TileMatrix
+  `fragments` mode counts each tile that holds one of a fragment's insertions, at `start` and `end -
+  1`, so a fragment whose insertions fall in two tiles of one range counts in both instead of only
+  the first; stores imported from such matrices must be re-imported. HDF5 sidecars in H5AD layout
+  need `encoding-type` or `h5sparse_format` and take axis names only from the index named by
+  `_index`; other HDF5 sparse groups ignore `sparse_layout` and `layout` attributes.
 - Exports: `to_h5ad` writes AnnData 0.2.0 encodings and omits `_index` from `column-order`;
   `to_mtx(compress=True)` adds a feature-type column.
 - Plotting: `dotplot` and `matrixplot` pool only features of one assay that share an explicit
@@ -832,6 +862,266 @@ The complete hard-break inventory is:
   `written_path`, `PlotRecipeResult.results`, several `SeuratReader` members, the parameter
   tuning handoff, Pareto, WNN, and refinement exports, `AgentRunConfig.thinkingOffProfile`, and
   `AgentOrchestrator.initialize_request`.
+- Pipeline records keep at most 512 characters of an error or interruption message and end a longer
+  one with `...`. An interruption with a longer message now ends the run as interrupted instead of
+  raising `ValueError`.
+- Pipeline signal handling never waits for a lock, so a second signal cannot deadlock a run.
+- A pipeline stage setting means exactly what the same keyword means on the stage's method, and an
+  omitted setting takes that method's default. Non-finite settings raise before a run record is
+  created.
+- Pipeline t-SNE settings get the checks of `run_tsne` when the recipe is resolved, before a run
+  record exists. A missing `sgtsnepi` only logs a warning there, because a stored embedding can be
+  reused without it.
+- One writer per store is the documented contract: write a store from one process at a time.
+- Importers no longer delete their destination (`scarf.storage.destinations`). They and
+  `SubsetZarr` raise `FileExistsError` for a destination that holds any key, and `ValueError` for a
+  local destination inside a Zarr store or a destination whose root group is an assay group. Each
+  importer gains `overwrite: bool = False`, which replaces only a Scarf store that no `DataStore`
+  has opened, as `SubsetZarr(overwrite_existing_file=True)` now does; a prepared store and content
+  that Scarf did not write are never replaced. A subset source is prepared, so
+  `overwrite_existing_file=True` no longer deletes it through another path or store object.
+- Local paths reach Zarr as `pathlib.Path`, so names that hold `#`, `?`, or `;` open as written.
+- `SubsetZarr` raises `ValueError` before it writes anything unless all its assays come from one
+  `DataStore`. It compared only their numbers of cells, so assays of two datastores of one size
+  were accepted and the subset paired one dataset's cell IDs with the other's counts.
+- `SubsetZarr`, `DataStoreMerge`, `mount_datastore`, and `repack_store` refuse a source store that
+  holds a pending derived assay before they write anything.
+- `subset_assay_zarr` never replaces anything in its store: an `out_grp` that overlaps `in_grp`
+  raises `ValueError`, and an existing `out_grp` raises `FileExistsError`.
+- `to_h5ad` writes a temporary file in the target's directory and moves it over the target once
+  complete, so a failed export leaves an earlier file of the same name intact.
+- Replacing a metadata column (`MetaData.insert(..., overwrite=True)`, `update_key`, `reset_key`)
+  encodes the new values first and restores the previous column on any failure or interruption. Text
+  that is not valid UTF-8 raises `ValueError`.
+- `MetaData.insert` records missing values in the column's missing mask instead of inventing them:
+  its `fill_value` default changes from `np.nan` to `None`. An explicit `fill_value` must fit the
+  column's dtype exactly, or `ValueError` is raised before the store changes. `I`, `ids`, and
+  `names` never hold missing values.
+- `MetaData.multi_sift` raises `TypeError` for a string `columns`, `lows`, or `highs` (a string
+  `columns` was split into characters), and `ValueError` when the columns and bounds differ in
+  number.
+- `CSVtoZarr` requires one `cellDataDtypes` entry for each `cellDataCols` column and raises
+  `ValueError` otherwise; unpaired columns used to be dropped silently.
+- Assay types are strict presets: `RNA`, `ATAC`, `ADT`, `HTO`, `CRISPR`, `ANTIGEN`, `CUSTOM`,
+  `GeneActivity`, `GeneScores`, `URNA`, or `Assay`. `DataStore(assay_types=...)` raises `ValueError`
+  for an unknown key or value, and a read-only open whose explicit type differs from the recorded
+  one raises `ValueError` naming the remedy (open once with `zarr_mode='r+'`). Each assay exposes
+  its resolved type as `Assay.assayType`.
+- `DataStore.summary()` reports each assay's resolved type (`Assay.assayType`) instead of the raw
+  `assayTypes` record.
+- `DataStore(min_features_per_cell=...)` must be an integer of at least -1. A writable open keeps
+  `I`, with a warning, when the filter would remove at least half of the active cells; the earlier
+  guard compared the threshold with the median, so an ADT panel of ten features lost every cell.
+  Derived assays no longer filter `I`. A writable open prepares assays, filters `I`, and records
+  `assayTypes` and `defaultAssay`; a read-only open writes nothing.
+- `mount_datastore` checks its forwarded `DataStore` options before it creates the target, and
+  deletes a target whose first open fails, so the mount can be retried.
+- `DataStoreMerge` keeps per-cell assay membership: the merged `<assay>_I` is False for the cells
+  whose source lacks the assay. Earlier merges marked such cells measured; merges of partially
+  measured sources must be redone from the original sources.
+- Membership survives export and import. `to_h5ad` and `to_anndata` without `run` declare the
+  exported assay's `<assay>_I` in `uns["scarf"]["assayMembership"]`, and `H5adToZarr` restores it.
+  Import writers skip, with a warning, other source columns named `<assay>_I`.
+- Membership columns are protected: `MetaData.insert`, `update_key`, and `reset_key` refuse
+  `<assay>_I` of any assay, and `drop` refuses a column that records membership. `add_grouped_assay`
+  and `add_melded_assay` copy the source assay's membership to the new assay.
+- Seurat imports with `assay_layers` record a cell that only an unselected layer holds as unmeasured
+  (False in `<assay>_I`); earlier builds recorded it as measured. Import such data again.
+- Analysis fails closed on cells that an assay did not measure (`<assay>_I` False): every operation
+  that reads an assay's values raises `UnmeasuredCellsError`, a `ValueError` that names the counts
+  and the remedy, before it plans or writes. Results that earlier releases computed over such cells
+  are not detected; rebuild them over a selection from `select_measured_cells`.
+- `DataStore.select_measured_cells(assay, *, cell_selection=None)` keeps the cells of a selection
+  that an assay measured, and returns the selection itself when the assay measured every cell.
+- Display reads show unmeasured cells as missing: their feature values are NaN, normalization is
+  fitted over measured cells only, embedding plots draw them in `missing_color`, and summary plots
+  leave them out of every statistic and of `n_cells`.
+- Plots of feature values record `provenance.extras["unmeasured_cells"]` when an assay did not
+  measure some plotted cells, and an embedding color without any value records None in
+  `extras["color_limits"]` and draws no colorbar unless its scale sets limits.
+- Quality-control filters treat `<assay>_nCounts`, `<assay>_nFeatures`, and the assay's percentage
+  columns as reads of that assay, so `auto_filter_cells`, `filter_cells`, and pipeline filtering
+  refuse unmeasured cells with `UnmeasuredCellsError`. Earlier, their zero metrics set the MAD
+  bounds.
+- `make_bulk` checks only the cells that it reads. A metadata grouping without `cell_selection`
+  reads the live `I` cells without a snapshot, so `make_bulk` writes nothing.
+- An operation checks its arguments and assay type before membership, and both before the
+  `PermissionError` of a read-only store.
+- Exports that cannot declare membership refuse unmeasured cells: `to_mtx`, and `to_anndata` layers
+  of an assay other than the exported one. `to_h5ad` and `to_anndata` without layers declare
+  membership.
+- The agent asks for a `cellKey` of measured cells (`NeedsInput`) during source inspection, before
+  any model decision.
+- `scarf.metadata.selection.CELL_VALUE_NAMES` names the canonical per-cell array of every
+  cell-aligned artifact kind and replaces `GROUPING_VALUE_NAMES`. Readers no longer fall back to a
+  `values` array, and other kinds raise `ValueError`. `select_cells` now accepts `pseudotime` and
+  `sampling` artifacts.
+- `DataStore.load_cell_values(ref, *, value=None, cell_selection=None)` returns a
+  `scarf.metadata.CellValues` (values, cell ids, and missing mask) for any cell-aligned artifact.
+  The read is checked against the memory budget before anything is read.
+- `select_cells` reads its values through the reader of `load_cell_values`, so its refusals take
+  that reader's messages, and the read is checked against the memory budget.
+- `FeatureRef` checks `value` against `by`: an index must be an integer and a name or id must be
+  text, else `TypeError`. `1.9`, `True`, and `"2"` no longer select features.
+- `clip_fraction` of `get_cell_vals` and of embedding plots must be at least 0 and less than 0.5,
+  checked before any value is read. `scarf.rescale_array` requires `frac` greater than 0.5 and at
+  most 1.
+- `DataStore.to_anndata` raises `ImportError` when `anndata` is not installed, instead of logging an
+  error and returning None. `to_h5ad` does not need `anndata`.
+- `to_anndata(run=run, matrix="normed")` and `to_h5ad(..., run=run, matrix="normed")` export the
+  run's stored `normalized` artifact over its highly variable features: the values that the run's
+  PCA read. Before, a run export normalized again over the whole feature universe and never matched
+  the run.
+- One streaming H5AD writer (`scarf.writers.export`) writes every export with h5py block by block
+  and converts dense blocks to CSR in bounded steps, so no complete matrix is held. Live export
+  files are unchanged.
+- Run exports decide their categoricals themselves: repeated or missing text becomes a categorical
+  with naturally ordered categories, so `to_anndata(run=...)` and the H5AD file agree. Run-export
+  files differ from those that AnnData wrote before: `X` is compressed with int64 indexes, text is
+  `string-array`, and empty groups are not written.
+- Artifact provenance gains an optional `revision`, an integer of at least 2; revision 1 is recorded
+  by omission, so no existing identity changes until an operation gains a revision
+  ({doc}`operation_revisions`). A superseded artifact is not reused, and planning logs `Recomputing
+  <operation>: ...`. `ArtifactStatus` gains `revision`, `current_revision`, `is_current`, and
+  `superseded_by`, and lineage reports mark superseded artifacts `stale`.
+- Version parameters that predate the operation revision registry stay frozen constants (Harmony,
+  membership strength, smart label, embedding initialization, label transfer, WAGGR, and AUCell);
+  only densMAP's is removed. See {ref}`legacy_version_parameters`.
+- Producers check the arrays that must hold only finite values as they write them
+  (`scarf.storage.finite_values`): normalized data, reductions, batch corrections, embeddings,
+  neighbor distances, and graph weights. A non-finite value raises `NonFiniteArtifactError`, a
+  `ValueError` that names the operation, the array, and the row, and nothing is published.
+- Reuse never checks for non-finite values: an earlier artifact is reused when its provenance
+  matches. Earlier Harmony corrections, connectivity maps, and UMAP, densMAP, and t-SNE embeddings
+  get new identities in 1.0.0 anyway; recompute an earlier normalized artifact that holds NaN with
+  `invalidate_cache=True`.
+- Normalized data is held to the finite-value contract: a NaN from a custom normalizer, or the
+  `log1p` of a count below -1, raises `NonFiniteArtifactError` from `run_normalization` instead of
+  being stored. The public `scarf.writers.chunked_to_zarr` and `write_renorm_subset_to_zarr` do not
+  check.
+- Saved normalization applies the configured normalizer: with `norm_dummy` or a custom RNA
+  normalizer, `renormalize_subset=True` no longer stores library-size values.
+- `log_transform` means `log1p` of the configured normalizer's output, in float64, on every path. A
+  normalizer applies only the flags that it supports (`applicable_normalization_flags`), and
+  defaults turn flags on only for the RNA library-size normalizers (`default_normalization_flags`).
+- `log_transform=True` with CLR, `norm_lib_size_log`, or an ATAC normalizer, and
+  `renormalize_subset=True` with CLR, `norm_dummy`, or an ADT or generic assay, raise `ValueError`.
+  To plot logged counts of any assay, use `NormalizationSpec(source="raw", transform="log1p")`.
+- Library-size normalization results are unchanged bit for bit. Scoped revisions of
+  `run_normalization`, `run_marker_search`, `run_pseudotime_marker_search`, and
+  `run_pseudotime_aggregation` recompute artifacts that recorded a flag that their normalizer did
+  not apply, and ADT and generic normalizations made with the defaults get new identities because
+  their recorded flags become False.
+- Every library-size path divides by one definition,
+  `scarf.assay.normalization.library_size_divisors`: a zero total becomes 1, and a negative or
+  non-finite total raises `ValueError` naming its source before any result is saved. Results for
+  valid totals are unchanged.
+- `run_aucell` and query projections accept bool count stores, and query projections reject complex
+  counts with `TypeError`.
+- Streamed means and variances neither overflow nor cancel: `ChunkedArray.mean` accumulates in
+  float64 on every axis, and variances merge per-block moments, so a constant feature's variance is
+  exactly zero. Feature summaries, HVG statistics, feature scaling, and PCA move only in their last
+  digits ({ref}`stable_identity_result_changes`).
+- Connectivity weights follow umap-learn: each cell's kernel is fitted with the cell itself at
+  distance zero, so rows sum to `bandwidth * log2(k + 1)`. This is revision 2 of
+  `build_connectivity_map`: earlier connectivity maps, and every result built on them (Leiden and
+  Paris clusterings, UMAP, densMAP, and t-SNE embeddings, membership strengths, diffusion,
+  imputation, pseudotime, fate maps, TopACeDo samples, doublet scores, and SNN graphs), are
+  recomputed. ANN indexes, neighbors, WNN graphs, and embedding initializations are unaffected.
+- UMAP identities record only machine-independent settings: `parallel_threads` becomes the execution
+  option `nthreads`, and `symmetric_graph` and `graph_upper_only` accept only booleans. Every UMAP
+  identity changes, so earlier embeddings are recomputed.
+- densMAP identities no longer record `densmap_algorithm_version`, and `DENSMAP_ALGORITHM_VERSION`
+  is removed; every densMAP embedding gets a new identity through its revision-2 connectivity map
+  anyway.
+- ANN thread counts are execution options: `build_ann_index` records `parallel_threads` as None, and
+  `ann_parallel` alone identifies a parallel index. Serial indexes keep their identities; a parallel
+  index recorded with a thread count is built again.
+- densMAP over equal local radii adds no density term and returns the UMAP layout of the same seed
+  instead of NaN coordinates; a non-finite radius raises `ValueError`.
+- t-SNE has one backend, the optional `sgtsnepi` package, and `run_tsne` never runs an `sgtsne`
+  executable. `temp_file_loc`, `parallel`, and `nthreads` are removed, so t-SNE identities change
+  and earlier embeddings are recomputed. `export_knn_to_mtx` is removed.
+- `run_tsne` validates its numeric settings before it reads the graph and records `lambda_scale` and
+  `box_h` as floats.
+- `run_tsne` raises `ImportError` naming the `tsne` extra when `sgtsnepi` is missing (wheels exist
+  for Linux x86_64 and for macOS 26 or newer on arm64). Reusing an existing embedding needs no
+  backend.
+- `pca_dims=0` builds the pipeline's graph on the normalized artifact instead of an identity
+  reduction, so the run has no `pca` or `reduction` output. It needs `doublets=False` and no Harmony
+  batch columns; either raises `ValueError` before the run starts.
+- Harmony: a cluster whose cells cancel keeps a zero centroid instead of NaN, `fit_harmony` raises
+  `ValueError` for non-finite results, and `batch_levels` follows design order. `run_harmony`
+  records operation revision 2, so earlier corrections, NaN ones included, are recomputed.
+- `calc_membership_strength` stores the fraction of a cell's graph neighbors that carry the cell's
+  own label. It stored the share of the most common neighbor label, so a cell labelled A among
+  neighbors labelled B scored 1. This is revision 2 of `calc_membership_strength`, so earlier
+  results are recomputed.
+- Marker `fold_change` is `mean / mean_rest` without sentinels: `+inf` for a feature that no other
+  cell expresses (it was 100.1), and NaN when both means are 0 (it was 0) or either is negative.
+  This is revision 2 of `run_marker_search`, so earlier marker tables are recomputed, and
+  `load_marker_table` refuses tables without the new `fold_change_policy`.
+- `select_hvgs` and `params["hvg"]` check every option before anything is written: `min_cells` an
+  integer of at least 0, `top_n` and `n_bins` integers of at least 1, `lowess_frac` from 0 to 1,
+  `keep_bounds` a boolean, and `bin_strategy` `"adaptive"` or `"fixed"`. Floats such as
+  `min_cells=20.0` now raise.
+- `make_bulk(aggr_type="mean")` on RNA divides each cell by its library-size divisor, as `normed`
+  does, which is 1 for a cell without counts. Before, such a cell made its group NaN, which was
+  returned as zeros. `make_bulk` no longer replaces NaN with 0 and raises `ValueError` for a
+  non-finite mean or sum. Recompute saved bulk tables of groups that hold cells without counts.
+- A stored statistical-test result is reused only when it records every attribute that the request
+  determines, `sample_by`, `pair_by`, and `summary_scope` included.
+- Doublet simulation meets its heterotypic fraction (`simulate_doublet_pairs` loses `max_tries`),
+  and `run_doublet_detection` raises `ValueError` when every selected cell has one cluster label.
+- `lisi_batch_mixing_score` ignores declared categories that no cell has, so labels from one
+  observed batch raise `ValueError` instead of returning NaN or 1.0.
+- `mapping_calibration` counts every cell with a known label in its coverage, cells without evidence
+  included; earlier releases overstated coverage. Provenance gains `n_without_evidence`.
+- Harmony, WNN, and SNN check their memory need against the datastore budget before they read
+  coordinates or graphs, and raise `MemoryError` naming the bytes needed.
+- `build_ann_index` and `query_neighbors` check the hnswlib index against the memory budget before
+  they build or load it. An index without a recorded `ann_m` raises `ValueError` asking to re-run
+  `build_ann_index`.
+- `run_cluster_selection` reads its sampled coordinates under the memory budget and raises
+  `MemoryError` before reading when they do not fit.
+- Dotplot size legends draw `SizeScale.areas` exactly, without the 180 pt² cap, and composite size
+  legends show the child's 25% to 100% entries.
+- `cluster_tree` keeps constant fill values (a fill of 5 has limits 5 to 6) and draws a single text,
+  categorical, or boolean value as one category instead of a colorbar.
+- Dot plot and matrix plot tables name their grouping columns by role (`group`, `subgroup`,
+  `sample`), so `group_by` keys named like summary columns work. With `standardize="feature"`,
+  `mean` keeps the raw means and a new `zscore` column holds the plotted values. The
+  `tables["matrix"]` of `matrixplot` and `marker_heatmap` is indexed by `feature`, with one column
+  per `group`.
+- With `run=`, `DataStore.plots.embedding` colors by frozen cell fields, run outputs as
+  `ArtifactRef`, or genes with an explicit `normalization=`, and `facet_by`, `subset_by`,
+  `Highlight`, and `DensityOverlay` take frozen fields. Run plots record the run in
+  `provenance.extras["run"]`.
+- `matrixplot` and `marker_heatmap` validate `cluster_method` and `cluster_metric` before they read
+  any data; `centroid`, `median`, and `ward` require `cluster_metric='euclidean'` and raise
+  `ValueError` otherwise.
+- Scarf's warnings point at the caller's own line (`scarf.utils.warnings.warn`), so a warning filter
+  that matches a Scarf `module` no longer matches them; filter by message or category instead.
+- Scarf imports on Windows: no module imports a POSIX-only module when it loads.
+  `scarf.utils.process_rss_mb` returns None where `/proc` is absent, and pipeline stages there
+  record no RSS samples.
+- The wheel is pure Python: the `sgtsne` executable, `bin/`, and `setup.py` are gone, and `sgtsnepi`
+  is the optional `tsne` extra. The Docker image installs only the `extra` extra; build it with
+  `--extra tsne` for t-SNE.
+- A GitHub release uploads to PyPI only after the test and documentation workflows, the build, and a
+  wheel smoke check pass on the tagged commit.
+- Ensembl GFF3 file names whose assembly contains dots are recognized, so fly and rat references
+  download again.
+- A Seurat matrix specification that holds a mapping where a vector belongs raises
+  `MatrixSourceError` naming the slot, instead of `KeyError`.
+- The Cytebase pipeline's HTTP API requires Modal proxy authentication and its own `Cytebase-Token`
+  header, from the `cytebase-api` Modal secret that every deployment environment needs. `GET
+  /jobs/{call_id}` reports only calls that the API started, and the API no longer serves
+  `/openapi.json` or documentation pages.
+- Profiling fixtures name ribosomal features, so their files and checksums change; prepare fixtures
+  under a new `datasetPrefixUri`.
+- A forced profiling `createStore` job deletes its store prefix before it downloads; an unforced one
+  refuses any non-empty destination.
 
 Compatibility exists only where a current public facade or an explicit file-schema test says it
 does. There are no silent migrations, implicit compatibility branches, or forwarding shims for
@@ -851,6 +1141,9 @@ Use these rules when adding code:
 8. Add compatibility only at an existing public facade.
 9. Use a concrete biological or computational package name.
    Do not introduce catch-all packages such as `core` or `analysis`.
+10. Record a change to what an operation computes as an `OperationRevision` in
+    `storage/operation_revisions.py` ({doc}`operation_revisions`), with a test of the revision;
+    never change recorded parameters to invalidate results.
 
 Architecture boundaries are enforced in `tests/test_import_architecture.py`.
 Public imports, result records, facade behavior, and wheel contents have separate contract tests.
@@ -862,12 +1155,18 @@ Public imports, result records, facade behavior, and wheel contents have separat
 - The datastore class chain remains for public compatibility.
 - Same-path package facades remain part of the public architecture.
 - A small set of domain modules has narrow storage dependencies for persisted artifacts.
-- Marker statistics and genomic feature construction live under `features`.
+- Marker statistics, statistical-test design, bulk aggregation, and genomic feature construction
+  live under `features`.
 - Pseudotime-specific feature aggregation and module clustering live under `trajectory.feature_dynamics`.
 - `metadata` remains a root data-model package because assays and datastore orchestration both depend on it.
 - Unified plotting uses a datastore adapter instead of reading Zarr paths.
 - Store-backed plotting is available through the lazy `DataStore.plots` accessor without moving implementation ownership out of `plotting`.
 - Old flat compatibility modules remain deleted.
+- Operation revisions are the only explicit invalidation mechanism; reuse stays exact on canonical
+  provenance, and superseded artifacts remain inspectable.
+- D8: `assayTypes` values are semantic labels, such as `RNA`, `ADT`, `HTO`, or `GeneActivity`,
+  each naming the preset class that the store declares for an assay. Scarf records no second type
+  attribute, such as a modality or a measurement technology, beside them.
 
 ### Deferred
 
@@ -879,6 +1178,17 @@ Deferred to a later structural phase:
 - Function-local cycles inside `assay` and `readers` remain accepted because there are no module-load cycles.
 - Heatmap plotting still reads Zarr-backed values from duck-typed store and assay inputs.
   Replacing those reads requires a separate plotting adapter design.
+- D5 pure open: deferred to 2.0. A writable open still prepares assays, filters `I` by
+  `min_features_per_cell`, and records `assayTypes` and `defaultAssay`, because the destination
+  contract decides what `overwrite=True` may replace by whether a store is prepared. The 2.0 plan
+  is an explicit `prepare_store` that writers call, with `min_features_per_cell` replaced by
+  recorded cell selections.
+- D7 per-cell panels wait until an operation consumes them.
+- D9 persisted ATAC TF-IDF state waits for an ATAC mapping reference, which can recompute it from
+  what the normalized artifact records.
+- D10 WNN sources keyed by artifact reference wait for a 1.x design; `select_measured_cells`
+  already gives one selection that every assay measured.
+- D11 a recipe protocol waits until a second pipeline recipe exists.
 
 ### Rejected
 

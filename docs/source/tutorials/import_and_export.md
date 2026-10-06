@@ -336,7 +336,8 @@ What this import covers:
 - Legacy `Assay`, `Assay5`, and `ChromatinAssay` count layers when their matrix layout is supported
 - Literal cell metadata, plus artifact refs for `active.ident` and selected reductions such as PCA
   or LSI
-- Partial Assay5 cell membership as per-assay boolean columns when needed
+- Partial Assay5 cell membership as per-assay boolean columns (`<assay>_I`) when the selected count
+  layers hold only some cells
 
 What it does not import as analysis artifacts:
 
@@ -346,8 +347,18 @@ What it does not import as analysis artifacts:
 - A return path to `.rds` or `.h5seurat` (export H5AD or MTX instead)
 
 Pass `assay_layers` when an assay stores several count layers and you need a non-default choice.
+A cell that only an unselected layer holds is recorded as not measured by that assay.
 Pass `sidecar_path_remaps` when a `SaveSeuratRds` sidecar cache points at moved on-disk matrices.
 Prefer original 10x HDF5 or Matrix Market counts when they are available and you only need raw matrices.
+
+`SeuratReader` and `inspect_seurat` hold the stitching indexes of each `Assay5` in memory and
+charge them to `maxMetadataBytes` of their `matrix_limits`, 256 MiB by default. The indexes cover
+the feature and cell positions of every selected count layer and the assay's cell membership,
+which adds about 36 budget bytes per cell that earlier releases did not charge. An assay over the
+limit is reported as not importable with the blocking diagnostic `metadata_index_limit`, and
+`SeuratToZarr` raises that `SeuratImportError`, so an import that fit close to the limit before can
+now fail. Pass `matrix_limits` with a larger `maxMetadataBytes`, or select fewer count layers with
+`assay_layers`.
 
 ## 6. Export to Matrix Market
 
@@ -591,7 +602,12 @@ See {doc}`../concepts/memory_and_execution` for memory planning and
 ## Common mistakes and limitations
 
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
-- Reusing an existing Zarr output path without confirming that it can be overwritten
+- Reusing an existing Zarr output path: a writer raises `FileExistsError` for a path that holds
+  data. `overwrite=True` replaces only an earlier conversion that no `DataStore` has opened; a
+  prepared store, one that a `DataStore` has opened, and other files are never replaced, so delete
+  them yourself or choose another path
+- Writing a store inside another store, such as `data.zarr/RNA` or `data.zarr/new.zarr`: writers
+  raise `ValueError`, so give every store its own directory outside other stores
 - Passing a count dtype to a reader or writer; the stored dtype follows the values
 - Exporting normalized values when a downstream method requires raw counts
 - Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version

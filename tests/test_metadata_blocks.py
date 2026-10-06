@@ -7,7 +7,7 @@ import pandas as pd
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.datastore._operations.features import _aligned_feature_labels
+from scarf.features.aggregation import aligned_feature_labels
 from scarf.metadata import MetaData
 from scarf.metadata.artifacts import artifact_values
 from scarf.metadata.queries import (
@@ -202,7 +202,7 @@ def test_make_bulk_pseudo_reps_warns_without_changing_values(
 
 def test_aligned_feature_labels_accepts_pandas_string_array() -> None:
     values = pd.array(["gene_a", "gene_b", "gene_c"], dtype="string")
-    labels = _aligned_feature_labels(np.asarray(values), pd.Index([0, 2]))
+    labels = aligned_feature_labels(np.asarray(values), pd.Index([0, 2]))
     frame = pd.DataFrame([[1.0], [2.0]])
     frame.set_index(labels, inplace=True)
     assert list(frame.index) == ["gene_a", "gene_c"]

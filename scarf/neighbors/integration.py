@@ -1,8 +1,70 @@
+from collections.abc import Sequence
+
 import numpy as np
 from scipy.sparse import coo_matrix
 
+from ..utils.arguments import integer_argument
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
+
+# Rows that the input checks of WNN integration scan at once.
+_VALIDATION_ROWS = 100_000
+# Coordinate values whose squared row norms are summed at once; the sum
+# holds two float64 copies of them.
+_NORM_BAND_VALUES = 1 << 20
+# Python objects an integration holds whatever the data size, such as the
+# per-cell candidate arrays and the progress bar, measured below 64 KiB.
+_WNN_OBJECT_BYTES = 256 * 1024
+
+
+def wnn_peak_bytes(
+    n_cells: int,
+    neighbor_counts: Sequence[int],
+    dims: Sequence[int],
+    *,
+    index_itemsize: int = 4,
+    coordinate_itemsize: int = 4,
+) -> int:
+    """Estimate the most bytes that WNN integration holds, including its inputs."""
+    cells = integer_argument(n_cells, "n_cells", minimum=1)
+    counts = [
+        integer_argument(count, "neighbor_counts", minimum=1)
+        for count in neighbor_counts
+    ]
+    widths = [integer_argument(width, "dims", minimum=1) for width in dims]
+    if len(counts) != len(widths) or len(counts) < 2:
+        raise ValueError(
+            "neighbor_counts and dims must describe the same two or more modalities"
+        )
+    index_bytes = integer_argument(index_itemsize, "index_itemsize", minimum=1)
+    value_bytes = integer_argument(
+        coordinate_itemsize, "coordinate_itemsize", minimum=1
+    )
+    modalities = len(counts)
+    edges = min(counts)
+    inputs = cells * sum(
+        count * index_bytes + width * value_bytes
+        for count, width in zip(counts, widths, strict=True)
+    )
+    checked_rows = min(cells, _VALIDATION_ROWS)
+    norm_rows = max(
+        min(cells, _norm_band_rows(width)) * (2 * width + 1) for width in widths
+    )
+    phases = (
+        # Each row band of neighbor checks holds the row numbers, a sorted
+        # copy of the band, and its comparisons.
+        checked_rows * (8 + max(counts) * (index_bytes + 2)),
+        # The finite check of a band of coordinates.
+        checked_rows * max(widths),
+        # The float64 inverse norms of every modality, the squared norms of
+        # the last one, and the float64 copies of one band of its rows.
+        cells * 8 * (modalities + 1) + 8 * norm_rows,
+        # The inverse norms; the uint32 columns, float32 weights, and
+        # float32 modality weights; and, as the graph is built, its uint32
+        # row indices and the int32 copies of its rows and columns.
+        cells * (8 * modalities + 4 * modalities + 20 * edges),
+    )
+    return inputs + max(phases) + _WNN_OBJECT_BYTES
 
 
 def _validate_neighbor_indices(
@@ -60,16 +122,30 @@ def _validate_embedding(
     return embedding
 
 
+def _norm_band_rows(dims: int) -> int:
+    """Return the rows of a band whose squared norms are summed at once."""
+    return max(1, _NORM_BAND_VALUES // max(1, int(dims)))
+
+
 def _inverse_row_norms(values: np.ndarray) -> np.ndarray:
-    norms = np.sqrt(
-        np.einsum(
+    """Return the inverse float64 L2 norm of each row, zero for a zero row.
+
+    The squared norms are summed in float64 over bands of rows, because the
+    sum casts both of its operands to float64 copies; each row's sum does not
+    depend on the band.
+    """
+    norms = np.empty(values.shape[0], dtype=np.float64)
+    band = _norm_band_rows(values.shape[1])
+    for start in range(0, values.shape[0], band):
+        rows = values[start : start + band]
+        norms[start : start + band] = np.einsum(
             "ij,ij->i",
-            values,
-            values,
+            rows,
+            rows,
             dtype=np.float64,
             optimize=True,
         )
-    )
+    np.sqrt(norms, out=norms)
     inverse = np.zeros(norms.shape, dtype=np.float64)
     np.divide(1.0, norms, out=inverse, where=norms > 0)
     return inverse

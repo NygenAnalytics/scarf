@@ -1,6 +1,7 @@
 import inspect
 import math
 from collections.abc import Mapping
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -110,6 +111,86 @@ def validate_harmony_parameters(
     return values
 
 
+def harmony_cluster_count(n_cells: int, nclust: int | None = None) -> int:
+    """Return the number of clusters that ``fit_harmony`` fits for ``n_cells``."""
+    if nclust is None:
+        return max(1, int(np.min([np.round(n_cells / 30.0), 100])))
+    if nclust < 1 or nclust > n_cells:
+        raise ValueError("Harmony nclust must be between one and the cell count")
+    return nclust
+
+
+# Rows of distances to every centroid that each OpenMP thread of
+# scikit-learn's chunked k-means loops holds while Harmony seeds its clusters.
+_KMEANS_THREAD_CHUNK_ROWS = 256
+# Python objects a fit holds whatever the data size, such as the optimizer,
+# the batch encoding, and the objective history, measured below 96 KiB.
+_HARMONY_OBJECT_BYTES = 256 * 1024
+
+
+def harmony_peak_bytes(
+    n_cells: int,
+    dims: int,
+    n_clusters: int,
+    n_levels: int,
+    *,
+    block_size: float = 0.05,
+    nthreads: int = 1,
+) -> int:
+    """Estimate the most bytes that fitting Harmony holds.
+
+    It includes the input matrix but not the batch labels or a custom ``cluster_fn``.
+    """
+    cells = integer_argument(n_cells, "n_cells", minimum=1)
+    d = integer_argument(dims, "dims", minimum=1)
+    k = integer_argument(n_clusters, "n_clusters", minimum=1)
+    b = integer_argument(n_levels, "n_levels", minimum=1)
+    threads = integer_argument(nthreads, "nthreads", minimum=1)
+    if isinstance(block_size, bool) or not isinstance(block_size, Real):
+        raise TypeError("block_size must be a real number")
+    if not math.isfinite(block_size) or block_size <= 0:
+        raise ValueError("block_size must be finite and positive")
+    # Every term below is a count of float64 values per cell. The update
+    # reassigns cells in equal blocks of this fraction of the cells.
+    block = 1.0 / math.ceil(1.0 / float(block_size))
+    # The input, original, corrected, and unit-length coordinates; the int64
+    # design with its intercept row; two bool copies of the one-hot design;
+    # and per-cell labels and codes.
+    held = 4 * d + (b + 1) + b / 4 + 1
+    # Seeding: a C-ordered copy of the unit-length coordinates, the squared
+    # norms, weights, and labels of every cell, and the distances of the
+    # ``2 + log(k)`` k-means++ candidates with a product temporary.
+    seeding = d + 2 * (2 + math.log(k)) + 8
+    # From the first assignment on, the assignments and their distances.
+    assigned = held + 2 * k
+    # The objective holds weighted assignments and a cross-entropy term
+    # with their product, or the term with a float64 copy of the design.
+    objective = max(3 * k, 2 * k + b)
+    # The update holds exponentiated distances and, for each block, copies
+    # of its assignments and a float64 copy of its part of the design.
+    update = max(2 * k, k + block * (3 * k + 1.25 * b))
+    # A correction round holds the new corrected coordinates beside the
+    # products of one cluster's ridge regression, or the temporaries that
+    # make the corrected coordinates unit length.
+    correction = d + (b + 1) + max(b + 1, 3 * d) + 1
+    per_cell = max(
+        held + seeding,
+        assigned + max(objective, update, correction),
+    )
+    # scikit-learn's chunked k-means loops hold, per thread, the distances
+    # of up to 256 cells to every centroid and the centroid sums.
+    threads_bytes = threads * k * (_KMEANS_THREAD_CHUNK_ROWS + d + 1) * 8
+    # The ridge penalty matrix lasts the whole fit, and each cluster's ridge
+    # system and the solver's copy of it are temporaries of the same size.
+    square_bytes = 3 * (b + 1) ** 2 * 8
+    return (
+        int(math.ceil(8 * cells * per_cell))
+        + square_bytes
+        + threads_bytes
+        + _HARMONY_OBJECT_BYTES
+    )
+
+
 def fit_harmony(
     data_mat: np.ndarray,
     meta_data: pd.DataFrame,
@@ -149,10 +230,7 @@ def fit_harmony(
         raise ValueError("Harmony input contains non-finite values")
 
     n_cells = data_mat.shape[1]
-    if nclust is None:
-        nclust = max(1, int(np.min([np.round(n_cells / 30.0), 100])))
-    elif nclust < 1 or nclust > n_cells:
-        raise ValueError("Harmony nclust must be between one and the cell count")
+    nclust = harmony_cluster_count(n_cells, nclust)
 
     sigma_arr = np.asarray(sigma, dtype=np.float64)
     if sigma_arr.ndim == 0:
@@ -162,14 +240,28 @@ def fit_harmony(
     if not np.all(np.isfinite(sigma_arr)) or np.any(sigma_arr <= 0):
         raise ValueError("Harmony sigma values must be finite and positive")
 
+    batch_columns = tuple(str(column) for column in meta_data.columns)
     categorical_metadata = meta_data.astype(
         {column: "category" for column in meta_data.columns}
     )
+    # A declared category that no cell has is not a batch level.
+    for column in categorical_metadata.columns:
+        categorical_metadata[column] = categorical_metadata[
+            column
+        ].cat.remove_unused_categories()
     phi_frame = pd.get_dummies(categorical_metadata)
     phi = phi_frame.to_numpy().T
-    phi_n = np.asarray(
-        [meta_data[column].nunique() for column in meta_data.columns],
-        dtype=int,
+    batch_levels = tuple(
+        tuple(str(level) for level in categorical_metadata[column].cat.categories)
+        for column in categorical_metadata.columns
+    )
+    phi_n = np.asarray([len(levels) for levels in batch_levels], dtype=int)
+    # get_dummies writes one indicator per category, column by column.
+    assert phi.shape[0] == int(np.sum(phi_n))
+    level_names = ", ".join(
+        f"{column}={level}"
+        for column, levels in zip(batch_columns, batch_levels, strict=True)
+        for level in levels
     )
 
     def _expand_parameter(
@@ -184,7 +276,11 @@ def fit_harmony(
         if array.shape == (len(phi_n),):
             return np.repeat(array, phi_n)
         if array.shape != (int(np.sum(phi_n)),):
-            raise ValueError(f"Each Harmony batch level must have a {name}")
+            raise ValueError(
+                f"Each Harmony batch level must have a {name}: pass one value, "
+                f"one per batch column ({', '.join(batch_columns)}), or one per "
+                f"batch level ({level_names}); got shape {array.shape}"
+            )
         return array
 
     theta_arr = _expand_parameter(theta, "theta")
@@ -221,12 +317,17 @@ def fit_harmony(
         random_state,
         cluster_fn,
     )
+    corrected = optimizer.result()
+    if not (
+        np.all(np.isfinite(corrected))
+        and np.all(np.isfinite(optimizer.R))
+        and np.all(np.isfinite(optimizer.Y))
+    ):
+        raise ValueError(
+            "Harmony produced non-finite corrected coordinates, assignments, "
+            "or centroids"
+        )
 
-    batch_columns = tuple(str(column) for column in meta_data.columns)
-    batch_levels = tuple(
-        tuple(str(value) for value in pd.unique(meta_data[column]))
-        for column in meta_data.columns
-    )
     cluster_backend = (
         "sklearn.cluster.KMeans"
         if isinstance(cluster_fn, str)
@@ -252,7 +353,7 @@ def fit_harmony(
     }
     return HarmonyResult(
         original=optimizer.Z_orig,
-        corrected=optimizer.result(),
+        corrected=corrected,
         assignments=optimizer.R,
         centroids=optimizer.Y,
         sigma=sigma_arr.copy(),

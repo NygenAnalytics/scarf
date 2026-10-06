@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from functools import partial
 
@@ -142,8 +143,9 @@ class Harmony:
     def cluster(self) -> int:
         self.dist_mat = 2 * (1 - np.dot(self.Y.T, self.Z_cos))
         for iteration in range(self.max_iter_kmeans):
-            self.Y = np.dot(self.Z_cos, self.R.T)
-            self.Y = self.Y / np.linalg.norm(self.Y, ord=2, axis=0)
+            # Cells whose directions cancel give a zero centroid, which stays
+            # zero rather than 0 / 0.
+            self.Y = _normalize_columns(np.dot(self.Z_cos, self.R.T))
             self.dist_mat = 2 * (1 - np.dot(self.Y.T, self.Z_cos))
             self.update_R()
             self.compute_objective()
@@ -187,13 +189,13 @@ class Harmony:
             for offset in range(self.window_size):
                 obj_old += self.objective_kmeans[objective_count - 2 - offset]
                 obj_new += self.objective_kmeans[objective_count - 1 - offset]
-            if abs(obj_old - obj_new) / abs(obj_old) < self.epsilon_kmeans:
+            if abs(_relative_decrease(obj_old, obj_new)) < self.epsilon_kmeans:
                 return True
             return False
         if i_type == 1:
             obj_old = self.objective_harmony[-2]
             obj_new = self.objective_harmony[-1]
-            error = (obj_old - obj_new) / abs(obj_old)
+            error = _relative_decrease(obj_old, obj_new)
             logger.debug(
                 f"Harmony error after {len(self.objective_harmony)} iterations: {error}"
             )
@@ -201,6 +203,18 @@ class Harmony:
                 return True
             return False
         return True
+
+
+def _relative_decrease(old: float, new: float) -> float:
+    """Return the decrease from ``old`` to ``new`` relative to ``|old|``.
+
+    An objective of exactly zero has no scale. No change from it is a relative
+    change of zero, and any other change is infinitely large, with its sign.
+    """
+    decrease = old - new
+    if old == 0:
+        return 0.0 if decrease == 0 else math.copysign(math.inf, decrease)
+    return float(decrease / abs(old))
 
 
 def safe_entropy(x: np.ndarray) -> np.ndarray:

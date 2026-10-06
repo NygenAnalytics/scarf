@@ -35,7 +35,8 @@ def test_decode_text_accepts_text_and_rejects_other_values() -> None:
     [
         ([True, None, False], "b", [True, False, False]),
         ([1, None, np.int32(3)], "i", [1, 0, 3]),
-        ([1, np.nan, 2.5], "f", [1.0, 0.0, 2.5]),
+        # Masked float rows hold NaN, as in every float column with a mask.
+        ([1, np.nan, 2.5], "f", [1.0, np.nan, 2.5]),
         ([b"a", None, "bc", 4], "U", ["a", "", "bc", "4"]),
     ],
 )

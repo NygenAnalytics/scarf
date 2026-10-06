@@ -502,6 +502,16 @@ def test_membership_and_smart_labels_are_artifact_only(graph_store) -> None:
     assert set(datastore.cells.columns) == columns_before
 
 
+def _declare_hto(datastore: DataStore) -> DataStore:
+    """Reopen the store writable with ``assay2`` declared as HTO, which it records."""
+    return DataStore(
+        datastore.zarr_loc,
+        default_assay="RNA",
+        min_features_per_cell=-1,
+        assay_types={"assay2": "HTO"},
+    )
+
+
 def test_hto_identity_is_artifact_backed(
     datastore_ephemeral,
     monkeypatch,
@@ -523,9 +533,7 @@ def test_hto_identity_is_artifact_backed(
     monkeypatch.setattr(
         "scarf.datastore._operations.quality_control.hto_demux", demultiplex
     )
-    assay_types = dict(datastore.zw.attrs["assayTypes"])
-    assay_types["assay2"] = "HTO"
-    datastore.zw.attrs["assayTypes"] = assay_types
+    datastore = _declare_hto(datastore)
 
     ref = datastore.run_hto_demultiplexing(
         selection, from_assay="assay2", random_seed=5
@@ -583,9 +591,7 @@ def test_hto_demultiplexing_respects_datastore_memory_budget(
 ) -> None:
     datastore = datastore_ephemeral
     selection = datastore.snapshot_cell_selection()
-    assay_types = dict(datastore.zw.attrs["assayTypes"])
-    assay_types["assay2"] = "HTO"
-    datastore.zw.attrs["assayTypes"] = assay_types
+    datastore = _declare_hto(datastore)
     datastore.memoryBytes = 1
 
     with pytest.raises(MemoryError, match="exceeds the datastore memory budget"):

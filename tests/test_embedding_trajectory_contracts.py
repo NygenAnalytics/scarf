@@ -20,7 +20,7 @@ def test_embedding_and_trajectory_entry_point_signatures_are_stable() -> None:
         "validate_pseudotime_regressor": validate_pseudotime_regressor,
     }
     assert signature_digest(methods) == (
-        "044d9c29d6a994394de6c0ca5d6151b552203e034e24d0b1f3d77d766ac3f9ae"
+        "d1af98d226150b81c1f5d8be645627caf270964b97646e735a0a668283fe6f9b"
     )
 
 

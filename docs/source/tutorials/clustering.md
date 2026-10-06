@@ -131,7 +131,10 @@ pd.Series(
 
 ## 3. Inspect membership strength
 
-Membership strength measures how strongly a cell connects to its assigned cluster.
+Membership strength measures how strongly a cell connects to its assigned cluster: it is the
+fraction of the cell's graph neighbours that carry the cell's own cluster label. A value of 1 means
+that every neighbour shares the cell's cluster. A cell whose neighbours sit mostly in other
+clusters scores low, even when those neighbours all share one other label.
 We use resolution 0.5 for this walkthrough.
 
 ```{code-cell} ipython3
@@ -150,8 +153,9 @@ ds.plots.embedding(layout=umap, color_by=membership)
 ds.plots.cluster_connectivity(graph=graph, groups=chosen, layout=umap)
 ```
 
-Low values throughout one cluster suggest a weak boundary. A narrow band of low values between
-otherwise coherent groups may represent continuous biology.
+Low values throughout one cluster suggest a weak boundary: many of its cells have most of their
+neighbours in other clusters. A narrow band of low values between otherwise coherent groups may
+represent continuous biology.
 
 ## 4. Review marker evidence
 
@@ -199,10 +203,10 @@ support, technical covariates, replicate coverage, and the study question.
 ## 5. Pipeline cluster selection
 
 When a pipeline run includes multiple Leiden candidates, it scores them with one deterministic
-shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates. Paris can still
-run as `clustering_run["paris"]`, but it is not an automatic winner. The `cluster_selection`
-artifact persists the scores, sampling policy, invalid-candidate reasons, tie order, and selected
-key:
+shared sample of at most 10,000 cells in the graph's PCA or Harmony coordinates or, with
+`pca_dims=0`, its normalized values. Paris can still run as `clustering_run["paris"]`, but it is
+not an automatic winner. The `cluster_selection` artifact persists the scores, sampling policy,
+invalid-candidate reasons, tie order, and selected key:
 
 ```python
 # Keep the saved cluster-selection diagnostics.

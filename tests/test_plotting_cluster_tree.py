@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import pytest
 from matplotlib.colors import to_hex
 
 import scarf.plotting as splt
@@ -129,3 +130,59 @@ def test_cluster_tree_keeps_missing_clusters_grey_under_a_uniform_fill():
     assert uniform[1] == uniform[2] != splt.ColorScale().missing_color
     assert partly_missing[1] == uniform[1]
     assert partly_missing[2] == splt.ColorScale().missing_color
+
+
+def test_cluster_tree_keeps_a_constant_fill_value():
+    result = splt.cluster_tree(
+        _tree_store([5.0] * 6),
+        graph=_GRAPH,
+        clusters=_CLUSTERS,
+        fill_by_value="score",
+        force_ints_as_cats=False,
+        cmap="viridis",
+        show_labels=False,
+        show=False,
+    )
+    try:
+        (scale, _sizes) = result.scales
+        assert isinstance(scale, splt.ColorScale)
+        assert (scale.vmin, scale.vmax) == (5.0, 6.0)
+        (legend,) = result.legends
+        assert legend.kind == "colorbar"
+        assert (legend.extras["vmin"], legend.extras["vmax"]) == (5.0, 6.0)
+        assert result.axes["colorbar"].get_ylim() == pytest.approx((5.0, 6.0))
+        # The shared policy places a constant value at the low end of the map.
+        low = to_hex(matplotlib.colormaps["viridis"](0.0))
+        assert _node_colors(result)[1:] == [low, low]
+    finally:
+        result.close()
+
+
+def test_cluster_tree_keeps_a_single_category_categorical():
+    result = splt.cluster_tree(
+        _tree_store(np.asarray(["A"] * 6)),
+        graph=_GRAPH,
+        clusters=_CLUSTERS,
+        fill_by_value="phase",
+        show_labels=False,
+        show=False,
+    )
+    try:
+        (scale, _sizes) = result.scales
+        assert isinstance(scale, splt.CategoricalScale)
+        assert scale.order == ("A",)
+        assert list(scale.palette) == ["A"]
+        (legend,) = result.legends
+        assert legend.kind == "categorical"
+        assert "colorbar" not in result.axes
+        wedges = [
+            collection
+            for collection in result.axes["tree"].collections
+            if len(collection.get_offsets()) == 1
+        ]
+        # Each cluster draws one full wedge in the category's color.
+        assert [to_hex(wedge.get_facecolors()[0]) for wedge in wedges] == [
+            scale.palette["A"]
+        ] * 2
+    finally:
+        result.close()

@@ -73,6 +73,16 @@ Regenerate the committed baseline on a quiet machine after an intended performan
 `SCARF_BENCHMARK_THREADS` sets the Numba thread count, one by default.
 `SCARF_BENCHMARK_OUTPUT` sets where results are written, `build/benchmarks/latest.json` by default.
 
+### Operation revisions
+
+A fix that changes what an analysis operation computes for unchanged parameters and inputs must also stop Scarf from reusing the results that earlier code stored ({doc}`operation_revisions`).
+To change an operation's outputs:
+
+1. Decide with the ladder in {doc}`operation_revisions` whether the change needs no revision, a scoped revision, or a revision of every artifact of the operation.
+2. Append the `OperationRevision` entry to the operation's tuple in `scarf/storage/operation_revisions.py`.
+3. Add a test that a new artifact of the operation records the revision and that an artifact of the earlier revision is recomputed, not reused.
+4. A change that needs no revision but still moves results is listed under {ref}`stable_identity_result_changes` on the operation revisions page.
+
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing sections.
@@ -187,6 +197,31 @@ Nothing leaves `build/cytebase` until you publish:
 Publishing swaps `<dataset>/data.zarr.tar.gz` in place and first preserves the archive it replaces as `<dataset>_legacy_master/data.zarr.tar.gz`.
 Preservation is a server-side copy by content hash, and it never overwrites a legacy snapshot that already exists.
 Those snapshots are the pre-1.0 Zarr v2 corpus that `tests/test_frozen_master_compat.py` reads; no documentation page opens them.
+
+## Releasing
+
+Publishing a GitHub release runs `.github/workflows/publish.yml`.
+Every job checks out the exact commit that the release tag named when the release was published (`github.sha`), and the upload to PyPI waits for four gates on that commit:
+
+- `verify` runs the test workflow, `pytest.yml`: the static checks, the visual regression comparison, and the complete suite on Python 3.12, 3.13, and 3.14 and with the lowest direct dependency versions. A release uploads no coverage report.
+- `docs` runs the documentation workflow, `docs.yml`: the documentation tests, the committed notebook cache check, and the nitpicky Sphinx build with reference coverage.
+- `build` first requires the release tag to still name that commit, then builds the wheel and the source distribution from a clean checkout and checks their metadata against the tag.
+- `smoke` runs `tests/smoke_wheel.py` on the built wheel on Linux with Python 3.12, 3.13, and 3.14 and on Windows with Python 3.12.
+
+`tests/smoke_wheel.py` checks that the wheel is pure Python and complete, installs it into a clean environment with `uv venv` and `uv pip install`, imports the public modules from the installed wheel, and runs `tests/smoke_workflow.py` with that environment's interpreter in isolated mode.
+That script imports a synthetic three-population count matrix with `SparseToZarr` and analyzes it with `pipeline.run`; the run must complete, its UMAP coordinates must be finite, and Leiden must find at least two clusters.
+It then exports the run's raw counts and normalized values with `to_h5ad` in that environment, which has no `anndata`, and reads both files back with h5py.
+On Linux x86_64 the environment installs the `tsne` extra and the run must also produce finite t-SNE coordinates; on every other platform the environment has no `sgtsnepi`, and `run_tsne` must raise the `ImportError` that names the extra.
+No smoke environment may have an `sgtsne` executable on `PATH`.
+
+Nothing is uploaded when a gate fails, and runs for the same tag publish one at a time.
+Fix the cause on `master`, then publish a release whose tag names the fixed commit.
+Re-running a failed workflow tests the same commit again, which helps only when the failure came from outside the commit, such as a network error.
+
+Run the smoke locally against a wheel you build. It installs the wheel's dependencies, so it needs network access or a warm uv cache:
+
+    uv build --wheel --clear --out-dir dist
+    uv run --no-project python tests/smoke_wheel.py dist/scarf-*.whl
 
 ## Acknowledgements
 

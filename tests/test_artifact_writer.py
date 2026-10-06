@@ -35,7 +35,8 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance(
         "assay": "RNA",
         "kind": "normalized",
         "operation": "run_normalization",
-        "parameters": {"log_transform": True},
+        # Outside every scoped revision, so provenance records no revision.
+        "parameters": {"log_transform": False},
         "inputs": {"selection": {"artifact_id": "a" * 64}},
         "execution_options": {"batch_size": 100},
     }
@@ -52,7 +53,7 @@ def test_artifact_writer_streams_to_random_path_then_reuses_provenance(
     assert status.execution_options == {"batch_size": 100}
     assert status.provenance == {
         "operation": "run_normalization",
-        "parameters": {"log_transform": True},
+        "parameters": {"log_transform": False},
         "inputs": {"selection": {"artifact_id": "a" * 64}},
     }
     assert group.path == artifact_path(planned.ref)
@@ -331,3 +332,37 @@ def test_start_artifact_refuses_a_read_only_root_before_writing() -> None:
         with artifact_transaction(read_only, planned):
             raise AssertionError("the body must not run")
     assert not inspect_artifact(read_only, planned.ref).exists
+
+
+def test_artifact_transaction_never_deletes_once_publication_is_issued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.storage.artifacts import artifact_group
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = _planned_normalized(root)
+    original = zarr.Group.update_attributes
+    in_flight = []
+
+    def interrupted(group: zarr.Group, attributes: dict) -> zarr.Group:
+        if attributes.get("complete") is True:
+            # Ctrl-C stops the caller while Zarr's I/O thread still runs the write.
+            in_flight.append(lambda: original(group, attributes))
+            raise KeyboardInterrupt
+        return original(group, attributes)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(zarr.Group, "update_attributes", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            with artifact_transaction(root, planned) as group:
+                group.create_array("data", data=np.arange(3.0))
+
+    status = inspect_artifact(root, planned.ref)
+    assert status.exists and not status.complete
+    # The late write lands on the intact slot, never on a deleted one.
+    (land,) = in_flight
+    land()
+    assert inspect_artifact(root, planned.ref).complete
+    np.testing.assert_array_equal(
+        artifact_group(root, planned.ref)["data"][:], np.arange(3.0)
+    )

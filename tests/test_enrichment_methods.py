@@ -377,6 +377,26 @@ def test_score_aucell_block_widens_half_precision_counts():
     )
 
 
+def test_score_aucell_block_ranks_bool_counts_as_their_uint8_values():
+    network = _prepared_network(weighted=False)
+    permutation = make_rank_permutation(4, 0)
+    sets = build_gene_set_index(network, np.arange(4)[permutation])
+    # Bool count stores hold detection flags; a flag ranks as its 0 or 1.
+    detected = np.array(
+        [[True, False, True, True], [False, True, False, False], [False] * 4]
+    )
+
+    flags = score_aucell_block(detected, permutation, sets, n_up=3)
+
+    np.testing.assert_array_equal(
+        flags,
+        score_aucell_block(detected.astype(np.uint8), permutation, sets, n_up=3),
+    )
+    np.testing.assert_array_equal(flags[2], 0.0)
+    with pytest.raises(ValueError, match="finite and numeric"):
+        score_aucell_block(detected.astype(np.complex128), permutation, sets, n_up=3)
+
+
 def test_score_aucell_block_bounds_kernel_scores_to_the_unit_interval(monkeypatch):
     import scarf.features.enrichment.aucell as aucell
 

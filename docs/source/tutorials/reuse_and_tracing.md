@@ -34,8 +34,9 @@ This guide shows how to reopen a result, change one parameter, and see which ste
 ## Dataset
 
 The prepared PBMC store carries a completed example run labelled `docs_default`. Its exact
-selection, normalization, PCA, neighbour, and graph refs provide the baseline. This page creates
-only the parameter forks needed to demonstrate reuse.
+selection, normalization, PCA, neighbour, and graph refs provide the baseline. An earlier release
+built that graph, so the lineage report below marks it stale. This page creates only the parameter
+forks needed to demonstrate reuse.
 
 This example was prepared with 15 principal components and 11 neighbours. Those are the settings
 we match below to reuse its results; `docs_default` is a saved label, not a promise that every
@@ -172,6 +173,12 @@ Previously completed artifacts remain on disk.
 The new reference has a different id and path.
 The operation and parameters stay the same.
 
+Scarf also stops reusing a result on its own when a release changes what the operation computes.
+Such a release gives the operation a new revision, and an earlier result of that operation is
+computed again, with one log line that names the result it replaced and what changed. The earlier
+result remains on disk, and lineage reports mark it as stale.
+See {doc}`../developers/operation_revisions`.
+
 For normalization, the call below would write a fresh normalized artifact while retaining the
 exact immutable `cell_selection` and `feature_selection` inputs. It is not executed here because a
 throwaway duplicate adds no evidence to the lineage figure.
@@ -204,6 +211,8 @@ lineage
 Notebook display renders the Mermaid dependency graph and the artifact details beneath it.
 The `k` branches should diverge after the ANN index.
 The `dims=20` branch should fork earlier, at PCA, then carry its own ANN, neighbours, and graph.
+The prepared graph was built by an earlier release, so the report marks it stale; a graph built
+from the same neighbours is a new artifact.
 
 Export the same report when it needs to travel with an analysis.
 `to_markdown()` is what notebook display uses. Inspect a short preview before writing or sending

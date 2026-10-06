@@ -1,5 +1,4 @@
 import copy
-import warnings
 from collections.abc import Generator, Mapping
 from contextlib import closing
 from dataclasses import dataclass
@@ -8,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ..assay import RNAassay, _read_block, norm_lib_size
-from ..assay.normalization import library_size_values
+from ..assay.normalization import library_size_divisors, library_size_values
 from ..metadata.rows import read_metadata_rows_chunkwise
 from ..storage.artifacts import callable_identity
 from ..storage.budget import ResourceBudget
@@ -22,6 +21,8 @@ from ..storage.partition import (
     row_band,
 )
 from ..utils.arrays import read_only_copy
+from ..utils.count_values import is_real_count_dtype
+from ..utils.warnings import warn
 
 if TYPE_CHECKING:
     from ..assay import Assay
@@ -149,21 +150,21 @@ def normalize_reference_counts(
     *,
     size_factor: float,
     log_transform: bool,
+    source: str,
     denominator: np.ndarray | None = None,
 ) -> np.ndarray:
+    """Library-size normalize rows of counts as a mapping reference does."""
     if denominator is None:
-        denominator = raw.sum(axis=1, dtype=np.float64)
-    if (
-        denominator.shape != (len(raw),)
-        or not np.all(np.isfinite(denominator))
-        or np.any(denominator < 0)
-    ):
-        raise ValueError("Query normalization totals must be finite and non-negative")
-    if np.any(denominator == 0):
-        denominator = np.where(denominator == 0, 1, denominator)
+        divisors = library_size_divisors(
+            raw.sum(axis=1, dtype=np.float64), source=source, copy=False
+        )
+    elif np.shape(denominator) != (len(raw),):
+        raise ValueError("Normalization totals must hold one value per row of counts")
+    else:
+        divisors = library_size_divisors(denominator, source=source)
     return library_size_values(
         raw,
-        denominator,
+        divisors,
         size_factor,
         dtype=np.float64,
         log_transform=log_transform,
@@ -210,8 +211,8 @@ class AlignedFeatureStream:
         if len(raw_data.shape) != 2:
             raise ValueError("Query raw counts must be two-dimensional")
         raw_dtype = np.dtype(raw_data.dtype)
-        if raw_dtype.hasobject or not np.issubdtype(raw_dtype, np.number):
-            raise TypeError("Query raw counts must have a numeric dtype")
+        if not is_real_count_dtype(raw_dtype):
+            raise TypeError(f"Query raw counts must be real numbers, not {raw_dtype}")
 
         cell_indices = checked_indices(
             query_cell_indices,
@@ -275,35 +276,31 @@ class AlignedFeatureStream:
             reference_indices.size / len(self._reference_feature_ids)
         )
         if self.renormalize_subset and self._feature_coverage < 1:
-            warnings.warn(
+            warn(
                 "The reference divides each cell by its total over the reference "
                 "features (renormalize_subset=True), but the query measures only "
                 f"{self._feature_coverage:.1%} of them. Query totals cover the "
                 "shared features alone, so normalized query values are larger "
-                "than the reference would compute for the same cell.",
-                UserWarning,
-                stacklevel=2,
+                "than the reference would compute for the same cell."
             )
 
         self._cell_scalars: np.ndarray | None = None
-        if not self.renormalize_subset:
+        if self.renormalize_subset:
+            self._totals_source = (
+                f"The reference-feature subset of query assay {query_assay.name!r}"
+            )
+        else:
             # Preparation guarantees a numeric total for every cell.
             scalar_name = f"{query_assay.name}_nCounts"
-            scalars = np.array(
+            self._totals_source = f"Query assay {scalar_name!r}"
+            scalars = library_size_divisors(
                 read_metadata_rows_chunkwise(
                     query_assay.cells,
                     scalar_name,
                     self._query_cell_indices,
                 ),
-                dtype=np.float64,
-                copy=True,
+                source=self._totals_source,
             )
-            if not np.all(np.isfinite(scalars)) or np.any(scalars < 0):
-                raise ValueError(
-                    f"Query assay {scalar_name!r} metadata must be finite "
-                    "and non-negative"
-                )
-            scalars[scalars == 0] = 1
             scalars.setflags(write=False)
             self._cell_scalars = scalars
 
@@ -454,6 +451,7 @@ class AlignedFeatureStream:
                     raw,
                     size_factor=self.size_factor,
                     log_transform=self.log_transform,
+                    source=self._totals_source,
                     denominator=(
                         None
                         if self._cell_scalars is None

@@ -1,8 +1,14 @@
+import os
 import signal
+import subprocess
+import sys
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
+import scarf.utils.shutdown as shutdown_module
 from scarf.utils.shutdown import (
     ShutdownRequested,
     ShutdownToken,
@@ -243,3 +249,175 @@ def test_second_signal_with_a_default_prior_delivers_it_again(
         assert raised == [int(signal.SIGTERM)]
     assert token.request_record is not None
     assert token.request_record.signal_name == "SIGTERM"
+
+
+def test_signal_during_a_request_cannot_deadlock_the_same_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    installed: dict[int, object] = {}
+    escalated: list[int] = []
+
+    def prior_handler(signum: int, _frame: object) -> None:
+        escalated.append(signum)
+
+    monkeypatch.setattr(signal, "getsignal", lambda _number: prior_handler)
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda number, handler: installed.__setitem__(int(number), handler),
+    )
+    token = ShutdownToken()
+    real_time_ns = time.time_ns
+    nested: list[bool] = []
+
+    def time_ns_with_a_second_signal() -> int:
+        # A second SIGINT arrives while the first one is being recorded, as
+        # CPython can run a pending handler inside the interrupted handler.
+        if not nested:
+            nested.append(True)
+            handler = installed[int(signal.SIGINT)]
+            assert callable(handler)
+            handler(int(signal.SIGINT), None)
+        return real_time_ns()
+
+    # Only the shutdown module sees the patched clock.
+    monkeypatch.setattr(
+        shutdown_module, "time", SimpleNamespace(time_ns=time_ns_with_a_second_signal)
+    )
+    with TemporarySignalGuard(token):
+        handler = installed[int(signal.SIGINT)]
+        assert callable(handler)
+        worker = threading.Thread(
+            target=handler, args=(int(signal.SIGINT), None), daemon=True
+        )
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive(), "a nested signal deadlocked the token"
+
+    # One signal requested shutdown and the other escalated to the prior handler.
+    assert escalated == [int(signal.SIGINT)]
+    assert token.requested
+    assert token.request_record is not None
+    assert token.request_record.signal_name == "SIGINT"
+    with pytest.raises(ShutdownRequested, match="received SIGINT"):
+        token.checkpoint()
+
+
+def test_concurrent_requests_record_exactly_one_winner() -> None:
+    token = ShutdownToken()
+    start = threading.Barrier(8)
+    results: list[bool] = []
+    results_lock = threading.Lock()
+
+    def request(index: int) -> None:
+        start.wait()
+        first = token.request(reason=f"request {index}")
+        with results_lock:
+            results.append(first)
+
+    workers = [
+        threading.Thread(target=request, args=(index,), daemon=True)
+        for index in range(8)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+    assert sorted(results) == [False] * 7 + [True]
+    record = token.request_record
+    assert record is not None and record.reason.startswith("request ")
+
+
+def test_signal_guard_restores_installed_handlers_when_installation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(threading, "current_thread", threading.main_thread)
+    calls: list[tuple[int, object]] = []
+
+    def prior_handler(_signum: int, _frame: object) -> None:
+        return None
+
+    def install(number: int, handler: object) -> None:
+        if int(number) == int(signal.SIGINT) and handler is not prior_handler:
+            raise OSError("cannot install a SIGINT handler")
+        calls.append((int(number), handler))
+
+    monkeypatch.setattr(signal, "getsignal", lambda _number: prior_handler)
+    monkeypatch.setattr(signal, "signal", install)
+    guard = TemporarySignalGuard(ShutdownToken())
+
+    with pytest.raises(OSError, match="cannot install a SIGINT handler"):
+        guard.__enter__()
+
+    # SIGTERM was installed before SIGINT failed, so both get their prior
+    # handler back.
+    assert [number for number, _ in calls] == [
+        int(signal.SIGTERM),
+        int(signal.SIGTERM),
+        int(signal.SIGINT),
+    ]
+    assert callable(calls[0][1]) and calls[0][1] is not prior_handler
+    assert calls[1][1] is prior_handler and calls[2][1] is prior_handler
+    assert not guard.available
+    guard.__exit__(None, None, None)
+    assert len(calls) == 3
+
+
+_SIGNAL_LOOP_CHILD = """
+import sys
+import time
+
+from scarf.utils.shutdown import ShutdownRequested, ShutdownToken, TemporarySignalGuard
+
+token = ShutdownToken()
+with TemporarySignalGuard(token) as guard:
+    assert guard.available
+    print("READY", flush=True)
+    deadline = time.monotonic() + 20
+    try:
+        # Reading the token dominates the loop, so the signal usually arrives
+        # while a reader is inside the token.
+        while time.monotonic() < deadline:
+            for _ in range(1000):
+                token.checkpoint()
+                token.requested
+    except ShutdownRequested as error:
+        print("REQUESTED", error.request.signal_name, flush=True)
+        sys.exit(0)
+sys.exit(3)
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal delivery")
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="a single signal deadlocked a locking token only on Python 3.14",
+)
+def test_sigint_while_polling_the_token_never_deadlocks() -> None:
+    environment = os.environ | {"OMP_NUM_THREADS": "1", "NUMBA_NUM_THREADS": "1"}
+    for trial in range(10):
+        child = subprocess.Popen(
+            [sys.executable, "-c", _SIGNAL_LOOP_CHILD],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        try:
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == "READY"
+            # Let the loop take and release the token many times first.
+            time.sleep(0.05)
+            child.send_signal(signal.SIGINT)
+            stdout, stderr = child.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            pytest.fail(f"trial {trial}: SIGINT deadlocked the polling loop")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+        assert child.returncode == 0, (trial, stdout, stderr)
+        assert stdout.strip() == "REQUESTED SIGINT", (trial, stdout, stderr)

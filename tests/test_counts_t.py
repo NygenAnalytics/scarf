@@ -1235,6 +1235,11 @@ def test_seed_assay_type_is_idempotent() -> None:
     seed_assay_type(root, "RNA", None, "RNA")
     seed_assay_type(root, "RNA", None, "RNA")
     assert root.attrs["assayTypes"] == {"RNA": "RNA"}
+    # A record that is not a mapping declares no type, so it is refused.
+    root.attrs["assayTypes"] = ["RNA"]
+    with pytest.raises(ValueError, match="which is not a mapping from assay name"):
+        seed_assay_type(root, "ADT", None, "ADT")
+    assert root.attrs["assayTypes"] == ["RNA"]
 
 
 def test_paired_layout_predicates_and_preflight_failures() -> None:

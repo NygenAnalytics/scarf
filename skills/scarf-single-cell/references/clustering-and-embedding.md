@@ -98,8 +98,12 @@ print(dict(zip(selection.attrs["candidateKeys"], np.asarray(selection["scores"][
 print("selected:", selection.attrs["selectedKey"], "invalid:", selection.attrs["invalidReasons"])
 ```
 
-Membership strength is the fraction of a cell's graph neighbours sharing its most common label.
-Pass the Harmony ref instead of `run["pca"]` when the graph was built on Harmony coordinates.
+Membership strength is the fraction of a cell's graph neighbours that carry its own cluster
+label, so a weak cell (below 0.5) has most of its neighbours in other clusters. Results from
+before 1.0.0 hold the share of the most common neighbour label instead; lineage marks them
+`stale`, and `calc_membership_strength` computes new ones.
+Separability needs `run["pca"]`: it raises `ValueError` for anything but a `run_pca` reduction,
+a Harmony ref included. On a Harmony graph, score PCA and say so.
 
 ### QC and doublet covariates per cluster
 
@@ -142,7 +146,8 @@ Combine the evidence; no single score decides.
    shows "2a", "2b"). A non-nested jump, where many cells change parent, is a reason to reject it.
 3. Markers: every cluster a finer candidate adds needs its own specific markers (about 3 or more
    at default `get_markers` filters, named genes, not only ribosomal, mitochondrial or ambient).
-4. Graph support: added clusters keep high mean membership strength and few weak cells.
+4. Graph support: added clusters keep high mean membership strength and few weak cells, so
+   most of their cells' neighbours share their label.
 5. QC and doublets: a split explained by counts, mito or doublet score is not a cell type. Keep it
    as `unresolved` (`markers-and-annotation.md`) instead of naming it.
 6. Representation: boundaries that survive an HVG, PC or `k` branch are robust; those that move
@@ -182,7 +187,7 @@ satisfy a structural constraint and are not, by themselves, biological evidence.
 ```python
 init = run["embedding_initialization"]  # K-means initialization built on run["pca"]
 umap_tight = ds.run_umap(graph, init, min_dist=0.5)
-tsne = ds.run_tsne(graph, init, verbose=False)
+tsne = ds.run_tsne(graph, init, verbose=False)  # needs the tsne extra (sgtsnepi)
 # For new coordinates, build a matching init first:
 # init = ds.build_embedding_initialization(new_pca_ref)
 print(ds.load_artifact(umap_tight)["values"].shape, ds.load_artifact(tsne)["values"].shape)
@@ -231,7 +236,7 @@ The same helper works for membership strength, doublet scores, cell cycle and en
 | `min_cluster_size` (Paris) | `None` (resolved automatically) | Raise to suppress tiny branches in the auto cut |
 | `min_dist` / `spread` (UMAP) | `1.0` / `2.0` | Lower `min_dist` (0.1 to 0.5) for tighter packing; appearance only |
 | `use_density_map` (UMAP) | `False` | `True` for densMAP when relative density matters |
-| `parallel` (UMAP, t-SNE) | `False` | `True` is faster but not reproducible |
+| `parallel` (UMAP) | `False` | `True` is faster but not reproducible; t-SNE has no parallel mode |
 
 ## Check before moving on
 
@@ -256,8 +261,15 @@ The same helper works for membership strength, doublet scores, cell cycle and en
 - UMAP and t-SNE distances, empty space and island size are not biological measurements. Never
   choose a resolution from a layout alone.
 - A read-only store (`zarr_mode="r"`) raises `PermissionError` unless an identical artifact exists.
-- `run_tsne` uses an `sgtsne` executable on `PATH` when present, otherwise the `sgtsnepi` Python
-  package. The docs state that t-SNE is unsupported on macOS and Windows.
+- `run_tsne` computes with the optional `sgtsnepi` package only (`pip install "scarf[tsne]"`), on
+  one thread; an `sgtsne` executable on `PATH` is ignored. `sgtsnepi` has wheels only for Linux
+  x86_64 and macOS 26 or newer on arm64. Without it, a new t-SNE raises `ImportError` naming the
+  `tsne` extra; an existing t-SNE artifact is still reused. Use UMAP when t-SNE is unavailable.
+- `run_tsne` checks `tsne_dims`, `max_iter`, `alpha` (integers of at least 1), `early_iter` (an
+  integer of at least 0), and `lambda_scale` and `box_h` (finite positive numbers) before it reads
+  the graph. `pipeline.run(params={"tsne": {...}})` applies the same checks before it creates a run
+  record, and with t-SNE on but no `sgtsnepi` it warns (naming the `tsne` extra) before the first
+  stage; it still runs, reusing a stored t-SNE, and only a new t-SNE fails, at its stage.
 
 ## See also
 

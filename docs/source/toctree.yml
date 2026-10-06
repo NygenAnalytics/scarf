@@ -155,3 +155,5 @@ subtrees:
         title: Architecture
       - file: developers/zarr_internals
         title: Zarr internals
+      - file: developers/operation_revisions
+        title: Operation revisions

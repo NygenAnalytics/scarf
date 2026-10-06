@@ -37,6 +37,13 @@ Low-level layout details for contributors live in {doc}`../developers/zarr_inter
 Each assay owns feature metadata, normalization, and feature selection.
 Cell-level columns are shared across assays. The Boolean cell column `I` marks the active cells
 used by live-metadata methods. Saved runs keep their own frozen cell selection.
+Every assay spans all cells of the store. When an assay measured only some of them, as after a
+merge of sources with different assays, the Boolean column `<assay>_I`, such as `ADT_I`, marks the
+cells it measured; the other cells hold zero counts for that assay. Without that column, the assay
+measured every cell. Those zero counts are no measurement, so an operation that reads an assay's
+values, such as normalization or marker search, refuses its unmeasured cells: select the measured
+ones first with `ds.select_measured_cells("ADT", cell_selection=...)`. Plots show the values of
+unmeasured cells as missing.
 
 ```{mermaid}
 flowchart TB
@@ -63,8 +70,10 @@ scarf.configure_output(level="WARNING", progress=False)
 
 This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
 The rebuilt store uses the current layout and contains a completed pipeline run named
-`docs_default`. Open it directly and reuse that run's exact selections, clustering, UMAP, and
-markers.
+`docs_default`. Open it directly and reuse that run's exact selections, clustering, and UMAP. An
+earlier release wrote its marker tables, which `get_markers` refuses; rank markers for its
+clusters with
+`ds.run_marker_search(analysis_run["clusters"], features=analysis_run["feature_universe"])`.
 
 ```{code-cell} ipython3
 # Download the prepared example, including its saved analysis.
@@ -125,7 +134,12 @@ cell_qc.set_index("ids").head()
 ```
 
 `insert` writes a new column and aligns values to the active subset unless you override `key`.
-Re-inserting an existing column requires `overwrite=True`.
+When the values cover only the rows that `key` selects, the other rows are missing: they are
+flagged in the column's missing mask, `to_pandas_dataframe` and plots show them as missing, and
+`sift` never selects them. Pass `fill_value` to store a real value in those rows instead; it must
+fit the values, such as `False` for a Boolean column. `None`, `NaN`, and `pd.NA` among the
+values are missing too. Re-inserting an existing column requires `overwrite=True`, and a failed
+replacement keeps the previous column.
 In this prepared store, every cell is active and the saved run contains the same cells, so its
 cluster labels align with the values we insert. For another analysis, check the cell selection
 before copying results into live metadata.
@@ -175,7 +189,8 @@ print(
 ## 2. Select cells from metadata
 
 `sift` returns a boolean mask for one numeric range.
-`multi_sift` combines several ranges, and `get_index_by` locates exact categorical values:
+`multi_sift` combines several ranges, with one lower and one upper bound for each column, and
+raises when the counts differ. `get_index_by` locates exact categorical values:
 
 ```{code-cell} ipython3
 # Record the active-cell count before creating new masks.
@@ -354,7 +369,7 @@ For feature arrays, pass `start="RNA/featureData"` to the same method.
 Each persisted result is an {term}`artifact`. Assay-scoped results live under
 `{assay}/artifacts/{kind}/{artifact_id}`; datastore-scoped selections and integrated results live
 under `artifacts/{kind}/{artifact_id}`.
-The kind names the operation family and the identifier is derived from the inputs and parameters, which is what lets Scarf recognise an equivalent result instead of recomputing it.
+The kind names the operation family and the identifier is random; Scarf recognises an equivalent result by its recorded operation, revision, parameters, and inputs instead of recomputing it.
 Nothing here encodes parameters in the path, so a second PCA at different dimensionality becomes a sibling entry rather than a new branch of the tree.
 
 To inspect saved result groups, use `ds.show_zarr_tree(start="RNA/artifacts", depth=1)`.

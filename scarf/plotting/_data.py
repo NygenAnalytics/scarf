@@ -1,6 +1,6 @@
 """Feature resolution and bounded group reducers."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from ..utils.arrays import sort_categories
 from typing import Any
 
@@ -18,8 +18,9 @@ from ..metadata.rows import (
     metadata_missing_mask,
     read_array_rows_chunkwise,
 )
-from ..metadata.selection import GROUPING_VALUE_NAMES, resolve_cell_aligned_artifact
+from ..metadata.selection import cell_value_spec, resolve_cell_aligned_artifact
 from ..storage.artifacts import ArtifactRef, artifact_group, inspect_artifact
+from ..storage.metadata_keys import assay_membership_column
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array
 from ._contracts import (
@@ -200,7 +201,7 @@ def _resolve_grouping(
     resolved = resolve_cell_aligned_artifact(
         store.zw,
         groups,
-        value_name=GROUPING_VALUE_NAMES.get(groups.kind, "values"),
+        value_name=cell_value_spec(groups.kind).name,
         expected_kind=groups.kind,
     )
     return (
@@ -321,6 +322,66 @@ def resolve_cell_selection(
     return mask, group_order
 
 
+_GROUP_ROLES = ("group", "subgroup")
+
+
+def _group_roles(group_keys: Sequence[str]) -> tuple[str, ...]:
+    """Name the grouping columns of a summary table by their role.
+
+    ``group`` and ``subgroup`` hold the values of the first and second
+    grouping key, or the labels of a label artifact. Role names never depend
+    on the source column names, so a grouping column cannot collide with a
+    summary column such as ``feature`` or ``mean``, or with ``sample``.
+    """
+    if not 1 <= len(group_keys) <= len(_GROUP_ROLES):
+        raise ValueError("Summary tables group cells by one or two keys")
+    return _GROUP_ROLES[: len(group_keys)]
+
+
+def unmeasured_cell_counts(
+    unmeasured: Mapping[str, np.ndarray],
+    plotted: Any,
+) -> dict[str, int]:
+    """Return how many of the plotted cells each feature assay did not measure."""
+    counts = {
+        assay: int(np.count_nonzero(np.asarray(mask)[plotted]))
+        for assay, mask in sorted(unmeasured.items())
+    }
+    return {assay: count for assay, count in counts.items() if count}
+
+
+def unmeasured_extras(unmeasured: Mapping[str, int]) -> dict[str, dict[str, int]]:
+    """Return the provenance extras that record unmeasured plotted cells."""
+    return {"unmeasured_cells": dict(unmeasured)} if unmeasured else {}
+
+
+def has_finite_values(values: Any) -> bool:
+    """Return whether numeric ``values`` hold a finite value."""
+    numeric = pd.to_numeric(pd.Series(np.asarray(values).ravel()), errors="coerce")
+    return bool(np.isfinite(numeric.to_numpy(dtype=np.float64)).any())
+
+
+def require_panel_values(
+    panels: Iterable[tuple[Any, str, bool, Any, str | None]],
+    unmeasured: Mapping[str, int],
+    n_cells: int,
+) -> None:
+    """Raise ``ValueError`` if unmeasured cells leave a feature panel without values."""
+    for values, label, is_feature, _identity, assay in panels:
+        if not is_feature or assay is None or assay not in unmeasured:
+            continue
+        if has_finite_values(values):
+            continue
+        column = assay_membership_column(assay)
+        raise ValueError(
+            f"No finite values remain for a distribution panel: assay {assay!r} "
+            f"did not measure {unmeasured[assay]} of the {n_cells} plotted cells "
+            f"(cell column {column!r} is False for them), so {label!r} has no "
+            "value to show. Plot cells that it measured, for example with "
+            f"subset_by={column!r}."
+        )
+
+
 def _summarize_feature_blocks(
     store: Any,
     resolved: Sequence[ResolvedFeature],
@@ -330,7 +391,23 @@ def _summarize_feature_blocks(
     feature_groups: list[str | None],
     normalization: NormalizationSpec | None,
     expression_cutoff: float,
+    *,
+    unmeasured: dict[str, np.ndarray] | None = None,
 ) -> pd.DataFrame:
+    """Summarize feature values over the groups of ``base``, block by block.
+
+    ``base`` holds one row per included cell, indexed by the cell's position
+    in ``cell_idx``, and one column per name in ``group_keys``. The caller
+    names those columns by role (``sample``, ``group``, ``subgroup``), so
+    they are distinct from the summary columns written here.
+
+    Every statistic of a group and feature covers the cells of the group
+    that have a value of the feature, which ``n_cells`` counts: a cell that
+    the feature's assay did not measure has none. ``fraction`` is the share
+    of those cells above ``expression_cutoff``, and ``mean``, ``fraction``,
+    and ``variance`` are NaN when no cell has a value. ``unmeasured``
+    receives the masks of unmeasured cells that the value layer records.
+    """
     grouped = base.groupby(group_keys, observed=True, dropna=False)
     codes = np.full(len(cell_idx), -1, dtype=np.int64)
     codes[base.index.to_numpy()] = grouped.ngroup().to_numpy()
@@ -351,7 +428,7 @@ def _summarize_feature_blocks(
     detected = np.zeros(shape, dtype=np.int64)
 
     for slots, start, values in iter_normalized_feature_blocks(
-        store, resolved, cell_idx, normalization
+        store, resolved, cell_idx, normalization, unmeasured=unmeasured
     ):
         block_codes = codes[start : start + len(values)]
         included = block_codes >= 0
@@ -399,13 +476,14 @@ def _summarize_feature_blocks(
     table = group_table.iloc[
         np.repeat(np.arange(len(group_table)), len(feature_table))
     ].reset_index(drop=True)
-    table["n_cells"] *= np.tile(
-        feature_table["multiplicity"].to_numpy(), len(group_table)
-    )
+    # A pooled row counts each of its features' values, as its mean does.
+    table["n_cells"] = counts.ravel()
     for name in ("feature", "feature_group"):
         table[name] = np.tile(feature_table[name].to_numpy(), len(group_table))
     table["mean"] = means.ravel()
-    table["fraction"] = detected.ravel() / table["n_cells"]
+    table["fraction"] = np.divide(
+        detected, counts, out=np.full(shape, np.nan), where=counts > 0
+    ).ravel()
     table["variance"] = variance.ravel()
     return table[
         [
@@ -483,13 +561,31 @@ def _summarize_resolved_features(
     study_design: StudyDesign | None = None,
     normalization: NormalizationSpec | None = None,
     expression_cutoff: float = 0.0,
-) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, int]]:
     """Aggregate resolved features over a grouping from ``_resolve_grouping``.
 
     ``group_labels`` holds each feature's bracket group, aligned with
     ``resolved``. Cells whose grouping label is masked as missing belong to
     no group. With ``sample_by``, samples get equal weight. Group and feature
     combinations without cells are omitted.
+
+    Tables name grouping columns by role (see :func:`_group_roles`), not
+    after the grouping keys: ``group`` and ``subgroup``, then ``feature``,
+    ``feature_group``, ``mean``, ``fraction``, ``n_cells`` and ``variance``.
+    The per-sample table leads with ``sample``, the ``sample_by`` value, and
+    the aggregate over samples adds ``n_samples`` before ``variance``.
+
+    Statistics cover the cells with a value of the feature, which
+    ``n_cells`` counts, so a cell that the feature's assay did not measure
+    adds to no statistic. A group or sample without such a cell keeps its
+    row with ``n_cells`` 0 and NaN statistics. The aggregate over samples
+    averages the means, fractions, and variances of the samples that have a
+    value, sums their ``n_cells``, and counts them as ``n_samples``.
+
+    Returns:
+        The aggregate table, the per-sample table or None, and the number of
+        summarized cells that each feature assay did not measure, for the
+        assays that missed some (see :func:`unmeasured_cell_counts`).
     """
     _check_shared_labels(resolved, group_labels)
     condition_by: str | None = None
@@ -498,7 +594,8 @@ def _summarize_resolved_features(
         condition_by = study_design.condition_by
 
     group_keys, cell_idx, group_cols, group_missing = grouping
-    base = pd.DataFrame({gk: col for gk, col in zip(group_keys, group_cols)})
+    roles = _group_roles(group_keys)
+    base = pd.DataFrame(dict(zip(roles, group_cols, strict=True)))
     labelled = (
         np.ones(len(cell_idx), dtype=bool)
         if group_missing is None
@@ -512,7 +609,7 @@ def _summarize_resolved_features(
             "coarsely."
         )
 
-    gb_keys = list(group_keys)
+    gb_keys = list(roles)
 
     if sample_by is not None:
         samples = _fetch_cell_column(store, sample_by, cell_idx=cell_idx, labels=True)
@@ -547,6 +644,7 @@ def _summarize_resolved_features(
     else:
         base = base.loc[labelled]
 
+    masks: dict[str, np.ndarray] = {}
     summary = _summarize_feature_blocks(
         store,
         resolved,
@@ -556,19 +654,24 @@ def _summarize_resolved_features(
         group_labels,
         normalization,
         expression_cutoff,
+        unmeasured=masks,
     )
+    unmeasured = unmeasured_cell_counts(masks, base.index.to_numpy())
     if sample_by is not None:
-        agg_keys = [*group_keys, "feature", "feature_group"]
+        agg_keys = [*roles, "feature", "feature_group"]
         aggregate = (
-            summary.groupby(agg_keys, observed=False, dropna=False)
+            # Means skip a sample without a value, and so do the other
+            # statistics and the sample count.
+            summary.assign(_has_value=summary["n_cells"] > 0)
+            .groupby(agg_keys, observed=False, dropna=False)
             .agg(
                 mean=("mean", "mean"),
                 fraction=("fraction", "mean"),
                 n_cells=("n_cells", "sum"),
-                n_samples=("sample", "nunique"),
+                n_samples=("_has_value", "sum"),
                 variance=("variance", "mean"),
             )
             .reset_index()
         )
-        return aggregate, summary
-    return summary, None
+        return aggregate, summary, unmeasured
+    return summary, None, unmeasured

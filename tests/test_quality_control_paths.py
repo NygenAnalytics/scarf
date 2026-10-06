@@ -18,6 +18,7 @@ from scarf.storage.artifacts import (
     fingerprint_strings,
     new_artifact_id,
 )
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.feature_selection import (
     _feature_selection_plan,
     _ordered_feature_ids_fingerprint,
@@ -160,6 +161,13 @@ def write_qc_template(zarr_loc: Path) -> dict[str, ArtifactRef]:
         inputs={"cell_selection": cells},
         arrays={"values": labels[:-1]},
     )
+    refs["clusters_in_rows"] = foreign_record(
+        store,
+        "cluster_labels",
+        "rows",
+        inputs={"cell_selection": cells},
+        arrays={"values": labels[:, None]},
+    )
     neighbors = np.asarray(
         artifact_group(store.zw, refs["rna_neighbors"])["indices"][:]
     )
@@ -270,18 +278,23 @@ def test_select_cells_rejects_invalid_bounds_and_include_values(
                 artifact_id=new_artifact_id(),
             ),
             ValueError,
-            "must identify a complete artifact",
+            "Cell-aligned artifact is unavailable or incomplete",
         ),
-        (lambda refs: refs["cells"], ValueError, "has no cell-selection input"),
+        # select_cells reads its input with the shared cell-aligned reader.
+        (
+            lambda refs: refs["cells"],
+            ValueError,
+            "'cell_selection' is not a cell-aligned artifact kind",
+        ),
         (
             lambda refs: refs["metric_with_malformed_selection"],
-            ValueError,
-            "cell selection is malformed",
+            ArtifactResolutionError,
+            "quality_metric artifact has a malformed 'cell_selection' input",
         ),
         (
             lambda refs: refs["rna_normalized"],
             ValueError,
-            "has no canonical 'values' array",
+            "'normalized' is not a cell-aligned artifact kind",
         ),
         (lambda refs: refs["matrix"], ValueError, "one value per source-selected cell"),
     ],
@@ -493,12 +506,16 @@ def test_feature_percentage_refuses_a_stored_selection_without_features(
     assert store.list_artifacts(kind="quality_metric", from_assay="RNA") == metrics
 
 
-def test_hto_demultiplexing_reads_the_hto_assay_by_default(read_only_store) -> None:
-    store, refs = read_only_store
+def test_hto_demultiplexing_reads_the_hto_assay_by_default(qc_store) -> None:
+    store, refs = qc_store
+    # Without a recorded type, the assay named HTO declares that preset, which
+    # a read-only open resolves but cannot record.
+    del store.zw.attrs["assayTypes"]
+    read_only = open_store(Path(store.zarr_loc), zarr_mode="r")
 
     # The three hashtags of the HTO assay need at least four selected cells.
     with pytest.raises(ValueError, match="at least 4 selected cells"):
-        store.run_hto_demultiplexing(refs["three_cells"])
+        read_only.run_hto_demultiplexing(refs["three_cells"])
 
 
 def test_hto_demultiplexing_validates_its_arguments(read_only_store) -> None:
@@ -619,6 +636,7 @@ def test_doublet_detection_needs_clusters_over_the_graph_cells(
         ("clusters_without_selection", "has no cell-selection input"),
         ("clusters_with_malformed_selection", "cell selection is malformed"),
         ("clusters_missing_a_cell", "one label per selected cell"),
+        ("clusters_in_rows", "one label per selected cell"),
     ],
 )
 def test_doublet_detection_rejects_cluster_records_that_do_not_label_the_cells(

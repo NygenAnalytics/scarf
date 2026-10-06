@@ -293,9 +293,10 @@ def test_normalized_results_are_the_float64_reference(count_results):
             results[f"{name}/feature_sum"], widened.sum(axis=0), rtol=1e-12
         )
         np.testing.assert_allclose(
-            results[f"{name}/feature_squared_sum"],
-            np.square(widened).sum(axis=0),
+            results[f"{name}/feature_m2"],
+            np.square(widened - widened.mean(axis=0)).sum(axis=0),
             rtol=1e-12,
+            atol=1e-12,
         )
     np.testing.assert_array_equal(
         results["normed/library"], _lib_size_reference(rna, feat_idx=RNA_SUBSET)
@@ -320,7 +321,6 @@ def test_normalized_results_are_the_float64_reference(count_results):
 
     for name, log_transform in (("summary", False), ("summary_log", True)):
         normalized = _lib_size_reference(rna, log_transform=log_transform)
-        mean = normalized.mean(axis=0)
         np.testing.assert_allclose(
             results[f"{name}/normed_tot"], normalized.sum(axis=0), rtol=1e-12
         )
@@ -329,9 +329,9 @@ def test_normalized_results_are_the_float64_reference(count_results):
         )
         np.testing.assert_allclose(
             results[f"{name}/sigmas"],
-            np.square(normalized).mean(axis=0) - np.square(mean),
-            rtol=1e-9,
-            atol=1e-9,
+            normalized.var(axis=0),
+            rtol=1e-12,
+            atol=1e-12,
         )
     np.testing.assert_allclose(
         results["summary_atac/prevalence"],
@@ -501,7 +501,9 @@ def test_normalizers_compute_float64_values_for_every_dtype(dtype, block_size):
         tfidf_values(counts, totals, idf).compute(), tfidf_values(widened, totals, idf)
     )
     np.testing.assert_array_equal(
-        _normalize_count_block(values, scaleFactor=SIZE_FACTOR, logTransform=True),
+        _normalize_count_block(
+            values, scaleFactor=SIZE_FACTOR, logTransform=True, source="RNA"
+        ),
         _lib_size_reference(
             widened, renormalize_subset=True, log_transform=True
         ).astype(np.float32),
@@ -524,10 +526,16 @@ def test_float32_counts_normalize_as_their_float64_values():
     for log_transform in (False, True):
         np.testing.assert_array_equal(
             _normalize_count_block(
-                fractional, scaleFactor=SIZE_FACTOR, logTransform=log_transform
+                fractional,
+                scaleFactor=SIZE_FACTOR,
+                logTransform=log_transform,
+                source="RNA",
             ),
             _normalize_count_block(
-                widened, scaleFactor=SIZE_FACTOR, logTransform=log_transform
+                widened,
+                scaleFactor=SIZE_FACTOR,
+                logTransform=log_transform,
+                source="RNA",
             ),
         )
 

@@ -312,6 +312,90 @@ def test_mount_datastore_rejects_conflicting_options(
     assert not Path(target).exists()
 
 
+def test_mount_datastore_checks_its_options_before_creating_the_target(
+    default_sources, monkeypatch, tmp_path
+):
+    # Before, options such as an unknown type raised only when the mounted
+    # target was opened, and the target that was left behind made a retry fail
+    # with Zarr's bare "already contains data".
+    import scarf.datastore.datastore as datastore_module
+
+    def create(*_args, **_kwargs):
+        raise AssertionError("the target was created before the options were checked")
+
+    source = str(tmp_path / "source.zarr")
+    _copy_source(default_sources, source)
+    monkeypatch.setattr(datastore_module, "create_matrix_source", create)
+    target = str(tmp_path / "target.zarr")
+    for options, error, message in (
+        ({"assay_types": {"RNA": "rna"}}, ValueError, "assay_type 'rna' of assay"),
+        ({"min_features_per_cell": "1"}, TypeError, "must be an integer"),
+        ({"mem_budget": "lots"}, ValueError, "Invalid memory spec: 'lots'"),
+        ({"nthread": 2}, TypeError, "unexpected keyword argument 'nthread'"),
+    ):
+        with pytest.raises(error, match=message):
+            mount_datastore(source, at=target, **options)
+
+
+def test_mount_datastore_transposes_follow_the_declared_types(monkeypatch, tmp_path):
+    from scipy.sparse import csr_matrix
+
+    import scarf.storage.stores as stores_module
+    from scarf.writers import SparseToZarr
+
+    def discard(*_args, **_kwargs):
+        raise AssertionError("the target was created before the types were checked")
+
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    SparseToZarr(
+        csr_matrix(_DEFAULT_VALUES),
+        source,
+        [f"c{i}" for i in range(10)],
+        [f"g{i}" for i in range(4)],
+        assay_name="GEX",
+        nthreads=1,
+    ).dump()
+    DataStore(source, min_features_per_cell=-1, nthreads=1)
+    assert "countsT" not in zarr.open_group(source, mode="r")["GEX"]
+
+    # Declaring GEX as RNA on the target needs the gene-major counts that the
+    # generic source assay lacks, which is found before the target exists.
+    with monkeypatch.context() as patch:
+        patch.setattr(stores_module, "discard_mount_target", discard)
+        with pytest.raises(ValueError, match="countsT"):
+            mount_datastore(source, at=target, assay_types={"GEX": "RNA"})
+    assert not Path(target).exists()
+
+    mounted = mount_datastore(source, at=target, assay_types={"GEX": "CRISPR"})
+    assert mounted.get_assay("GEX").assayType == "CRISPR"
+    manifest = zarr.open_group(target, mode="r").attrs[MATRIX_SOURCE_ATTR]
+    assert manifest["assays"]["GEX"]["requiresTranspose"] is False
+
+
+def test_a_mount_whose_first_open_fails_leaves_no_target(
+    default_sources, monkeypatch, tmp_path
+):
+    from scarf.datastore.base_datastore import BaseDataStore
+
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    _copy_source(default_sources, source)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("injected failure of the first writable open")
+
+    # Only the writable open of the new target filters cells.
+    monkeypatch.setattr(BaseDataStore, "_filter_cells", fail)
+    with pytest.raises(OSError, match="injected failure"):
+        mount_datastore(source, at=target, min_features_per_cell=1)
+    assert not Path(target).exists()
+    monkeypatch.undo()
+
+    mounted = mount_datastore(source, at=target, min_features_per_cell=1)
+    assert mounted.assay_names == ["RNA"]
+
+
 def test_mount_datastore_rejects_existing_target(default_sources, tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")

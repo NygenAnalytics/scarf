@@ -1,9 +1,11 @@
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from ..utils.arguments import integer_argument
 from ._types import NeighborMetric, ZarrArray
 
 _EDGE_BATCH_ROWS = 100_000
+_LABEL_AGREEMENT_BLOCK_EDGES = 1_048_576
 
 
 def _validated_cluster_labels(
@@ -140,6 +142,47 @@ def calculate_knn_cluster_similarity(
         inter_cluster_weights += weight_counts.reshape(num_clusters, num_clusters)
 
     return _finalize_cluster_similarity(inter_cluster_weights)
+
+
+def neighbor_label_agreement(
+    edges: np.ndarray | ZarrArray,
+    label_codes: np.ndarray,
+    *,
+    k: int,
+    block_edges: int = _LABEL_AGREEMENT_BLOCK_EDGES,
+) -> np.ndarray:
+    """Return the fraction of each cell's stored neighbors that share its label.
+
+    ``edges`` must hold ``k`` rows per cell in cell-major order.
+    """
+    k = integer_argument(k, "k", minimum=1)
+    block_edges = integer_argument(block_edges, "block_edges", minimum=1)
+    label_codes = np.asarray(label_codes)
+    if label_codes.ndim != 1:
+        raise ValueError("Label codes must be one-dimensional")
+    if not np.issubdtype(label_codes.dtype, np.integer):
+        raise TypeError("Label codes must contain integers")
+    n_cells = len(label_codes)
+    if tuple(edges.shape) != (n_cells * k, 2):
+        raise ValueError("Graph edges must hold k rows for each labelled cell")
+    if not np.issubdtype(edges.dtype, np.integer):
+        raise TypeError("Graph edges must contain integers")
+    agreement = np.empty(n_cells, dtype=np.float64)
+    block_cells = max(1, block_edges // k)
+    for start in range(0, n_cells, block_cells):
+        stop = min(start + block_cells, n_cells)
+        block = np.asarray(edges[start * k : stop * k]).reshape(stop - start, k, 2)
+        sources = np.arange(start, stop, dtype=block.dtype)[:, None]
+        if not np.array_equal(
+            block[:, :, 0], np.broadcast_to(sources, (stop - start, k))
+        ):
+            raise ValueError("Graph edges are not stored in cell-major order")
+        neighbors = block[:, :, 1]
+        if np.any(neighbors < 0) or np.any(neighbors >= n_cells):
+            raise IndexError("Graph neighbor index is outside the label array")
+        shared = label_codes[neighbors] == label_codes[start:stop, None]
+        agreement[start:stop] = np.count_nonzero(shared, axis=1) / k
+    return agreement
 
 
 def calculate_top_k_neighbor_distances(

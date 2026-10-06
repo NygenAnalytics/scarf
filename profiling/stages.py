@@ -296,6 +296,12 @@ def _prepare_create_store(
     storageIo: StorageIoConfig | None = None,
     storeProbe: Any | None = None,
 ) -> tuple[H5adReader, H5adToZarr]:
+    """Open the H5AD and construct the writer of the store at ``storeUri``.
+
+    The writer creates its store only at an empty destination. A forced
+    createStore stage job therefore deletes the store before this runs, and
+    an unforced one refuses a destination that already holds a store.
+    """
     options = storage_options(storeUri)
     location = _wrap_store_probe(storeUri, options, storeProbe)
     reader = H5adReader(
@@ -530,12 +536,19 @@ def _write_counts_t(
         profile=profile,
     )
     writer_metrics: dict[str, Any] = {}
+    resident_mb = process_rss_mb()
+    if resident_mb is None:
+        raise RuntimeError(
+            "Profiling stages measure resident memory through Linux /proc, which "
+            "this platform does not provide; writeCountsT needs it to budget "
+            "the countsT write"
+        )
     counts_t = write_counts_t(
         context.counts,
         context.group,
         profile=profile,
         resources=context.budget,
-        residentBytes=int(process_rss_mb() * 1024**2),
+        residentBytes=int(resident_mb * 1024**2),
         io=_storage_io_policy(storageIo),
         metrics=writer_metrics,
         overwrite=True,

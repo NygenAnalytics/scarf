@@ -22,13 +22,15 @@ def test_count_normalization_allocates_only_its_output_and_row_totals(dtype):
     totals = widened.sum(axis=1)
     totals[totals == 0] = 1
     expected = np.log1p(1000.0 * widened / totals[:, None]).astype(np.float32)
-    # The float32 output plus float64 row totals and their zero mask.
+    # The float32 output plus float64 row totals and one boolean mask, as the
+    # divisors are checked and made in place.
     allocation_limit = expected.nbytes + len(values) * (8 + 1) + 128 * 1024
+    options = {"scaleFactor": 1000.0, "logTransform": True, "source": "RNA"}
     # Compile the kernel for this dtype before tracing the steady-state allocations.
-    _normalize_count_block(values[:1], scaleFactor=1000.0, logTransform=True)
+    _normalize_count_block(values[:1], **options)
     tracemalloc.start()
     try:
-        actual = _normalize_count_block(values, scaleFactor=1000.0, logTransform=True)
+        actual = _normalize_count_block(values, **options)
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -38,7 +40,8 @@ def test_count_normalization_allocates_only_its_output_and_row_totals(dtype):
 
 def _subset_indices(rna):
     cell_idx = np.arange(rna.cells.N)
-    feat_idx = np.array([0, 1, 3])
+    # Every cell has counts in feature 3, so subset and library totals differ.
+    feat_idx = np.array([0, 1])
     return cell_idx, feat_idx
 
 
@@ -122,6 +125,8 @@ def test_run_normalization_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
         artifact_group(toy_crdir_ds.zw, normalized)["data"][:],
         expected,
     )
+    # Revision 2 of run_normalization covers only other normalizers' flags.
+    assert toy_crdir_ds.inspect_artifact(normalized).revision == 1
 
 
 def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkeypatch):
@@ -142,7 +147,7 @@ def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkey
         "scarf.assay.normalization.write_renorm_subset_to_zarr",
         fake_fused,
     )
-    _, feat_idx = _subset_indices(rna)
+    cell_idx, feat_idx = _subset_indices(rna)
     cells, features = _normalization_inputs(toy_crdir_ds, "RNA", feat_idx)
     normalized = toy_crdir_ds.run_normalization(
         cells,
@@ -153,7 +158,11 @@ def test_run_normalization_without_renorm_still_uses_normed(toy_crdir_ds, monkey
     )
     assert called["normed"] == 1
     assert called["fused"] == 0
-    assert "subset_params" not in artifact_group(toy_crdir_ds.zw, normalized).attrs
+    # Each cell is divided by its library total, not by its subset total.
+    np.testing.assert_array_equal(
+        artifact_group(toy_crdir_ds.zw, normalized)["data"][:],
+        orig_normed(rna, cell_idx, feat_idx).compute().astype(np.float32),
+    )
 
 
 def test_run_normalization_renorm_cache_hit(toy_crdir_ds, monkeypatch):
@@ -211,8 +220,6 @@ def test_atac_run_normalization_reuses_complete_artifact(
     )
 
     created = atac_datastore.run_normalization(**kwargs, invalidate_cache=True)
-    group = artifact_group(atac_datastore.zw, created)
-    assert "subset_params" not in group.attrs
     reused = atac_datastore.run_normalization(**kwargs)
     assert atac_datastore.run_normalization(**kwargs) == reused
 
@@ -231,6 +238,8 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
     from scarf.storage.feature_stream import FeatureCellBand
     from scarf.assay.normalization import (
         _counts_t_renormalized_batches,
+        norm_dummy,
+        norm_lib_size,
         write_renorm_subset_to_zarr,
     )
     from tests.test_feature_stream import _counts_t_with_plan
@@ -354,7 +363,9 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
     root = zarr.open_group(store=MemoryStore(), mode="w")
     raw = np.arange(12, dtype=np.float32).reshape(3, 4)
     root.attrs.update({"prepared": True, "dataset_fingerprint": "test-dataset"})
-    missing_sf = SimpleNamespace(rawData=raw, rawDataT=None, sf=None)
+    missing_sf = SimpleNamespace(
+        rawData=raw, rawDataT=None, sf=None, normMethod=norm_lib_size, name="RNA"
+    )
     with pytest.raises(ValueError, match="size factor"):
         write_renorm_subset_to_zarr(
             missing_sf,
@@ -364,20 +375,44 @@ def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None
             "missing_sf",
             1,
         )
+    # The writer computes library sizes, so it refuses any other normalizer.
+    other_normalizer = SimpleNamespace(
+        rawData=raw, rawDataT=None, sf=1000.0, normMethod=norm_dummy, name="RNA"
+    )
+    with pytest.raises(ValueError, match="writes library-size values"):
+        write_renorm_subset_to_zarr(
+            other_normalizer,
+            np.arange(3),
+            np.arange(4),
+            root,
+            "other_normalizer",
+            1,
+        )
+    assert "other_normalizer" not in root
+    library_size = SimpleNamespace(
+        name="RNA",
+        rawData=ChunkedArray.from_numpy(raw),
+        z=root,
+        rawDataT=None,
+        sf=1000.0,
+        normMethod=norm_lib_size,
+        resources=ResourceBudget(8 * 1024 * 1024, 1),
+        storageIo=None,
+    )
+    # A finite check needs the operation that it names, before any output.
+    with pytest.raises(ValueError, match="requireFinite needs the operation"):
+        write_renorm_subset_to_zarr(
+            library_size,
+            np.arange(3),
+            np.arange(4),
+            root,
+            "unnamed",
+            1,
+            requireFinite=True,
+        )
+    assert "unnamed" not in root
     write_renorm_subset_to_zarr(
-        SimpleNamespace(
-            rawData=ChunkedArray.from_numpy(raw),
-            z=root,
-            rawDataT=None,
-            sf=1000.0,
-            resources=ResourceBudget(8 * 1024 * 1024, 1),
-            storageIo=None,
-        ),
-        np.arange(3),
-        np.arange(4),
-        root,
-        "from_counts",
-        1,
+        library_size, np.arange(3), np.arange(4), root, "from_counts", 1
     )
     # Without countsT the subset totals come from the raw counts.
     np.testing.assert_array_equal(

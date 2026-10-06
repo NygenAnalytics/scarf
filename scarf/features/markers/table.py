@@ -30,6 +30,15 @@ MARKER_TIE_CORRECTION = True
 MARKER_CONTINUITY_CORRECTION = True
 MARKER_ADJUSTMENT_METHOD = "fdr_bh"
 MARKER_ADJUSTMENT_SCOPE = "within_group_all_tested_features"
+# ``fold_change`` is the group mean over the rest mean when both are
+# non-negative and the rest mean is positive, +inf when only the group mean is
+# positive, and NaN when both means are 0 or either is negative. Marker slots
+# record this policy as metadata, which the loader and the reuse validator
+# require, so a table that uses the 100.1 and 0 sentinels of earlier releases
+# is neither read nor reused. Operation revision 2 of run_marker_search, not a
+# recorded parameter, identifies tables that follow the policy, so planning
+# reports such an earlier table as a superseded match.
+MARKER_FOLD_CHANGE_POLICY = "ratio_of_means_inf_when_rest_zero_nan_when_undefined"
 _MARKER_METADATA = {
     "method": MARKER_METHOD,
     "alternative": MARKER_ALTERNATIVE,
@@ -37,6 +46,7 @@ _MARKER_METADATA = {
     "continuity_correction": MARKER_CONTINUITY_CORRECTION,
     "adjustment_method": MARKER_ADJUSTMENT_METHOD,
     "adjustment_scope": MARKER_ADJUSTMENT_SCOPE,
+    "fold_change_policy": MARKER_FOLD_CHANGE_POLICY,
 }
 
 __all__ = [
@@ -49,6 +59,44 @@ __all__ = [
 # with the Mann-Whitney z statistic in place of ``p_value``.
 _RANK_COLUMNS = len(MARKER_STAT_COLUMNS) - 1
 _P_VALUE = MARKER_STAT_COLUMNS.index("p_value")
+
+
+def _statistics_violation(stats: np.ndarray, columns: Sequence[str]) -> str | None:
+    """Return how one group's stored marker statistics break their contract.
+
+    Every statistic but ``fold_change`` is finite, and ``fold_change``
+    follows ``MARKER_FOLD_CHANGE_POLICY``: it is NaN or lies in [0, +inf], it
+    is +inf only where ``mean_rest`` is 0, and it is NaN only where both
+    means are 0 or either is negative. Stored values are rounded to five
+    decimals, so the checks hold in one direction only: rounding keeps a mean
+    of 0 at 0 and the sign of a negative mean, which can round to -0.0, but
+    it also rounds a small positive mean to 0.
+
+    Returns:
+        A description of the first broken rule, or None.
+    """
+    # One column at a time, so the checks hold no copy of the table.
+    for position, name in enumerate(columns):
+        if name != "fold_change" and not np.isfinite(stats[:, position]).all():
+            return "statistics other than fold_change must all be finite"
+    ratios = stats[:, columns.index("fold_change")]
+    means = stats[:, columns.index("mean")]
+    rest_means = stats[:, columns.index("mean_rest")]
+    if np.any(ratios < 0.0):
+        return "fold_change holds a negative value"
+    if np.any(np.isposinf(ratios) & (rest_means != 0.0)):
+        return "fold_change is +inf where mean_rest is not 0"
+    # The sign bit marks a negative mean and the -0.0 that it can round to.
+    undefined = (
+        ((means == 0.0) & (rest_means == 0.0))
+        | np.signbit(means)
+        | np.signbit(rest_means)
+    )
+    if np.any(np.isnan(ratios) & ~undefined):
+        return (
+            "fold_change is NaN where both means are non-negative and one is positive"
+        )
+    return None
 
 
 def stored_table_bytes(n_features: int) -> int:
@@ -182,8 +230,9 @@ class RankMarkerResult:
             group_id: One of ``group_ids``.
 
         Raises:
-            ValueError: If ``group_id`` is not a group of the result, or a
-                statistic is not finite.
+            ValueError: If ``group_id`` is not a group of the result, a
+                statistic other than ``fold_change`` is not finite, or
+                ``fold_change`` breaks ``MARKER_FOLD_CHANGE_POLICY``.
         """
         rank = self.statistics[:, self._position(group_id)]
         stored = np.empty((rank.shape[0], len(MARKER_STAT_COLUMNS)), dtype=np.float64)
@@ -191,8 +240,9 @@ class RankMarkerResult:
         p_values = 2.0 * ndtr(-np.abs(rank[:, _P_VALUE]))
         stored[:, _P_VALUE] = p_values
         stored[:, -1] = adjust_pvalues(p_values, "fdr_bh")
-        if not np.isfinite(stored).all():
-            raise ValueError("Marker statistics must all be finite")
+        violation = _statistics_violation(stored, MARKER_STAT_COLUMNS)
+        if violation is not None:
+            raise ValueError(f"Marker {violation}")
         return stored
 
     def table(self, group_id: Any, feature_names: np.ndarray) -> pd.DataFrame:
@@ -274,6 +324,18 @@ def _canonical_slot(
     """Validate slot metadata and return stat columns and feature indices."""
     if "feature_index" not in slot_group:
         raise ValueError("Canonical marker tables require feature_index and stats")
+    if "fold_change_policy" not in slot_group.attrs:
+        raise ValueError(
+            "Marker table records no fold_change_policy metadata: an earlier "
+            "Scarf release wrote it, and its fold_change column holds that "
+            "release's sentinels, 100.1 for a feature absent from the other "
+            "cells and 0 for a feature absent from every cell. Recompute it "
+            "from the same clustering and feature selection with "
+            "DataStore.run_marker_search; for a pipeline run, "
+            'ds.run_marker_search(run["clusters"], '
+            'features=run["feature_universe"]). A saved agent result keeps '
+            "the table that it read, so run that analysis again"
+        )
     for name, expected in _MARKER_METADATA.items():
         if name not in slot_group.attrs:
             raise ValueError(f"Canonical marker tables require {name} metadata")
@@ -319,8 +381,9 @@ def _canonical_cluster_stats(
         raise ValueError("Canonical marker stats must use a floating dtype")
     if not np.isfinite(stats[:, columns.index("p_value_adjusted")]).all():
         raise ValueError("Canonical marker p_value_adjusted values must all be finite")
-    if not np.isfinite(stats).all():
-        raise ValueError("Canonical marker statistics must all be finite")
+    violation = _statistics_violation(stats, columns)
+    if violation is not None:
+        raise ValueError(f"Canonical marker {violation}")
     return stats
 
 

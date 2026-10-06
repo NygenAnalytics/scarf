@@ -54,13 +54,14 @@ _PUBLIC_CLASS_METHODS = {
         "dump",
     ),
 }
+# Every importer takes the keyword ``overwrite``.
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "dcd79c317ee80f91a6990bb2139290f098833400c7ff4db24c1b9f85c6b2f1fa",
-    H5adToZarr: "11ef319e746a2750d99d04d778a2c4cc2de9092d44fae2d9b203ec5e747a1d11",
-    SparseToZarr: "3b376a0b1f1888596d352fb32ea94d2c422ad7977f36f7e8c7893e2dc345171e",
-    CSVtoZarr: "8e1f46c23a50c6cb52a89df4a87fd4b8911c30527244856c20c448a50931d1dd",
+    CrToZarr: "52d442411d74637bc13ef200681f3a73ba5e32b085c1313332327eb9106823d9",
+    H5adToZarr: "af557d28c7a99d860acfeed7a95158a7c3ca07a24db85702acf087cbcbeaf8a3",
+    SparseToZarr: "93e2b19b931a3fb26315a5bcc32ed45da2633cfa38ae177c832e37236e09b1e2",
+    CSVtoZarr: "b005b7bd9fccc8d0c1ad987954f7f7d6de909987b42d577f4f416ccd9b5835de",
     SubsetZarr: "76fd6326d68a545065ce07fed9411ec7f02d3f080041db627c3623bda5fe4ed8",
-    SeuratToZarr: "f004e56b22727b4d229824a37b8b877655a650c8b4bab235693a4449acaf7111",
+    SeuratToZarr: "ae7e55e7c2e34d71b6fc1755babb987f2957e05cfd255d026327b989e1ec0c6d",
 }
 _MODULE_FUNCTIONS = (
     "create_zarr_count_assay",
@@ -72,8 +73,9 @@ _MODULE_FUNCTIONS = (
     "to_mtx",
     "write_renorm_subset_to_zarr",
 )
+# to_h5ad takes the keyword-only matrix="raw" or "normed" beside run.
 _MODULE_SIGNATURE_DIGEST = (
-    "878ad602360bfdcbda3bd69cbfa8138ef20ee8a3b77e0324f73da7836e17f39f"
+    "d2b52149156853c361e7a78b8bbeaee30788df456db0b32da6acae49677a1076"
 )
 
 

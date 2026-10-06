@@ -1,3 +1,4 @@
+import re
 import warnings
 from typing import Any
 
@@ -13,14 +14,54 @@ from scarf.storage.budget import ResourceBudget
 from tests.store_probes import RecordingStore
 
 
-@pytest.mark.parametrize("totals", [[1], [-1, 1], [np.nan, 1], [np.inf, 1]])
-def test_reference_normalization_rejects_invalid_totals(totals):
+@pytest.mark.parametrize(
+    ("totals", "message"),
+    [
+        ([1], "Normalization totals must hold one value per row of counts"),
+        ([-1, 1], "Query assay 'RNA_nCounts' holds negative or non-finite totals"),
+        ([np.nan, 1], "Query assay 'RNA_nCounts' holds negative or non-finite totals"),
+        ([np.inf, 1], "Query assay 'RNA_nCounts' holds negative or non-finite totals"),
+    ],
+)
+def test_reference_normalization_rejects_invalid_totals(totals, message):
     counts = np.array([[1, 2], [3, 4]], dtype=np.uint16)
-    with pytest.raises(ValueError, match="totals must be finite and non-negative"):
+    with pytest.raises(ValueError, match=re.escape(message)):
         normalize_reference_counts(
-            counts, size_factor=100, log_transform=False, denominator=np.array(totals)
+            counts,
+            size_factor=100,
+            log_transform=False,
+            source="Query assay 'RNA_nCounts'",
+            denominator=np.array(totals),
         )
     np.testing.assert_array_equal(counts, [[1, 2], [3, 4]])
+
+
+def test_reference_normalization_divides_by_the_library_size_divisors() -> None:
+    counts = np.array([[1, 2], [0, 0], [3.5, 0.25]], dtype=np.float32)
+    totals = np.array([3.0, 0.0, 3.75])
+    expected = 100 * counts.astype(np.float64) / np.array([[3.0], [1.0], [3.75]])
+
+    for denominator in (totals, None):
+        normalized = normalize_reference_counts(
+            counts,
+            size_factor=100,
+            log_transform=False,
+            source="Query assay 'RNA_nCounts'",
+            denominator=denominator,
+        )
+        # A row without counts normalizes to zeros, never NaN.
+        np.testing.assert_array_equal(normalized, expected)
+    np.testing.assert_array_equal(totals, [3.0, 0.0, 3.75])
+    with pytest.raises(
+        ValueError,
+        match="The reference-feature subset of query assay 'RNA' holds negative",
+    ):
+        normalize_reference_counts(
+            -counts,
+            size_factor=100,
+            log_transform=False,
+            source="The reference-feature subset of query assay 'RNA'",
+        )
 
 
 class _MemoryMetadata:
@@ -229,13 +270,15 @@ def test_aligned_feature_stream_renormalizes_over_matched_reference_features() -
         dtype=np.uint32,
     )
     assay, _, _ = _query_assay(counts, ["a", "b", "extra"])
-    with pytest.warns(UserWarning, match=r"measures only 66\.7% of them"):
+    with pytest.warns(UserWarning, match=r"measures only 66\.7% of them") as record:
         stream = _stream(
             assay,
             reference_ids=np.array(["b", "missing", "a"]),
             means=np.array([0.0, 11.0, 0.0]),
             normalization=_normalization(size_factor=10, renormalize_subset=True),
         )
+    # The warning points at the line that called Scarf.
+    assert record[0].filename == __file__
 
     np.testing.assert_allclose(
         _collect(stream),
@@ -387,6 +430,18 @@ def test_aligned_feature_stream_reads_read_only_counts_without_zarr_writes() -> 
     assert all(operation == "get" for operation, _ in store.ops)
     assert all("normed__" not in key for _, key in store.ops)
     assert list(assay.z.array_keys()) == ["counts"]
+
+
+def test_aligned_feature_stream_rejects_complex_query_counts() -> None:
+    with warnings.catch_warnings():
+        # The helper's float totals drop the imaginary parts.
+        warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+        assay, _, _ = _query_assay(
+            np.array([[1, 2]], dtype=np.complex64), ["a", "b"], chunks=(1, 1)
+        )
+
+    with pytest.raises(TypeError, match="must be real numbers, not complex64"):
+        _stream(assay)
 
 
 @pytest.mark.parametrize("policy", ["intersection", "mean", "", "ERROR"])

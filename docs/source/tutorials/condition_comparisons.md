@@ -122,9 +122,9 @@ if not source_store.exists():
         staged_store.replace(source_store)
 ```
 
-Keep the published cohort without an extra feature-count filter. Mounting puts the new
-selection and test results in a temporary working store while leaving the count matrix
-in its reusable source store.
+Keep the published cohort with `min_features_per_cell=0`, which drops only cells without
+detected features (none here). Mounting puts the new selection and test results in a temporary
+working store while leaving the count matrix in its reusable source store.
 
 ```{code-cell}
 # Open the source without dropping cells before selecting the cohort.

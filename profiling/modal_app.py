@@ -30,6 +30,7 @@ from uuid import uuid4
 
 import modal
 from scarf.storage import ArtifactRef
+from scarf.storage.stores import zarr_location_has_content
 
 from profiling.config import (
     ALL_STAGE_CHOICES,
@@ -69,10 +70,12 @@ from profiling.modal_support import (
 from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
     ObjectDownload,
+    delete_prefix,
     download_file,
     object_exists,
     object_size,
     put_json_if_absent,
+    storage_options,
     upload_file,
 )
 from profiling.results import (
@@ -169,9 +172,31 @@ def _stage_context(
 
 
 def _store_has_content(storeUri: str) -> bool:
-    if storeUri.startswith("s3://"):
-        return object_exists(f"{storeUri}/zarr.json")
-    return (Path(storeUri.removeprefix("file://")) / "zarr.json").exists()
+    """Return whether the createStore destination holds any key or local path."""
+    return zarr_location_has_content(
+        storeUri, storage_options=storage_options(storeUri)
+    )
+
+
+def _delete_forced_store(config: ProfilingConfig, nRows: int, storeUri: str) -> None:
+    """Delete the store that a forced createStore replaces.
+
+    Writers create a store only at an empty destination and never replace one
+    that a DataStore has opened, as initializeStore does, so a forced
+    createStore deletes the store itself instead of relying on the import to
+    replace it.
+    """
+    print(
+        "[createStore] force: deleting any existing store of "
+        f"runTag={config.runTag!r} size={nRows} at {storeUri}",
+        flush=True,
+    )
+    deleted = delete_prefix(storeUri)
+    print(
+        f"[createStore] force: deleted {deleted.objectCount} objects "
+        f"({deleted.totalBytes} bytes) of runTag={config.runTag!r} size={nRows}",
+        flush=True,
+    )
 
 
 def _dataset_fields(
@@ -443,7 +468,9 @@ def run_stage_job(
     """Run one stage of the run over ``stages`` (default: the configured stages).
 
     A create-only claim per runTag, size, and stage keeps a second job off the
-    same stage, and a runTag held by an e2e funnel is refused.
+    same stage, and a runTag held by an e2e funnel is refused. createStore
+    refuses a destination that holds anything before it downloads the H5AD;
+    a forced createStore deletes the store first instead.
     """
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
@@ -475,6 +502,10 @@ def run_stage_job(
         try:
             local_h5ad: Path | None = None
             if stage == "createStore":
+                if force:
+                    # Deleted before the download, so a failure is recorded
+                    # as this stage's result before any expensive work.
+                    _delete_forced_store(config, nRows, store_uri)
                 local_h5ad = work / f"{nRows}.h5ad"
                 download = download_file(config.datasetUri(nRows), local_h5ad)
 
@@ -943,7 +974,8 @@ def main(*arg_list: str) -> None:
         action="store_true",
         help=(
             "Recompute an existing targeted stage, invalidate reusable artifacts, "
-            "and overwrite its stage result JSON."
+            "and overwrite its stage result JSON. A forced createStore deletes the "
+            "existing store first."
         ),
     )
     run_parser.add_argument("--allow-reuse", action="store_true", help=allow_reuse_help)

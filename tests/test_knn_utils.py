@@ -732,38 +732,40 @@ def test_build_connectivity_arrays_runs_in_memory():
             [0.25, 0.55, 0.90, 2.00, 4.00],
         ]
     )
+    # umap-learn's weights for these rows with each cell prepended at distance
+    # zero, as fuzzy_simplicial_set computes them for n_neighbors=6.
     expected_weights = np.array(
         [
             1.0,
-            0.9779863,
-            0.92504877,
-            0.8557153,
-            0.7241439,
+            0.9449202,
+            0.8201305,
+            0.6726141,
+            0.43977392,
             1.0,
-            0.97687674,
-            0.92925274,
-            0.85528576,
-            0.7214707,
+            0.9420736,
+            0.8293171,
+            0.67118084,
+            0.4348761,
             1.0,
-            0.97586185,
-            0.9331116,
-            0.8548864,
-            0.7190224,
+            0.93945545,
+            0.8378171,
+            0.669816,
+            0.43035665,
             1.0,
-            0.97493076,
-            0.93666923,
-            0.8545199,
-            0.71678144,
+            0.93703866,
+            0.84570956,
+            0.668519,
+            0.42617577,
             1.0,
-            0.9740712,
-            0.9399542,
-            0.85416996,
-            0.71470064,
+            0.93480074,
+            0.85306203,
+            0.6672895,
+            0.422301,
             1.0,
-            0.973276,
-            0.9429993,
-            0.8538406,
-            0.7127714,
+            0.93272024,
+            0.8599265,
+            0.6661159,
+            0.41868982,
         ],
         dtype=np.float32,
     )
@@ -790,13 +792,14 @@ def test_build_connectivity_arrays_runs_in_memory():
         ).astype(np.uint32),
     )
     np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
-    # The UMAP kernel: the nearest neighbor (rho) gets weight one, the others
-    # exp(-(d - rho) / sigma) with one sigma per cell chosen so that they sum
-    # to log2(k) * bandwidth.
+    # The UMAP kernel over a row that starts with the cell itself: the nearest
+    # neighbor (rho) gets weight one and the others exp(-(d - rho) / sigma),
+    # with one sigma per cell chosen so that all k weights sum to
+    # log2(k + 1) * bandwidth.
     rows = weights.reshape(n_cells, n_neighbors).astype(np.float64)
     np.testing.assert_array_equal(rows[:, 0], 1.0)
     np.testing.assert_allclose(
-        rows[:, 1:].sum(axis=1), np.log2(n_neighbors) * 1.5, rtol=1e-4
+        rows.sum(axis=1), np.log2(n_neighbors + 1) * 1.5, rtol=1e-4
     )
     sigmas = -(dist[:, 1:] - dist[:, :1]) / np.log(rows[:, 1:])
     np.testing.assert_allclose(
@@ -945,7 +948,7 @@ def test_connectivity_preserves_zero_weight_neighbors():
     )
 
     expected = np.tile(
-        np.array([1.0, 1.0, 1.0, 0.9512299, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 0.94176507, 0.0], dtype=np.float32),
         n_cells,
     )
     np.testing.assert_array_equal(
@@ -953,6 +956,44 @@ def test_connectivity_preserves_zero_weight_neighbors():
         np.column_stack((np.repeat(np.arange(n_cells), n_neighbors), indices.ravel())),
     )
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.slow
+def test_connectivity_matches_umap_fuzzy_simplicial_set():
+    from umap.umap_ import fuzzy_simplicial_set
+
+    n_cells, k = 500, 11
+    coordinates = np.random.default_rng(0).normal(size=(n_cells, 8))
+    squared = ((coordinates[:, None, :] - coordinates[None, :, :]) ** 2).sum(axis=2)
+    # umap-learn's KNN rows start with the cell itself at distance zero.
+    with_self = np.argsort(squared, axis=1, kind="stable")[:, : k + 1]
+    np.testing.assert_array_equal(with_self[:, 0], np.arange(n_cells))
+    distances = np.sqrt(np.take_along_axis(squared, with_self, axis=1)).astype(
+        np.float32
+    )
+    expected, _sigmas, _rhos = fuzzy_simplicial_set(
+        coordinates,
+        n_neighbors=k + 1,
+        random_state=None,
+        metric="euclidean",
+        knn_indices=with_self,
+        knn_dists=distances,
+        local_connectivity=1.0,
+        apply_set_operations=False,
+    )
+
+    # Scarf's rows hold the k other cells only.
+    edges, weights = build_connectivity_arrays(
+        with_self[:, 1:],
+        distances[:, 1:],
+        local_connectivity=1.0,
+        bandwidth=1.0,
+    )
+
+    observed = coo_matrix(
+        (weights, (edges[:, 0], edges[:, 1])), shape=(n_cells, n_cells)
+    )
+    np.testing.assert_array_equal(observed.toarray(), expected.toarray())
 
 
 def test_take_nearest_per_row_handles_rows_that_lost_zero_weight_edges():

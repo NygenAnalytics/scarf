@@ -280,15 +280,67 @@ def test_stage_job_refuses_a_run_tag_held_by_a_funnel(
     assert not [key for key in keys if key.endswith(".claim.json")]
 
 
+def _keys(object_store, prefix: str = "") -> list[str]:
+    return sorted(
+        item["path"]
+        for batch in object_store.list()
+        for item in batch
+        if item["path"].startswith(prefix)
+    )
+
+
+_GROUP_DOCUMENT = b'{"zarr_format": 3, "node_type": "group", "attributes": {}}'
+
+
+def _probe_object_store(monkeypatch, object_store) -> None:
+    """Let the content check of createStore read the fake bucket."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import MemoryStore as ZarrMemoryStore
+
+    options = {"endpoint": "https://r2.invalid"}
+
+    def make_store(location, storage_options=None, read_only=False):
+        # The probe reads the bucket with the R2 options of the store URI.
+        assert storage_options == options
+        prefix = urlsplit(location).path.strip("/")
+        start = f"{prefix}/" if prefix else ""
+        return ZarrMemoryStore(
+            {
+                key[len(start) :]: default_buffer_prototype().buffer.from_bytes(
+                    bytes(object_store.get(key).bytes())
+                )
+                for key in _keys(object_store, start)
+            }
+        )
+
+    monkeypatch.setattr("scarf.storage.stores.make_store", make_store)
+    monkeypatch.setattr(modal_app, "storage_options", lambda _uri: options)
+
+
+@pytest.mark.parametrize("root", [True, False], ids=["store", "keys-without-root"])
 def test_create_store_refuses_an_existing_store_unless_forced(
-    object_store, monkeypatch, tmp_path
+    object_store, monkeypatch, tmp_path, root
 ):
     config = _config(runTag="existing-store")
     monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    _probe_object_store(monkeypatch, object_store)
     object_store.put(urlsplit(config.datasetUri(10_000)).path.lstrip("/"), b"h5ad")
-    object_store.put(
-        urlsplit(f"{config.storeUri(10_000)}/zarr.json").path.lstrip("/"), b"{}"
-    )
+    store_key = urlsplit(config.storeUri(10_000)).path.lstrip("/")
+    other_size_key = urlsplit(config.storeUri(100_000)).path.lstrip("/")
+    for key in (
+        f"{store_key}/zarr.json" if root else f"{store_key}/RNA/c/0",
+        f"{store_key}/RNA/zarr.json",
+        f"{other_size_key}/zarr.json",
+    ):
+        object_store.put(key, _GROUP_DOCUMENT)
+    store_at_download = []
+    real_download = modal_app.download_file
+
+    def download(uri, destination):
+        store_at_download.append(_keys(object_store, f"{store_key}/"))
+        return real_download(uri, destination)
+
+    monkeypatch.setattr(modal_app, "download_file", download)
     runs = []
     monkeypatch.setattr(
         modal_app,
@@ -298,13 +350,54 @@ def test_create_store_refuses_an_existing_store_unless_forced(
 
     with pytest.raises(FileExistsError, match="would replace the existing store"):
         _run_stage_job(config, "createStore", "unforced")
-    assert runs == []
+    # The refusal comes before the download and leaves the store untouched.
+    assert (store_at_download, runs) == ([], [])
+    assert len(_keys(object_store, f"{store_key}/")) == 2
 
     payload = _run_stage_job(config, "createStore", "forced", True)
+    # The forced run deleted the store before downloading the H5AD.
+    assert store_at_download == [[]]
     assert runs and runs[0]["invalidateCache"] is True
+    assert payload["status"] == "ok"
     assert payload["datasetUri"] == config.datasetUri(10_000)
     assert payload["datasetBytes"] == 4
     assert payload["datasetETag"]
+    assert _keys(object_store, f"{other_size_key}/") == [f"{other_size_key}/zarr.json"]
+
+
+def test_forced_create_store_records_a_failed_deletion_before_downloading(
+    object_store, monkeypatch, tmp_path
+):
+    config = _config(runTag="failed-deletion")
+    monkeypatch.setattr(modal_app, "_WORK", tmp_path)
+    r2.put_json(
+        config.resultUri(10_000, "createStore"),
+        {"submissionId": "previous", "status": "ok"},
+    )
+
+    def refuse(_uri):
+        raise RuntimeError("deletion refused")
+
+    monkeypatch.setattr(modal_app, "delete_prefix", refuse)
+    monkeypatch.setattr(
+        modal_app,
+        "download_file",
+        lambda *_args, **_kwargs: pytest.fail("a failed deletion must stop the run"),
+    )
+    monkeypatch.setattr(
+        modal_app,
+        "run_stage",
+        lambda *_args, **_kwargs: pytest.fail("a failed deletion must stop the run"),
+    )
+
+    payload = _run_stage_job(config, "createStore", "forced", True)
+
+    assert (payload["status"], payload["error"]) == (
+        "error",
+        "RuntimeError: deletion refused",
+    )
+    # The failure replaces the result that described the deleted store.
+    assert results.load_result(config, 10_000, "createStore") == payload
 
 
 def test_stage_job_refuses_an_override_for_non_consume_stages(

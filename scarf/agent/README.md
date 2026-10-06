@@ -82,7 +82,21 @@ Reference text is frozen into evidence with content hashes. PDF parsing, web
 retrieval, and automatic bibliography lookup are outside the procedure. Context,
 references, and metadata values are treated as evidence rather than instructions.
 
-The default `cellKey` is `I`. It must be a complete boolean selection. Supply
+The default `cellKey` is `I`. It must be a complete boolean selection. On a
+merged store whose RNA assay measured only some cells, its membership column
+`<assay>_I` is False for the others, whose zero counts are no measurement. Every
+stage, the QC flags included, reads the assay over the cells of `cellKey`, so
+source inspection stops with a `needsInput` question for `cellKey` before any
+model call when the assay did not measure some of them. Supply a boolean column
+that is True only for the cells of `I` that the assay measured, written once on a
+writable `DataStore`:
+
+```python
+ds.cells.insert("RNA_measured", ds.cells.fetch_all("I") & ds.cells.fetch_all("RNA_I"))
+```
+
+and pass `AnalysisConfig(cellKey="RNA_measured")`. The membership column alone
+also holds cells that a filter removed from `I`. Supply
 `assay` explicitly if the store contains multiple RNA assays. The procedure needs
 at least four retained cells and three eligible features; the configured PCA rank
 and neighbor count must also be feasible for the actual data. Set smaller values
@@ -509,7 +523,10 @@ missing new evidence is labelled not recorded, and a presentation-only alias rea
 the old `markerCoherence` value as the same marker-support definition. Saved JSON
 is not migrated or rewritten. Changed procedure identities require a new run for
 execution or semantic replay; reading results and regenerating reports remains
-available, and numerical export still verifies the source and exact artifacts.
+available, and numerical export still verifies the source and exact artifacts. Marker tables
+of analyses saved before Scarf 1.0.0 are the exception: their `fold_change` column held
+sentinels, so marker reads, exports, and marker plots of such an analysis raise and ask for a
+new analysis.
 
 An `Observed source metadata:` JSON summary in supplied context is presented as
 readable field summaries and expandable category counts, preserving the
@@ -566,10 +583,12 @@ can be used for coloring through the existing plotting accessor.
 Export requires a new directory outside the numerical store. It writes
 `summary.json`, `clusters.csv`, `umap.csv`, `markers.csv`, and `annotations.csv`.
 Cluster and UMAP CSV files share the frozen selected-cell order and explicit cell
-IDs. Annotation records are checked against the final clustering. Export does not
-rerun numerical stages or contact a model. Files are published atomically one at
-a time; an interrupted export can leave a partial directory, so use a new export
-directory for a fresh attempt.
+IDs. `markers.csv` holds every marker statistic; its `fold_change` is `inf` for a
+gene that no other cell expresses and empty where no cell expresses it, which
+`pandas.read_csv` reads back as `inf` and NaN. Annotation records are checked
+against the final clustering. Export does not rerun numerical stages or contact a
+model. Files are published atomically one at a time; an interrupted export can
+leave a partial directory, so use a new export directory for a fresh attempt.
 
 ### Side effects and boundaries
 

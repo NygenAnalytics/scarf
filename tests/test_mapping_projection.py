@@ -622,6 +622,36 @@ def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort()
     _assert_aborted(third)
 
 
+def test_projection_writer_never_deletes_once_publication_is_issued(
+    monkeypatch,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+    writer.write_block(0, *_blocks())
+    original = zarr.Group.update_attributes
+
+    def interrupted(group: zarr.Group, attributes: dict) -> zarr.Group:
+        if attributes.get("complete") is True:
+            # Ctrl-C stops the caller while Zarr's I/O thread still runs the write.
+            raise KeyboardInterrupt
+        return original(group, attributes)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(zarr.Group, "update_attributes", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            writer.finish(_diagnostics())
+
+    # run_mapping aborts only a writer that did not finish, and the writer
+    # finished before its publication write started.
+    assert writer.finished
+    with pytest.raises(RuntimeError, match="cannot be aborted"):
+        writer.abort()
+    status = inspect_artifact(root, plan.ref)
+    assert status.exists and not status.complete
+
+
 def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
     root, cell_selection, feature_selection = _query_inputs()
     reference, _ = _mapping_reference()

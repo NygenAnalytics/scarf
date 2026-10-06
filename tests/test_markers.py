@@ -112,7 +112,9 @@ def _reference_calc(
     s2 = (vdf > 0).groupby(groups).sum().reindex(group_set)
     e = s2 / g
     e_o = (s2.sum() - s2) / g_o
-    fc = (m / m_o).fillna(0)
+    # A ratio of non-negative means: +inf when only the group mean is
+    # positive, NaN when both means are 0 or either is negative.
+    fc = (m / m_o).where((m >= 0) & (m_o >= 0))
     pvals = pd.DataFrame(
         np.vstack(
             [
@@ -143,6 +145,9 @@ def test_batch_stats_matches_pandas_reference():
     groups = rng.integers(1, 4, size=n_cells)
     # Group 1 expresses four genes more, so some p-values are small.
     data[groups == 1, :4] += rng.poisson(1.5, size=((groups == 1).sum(), 4))
+    # Only group 1 expresses gene 14, and no cell expresses gene 15.
+    data[:, 14] = np.where(groups == 1, rng.poisson(2.0, size=n_cells) + 1, 0)
+    data[:, 15] = 0.0
     group_set = np.array(sorted(set(groups)))
     idx_map = {v: i for i, v in enumerate(group_set)}
     int_indices = np.array([idx_map[x] for x in groups])
@@ -153,12 +158,14 @@ def test_batch_stats_matches_pandas_reference():
 
     # score, mean, mean_rest, frac_exp, frac_exp_rest
     np.testing.assert_allclose(got[:, :, :5], ref[:, :, :5], rtol=1e-12, atol=1e-15)
-    # fold_change agrees where the reference is finite
-    finite = np.isfinite(ref[:, :, 5])
-    np.testing.assert_allclose(got[:, :, 5][finite], ref[:, :, 5][finite], rtol=1e-12)
-    # two-sided p-values, small ones included
-    assert ref[:, :, 6].min() < 1e-3
-    np.testing.assert_allclose(_p_values(got), ref[:, :, 6], rtol=1e-9)
+    # fold_change agrees everywhere, +inf and NaN included.
+    assert np.isposinf(ref[14, 0, 5]) and np.isnan(ref[15, :, 5]).all()
+    np.testing.assert_allclose(got[:, :, 5], ref[:, :, 5], rtol=1e-12)
+    # Two-sided p-values, small ones included. SciPy gives NaN for gene 15,
+    # whose ranks do not vary, where the kernel tests nothing and gives 1.
+    assert ref[:15, :, 6].min() < 1e-3
+    np.testing.assert_allclose(_p_values(got)[:15], ref[:15, :, 6], rtol=1e-9)
+    np.testing.assert_array_equal(_p_values(got)[15], 1.0)
 
 
 def test_batch_stats_preserves_float64_near_ties_against_scipy():
@@ -325,7 +332,7 @@ def test_mannwhitneyu_from_ranks_returns_one_for_zero_variance():
     np.testing.assert_array_equal(p_values["constant"], [1.0, 1.0])
 
 
-def test_batch_stats_distinguishes_zero_fold_change_from_zero_rest_sentinel():
+def test_batch_stats_distinguishes_zero_fold_change_from_undefined_ratios():
     data = np.array(
         [
             [0.0, 2.0, 1.0],
@@ -341,11 +348,41 @@ def test_batch_stats_distinguishes_zero_fold_change_from_zero_rest_sentinel():
         n_total=4,
     )
 
-    assert np.array_equal(stats[0, :, 5], [0.0, 0.0])
-    assert stats[1, 0, 5] == pytest.approx(100.1)
-    assert stats[1, 1, 5] == pytest.approx(0.0)
+    # No cell expresses feature 0, so neither group has a ratio.
+    assert np.isnan(stats[0, :, 5]).all()
+    # Only group 0 expresses feature 1: infinite there, a true 0 in group 1.
+    assert stats[1, 0, 5] == np.inf
+    assert stats[1, 1, 5] == 0.0
     assert np.array_equal(stats[2, :, 5], [1.0, 1.0])
     assert np.array_equal(_p_values(stats)[0], [1.0, 1.0])
+
+
+def test_exclusive_marker_ranks_above_every_finite_fold_change() -> None:
+    # Only group a expresses the faint feature, the ratio feature is 200 times
+    # higher in group a, and no cell expresses the absent feature.
+    data = np.array(
+        [
+            [0.01, 200.0, 0.0],
+            [0.01, 200.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
+    codes = np.array([0, 0, 1, 1])
+    result = RankMarkerResult(
+        group_ids=np.array(["a", "b"]),
+        group_sizes=np.bincount(codes),
+        feature_index=np.arange(3),
+        statistics=_batch_stats(data, codes, np.bincount(codes), len(codes)),
+    )
+    table = result.table("a", np.array(["faint", "ratio", "absent"]))
+    by_fold_change = table.sort_values("fold_change", ascending=False)
+
+    # The 100.1 sentinel of earlier releases ranked the faint marker second.
+    assert by_fold_change["feature_name"].tolist() == ["faint", "ratio", "absent"]
+    assert by_fold_change["fold_change"].iloc[0] == np.inf
+    assert by_fold_change["fold_change"].iloc[1] == 200.0
+    assert np.isnan(by_fold_change["fold_change"].iloc[2])
 
 
 def test_marker_stats_python_kernel_matches_compiled_kernel():
@@ -378,8 +415,8 @@ def test_marker_stats_python_kernel_matches_compiled_kernel():
     )
 
     np.testing.assert_allclose(python_stats, compiled_stats)
-    assert python_stats[1, 0, 5] == pytest.approx(100.1)
-    assert np.array_equal(python_stats[0, :, 5], [0.0, 0.0, 0.0])
+    assert python_stats[1, 0, 5] == np.inf
+    assert np.isnan(python_stats[0, :, 5]).all()
 
 
 def test_marker_stats_python_kernel_handles_single_cell_population():
@@ -390,12 +427,14 @@ def test_marker_stats_python_kernel_handles_single_cell_population():
         1.0,
     )
 
+    # Without other cells, a feature that the cell does not express has no
+    # ratio, and one that it does express is infinitely enriched.
     np.testing.assert_allclose(
         stats[:, 0, :7],
         np.array(
             [
-                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [1.0, 2.0, 0.0, 1.0, 0.0, 100.1, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, np.nan, 0.0],
+                [1.0, 2.0, 0.0, 1.0, 0.0, np.inf, 0.0],
             ]
         ),
     )
@@ -403,16 +442,46 @@ def test_marker_stats_python_kernel_handles_single_cell_population():
 
 
 @pytest.mark.parametrize(
-    ("sums", "detected", "ranks", "dense_ranks", "sizes", "n_total", "ties"),
+    (
+        "sums",
+        "detected",
+        "ranks",
+        "dense_ranks",
+        "sizes",
+        "n_total",
+        "ties",
+        "fold_changes",
+    ),
     [
-        ([3, 0, 0], [2, 0, 0], [9, 4, 8], [5, 2, 4], [2, 2, 2], 6, 6),
+        (
+            [3, 0, 0],
+            [2, 0, 0],
+            [9, 4, 8],
+            [5, 2, 4],
+            [2, 2, 2],
+            6,
+            6,
+            [np.inf, 0.0, 0.0],
+        ),
         # An empty group and an empty complement, with no ranks or ties.
-        ([0, 0], [0, 0], [0, 0], [0, 0], [0, 1], 1, 0),
+        ([0, 0], [0, 0], [0, 0], [0, 0], [0, 1], 1, 0, [np.nan, np.nan]),
+        # Signed values: group 0 and the complement of group 2 have
+        # negative means.
+        (
+            [-4, 2, 6],
+            [0, 2, 2],
+            [3, 7, 11],
+            [2, 4, 6],
+            [2, 2, 2],
+            6,
+            0,
+            [np.nan, 2.0, np.nan],
+        ),
     ],
-    ids=["groups", "empty"],
+    ids=["groups", "empty", "signed"],
 )
 def test_group_statistics_python_kernel_matches_compiled_kernel(
-    sums, detected, ranks, dense_ranks, sizes, n_total, ties
+    sums, detected, ranks, dense_ranks, sizes, n_total, ties, fold_changes
 ) -> None:
     from scarf.features.markers.rank import _write_group_statistics
 
@@ -427,7 +496,10 @@ def test_group_statistics_python_kernel_matches_compiled_kernel(
         outcomes.append(out)
 
     np.testing.assert_array_equal(outcomes[0], outcomes[1])
-    assert np.isfinite(outcomes[0][:, :7]).all()
+    # Every statistic but the fold change and the AUC of an empty group is
+    # finite.
+    assert np.isfinite(outcomes[0][:, [0, 1, 2, 3, 4, 6]]).all()
+    np.testing.assert_array_equal(outcomes[0][:, 5], fold_changes)
 
 
 def test_radix_argsort_python_kernel_sorts_like_a_stable_sort() -> None:
@@ -584,6 +656,13 @@ def test_marker_search_on_a_read_only_store_reuses_but_never_searches(
 
     assert (
         read_only.run_marker_search(saved, from_assay="RNA", features=features)
+        == marker
+    )
+    # A flag of None means its default, as an omitted flag does.
+    assert (
+        read_only.run_marker_search(
+            saved, from_assay="RNA", features=features, log_transform=None
+        )
         == marker
     )
     with pytest.raises(PermissionError, match="run_marker_search requires"):
@@ -995,7 +1074,9 @@ def _feature_batch(columns: dict[str, list[float]]):
 def test_find_markers_by_regression_handles_expression_threshold():
     class Assay:
         @staticmethod
-        def iter_normed_feature_wise(**_kwargs):
+        def iter_normed_feature_wise(**kwargs):
+            # A flag of None reaches the assay as its default.
+            assert kwargs["log_transform"] is False
             yield _feature_batch(
                 {
                     "correlated": [0.0, 1.0, 2.0, 3.0],
@@ -1011,6 +1092,7 @@ def test_find_markers_by_regression_handles_expression_threshold():
         feat_idx=np.arange(4),
         regressor=np.arange(4),
         min_cells=2,
+        log_transform=None,
     )
 
     assert result.loc["correlated", "r_value"] == pytest.approx(1.0)
@@ -1056,19 +1138,49 @@ def test_regression_r_batch_matches_py_func():
     np.testing.assert_array_equal(compiled[1], python[1])
 
 
+# Feature scales whose values stay exact: integer counts below 2**14 times any
+# of these powers of two are exact, subnormal ones included.
+_FEATURE_SCALES = [2.0**600, 2.0**-40, 2.0**-60, 2.0**-600, 2.0**-1060]
+
+
+def _scale_id(scale: float) -> str:
+    return f"2**{int(np.log2(scale))}"
+
+
 def test_regression_r_does_not_depend_on_the_value_scale():
     regressor = np.linspace(0.0, 1.0, 40)
-    values = np.random.default_rng(4).poisson(0.8, size=40) + 3.0 * regressor
+    rng = np.random.default_rng(4)
+    values = (rng.poisson(0.8, size=40) + np.arange(40) // 4).astype(np.float64)
     # Power-of-two scales change no rounding, so r must not change at all.
-    data = np.column_stack([values, values * 2.0**600, values * 2.0**-40])
+    data = np.column_stack([values, *(values * scale for scale in _FEATURE_SCALES)])
     x_centered = regressor - regressor.mean()
     ssxm = float(np.dot(x_centered, x_centered) / regressor.size)
     for kernel in (_regression_r_batch, _regression_r_batch.py_func):
         r_vals, status = kernel(data, x_centered, ssxm, 1, float(np.finfo(float).eps))
 
-        np.testing.assert_array_equal(status, [0, 0, 0])
-        np.testing.assert_array_equal(r_vals, np.full(3, r_vals[0]))
+        np.testing.assert_array_equal(status, np.zeros(data.shape[1]))
+        np.testing.assert_array_equal(r_vals, np.full(data.shape[1], r_vals[0]))
         assert r_vals[0] == pytest.approx(linregress(regressor, values).rvalue)
+    # scipy's r does not change at a scale where its own sums stay normal.
+    tiny = linregress(regressor, values * 2.0**-60).rvalue
+    assert tiny == pytest.approx(linregress(regressor, values).rvalue, rel=1e-12)
+
+
+def test_regression_treats_features_constant_within_rounding_as_untested():
+    regressor = np.linspace(0.0, 1.0, 6)
+    eps = float(np.finfo(float).eps)
+    # A spread of one unit in the last place is no variation, at any scale.
+    near_constant = np.array([1.0, 1.0 + eps, 1.0, 1.0 + eps, 1.0, 1.0])
+    data = np.column_stack(
+        [near_constant, near_constant * 2.0**-60, near_constant * 2.0**600]
+    )
+    x_centered = regressor - regressor.mean()
+    ssxm = float(np.dot(x_centered, x_centered) / regressor.size)
+    for kernel in (_regression_r_batch, _regression_r_batch.py_func):
+        r_vals, status = kernel(data, x_centered, ssxm, 1, eps)
+
+        np.testing.assert_array_equal(status, np.full(3, _REG_SENTINEL))
+        np.testing.assert_array_equal(r_vals, np.zeros(3))
 
 
 @pytest.mark.parametrize(
@@ -1077,16 +1189,20 @@ def test_regression_r_does_not_depend_on_the_value_scale():
 def test_find_markers_by_regression_does_not_depend_on_the_regressor_scale(scale):
     values = np.array([0.0, 1.0, 3.0, 2.0, 5.0])
     regressor = np.arange(5.0)
+    features = {"values": values} | {
+        f"scaled_{index}": values * feature_scale
+        for index, feature_scale in enumerate(_FEATURE_SCALES)
+    }
 
     class Assay:
         @staticmethod
         def iter_normed_feature_wise(**_kwargs):
-            yield _feature_batch({"values": values, "scaled": values * 2.0**600})
+            yield _feature_batch(features)
 
     result = find_markers_by_regression(
         Assay(),
         cell_idx=np.arange(5),
-        feat_idx=np.arange(2),
+        feat_idx=np.arange(len(features)),
         regressor=regressor * scale,
         min_cells=1,
     )
@@ -1094,7 +1210,36 @@ def test_find_markers_by_regression_does_not_depend_on_the_regressor_scale(scale
     expected = linregress(regressor, values)
     assert result.loc["values", "r_value"] == pytest.approx(expected.rvalue, rel=1e-12)
     assert result.loc["values", "p_value"] == pytest.approx(expected.pvalue, rel=1e-8)
-    np.testing.assert_array_equal(result.loc["scaled"], result.loc["values"])
+    for name in features:
+        np.testing.assert_array_equal(result.loc[name], result.loc["values"])
+
+
+@pytest.mark.parametrize("feature_scale", [1.0, 2.0**-1060], ids=_scale_id)
+@pytest.mark.parametrize("regressor_scale", [1.0, 2.0**-1070], ids=_scale_id)
+def test_two_cell_regression_does_not_depend_on_the_scale(
+    feature_scale, regressor_scale
+):
+    class Assay:
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield _feature_batch(
+                {
+                    "increasing": np.array([1.0, 3.0]) * feature_scale,
+                    "decreasing": np.array([3.0, 1.0]) * feature_scale,
+                    "constant": np.array([3.0, 3.0]) * feature_scale,
+                }
+            )
+
+    result = find_markers_by_regression(
+        Assay(),
+        cell_idx=np.arange(2),
+        feat_idx=np.arange(3),
+        regressor=np.array([1.0, 2.0]) * regressor_scale,
+        min_cells=1,
+    )
+
+    np.testing.assert_array_equal(result["r_value"], [1.0, -1.0, 0.0])
+    assert result["p_value"].isna().all()
 
 
 def test_regression_batch_matches_linregress():
@@ -1108,11 +1253,12 @@ def test_regression_batch_matches_linregress():
             rng.poisson(0.5, size=n_cells).astype(float),
             np.zeros(n_cells),
             np.where(np.arange(n_cells) < 3, 1.0, 0.0),
+            (2.0 * regressor + 3.0) * 2.0**-60,
         ]
     )
     x_centered = regressor - regressor.mean()
     ssxm = float(np.dot(x_centered, x_centered) / n_cells)
-    labels = np.array(["pos", "neg", "sparseish", "constant", "too_sparse"])
+    labels = np.array(["pos", "neg", "sparseish", "constant", "too_sparse", "tiny"])
     r_vals, p_vals, status = _regression_batch_results(
         np.ascontiguousarray(data),
         np.ascontiguousarray(x_centered),
@@ -1123,7 +1269,8 @@ def test_regression_batch_matches_linregress():
     )
     for i, label in enumerate(labels):
         v = data[:, i]
-        if (v > 0).sum() >= 5 and np.ptp(v) > np.finfo(float).eps:
+        # Values that span no more than eps of their magnitude are constant.
+        if (v > 0).sum() >= 5 and np.ptp(v) > np.finfo(float).eps * np.abs(v).max():
             ref = linregress(regressor, v)
             assert r_vals[i] == pytest.approx(ref.rvalue, rel=1e-10, abs=1e-12)
             assert p_vals[i] == pytest.approx(ref.pvalue, rel=1e-8, abs=1e-12)
@@ -1316,11 +1463,13 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
     np.testing.assert_array_equal(results.group_sizes, [2, 2])
     np.testing.assert_array_equal(results.feature_index, [10, 11, 12, 13])
 
-    assert group_a.loc[10, "fold_change"] == pytest.approx(100.1)
-    assert group_a.loc[11, "fold_change"] == pytest.approx(0.0)
+    # Features 10 and 12 are exclusive to one group, and no cell expresses 11.
+    assert group_a.loc[10, "fold_change"] == np.inf
+    assert np.isnan(group_a.loc[11, "fold_change"])
     assert group_a.loc[13, "fold_change"] == pytest.approx(1.0)
-    assert group_b.loc[12, "fold_change"] == pytest.approx(100.1)
-    assert group_b.loc[10, "fold_change"] == pytest.approx(0.0)
+    assert group_b.loc[12, "fold_change"] == np.inf
+    assert group_b.loc[10, "fold_change"] == 0.0
+    assert np.isnan(group_b.loc[11, "fold_change"])
     in_a = np.array([True, True, False, False])
     for feature, column in ((10, 0), (12, 2)):
         expected = mannwhitneyu(
@@ -1796,7 +1945,10 @@ def _make_canonical_marker_slot(columns=None):
     import zarr
     from zarr.storage import MemoryStore
 
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS
+    from scarf.features.markers.table import (
+        MARKER_FOLD_CHANGE_POLICY,
+        MARKER_STAT_COLUMNS,
+    )
 
     if columns is None:
         columns = MARKER_STAT_COLUMNS
@@ -1822,6 +1974,7 @@ def _make_canonical_marker_slot(columns=None):
             "continuity_correction": True,
             "adjustment_method": "fdr_bh",
             "adjustment_scope": "within_group_all_tested_features",
+            "fold_change_policy": MARKER_FOLD_CHANGE_POLICY,
         }
     )
     slot.create_array("feature_index", data=np.array([0, 1], dtype=np.int32))
@@ -1878,16 +2031,116 @@ def test_canonical_marker_reader_rejects_non_finite_statistics():
 
     slot, cluster = _make_canonical_marker_slot()
     stats = np.asarray(cluster["stats"][:])
-    stats[0, MARKER_STAT_COLUMNS.index("fold_change")] = np.inf
+    stats[0, MARKER_STAT_COLUMNS.index("score")] = np.inf
     cluster["stats"][:] = stats
 
-    with pytest.raises(ValueError, match="statistics must all be finite"):
+    with pytest.raises(
+        ValueError, match="statistics other than fold_change must all be finite"
+    ):
         load_marker_table(
             slot,
             cluster,
             np.array(["g0", "g1"]),
             group_id=1,
         )
+
+
+# Stored (mean, mean_rest, fold_change) rows. A negative mean leaves no ratio.
+_ACCEPTED_FOLD_CHANGES = {
+    "negative-mean": (-0.5, 0.25, np.nan),
+    "negative-rest": (0.5, -0.25, np.nan),
+}
+_REJECTED_FOLD_CHANGES = {
+    "negative": ((0.5, 0.5, -1.0), "fold_change holds a negative value"),
+    "infinite-with-rest": (
+        (0.5, 0.25, np.inf),
+        r"fold_change is \+inf where mean_rest is not 0",
+    ),
+    "nan-with-means": (
+        (0.5, 0.25, np.nan),
+        "fold_change is NaN where both means are non-negative and one is positive",
+    ),
+}
+
+
+def _set_fold_change_row(cluster, row: tuple[float, float, float]) -> None:
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
+
+    stats = np.asarray(cluster["stats"][:])
+    for column, value in zip(("mean", "mean_rest", "fold_change"), row, strict=True):
+        stats[0, MARKER_STAT_COLUMNS.index(column)] = value
+    cluster["stats"][:] = stats
+
+
+@pytest.mark.parametrize("case", sorted(_ACCEPTED_FOLD_CHANGES))
+def test_canonical_marker_reader_accepts_fold_changes_of_the_policy(case) -> None:
+    from scarf.features.markers.table import load_marker_table
+
+    slot, cluster = _make_canonical_marker_slot()
+    row = _ACCEPTED_FOLD_CHANGES[case]
+    _set_fold_change_row(cluster, row)
+
+    loaded = load_marker_table(slot, cluster, np.array(["g0", "g1"]), group_id=1)
+    stored = loaded.set_index("feature_index").loc[0, ["mean", "mean_rest"]]
+    assert stored.tolist() == list(row[:2])
+    np.testing.assert_array_equal(
+        loaded.set_index("feature_index").loc[0, "fold_change"], row[2]
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_REJECTED_FOLD_CHANGES))
+def test_canonical_marker_reader_rejects_fold_changes_outside_the_policy(
+    case,
+) -> None:
+    from scarf.features.markers.table import load_marker_table
+
+    slot, cluster = _make_canonical_marker_slot()
+    row, message = _REJECTED_FOLD_CHANGES[case]
+    _set_fold_change_row(cluster, row)
+
+    with pytest.raises(ValueError, match=f"Canonical marker {message}"):
+        load_marker_table(slot, cluster, np.array(["g0", "g1"]), group_id=1)
+
+
+def test_rank_marker_result_refuses_to_store_fold_changes_outside_the_policy() -> None:
+    result = _rank_result()
+    statistics = np.array(result.statistics)
+    row, message = _REJECTED_FOLD_CHANGES["negative"]
+    statistics[0, 0, [1, 2, 5]] = row
+    poisoned = RankMarkerResult(
+        group_ids=result.group_ids,
+        group_sizes=result.group_sizes,
+        feature_index=result.feature_index,
+        statistics=statistics,
+    )
+
+    with pytest.raises(ValueError, match=f"Marker {message}"):
+        poisoned.stored_statistics(1)
+    # The other group's table is unaffected.
+    poisoned.stored_statistics(4)
+
+
+def test_stored_fold_changes_survive_rounding_of_the_means() -> None:
+    result = _rank_result()
+    statistics = np.array(result.statistics)
+    # Means below the rounding unit: a positive mean beside a rest mean of 0,
+    # a ratio over a tiny rest mean, and a tiny negative mean.
+    statistics[:, 0, [1, 2, 5]] = [
+        [1e-7, 0.0, np.inf],
+        [0.4, 1e-7, 4e6],
+        [-1e-7, 0.5, np.nan],
+    ]
+    stored = RankMarkerResult(
+        group_ids=result.group_ids,
+        group_sizes=result.group_sizes,
+        feature_index=result.feature_index,
+        statistics=statistics,
+    ).stored_statistics(1)
+
+    np.testing.assert_array_equal(stored[:, 1], [0.0, 0.4, -0.0])
+    assert np.signbit(stored[2, 1])
+    np.testing.assert_array_equal(stored[:, 2], [0.0, 0.0, 0.5])
+    np.testing.assert_array_equal(stored[:, 5], [np.inf, 4e6, np.nan])
 
 
 def test_canonical_marker_reader_rejects_all_nan_adjusted_values():
@@ -2069,7 +2322,10 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
     corruption,
 ):
     import scarf.features.markers as marker_algorithms
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS
+    from scarf.features.markers.table import (
+        MARKER_FOLD_CHANGE_POLICY,
+        MARKER_STAT_COLUMNS,
+    )
     from scarf.storage.artifacts import artifact_path
 
     location, arguments, old_ref = pbmc_marker_table
@@ -2108,7 +2364,7 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
         del first_group["stats"]
     elif corruption == "stat_values":
         stats = np.asarray(first_group["stats"][:])
-        stats[0, MARKER_STAT_COLUMNS.index("fold_change")] = np.inf
+        stats[0, MARKER_STAT_COLUMNS.index("score")] = np.inf
         first_group["stats"][:] = stats
     else:
         stats = np.asarray(first_group["stats"][:])
@@ -2138,9 +2394,101 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
     assert status.parameters["continuity_correction"] is True
     assert status.parameters["adjustment_method"] == "fdr_bh"
     assert status.parameters["adjustment_scope"] == "within_group_all_tested_features"
+    # The policy is slot metadata; operation revision 2 identifies tables
+    # that follow it.
+    assert "fold_change_policy" not in status.parameters
+    assert (
+        store.zw[artifact_path(new_ref)].attrs["fold_change_policy"]
+        == MARKER_FOLD_CHANGE_POLICY
+    )
+    assert status.revision == 2 and status.is_current
     assert "schema_version" not in status.parameters
     assert "algorithm_version" not in status.parameters
     assert "correction_method" not in status.parameters
+
+
+def _record_as_earlier_release(store: DataStore, saved: ArtifactRef) -> None:
+    """Rewrite a default marker table of the RNA assay as releases before 1.0.0 did.
+
+    Those releases recorded the same inputs and these parameters, with no
+    revision, and wrote no fold-change policy into the slot metadata. They
+    recorded the normalization flags as passed and each omitted one as
+    False, so a default request records the same flags now.
+    """
+    from scarf.storage.artifacts import artifact_path, make_provenance
+
+    group = store.zw[artifact_path(saved)]
+    group.attrs["provenance"] = make_provenance(
+        operation="run_marker_search",
+        parameters={
+            "normalization": {"log_transform": False, "renormalize_subset": False},
+            "normalization_method": {
+                "module": "scarf.assay",
+                "qualname": "norm_lib_size",
+            },
+            "size_factor": store.RNA.sf,
+            "method": "mannwhitneyu",
+            "alternative": "two-sided",
+            "tie_correction": True,
+            "continuity_correction": True,
+            "adjustment_method": "fdr_bh",
+            "adjustment_scope": "within_group_all_tested_features",
+        },
+        inputs=group.attrs["provenance"]["inputs"],
+    )
+    del group.attrs["fold_change_policy"]
+
+
+def test_marker_tables_of_earlier_releases_are_neither_reused_nor_read(
+    marker_table, tmp_path, monkeypatch
+) -> None:
+    import scarf.features.markers as marker_algorithms
+    from scarf.features.markers.table import MARKER_FOLD_CHANGE_POLICY
+    from scarf.plotting.heatmaps import _prepare_marker_heatmap
+    from scarf.storage.artifacts import artifact_path
+
+    store, clusters, features, saved = _saved_marker_table(marker_table, tmp_path)
+    _record_as_earlier_release(store, saved)
+    status = store.inspect_artifact(saved)
+    assert status.complete and status.revision == 1 and not status.is_current
+    assert [entry.revision for entry in status.superseded_by] == [2]
+
+    with pytest.raises(
+        ValueError, match="Recompute it from the same clustering and feature selection"
+    ):
+        store.get_markers(saved)
+    with pytest.raises(
+        ValueError, match="Recompute it from the same clustering and feature selection"
+    ):
+        store.export_markers_to_csv(saved, str(tmp_path / "markers.csv"))
+    assert not (tmp_path / "markers.csv").exists()
+    with pytest.raises(
+        ValueError, match="Recompute it from the same clustering and feature selection"
+    ):
+        _prepare_marker_heatmap(store, marker=saved, topn=3, log_transform=None)
+
+    original = marker_algorithms.find_markers_by_rank
+    calls = 0
+
+    def tracked_marker_search(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        marker_algorithms, "find_markers_by_rank", tracked_marker_search
+    )
+    recomputed = store.run_marker_search(clusters, features=features)
+    assert calls == 1
+    assert recomputed != saved
+    current = store.inspect_artifact(recomputed)
+    assert current.revision == 2 and current.is_current
+    assert "fold_change_policy" not in current.parameters
+    assert (
+        store.zw[artifact_path(recomputed)].attrs["fold_change_policy"]
+        == MARKER_FOLD_CHANGE_POLICY
+    )
+    assert not store.get_markers(recomputed, min_score=-1, min_frac_exp=-1).empty
 
 
 @pytest.mark.parametrize(
@@ -2152,6 +2500,7 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
         ("slot", "continuity_correction"),
         ("slot", "adjustment_method"),
         ("slot", "adjustment_scope"),
+        ("slot", "fold_change_policy"),
         ("slot", "stat_columns"),
         ("cluster", "n_group"),
         ("cluster", "n_reference"),
@@ -2185,6 +2534,7 @@ def test_canonical_marker_reader_rejects_incomplete_metadata(
         ("slot", "continuity_correction", False),
         ("slot", "adjustment_method", "bonferroni"),
         ("slot", "adjustment_scope", "all_groups"),
+        ("slot", "fold_change_policy", "pseudocount_log2_ratio"),
         ("cluster", "n_group", 1),
         ("cluster", "n_reference", 1),
     ],
@@ -2422,12 +2772,21 @@ def test_marker_search_does_not_accept_n_threads(
         )
 
 
-@pytest.mark.parametrize("method_name", ["norm_clr", "norm_dummy", "norm_tf_idf"])
+@pytest.mark.parametrize(
+    ("method_name", "log_transform"),
+    [
+        ("norm_clr", False),
+        ("norm_dummy", False),
+        ("norm_dummy", True),
+        ("norm_tf_idf", False),
+    ],
+)
 def test_dense_adapters_rank_countst_batches_like_the_dense_kernel(
-    monkeypatch, method_name
+    monkeypatch, method_name, log_transform
 ) -> None:
     import scarf.assay.normalization as normalization
     from scarf.storage.budget import ResourceBudget
+    from scarf.storage.execution import execution_report_scope
     from tests.test_feature_stream import _counts_t_with_plan
 
     # A selection of some features of each read group copies their rows.
@@ -2450,6 +2809,12 @@ def test_dense_adapters_rank_countst_batches_like_the_dense_kernel(
             np.testing.assert_array_equal(feat_idx, feature_index)
             return None, (term_totals, len(cell_idx), document_frequency)
 
+        def _normalization_flags(self):
+            # Only norm_dummy values take log_transform.
+            if self.normMethod is normalization.norm_dummy:
+                return frozenset({"log_transform"})
+            return frozenset()
+
     monkeypatch.setattr(marker_search_module, "ATACassay", FakeAssay)
     groups = np.array(["a", "a", "a", "b", "b", "b", "b", "a"])
     result = find_markers_by_rank(
@@ -2458,6 +2823,7 @@ def test_dense_adapters_rank_countst_batches_like_the_dense_kernel(
         cell_idx=np.arange(8),
         feat_idx=feature_index[::-1],
         nthreads=1,
+        log_transform=log_transform,
     )
 
     raw = values[:, feature_index]
@@ -2469,12 +2835,29 @@ def test_dense_adapters_rank_countst_batches_like_the_dense_kernel(
             term_totals,
             normalization.inverse_document_frequency(8, document_frequency),
         )
+    elif log_transform:
+        reference = np.log1p(raw, dtype=np.float64)
     else:
         reference = raw
     codes = (groups == "b").astype(np.int64)
     np.testing.assert_array_equal(
         result.statistics, _batch_stats(reference, codes, np.bincount(codes), 8)
     )
+    if method_name == "norm_dummy" and log_transform:
+        # The search reserves the float64 logarithms of its 8 cells and 4 features.
+        reserved = {}
+        for log in (False, True):
+            with execution_report_scope() as reports:
+                find_markers_by_rank(
+                    FakeAssay(),
+                    groups=groups,
+                    cell_idx=np.arange(8),
+                    feat_idx=feature_index,
+                    nthreads=1,
+                    log_transform=log,
+                )
+            reserved[log] = reports[0].plan.residentBytes
+        assert reserved[True] - reserved[False] == 8 * 4 * 8
 
 
 def test_tf_idf_marker_search_requires_an_atac_assay() -> None:
@@ -2629,11 +3012,11 @@ def test_library_size_markers_reject_invalid_counts_and_totals(
     [
         ([5], -2.0, r"Feature 5 of RNA has a negative or non-finite"),
         # A negative total makes every value of the cell positive.
-        (list(range(22)), -1.0, r"tested features of RNA hold negative or non"),
+        (list(range(22)), -1.0, r"tested-feature subset of RNA holds negative or"),
         pytest.param(
             [20, 21],
             1e308,
-            r"tested features of RNA hold negative or non",
+            r"tested-feature subset of RNA holds negative or",
             # The subset total overflows to infinity.
             marks=pytest.mark.filterwarnings("ignore:overflow encountered"),
         ),
@@ -2865,3 +3248,29 @@ def test_stored_marker_tables_are_the_reference_statistics(
         np.testing.assert_array_equal(
             stored[group_id], _reference_stored_stats(reference[:, position])
         )
+
+
+def test_marker_tables_keep_infinite_and_undefined_fold_changes(
+    marker_table, tmp_path
+) -> None:
+    store, *_, ref = _saved_marker_table(marker_table, tmp_path)
+    markers = store.get_markers(ref, min_score=-1, min_frac_exp=-1)
+    fold_change = markers.set_index(["feature_name", "group_id"])["fold_change"]
+
+    # No cell expresses RNA0, and only group g0 expresses RNA1.
+    assert np.isnan(fold_change.loc["RNA0"]).all()
+    assert fold_change.loc["RNA1"].to_dict() == {"g0": np.inf, "g1": 0.0, "g2": 0.0}
+    statistics = markers.drop(columns=["group_id", "feature_name", "fold_change"])
+    assert np.isfinite(statistics.to_numpy(dtype=np.float64)).all()
+    assert not (markers["fold_change"] < 0).any()
+    infinite = markers.loc[np.isposinf(markers["fold_change"])]
+    assert (infinite["mean_rest"] == 0).all()
+    undefined = markers.loc[np.isnan(markers["fold_change"])]
+    assert ((undefined["mean"] == 0) & (undefined["mean_rest"] == 0)).all()
+    # The table round-trips through CSV, infinite and NaN values included.
+    markers.to_csv(tmp_path / "markers.csv", index=False)
+    pd.testing.assert_frame_equal(
+        pd.read_csv(tmp_path / "markers.csv", float_precision="round_trip"),
+        markers,
+        check_exact=True,
+    )

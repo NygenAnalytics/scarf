@@ -43,14 +43,12 @@ dependencies = [
     "pandas>=2.2.2",
     "scikit-learn>=1.5",
     "scipy>=1.15,!=1.17.0",
-    "setuptools>=61",
     "statsmodels>=0.14.5",
     "threadpoolctl>=3.5.0",
     "tqdm>=4.60",
     "umap-learn>=0.5.12",
     "zarr>=3.2.0",
     "obstore>=0.5.1",
-    "sgtsnepi",
     "huggingface-hub>=2.0.0",
     "zstandard>=0.25.0",
     "igraph>=1.0.0",
@@ -77,6 +75,11 @@ extra = [
     "ipython-autotime>=0.3",
     "ipywidgets>=8",
 ]
+# t-SNE's only backend. sgtsnepi is GPLv3 and publishes wheels only for Linux
+# x86_64 and macOS 26 or newer on arm64; elsewhere it compiles from source.
+tsne = [
+    "sgtsnepi>=0.7",
+]
 test = [
     "pytest>=7.0",
     "pytest-cov>=4",
@@ -86,6 +89,8 @@ test = [
     "scikit-network>=0.33.1",
     "rdata>=1.1.0",
     "pydantic-ai-slim[openai]>=2.51.0",
+    # CI runs t-SNE on Linux x86_64, where sgtsnepi has wheels.
+    "sgtsnepi>=0.7; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 docs = [
     "jinja2",
@@ -103,6 +108,8 @@ docs = [
     "jupyter-cache>=1.0.1",
     "sphinx-reredirects>=1.1.0",
     "sphinxcontrib-mermaid>=2.1.0",
+    # The tutorials run t-SNE on Linux x86_64, where sgtsnepi has wheels.
+    "sgtsnepi>=0.7; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.urls]
@@ -117,14 +124,14 @@ include-package-data = false
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scarf*"]
-exclude = ["profiling*", "scripts*", "tests*", "docs*", "bin*"]
+exclude = ["profiling*", "scripts*", "tests*", "docs*"]
 
 [tool.setuptools_scm]
 version_file = "scarf/_version.py"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -v -n auto --dist loadfile"
+addopts = "-ra -v -n logical --dist loadfile"
 markers = [
     "integration: live network tests",
     "slow: tests that build graphs or run iterative numerical workflows",
@@ -159,7 +166,6 @@ ignore-nested-classes = true
 ignore-setters = false
 fail-under = 50
 exclude = [
-    "setup.py",
     "docs",
     "tests"
 ]
@@ -203,7 +209,6 @@ docs-modal = [
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },
-    { file = "setup.py" },
     { git = { commit = true, tags = true } },
 ]
 no-binary-package = ["pcst-fast", "hnswlib"]
@@ -234,7 +239,7 @@ select = ["E4", "E7", "E9", "F"]
 strict = false
 
 python_version = "3.12"
-exclude = ["^docs/", "^setup\\.py$", "^scarf/_version\\.py$"]
+exclude = ["^docs/", "^scarf/_version\\.py$"]
 
 disable_error_code = ["import-untyped"]
 
@@ -265,6 +270,7 @@ module = [
     "numba.*",
     "pydantic_ai",
     "pydantic_ai.*",
+    "sgtsnepi",
 ]
 ignore_missing_imports = true
 

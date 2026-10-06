@@ -48,7 +48,9 @@ The stage methods below expose the same persisted results with more control.
 
 The rebuilt store carries a completed `docs_default` pipeline run. This page starts from that
 run's frozen cell and feature selections, then calls every graph stage explicitly. Identical calls
-reuse the completed baseline artifacts; later sections create only the branches they discuss.
+reuse the run's normalization, PCA, ANN index, and neighbours; its graph predates this release's
+corrected edge weights (revision 2 of `build_connectivity_map`), so the graph, UMAP, and clusters
+below are new. Later sections create only the branches they discuss.
 
 ```{code-cell} ipython3
 # Arrange and save Matplotlib figures.
@@ -283,7 +285,7 @@ several columns, or a column collecting several rows, to find splits or merges t
 
 ## 5. Recompute only what changed
 
-Artifact identity includes the operation, scientific parameters, and upstream inputs.
+Artifact identity includes the operation, scientific parameters, upstream inputs, and the operation's revision.
 Calling an identical stage reuses its completed result.
 Changing `k` reuses normalization, PCA, and the ANN index but creates new neighbour and connectivity artifacts.
 Changing the cell or feature selection requires new downstream results. The saved results of

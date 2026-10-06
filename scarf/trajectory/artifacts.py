@@ -5,18 +5,18 @@ import numpy as np
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..storage.arrays import create_zarr_dataset, linked_missing_mask
+from ..metadata.selection import resolve_cell_aligned_artifact
+from ..storage.arrays import create_zarr_dataset
 from ..storage.artifacts import (
     ArtifactRef,
     ValueFingerprintBuilder,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
-    inspect_artifact,
 )
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
 from ..storage.selections import validate_cell_selection
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.types import as_zarr_array
 from .parameters import (
     AGGREGATION_ANN_PARAMETER_NAMES,
     AGGREGATION_ANN_STATIC_PARAMETER_NAMES,
@@ -116,11 +116,6 @@ _AGGREGATION_ATTRIBUTES = _RESULT_ATTRIBUTES | {
     "effective_bins",
 }
 
-_CELL_VALUE_NAMES = {
-    "cell_cycle": "phase",
-    "cluster_cut": "labels",
-    "pseudotime": "pseudotime",
-}
 _MISSING_LABEL = object()
 
 _MARKER_METHODS = {
@@ -413,33 +408,16 @@ def load_cell_artifact_values(
     *,
     value_name: str | None = None,
 ) -> tuple[np.ndarray, ArtifactRef, np.ndarray | None]:
+    """Return a cell artifact's values, its cell selection, and its missing-row mask."""
     if not isinstance(ref, ArtifactRef):
         raise TypeError("cell data input must be an ArtifactRef")
-    status = inspect_artifact(root, ref)
-    if not status.exists or not status.complete:
-        raise ValueError("Cell-data artifact is unavailable or incomplete")
-    selection = status.input_ref("cell_selection")
-    selected_count = selection_size(root, selection)
-    canonical_name = value_name or _CELL_VALUE_NAMES.get(ref.kind, "values")
-    group = as_zarr_group(root[status.path], name=status.path)
-    if canonical_name not in group:
-        raise ValueError(
-            f"{ref.kind} artifact has no {canonical_name!r} cell-data array"
-        )
-    values_array = as_zarr_array(group[canonical_name], name=canonical_name)
-    if values_array.ndim < 1 or int(values_array.shape[0]) != selected_count:
-        raise ValueError("Cell-data artifact values do not match their selection")
-    values = np.asarray(values_array[:])
-    missing_array = linked_missing_mask(
-        group,
-        canonical_name,
-        label=f"Cell-data artifact array {canonical_name!r}",
-        values=values_array,
+    resolved = resolve_cell_aligned_artifact(
+        root,
+        ref,
+        value_name=value_name,
+        ndim=None,
     )
-    missing = (
-        None if missing_array is None else np.asarray(missing_array[:], dtype=bool)
-    )
-    return values, selection, missing
+    return resolved.values, resolved.source_cell_selection, resolved.missing_mask
 
 
 def labels_with_missing_mask(

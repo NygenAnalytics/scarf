@@ -14,7 +14,10 @@ This is separate from integrating RNA and ADT measurements: demultiplexing class
 
 Scarf expects an HTO assay, named `HTO` by default, in the same datastore as the biological assays.
 Open that datastore as `ds` before following the examples. The assay must be declared as type
-`HTO` when imported; naming an ordinary RNA or ADT assay `HTO` is not enough.
+`HTO`; naming an ordinary RNA or ADT assay `HTO` is not enough. Declare the type when importing, or
+open the store once with `zarr_mode="r+"` and `assay_types={"HTO": "HTO"}`, which records the type
+in the store for later opens. A merged store keeps the `HTO` type when every source that holds the
+assay declares it.
 `run_hto_demultiplexing` normalizes the hashtag counts, estimates background, and returns an immutable
 identity artifact without changing shared cell metadata.
 

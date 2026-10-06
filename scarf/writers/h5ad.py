@@ -421,15 +421,19 @@ class H5adToZarr:
         assay_type: Preset assay type, such as ``RNA``, for a single imported
                     assay whose name is not a preset. When None, the assay
                     name decides the type. Not allowed with ``assay_split_key``.
+        overwrite: If True, replace a Scarf store that no ``DataStore`` has opened.
 
     Each assay stores its counts in the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
     canonical source values of its own features, so the same counts import
     identically from every H5AD encoding.
 
+    Raises:
+        FileExistsError: If ``zarr_loc`` is not empty and may not be replaced.
+
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
-        assayName: The Zarr hierarchy (array or group).
+        assayName: Name of the imported assay; None with ``assay_split_key``.
         z: The Zarr hierarchy (array or group).
         storageDtypes: Count storage dtype of each imported assay.
         policy: Count-matrix layout policy of every imported assay.
@@ -451,13 +455,17 @@ class H5adToZarr:
         assay_name_map: dict[str, str] | None = None,
         analysis_assay: str | None = None,
         assay_type: str | None = None,
+        *,
+        overwrite: bool = False,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay
-        from ..storage.stores import load_zarr
-        from .counts_t import validate_assay_type
+        from ..storage.destinations import check_destination, create_destination
+        from ..assay.classification import validate_assay_type
 
-        validate_assay_type(assay_type)
+        validate_assay_type(
+            assay_type, assay="RNA" if assay_name is None else assay_name
+        )
         if assay_type is not None and assay_split_key is not None:
             raise ValueError(
                 "assay_type applies to a single assay and cannot be combined "
@@ -515,6 +523,14 @@ class H5adToZarr:
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.io = io
+        # A declared membership column that is malformed fails here, before
+        # the destination is read or created.
+        self._membership = self._declared_membership()
+        # A destination that would be refused fails before the passes over
+        # the source below; create_destination checks it again.
+        check_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         self._sourceDigest = self._hash_source() if has_analysis else None
         self._projection = (
             None
@@ -536,7 +552,10 @@ class H5adToZarr:
         self.h5ad.materialize_csc(self.resources.memoryBytes)
         # A layout that does not fit fails here, before the destination exists.
         self.policy = self._fit_count_layout(policy)
-        self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
+        # The destination must be empty, or with overwrite an unprepared store.
+        self.z = create_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         self._ini_cell_data()
         for resolved_assay_name in self.assayNames:
             if self.assayFeatures is None:
@@ -564,10 +583,46 @@ class H5adToZarr:
             else as_zarr_group(self.z[self.workspace], name=self.workspace)
         )
 
+    def _declared_membership(self) -> dict[str, np.ndarray]:
+        """Read the membership of each imported assay that the file declares.
+
+        Returns:
+            The values of each declared membership column of an imported
+            assay, one boolean per cell.
+
+        Raises:
+            ValueError: If a declared column is absent from ``obs``, is not
+                boolean, or has missing values.
+        """
+        from ..metadata.membership import checked_membership_values
+
+        declared = self.h5ad.assay_membership()
+        restored: dict[str, np.ndarray] = {}
+        for assay in self.assayNames:
+            column = declared.get(assay)
+            if column is None:
+                continue
+            if not self.h5ad._check_exists(self.h5ad.cellAttrsKey, column):
+                raise ValueError(
+                    f"The file declares {column!r} as the membership of assay "
+                    f"{assay!r}, but {self.h5ad.cellAttrsKey} has no such column"
+                )
+            values, missing = self.h5ad._read_column(self.h5ad.cellAttrsKey, column)
+            restored[assay] = checked_membership_values(values, missing, assay=assay)
+        return restored
+
     def _ini_cell_data(self) -> None:
-        from ..storage.metadata_keys import metadata_column_keys
+        from ..metadata.membership import reserved_membership_columns
+        from ..storage.metadata_keys import (
+            assay_membership_column,
+            metadata_column_keys,
+        )
         from ..storage.schema import create_cell_data
-        from ._store import keyed_metadata_columns, write_metadata_column
+        from ._store import (
+            keyed_metadata_columns,
+            write_membership_column,
+            write_metadata_column,
+        )
 
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
@@ -577,22 +632,31 @@ class H5adToZarr:
             names=ids,
             profile=self.profile,
         )
+        # The membership column name of every imported assay is reserved. A
+        # declared membership is restored below; any other column of that
+        # name is skipped with a warning.
+        reserved = reserved_membership_columns(self.assayNames)
+        restored = {assay_membership_column(assay) for assay in self._membership}
         # Keys are planned over every decodable obs column, including the ID
         # and cluster columns left out below, so a renamed column takes the
         # same key whichever columns an import selects.
         keys = metadata_column_keys(
             self.h5ad._source_column_names(self.h5ad.cellAttrsKey),
-            taken=g.keys(),
+            taken=[*g.keys(), *reserved],
         )
         for key, (values, missing) in keyed_metadata_columns(
             (
                 (name, (values, missing))
                 for name, values, missing in self.h5ad._cell_columns()
+                if name not in restored
             ),
             keys,
             "cell",
+            membership=reserved,
         ):
             write_metadata_column(g, key, values, missing, profile=self.profile)
+        for assay, members in self._membership.items():
+            write_membership_column(g, assay, members, profile=self.profile)
 
     def _ini_feature_data(self) -> None:
         from ..storage.metadata_keys import metadata_column_keys

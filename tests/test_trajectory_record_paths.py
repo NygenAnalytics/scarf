@@ -459,19 +459,19 @@ _SOURCE_SINK_INPUTS: dict[
     "missing-artifact": (
         lambda trajectory: _missing("cluster_labels"),
         ValueError,
-        "Cell-data artifact is unavailable or incomplete",
+        "Cell-aligned artifact is unavailable or incomplete",
     ),
     "diffusion-operator": (
         lambda trajectory: trajectory.store.run_diffusion_operator(
             trajectory.graph, t=1
         ),
         ValueError,
-        "diffusion_operator artifact has no 'values' cell-data array",
+        "'diffusion_operator' is not a cell-aligned artifact kind",
     ),
     "truncated-labels": (
         _truncated_labels,
         ValueError,
-        "Cell-data artifact values do not match their selection",
+        "Cell-aligned artifact must contain one row per source-selected cell",
     ),
     "labels-of-another-selection": (
         lambda trajectory: trajectory.labels(

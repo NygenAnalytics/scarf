@@ -32,10 +32,16 @@ distribution testing and emits a ``UserWarning``; sample-level aggregation
 (``sample_stat`` over ``samples``) is "sample-level distribution summary
 testing" and is not a replacement for replicate-aware differential
 expression (for example DESeq2 or edgeR).
+
+The module also owns the statistical design of a
+``DataStore.run_statistical_testing`` request: its validated options, the
+effective rows of the design, the chosen test, the pooled multiple-testing
+correction across keys, and the result record. The datastore reads the
+values, plans the artifact, and persists the result.
 """
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Literal
@@ -44,9 +50,17 @@ import numpy as np
 import pandas as pd
 from scipy.stats import f_oneway, kruskal, norm, ttest_ind, wilcoxon
 
-from ..metadata.selection import CellField, valid_category_mask as _valid_group_mask
+from ..metadata.selection import (
+    CellField,
+    FeatureRef,
+    NormalizationSpec,
+    ResolvedGrouping,
+    StudyDesign,
+    valid_category_mask as _valid_group_mask,
+)
 from ..storage.artifacts import fingerprint_array, fingerprint_strings, provenance_hash
 from ..storage.refs import ArtifactRef
+from ..utils.warnings import warn
 from .markers.rank import mannwhitneyu_from_ranks, tie_sum
 from .values import ResolvedFeature
 
@@ -132,19 +146,37 @@ __all__ = [
     "GroupComparisonResult",
     "KRUSKAL_WALLIS_COLUMNS",
     "MANN_WHITNEY_COLUMNS",
+    "StatisticalDesignColumns",
+    "StatisticalKey",
+    "StatisticalRequest",
+    "StatisticalSelection",
     "StatisticalTestResult",
     "WELCH_COLUMNS",
     "WILCOXON_COLUMNS",
     "adjust_pvalues",
     "aggregate_samples",
+    "build_statistical_result",
+    "choose_statistical_method",
     "compare_group_distributions",
     "design_fingerprints",
     "distinct_label_keys",
     "native_value",
+    "pool_adjust",
+    "reject_missing_statistical_values",
+    "require_subjects_across_conditions",
     "resolve_group_order",
+    "resolve_statistical_request",
+    "select_statistical_rows",
     "select_study_design_rows",
+    "split_group_columns",
+    "statistical_equal_var",
+    "statistical_posthoc_columns",
+    "statistical_storage_columns",
+    "statistical_summary_scope",
+    "study_design_pairs_conditions",
     "tested_column_identity",
     "tested_feature_identity",
+    "validate_statistical_design",
     "value_fingerprint",
 ]
 
@@ -432,12 +464,10 @@ def resolve_group_order(
             )
         dropped = [value for value in ordered if value not in surviving_set]
         for value in dropped:
-            warnings.warn(
+            warn(
                 f"Requested group {value!r} was removed because all of its "
                 "cells were excluded by subset or sample filters; it is not "
-                "part of the comparison design.",
-                UserWarning,
-                stacklevel=3,
+                "part of the comparison design."
             )
     else:
         missing = [value for value in ordered if value not in surviving_set]
@@ -1080,7 +1110,7 @@ def compare_group_distributions(
             seen_pairs.add(pair)
 
     if samples is None:
-        warnings.warn(_CELL_LEVEL_WARNING, UserWarning, stacklevel=2)
+        warn(_CELL_LEVEL_WARNING)
 
     valid = _valid_group_mask(groups)
     values = values[valid]
@@ -1214,4 +1244,587 @@ def compare_group_distributions(
     table = _kruskal_wallis(values, groups, present)
     return GroupComparisonResult(
         _maybe_adjust(table, adjustment),
+    )
+
+
+# Statistical-testing requests. ``DataStore.run_statistical_testing`` resolves
+# its grouping, reads values, and persists results; the functions below decide
+# what a request means and assemble its result.
+
+_TWO_GROUP_TESTS = frozenset({"mann_whitney", "wilcoxon", "welch", "t_test"})
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticalRequest:
+    """Validated options of one statistical-testing request."""
+
+    keys: tuple[Any, ...]
+    normalization: dict[str, str]
+    sample_by: str | None
+    pair_by: str | None
+    design_pair_by: str | None
+    groups: tuple[Any, ...] | None
+    comparisons: tuple[tuple[Any, Any], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticalKey:
+    """One tested key, resolved once per statistical-testing call."""
+
+    label: str
+    tested_feature: str
+    source_assay: str | None
+    feature: ResolvedFeature | None = None
+    column: str | None = None
+    column_values: Any = None
+    column_missing: np.ndarray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticalDesignColumns:
+    """Sample, pair, and subset values of a grouping's cells."""
+
+    samples: np.ndarray | None = None
+    pairs: np.ndarray | None = None
+    subset: np.ndarray | None = None
+    sample_missing: np.ndarray | None = None
+    pair_missing: np.ndarray | None = None
+    subset_missing: np.ndarray | None = None
+    subset_by: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticalSelection:
+    """Effective rows and identities for one statistical-testing design."""
+
+    groups: np.ndarray
+    samples: np.ndarray | None
+    pairs: np.ndarray | None
+    selection_mask: np.ndarray
+    effective_cell_idx: np.ndarray
+    group_order: tuple[Any, ...]
+    fingerprints: DesignFingerprints
+    subset_fingerprint: str | None
+
+
+def _study_design_pairing_error(subject_by: str, reason: str) -> ValueError:
+    """Return the error for a study design whose pairing the test cannot use."""
+    return ValueError(
+        f"StudyDesign pairs samples by {subject_by!r}, but {reason}. Only the "
+        "paired Wilcoxon test models subjects, and it needs exactly two "
+        "conditions with subjects measured in both. For repeated measures "
+        "across three or more conditions, select two conditions with groups=. "
+        f"For subjects nested within conditions, pass sample_by={subject_by!r} "
+        "without a StudyDesign pairing column so each subject is one "
+        "independent sample."
+    )
+
+
+def _subjects_span_groups(pairs: np.ndarray, groups: np.ndarray) -> bool:
+    """Return whether any subject is observed in more than one group."""
+    frame = pd.DataFrame(
+        {
+            "pair": np.asarray(pairs, dtype=object),
+            "group": np.asarray(groups, dtype=object),
+        }
+    )
+    return bool((frame.groupby("pair", sort=False)["group"].nunique() > 1).any())
+
+
+def _statistical_normalization(
+    normalization: NormalizationSpec | None,
+) -> dict[str, str]:
+    source = (
+        "assay" if normalization is None else getattr(normalization, "source", None)
+    )
+    transform = (
+        "none" if normalization is None else getattr(normalization, "transform", None)
+    )
+    if source not in ("assay", "raw"):
+        raise ValueError("normalization.source must be 'assay' or 'raw'")
+    if transform not in ("none", "log1p"):
+        raise ValueError("normalization.transform must be 'none' or 'log1p'")
+    return {"source": source, "transform": transform}
+
+
+def _normalized_variant_groups(
+    groups: Sequence[Any] | None,
+) -> tuple[Any, ...] | None:
+    if groups is None:
+        return None
+    return tuple(native_value(value) for value in groups)
+
+
+def _normalized_variant_comparisons(
+    comparisons: Sequence[tuple[Any, Any]] | None,
+) -> tuple[tuple[Any, Any], ...] | None:
+    if comparisons is None:
+        return None
+    return tuple(
+        (native_value(left), native_value(right)) for left, right in comparisons
+    )
+
+
+def resolve_statistical_request(
+    keys: Any,
+    *,
+    test: str,
+    posthoc: str | None,
+    adjustment: str,
+    alternative: str,
+    sample_stat: str,
+    sample_by: str | None,
+    pair_by: str | None,
+    study_design: StudyDesign | None,
+    groups: Sequence[Any] | None,
+    comparisons: Sequence[tuple[Any, Any]] | None,
+    normalization: NormalizationSpec | None,
+) -> StatisticalRequest:
+    """Validate the options of one statistical-testing request."""
+    if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
+        raise ValueError("adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'")
+    if alternative not in ("two-sided", "less", "greater"):
+        raise ValueError("alternative must be 'two-sided', 'less', or 'greater'")
+    if posthoc not in (None, "dunn"):
+        raise ValueError("posthoc must be 'dunn' or None")
+    if sample_stat not in ("mean", "median", "fraction"):
+        raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
+    if test not in (
+        "auto",
+        "mann_whitney",
+        "kruskal_wallis",
+        "wilcoxon",
+        "welch",
+        "t_test",
+        "one_way_anova",
+    ):
+        if test in _PARAMETRIC_TESTS:
+            raise NotImplementedError(
+                "Scarf implements mann_whitney, kruskal_wallis, wilcoxon "
+                "plus the explicit cell-level parametric welch/t_test "
+                f"and one_way_anova; {test!r} is a non-parametric-phase "
+                "alias with no implementation."
+            )
+        raise ValueError(
+            "test must be 'auto', 'mann_whitney', 'kruskal_wallis', "
+            "'wilcoxon', 'welch', 't_test', or 'one_way_anova'"
+        )
+    normalization_digest = _statistical_normalization(normalization)
+    # A study-design pairing column applies only to the paired Wilcoxon
+    # test. With test="auto" it is decided once the conditions are known.
+    design_pair_by: str | None = None
+    if study_design is not None:
+        if sample_by is not None and sample_by != study_design.sample_by:
+            raise ValueError("sample_by conflicts with study_design.sample_by")
+        sample_by = study_design.sample_by
+        if pair_by is None:
+            design_pair_by = study_design.subject_by or study_design.pair_by
+        if design_pair_by is not None:
+            if test == "wilcoxon":
+                pair_by = design_pair_by
+            elif test != "auto":
+                raise _study_design_pairing_error(
+                    design_pair_by,
+                    f"test={test!r} treats samples as independent",
+                )
+    native_groups = _normalized_variant_groups(groups)
+    native_comparisons = _normalized_variant_comparisons(comparisons)
+    if native_groups is not None and len(native_groups) == 0:
+        raise ValueError("groups must be non-empty when provided")
+    if native_comparisons is not None and len(native_comparisons) == 0:
+        raise ValueError("comparisons must be non-empty when provided")
+    if isinstance(keys, (str, CellField, FeatureRef)):
+        key_list: tuple[Any, ...] = (keys,)
+    else:
+        key_list = tuple(keys)
+    if not key_list:
+        raise ValueError("keys must be non-empty")
+    return StatisticalRequest(
+        keys=key_list,
+        normalization=normalization_digest,
+        sample_by=sample_by,
+        pair_by=pair_by,
+        design_pair_by=design_pair_by,
+        groups=native_groups,
+        comparisons=native_comparisons,
+    )
+
+
+def select_statistical_rows(
+    grouping: ResolvedGrouping,
+    columns: StatisticalDesignColumns,
+    *,
+    groups: tuple[Any, ...] | None,
+) -> StatisticalSelection:
+    """Resolve the effective rows of one design over a grouping's cells."""
+    groups_array = np.asarray(grouping.labels)
+    cell_idx = np.asarray(grouping.cell_idx, dtype=np.int64)
+    samples_array = columns.samples
+    pairs_array = columns.pairs
+    subset_values = columns.subset
+    group_missing = grouping.missing_mask
+
+    # Every value array holds one row per grouping cell.
+    selection_mask = np.ones(len(groups_array), dtype=bool)
+    if subset_values is not None:
+        subset_array = np.asarray(subset_values)
+        if subset_array.dtype != bool:
+            raise TypeError(
+                f"{columns.subset_by!r} must be boolean; got {subset_array.dtype}"
+            )
+        selection_mask &= subset_array
+        if columns.subset_missing is not None:
+            selection_mask &= ~columns.subset_missing
+    selection_mask &= _valid_group_mask(
+        groups_array,
+        missing_mask=group_missing,
+    )
+    if groups is not None:
+        selection_mask &= np.isin(groups_array, groups)
+    selection_mask, _ = select_study_design_rows(
+        selection_mask,
+        samples=samples_array,
+        sample_missing=columns.sample_missing,
+        pairs=pairs_array,
+        pair_missing=columns.pair_missing,
+    )
+    if not selection_mask.any():
+        raise ValueError("No cells remain after statistical-testing selections")
+
+    selected_groups = np.asarray(groups_array[selection_mask])
+    selected_samples = (
+        np.asarray(samples_array[selection_mask]) if samples_array is not None else None
+    )
+    selected_pairs = (
+        np.asarray(pairs_array[selection_mask]) if pairs_array is not None else None
+    )
+    effective_cell_idx = np.asarray(cell_idx[selection_mask], dtype=np.int64)
+    group_order = tuple(
+        resolve_group_order(
+            selected_groups,
+            group_order=groups,
+            full_groups=groups_array,
+        )
+    )
+    return StatisticalSelection(
+        groups=selected_groups,
+        samples=selected_samples,
+        pairs=selected_pairs,
+        selection_mask=selection_mask,
+        effective_cell_idx=effective_cell_idx,
+        group_order=group_order,
+        fingerprints=design_fingerprints(
+            effective_cell_idx,
+            selected_groups,
+            selected_samples,
+            selected_pairs,
+        ),
+        subset_fingerprint=(
+            value_fingerprint(subset_values) if subset_values is not None else None
+        ),
+    )
+
+
+def study_design_pairs_conditions(
+    design_pair_by: str | None,
+    pair_by: str | None,
+    selection: StatisticalSelection,
+) -> bool:
+    """Return whether an automatic test must pair samples by ``design_pair_by``.
+
+    If so, the caller selects the rows again with that pairing column.
+    """
+    if design_pair_by is None or pair_by is not None or len(selection.group_order) < 2:
+        return False
+    # test="auto": only two conditions give the paired Wilcoxon test.
+    n_conditions = len(selection.group_order)
+    if n_conditions > 2:
+        raise _study_design_pairing_error(
+            design_pair_by,
+            f"the design has {n_conditions} conditions",
+        )
+    return True
+
+
+def require_subjects_across_conditions(
+    design_pair_by: str | None,
+    selection: StatisticalSelection,
+) -> None:
+    """Reject a study-design pairing whose subjects never change condition."""
+    if (
+        design_pair_by is not None
+        and selection.pairs is not None
+        and not _subjects_span_groups(selection.pairs, selection.groups)
+    ):
+        raise _study_design_pairing_error(
+            design_pair_by,
+            "every subject is measured in only one condition",
+        )
+
+
+def reject_missing_statistical_values(
+    keys: Sequence[StatisticalKey],
+    selection_mask: np.ndarray,
+) -> None:
+    """Reject explicit missing tested metadata in the effective selection."""
+    for key in keys:
+        if key.column_missing is not None and np.any(
+            key.column_missing[selection_mask]
+        ):
+            raise ValueError(
+                f"Tested metadata column {key.column!r} contains missing "
+                "values in the effective cell selection"
+            )
+
+
+def validate_statistical_design(
+    method: str,
+    group_order: Sequence[Any],
+    comparisons: tuple[tuple[Any, Any], ...] | None,
+) -> None:
+    """Reject group counts and comparisons that the chosen test cannot use."""
+    n_groups = len(group_order)
+    if n_groups < 2:
+        raise ValueError("At least two populated groups are required")
+    if method == "mann_whitney" and n_groups != 2:
+        raise ValueError(
+            "mann_whitney requires exactly two groups; use groups= to select "
+            "two groups or kruskal_wallis for three or more"
+        )
+    if method == "wilcoxon" and n_groups != 2:
+        raise ValueError(
+            "wilcoxon requires exactly two groups on aggregated sample data"
+        )
+    if method == "kruskal_wallis" and n_groups < 3:
+        raise ValueError(
+            "kruskal_wallis requires at least three groups; use mann_whitney "
+            "for exactly two"
+        )
+    if comparisons is None:
+        return
+    seen: set[tuple[Any, Any]] = set()
+    for left, right in comparisons:
+        if left == right:
+            raise ValueError("comparisons must reference two distinct groups")
+        if (left, right) in seen or (right, left) in seen:
+            raise ValueError(
+                "comparisons must not contain duplicate or reversed-duplicate pairs"
+            )
+        seen.add((left, right))
+        if left not in group_order or right not in group_order:
+            raise ValueError(
+                "comparisons references a group not present in the data: "
+                f"{left!r} or {right!r}"
+            )
+        if method in _TWO_GROUP_TESTS and (left, right) != tuple(group_order[:2]):
+            raise ValueError(
+                f"{method} compares {group_order[0]!r} with {group_order[1]!r}; "
+                f"comparison {(left, right)!r} is reversed. Pass groups= to set "
+                "the contrast direction."
+            )
+
+
+def choose_statistical_method(
+    test: str,
+    selection: StatisticalSelection,
+    *,
+    groups: tuple[Any, ...] | None,
+    comparisons: tuple[tuple[Any, Any], ...] | None,
+    posthoc: str | None,
+    alternative: str,
+    sample_by: str | None,
+    pair_by: str | None,
+    sample_stat: str,
+    expression_cutoff: float,
+) -> str:
+    """Return the test that a design runs, after checking the request against it."""
+    present = list(selection.group_order)
+    n_groups = len(present)
+    if test == "auto":
+        if selection.pairs is not None:
+            effective_method = "wilcoxon"
+        elif n_groups == 2:
+            effective_method = "mann_whitney"
+        else:
+            effective_method = "kruskal_wallis"
+    else:
+        effective_method = test
+        if groups is not None and n_groups != len(groups):
+            raise ValueError(
+                "Explicit statistical group selections must all retain at "
+                "least one valid cell"
+            )
+        if effective_method in ("welch", "t_test") and n_groups != 2:
+            raise ValueError(
+                "welch requires exactly two groups; use groups= to select "
+                "two groups or one_way_anova for three or more"
+            )
+    if posthoc == "dunn" and effective_method != "kruskal_wallis":
+        raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
+    if alternative != "two-sided" and effective_method not in ("welch", "t_test"):
+        raise ValueError(
+            "alternative is only supported for test='welch' or test='t_test'"
+        )
+    if pair_by is not None and effective_method != "wilcoxon":
+        raise ValueError("pair_by is only supported for test='wilcoxon'")
+    if effective_method == "wilcoxon" and (sample_by is None or pair_by is None):
+        raise ValueError(
+            "wilcoxon requires sample aggregation with both sample_by and pair_by"
+        )
+    if sample_by is None and sample_stat != "mean":
+        raise ValueError("sample_stat requires sample_by")
+    if sample_by is None and expression_cutoff != 0.0:
+        raise ValueError("expression_cutoff requires sample_by")
+    if expression_cutoff != 0.0 and sample_stat != "fraction":
+        raise ValueError("expression_cutoff is only used when sample_stat='fraction'")
+    if comparisons is not None and (
+        effective_method == "one_way_anova"
+        or effective_method == "kruskal_wallis"
+        and posthoc is None
+    ):
+        raise ValueError(
+            "comparisons requires a pairwise test; use posthoc='dunn' with "
+            "kruskal_wallis"
+        )
+    validate_statistical_design(effective_method, present, comparisons)
+    return effective_method
+
+
+def statistical_summary_scope(sample_by: str | None) -> SummaryScope:
+    """Return whether a test compares sample summaries or single cells."""
+    return "sample" if sample_by is not None else "cell"
+
+
+def statistical_equal_var(method: str | None) -> bool | None:
+    """Return the equal-variance flag persisted for a test method."""
+    return False if method in ("welch", "t_test") else None
+
+
+def statistical_storage_columns(method: str) -> tuple[str, ...]:
+    """Persisted primary-table columns, including adjustment."""
+    base_map: dict[str, tuple[str, ...]] = {
+        "mann_whitney": MANN_WHITNEY_COLUMNS,
+        "wilcoxon": WILCOXON_COLUMNS,
+        "welch": WELCH_COLUMNS,
+        "t_test": WELCH_COLUMNS,
+        "one_way_anova": ANOVA_COLUMNS,
+    }
+    if method == "kruskal_wallis":
+        return (*KRUSKAL_WALLIS_COLUMNS, "p_value_adjusted")
+    if method in base_map:
+        return (*base_map[method], "p_value_adjusted")
+    raise ValueError(f"Unknown statistical test method: {method!r}")
+
+
+def statistical_posthoc_columns(
+    posthoc: str | None,
+) -> tuple[str, ...]:
+    """Persisted post-hoc table columns, including adjustment."""
+    if posthoc == "dunn":
+        return (*DUNN_COLUMNS, "p_value_adjusted")
+    return ()
+
+
+def split_group_columns(columns: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split stored table columns into group-label and numeric columns."""
+    string_columns = [column for column in columns if column in ("group_1", "group_2")]
+    numeric_columns = [column for column in columns if column not in string_columns]
+    return string_columns, numeric_columns
+
+
+def pool_adjust(
+    tables: dict[str, pd.DataFrame],
+    adjustment: AdjustmentMethod,
+) -> dict[str, pd.DataFrame]:
+    """Add ``p_value_adjusted`` to each table with one pooled correction pass."""
+    if not tables:
+        return {}
+    all_p_values = np.concatenate(
+        [
+            table["p_value"].to_numpy(dtype=np.float64, copy=False)
+            for table in tables.values()
+        ]
+    )
+    adjusted = adjust_pvalues(all_p_values, adjustment)
+    offset = 0
+    out: dict[str, pd.DataFrame] = {}
+    for label, table in tables.items():
+        frame = table.copy()
+        n_rows = len(frame)
+        frame["p_value_adjusted"] = adjusted[offset : offset + n_rows]
+        offset += n_rows
+        out[label] = frame
+    return out
+
+
+def build_statistical_result(
+    outcomes: Mapping[str, GroupComparisonResult],
+    *,
+    selection: StatisticalSelection,
+    method: str,
+    posthoc: str | None,
+    adjustment: AdjustmentMethod,
+    grouping: ArtifactRef | None,
+    group_field: CellField | None,
+    cell_selection: ArtifactRef | None,
+    sample_by: str | None,
+    pair_by: str | None,
+    sample_stat: str,
+    expression_cutoff: float,
+    alternative: str,
+    tested_features: Sequence[str],
+    source_assays: Sequence[str | None],
+    source_dataset_fingerprint: str | None,
+    value_fingerprints: tuple[str, ...],
+    normalization: Mapping[str, str],
+    normalization_method: dict[str, str] | None,
+    size_factor: float | None,
+    artifact: ArtifactRef | None,
+) -> StatisticalTestResult:
+    """Correct each key's outcome across keys and assemble the result record."""
+    p_value_method = next(iter(outcomes.values())).p_value_method
+    tables = pool_adjust(
+        {label: outcome.table for label, outcome in outcomes.items()},
+        adjustment,
+    )
+    posthoc_tables = pool_adjust(
+        {
+            label: outcome.posthoc_table
+            for label, outcome in outcomes.items()
+            if outcome.posthoc_table is not None
+        },
+        adjustment,
+    )
+    return StatisticalTestResult(
+        method=method,
+        posthoc=posthoc,
+        adjustment_method=adjustment,
+        grouping=grouping,
+        group_field=group_field,
+        sample_by=sample_by,
+        pair_by=pair_by,
+        sample_stat=sample_stat,
+        expression_cutoff=expression_cutoff,
+        alternative=alternative,
+        equal_var=statistical_equal_var(method),
+        n_groups=len(selection.group_order),
+        n_cells=int(selection.selection_mask.sum()),
+        tested_features=tuple(tested_features),
+        summary_scope=statistical_summary_scope(sample_by),
+        artifact=artifact,
+        cell_selection=cell_selection,
+        cell_selection_fingerprint=selection.fingerprints.cell_selection_fingerprint,
+        group_fingerprint=selection.fingerprints.group_fingerprint,
+        group_order=tuple(native_value(value) for value in selection.group_order),
+        normalization=dict(normalization),
+        source_assays=tuple(source_assays),
+        source_dataset_fingerprint=source_dataset_fingerprint,
+        value_fingerprints=value_fingerprints,
+        sample_fingerprint=selection.fingerprints.sample_fingerprint,
+        pair_fingerprint=selection.fingerprints.pair_fingerprint,
+        normalization_method=normalization_method,
+        size_factor=size_factor,
+        tables=tables,
+        posthoc_tables=posthoc_tables,
+        p_value_method=p_value_method,
     )

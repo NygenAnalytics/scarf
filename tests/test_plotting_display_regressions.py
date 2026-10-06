@@ -80,7 +80,7 @@ def test_matrixplot_orders_groups_like_dotplot():
     dot = splt.dotplot(store, features=["GeneA"], group_by="group", show=False)
     try:
         expected = ["group1", "group2", "group10"]
-        assert list(matrix.tables["matrix"].columns[1:]) == expected
+        assert list(matrix.tables["matrix"].columns) == expected
         assert dot.provenance.extras["group_order"] == expected
     finally:
         matrix.close()
@@ -95,7 +95,7 @@ def test_matrixplot_orders_groups_like_dotplot():
         show=False,
     )
     try:
-        assert list(matrix.tables["matrix"].columns[1:]) == ["2", "10", "1"]
+        assert list(matrix.tables["matrix"].columns) == ["2", "10", "1"]
     finally:
         matrix.close()
     with pytest.raises(ValueError, match="applies only to value='mean'"):
@@ -135,6 +135,213 @@ def test_dotplot_keeps_a_row_for_each_bracket_of_a_shared_feature():
         ]
     finally:
         result.close()
+
+
+_SUMMARY_VALUE_COLUMNS = [
+    "feature",
+    "feature_group",
+    "mean",
+    "fraction",
+    "n_cells",
+    "variance",
+]
+
+
+def _keyed_summary_store(**columns) -> _ArrayStore:
+    """Two features over cells grouped by arbitrarily named metadata columns."""
+    n_cells = len(next(iter(columns.values())))
+    values = np.arange(2 * n_cells, dtype=np.float64).reshape(n_cells, 2) ** 1.5
+    return _ArrayStore(
+        {"I": np.ones(n_cells, dtype=bool)}
+        | {name: np.asarray(labels) for name, labels in columns.items()},
+        values,
+    )
+
+
+def test_summary_tables_name_two_grouping_keys_group_and_subgroup():
+    store = _keyed_summary_store(
+        feature=np.repeat(["b", "a"], 4),
+        mean=np.tile(["y", "x"], 4),
+    )
+
+    result = splt.dotplot(
+        store, features=["GeneA"], group_by=("feature", "mean"), show=False
+    )
+    try:
+        aggregate = result.tables["aggregate"]
+        assert list(aggregate.columns) == [
+            "group",
+            "subgroup",
+            *_SUMMARY_VALUE_COLUMNS,
+        ]
+        assert list(zip(aggregate["group"], aggregate["subgroup"], strict=True)) == [
+            ("a", "x"),
+            ("a", "y"),
+            ("b", "x"),
+            ("b", "y"),
+        ]
+        ax = result.axes["dotplot"]
+        assert [text.get_text() for text in ax.get_xticklabels()] == [
+            "a | x",
+            "a | y",
+            "b | x",
+            "b | y",
+        ]
+        assert ax.get_xlabel() == "feature / mean"
+        assert result.provenance.extras["group_by"] == ["feature", "mean"]
+    finally:
+        result.close()
+
+
+def test_summary_tables_keep_a_sample_grouping_apart_from_sample_by():
+    sample = np.repeat(["s2", "s1"], 4)
+    donor = np.tile(["d1", "d2"], 4)
+    store = _keyed_summary_store(sample=sample, donor=donor)
+    gene = store.RNA._values[:, 0]
+
+    result = splt.dotplot(
+        store, features=["GeneA"], group_by="sample", sample_by="donor", show=False
+    )
+    try:
+        per_sample = result.tables["per_sample"]
+        assert list(per_sample.columns) == ["sample", "group", *_SUMMARY_VALUE_COLUMNS]
+        # "sample" holds the sample_by values; "group" the grouping column.
+        assert list(zip(per_sample["sample"], per_sample["group"], strict=True)) == [
+            ("d1", "s1"),
+            ("d1", "s2"),
+            ("d2", "s1"),
+            ("d2", "s2"),
+        ]
+        aggregate = result.tables["aggregate"]
+        assert list(aggregate.columns) == [
+            "group",
+            "feature",
+            "feature_group",
+            "mean",
+            "fraction",
+            "n_cells",
+            "n_samples",
+            "variance",
+        ]
+        assert aggregate["group"].tolist() == ["s1", "s2"]
+        assert aggregate["n_samples"].tolist() == [2, 2]
+        # Each group averages its per-donor means.
+        expected = [
+            np.mean(
+                [
+                    gene[(sample == group) & (donor == name)].mean()
+                    for name in ("d1", "d2")
+                ]
+            )
+            for group in ("s1", "s2")
+        ]
+        np.testing.assert_allclose(aggregate["mean"], expected)
+        assert result.provenance.extras["group_by"] == ["sample"]
+        assert result.provenance.extras["sample_by"] == "donor"
+    finally:
+        result.close()
+
+
+def test_matrixplot_returns_its_matrix_for_a_group_labelled_feature():
+    labels = np.repeat(["other", "feature"], 4)
+    store = _keyed_summary_store(group=labels)
+    values = store.RNA._values
+
+    result = splt.matrixplot(
+        store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        row_annotations={"index": ["x", "y"]},
+        column_annotations={"index": ["u", "v"]},
+        show=False,
+    )
+    try:
+        # The table is the drawn matrix: features down, groups across.
+        matrix = result.tables["matrix"]
+        assert matrix.index.name == "feature"
+        assert matrix.columns.name == "group"
+        assert matrix.index.tolist() == ["GeneA", "GeneB"]
+        assert matrix.columns.tolist() == ["feature", "other"]
+        expected = np.array(
+            [
+                [
+                    values[labels == group, column].mean()
+                    for group in ("feature", "other")
+                ]
+                for column in (0, 1)
+            ]
+        )
+        np.testing.assert_allclose(matrix.to_numpy(), expected)
+        np.testing.assert_allclose(
+            result.axes["matrixplot"].images[0].get_array(), expected
+        )
+        # Annotation tables are indexed by the labels they annotate.
+        row_annotations = result.tables["row_annotations"]
+        assert row_annotations.index.name == "feature"
+        assert row_annotations["index"].to_dict() == {"GeneA": "x", "GeneB": "y"}
+        column_annotations = result.tables["column_annotations"]
+        assert column_annotations.index.name == "group"
+        assert column_annotations["index"].to_dict() == {"feature": "u", "other": "v"}
+    finally:
+        result.close()
+
+
+def test_standardized_summaries_keep_raw_means_beside_z_scores():
+    labels = np.repeat(["a", "b", "c"], 4)
+    store = _keyed_summary_store(group=labels)
+    values = pd.DataFrame(store.RNA._values, columns=["GeneA", "GeneB"])
+    means = values.groupby(labels).mean()
+    z_scores = (means - means.mean()) / means.std()
+
+    result = splt.matrixplot(
+        store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        standardize="feature",
+        show=False,
+    )
+    try:
+        aggregate = result.tables["aggregate"]
+        assert list(aggregate.columns) == ["group", *_SUMMARY_VALUE_COLUMNS, "zscore"]
+        rows = aggregate.set_index(["group", "feature"])
+        for group in ("a", "b", "c"):
+            for feature in ("GeneA", "GeneB"):
+                assert rows.loc[(group, feature), "mean"] == pytest.approx(
+                    means.loc[group, feature]
+                )
+                assert rows.loc[(group, feature), "zscore"] == pytest.approx(
+                    z_scores.loc[group, feature]
+                )
+        assert result.provenance.extras["color_values"] == "zscore"
+        # The matrix draws the z-scores.
+        np.testing.assert_allclose(result.tables["matrix"], z_scores.T.to_numpy())
+        np.testing.assert_allclose(
+            result.axes["matrixplot"].images[0].get_array(), z_scores.T.to_numpy()
+        )
+    finally:
+        result.close()
+
+    dots = splt.dotplot(
+        store,
+        features=["GeneA", "GeneB"],
+        group_by="group",
+        standardize="feature",
+        show=False,
+    )
+    try:
+        aggregate = dots.tables["aggregate"]
+        pairs = list(zip(aggregate["group"], aggregate["feature"], strict=True))
+        np.testing.assert_allclose(aggregate["mean"], [means.loc[p] for p in pairs])
+        np.testing.assert_allclose(
+            aggregate["zscore"], [z_scores.loc[p] for p in pairs]
+        )
+        assert dots.provenance.extras["color_values"] == "zscore"
+        # The dots draw the z-scores.
+        np.testing.assert_allclose(
+            dots.axes["dotplot"].collections[0].get_array(), aggregate["zscore"]
+        )
+    finally:
+        dots.close()
 
 
 def test_composition_orders_samples_and_conditions_naturally():

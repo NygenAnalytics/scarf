@@ -132,8 +132,9 @@ if not source_store.exists():
         staged_store.replace(source_store)
 ```
 
-Initialize the source with `min_features_per_cell=0`. This keeps the imported cell axis intact
-while the tutorial defines its own exact selection.
+Initialize the source with `min_features_per_cell=0`, which drops only cells without detected
+features (none here), so the imported cell axis stays intact while the tutorial defines its own
+exact selection.
 
 ```{code-cell} ipython3
 # Open the source without dropping cells before selecting the cohort.

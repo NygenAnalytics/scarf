@@ -1,6 +1,5 @@
 """Distribution plots for metadata and feature values."""
 
-import warnings
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -31,6 +30,7 @@ from ..storage.artifacts import (
 )
 from ..storage.selections import read_stored_selection_indices
 from ..storage.types import as_zarr_array
+from ..utils.warnings import warn
 from ._contracts import (
     CategoricalScale,
     CellField,
@@ -45,8 +45,11 @@ from ._data import (
     _artifact_cell_selection,
     _cell_metadata_columns,
     fetch_normalized_feature_matrix,
+    require_panel_values,
     resolve_cell_selection,
     resolve_feature,
+    unmeasured_cell_counts,
+    unmeasured_extras,
 )
 from ._deps import require_matplotlib, require_seaborn
 from ._display import resolve_categorical_scale
@@ -99,11 +102,14 @@ def _fetch_series(
     cell_indices: np.ndarray,
     from_assay: str | None,
     normalization: NormalizationSpec,
+    unmeasured: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, str, bool, str, str | None]:
     """Return values, label, feature flag, stable identity, and source assay.
 
     ``metadata_columns`` lists the cell-metadata columns that a plain string
     key may name; any other string key is resolved as a feature.
+    ``unmeasured`` receives the cells that a feature's assay did not
+    measure, as the value layer records them.
     """
     if isinstance(key, CellField):
         values, identity = _fetch_metadata_series(store, key.key, cell_indices)
@@ -123,6 +129,7 @@ def _fetch_series(
             [resolved],
             cell_indices,
             normalization=normalization,
+            unmeasured=unmeasured,
         )
         return (
             mat[:, 0],
@@ -948,6 +955,9 @@ def distribution(
     reference colorbar. On caller-supplied axes the colorbar is not drawn;
     its limits are exposed through ``PlotResult.legends``.
     ``color_by="mean"`` cannot be combined with ``split_by``.
+
+    Raises:
+        ValueError: If a gene's assay measured none of the plotted cells.
     """
     plt, mpl = require_matplotlib()
     value_artifact = keys if isinstance(keys, ArtifactRef) else None
@@ -1243,6 +1253,7 @@ def distribution(
             )
             artifact_series.append((values[keep], value_name, False, identity, None))
 
+    unmeasured: dict[str, np.ndarray] = {}
     series_list = (
         artifact_series
         if artifact_series is not None
@@ -1254,6 +1265,7 @@ def distribution(
                 cell_indices=base_cell_idx,
                 from_assay=from_assay,
                 normalization=normalization,
+                unmeasured=unmeasured,
             )
             for k in key_list
         ]
@@ -1398,6 +1410,9 @@ def distribution(
     if pair_arr is not None:
         pair_arr = pair_arr[selection_mask]
     n = int(selection_mask.sum())
+    unmeasured_cells = unmeasured_cell_counts(unmeasured, selection_mask)
+    # A feature has no value for a cell that its assay did not measure.
+    require_panel_values(series_list, unmeasured_cells, n)
     fingerprints = design_fingerprints(
         selected_cell_idx,
         groups_arr,
@@ -1718,7 +1733,7 @@ def distribution(
 
             def _warn_once(reason_key: str, message: str) -> None:
                 if reason_key not in warned_validation:
-                    warnings.warn(message, UserWarning, stacklevel=3)
+                    warn(message)
                     warned_validation.add(reason_key)
 
             for index, (
@@ -2016,6 +2031,7 @@ def distribution(
                     }
                 ),
                 "assays": sorted(feature_assays),
+                **unmeasured_extras(unmeasured_cells),
                 **(
                     {
                         "stats_method": sorted(stats_methods),

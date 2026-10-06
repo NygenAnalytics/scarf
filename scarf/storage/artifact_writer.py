@@ -21,6 +21,7 @@ from .artifacts import (
     reusable_artifact_groups,
     serialize_artifact_value,
 )
+from .operation_revisions import effective_revision
 from .stores import metadata_workers, run_concurrently
 
 
@@ -71,6 +72,8 @@ def _record_plan(planned: "PlannedArtifact") -> "PlannedArtifact":
 
 @dataclass(frozen=True, slots=True)
 class PlannedArtifact:
+    """What ``plan_artifact`` decided: a reused artifact or a new one."""
+
     ref: ArtifactRef
     provenance: dict[str, Any]
     execution_options: dict[str, Any]
@@ -82,6 +85,8 @@ class PlannedArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ArrayRequirement:
+    """A required array of an artifact payload."""
+
     name: str
     shape: tuple[int | None, ...] | None = None
     dtype_kind: str | None = None
@@ -105,9 +110,7 @@ class ArrayRequirement:
         if self.dtype_kind is not None:
             if np.dtype(array.dtype).kind != self.dtype_kind:
                 return False
-        if self.dtype is not None and np.dtype(array.dtype) != np.dtype(self.dtype):
-            return False
-        return True
+        return self.dtype is None or np.dtype(array.dtype) == np.dtype(self.dtype)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,11 +178,22 @@ def plan_artifact(
     required_attributes: tuple[str | AttributeRequirement, ...] = (),
     reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
 ) -> PlannedArtifact:
+    """Reuse a complete artifact with this exact provenance or plan a new one."""
     provenance = make_provenance(
         operation=operation,
         parameters=parameters,
         inputs=inputs,
     )
+    revision = effective_revision(
+        operation, kind, provenance["parameters"], provenance["inputs"]
+    )
+    if revision > 1:
+        provenance = make_provenance(
+            operation=operation,
+            parameters=provenance["parameters"],
+            inputs=provenance["inputs"],
+            revision=revision,
+        )
     stored_execution_options = serialize_artifact_value(execution_options)
     if not isinstance(stored_execution_options, dict):
         raise TypeError("execution_options must serialize to a mapping")
@@ -275,10 +289,11 @@ def start_artifact(root: zarr.Group, planned: PlannedArtifact) -> zarr.Group:
         raise FileExistsError(f"Artifact path already exists: {path}") from exc
 
 
-def finish_artifact(
+def validate_artifact_payload(
     group: zarr.Group,
     planned: PlannedArtifact,
 ) -> None:
+    """Check a started artifact against its plan before it is published."""
     if planned.reused:
         raise ValueError("Cannot finish a reused artifact")
     if group.attrs.get("complete") is not False:
@@ -307,6 +322,14 @@ def finish_artifact(
         group,
     ):
         raise ValueError("Artifact payload does not satisfy its reuse contract")
+
+
+def finish_artifact(
+    group: zarr.Group,
+    planned: PlannedArtifact,
+) -> None:
+    """Validate a started artifact and mark it complete."""
+    validate_artifact_payload(group, planned)
     group.attrs["complete"] = True
 
 
@@ -330,17 +353,20 @@ def artifact_transaction(
 ) -> Iterator[zarr.Group]:
     """Start a planned artifact, yield its group, and finish it after the body.
 
-    If the body or the finish raises, including ``KeyboardInterrupt``, the
+    If the body or the payload validation raises, including ``KeyboardInterrupt``, the
     started group is deleted before the error propagates, so a failed write
     leaves no incomplete artifact behind.
     """
     group = start_artifact(root, planned)
     try:
         yield group
-        finish_artifact(group, planned)
+        validate_artifact_payload(group, planned)
     except BaseException:
         discard_artifact(root, planned)
         raise
+    # The publication write follows the try, so nothing is deleted once it is
+    # issued.
+    group.attrs["complete"] = True
 
 
 def reused_artifact_group(

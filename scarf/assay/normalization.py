@@ -9,9 +9,22 @@ normalization unrounded. Totals accumulate in float64. Sums over cells, such
 as the CLR log means, combine the partial sums of stored row blocks, so their
 last float64 bits follow the count layout, which byte targets make differ
 between dtypes of different widths.
+
+Every normalized path applies the assay's configured ``normMethod``. Paths
+that compute library-size values from the counts themselves, such as the
+subset writer and the RNA feature streams, run only when
+:func:`uses_library_size_normalization` holds. The flag ``log_transform``
+means one thing everywhere: ``log1p`` of the configured normalizer's own
+output, in float64. ``renormalize_subset`` hands the normalizer each cell's
+total over the selected features instead of over the whole library.
+:func:`applicable_normalization_flags` says which flags a normalizer takes,
+and a request for any other flag raises ``ValueError``.
+:func:`default_normalization_flags` says which of them an operation's default
+turns on: only those of the RNA library-size normalizers, whose scale Scarf
+knows. Every other flag defaults to False.
 """
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -37,8 +50,10 @@ from ..storage.materialize import (
     _feature_summary,
     _merge_feature_summaries,
     _write_feature_summaries,
+    feature_summary_bytes,
 )
 from ..utils.compute import controlled_compute
+from ..utils.moments import ColumnMoments
 from ..storage.artifacts import ArtifactRef, artifact_group, require_complete_artifact
 from ..storage.errors import ArtifactResolutionError
 from ..storage.feature_selection import validate_feature_selection
@@ -126,6 +141,36 @@ def reject_unknown_normalization_params(
     for name in params:
         if name not in NORMALIZATION_PARAM_NAMES:
             raise TypeError(f"{caller}() got an unexpected keyword argument {name!r}")
+
+
+def library_size_divisors(
+    totals: ArrayLike,
+    *,
+    source: str,
+    copy: bool = True,
+) -> NDArray[np.float64]:
+    """Return the library-size divisor of each cell from its total.
+
+    Args:
+        totals: Library total of each cell.
+        source: Name of the totals, used in the error message.
+        copy: Whether to copy ``totals``; False updates a float64 ``totals`` in place.
+
+    Returns:
+        A float64 array of the totals with zeros replaced by 1.
+
+    Raises:
+        ValueError: If a total is negative or not finite.
+    """
+    divisors = np.array(totals, dtype=np.float64, copy=copy)
+    # One reduction at a time keeps a single boolean mask alive.
+    if not (np.isfinite(divisors).all() and (divisors >= 0).all()):
+        raise ValueError(
+            f"{source} holds negative or non-finite totals of selected cells; "
+            "library-size normalization requires finite non-negative counts"
+        )
+    divisors[divisors == 0] = 1
+    return divisors
 
 
 def library_size_values(
@@ -357,17 +402,25 @@ def norm_lib_size(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     return _library_size_scaled(assay, counts)
 
 
+def uses_library_size_normalization(assay: "Assay") -> bool:
+    """Return whether ``assay`` normalizes with ``norm_lib_size`` and a size factor.
+
+    Args:
+        assay: Assay to check.
+
+    Returns:
+        True if it does, otherwise False.
+    """
+    return assay.normMethod is norm_lib_size and getattr(assay, "sf", None) is not None
+
+
 def lib_size_feature_stream_eligible(
     assay: "Assay",
     *,
     renormalize_subset: bool = False,
 ) -> bool:
     """True when column-wise lib-size streaming matches ``normed`` semantics."""
-    return (
-        assay.normMethod is norm_lib_size
-        and not renormalize_subset
-        and getattr(assay, "sf", None) is not None
-    )
+    return uses_library_size_normalization(assay) and not renormalize_subset
 
 
 def norm_lib_size_log(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
@@ -421,6 +474,111 @@ def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
 norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
     "scarf.assay.norm_tf_idf:selected-cell-df:total-count-tf"
 )
+
+
+_LOG_TRANSFORM = "log_transform"
+_RENORMALIZE_SUBSET = "renormalize_subset"
+
+
+def applicable_normalization_flags(assay: "Assay") -> frozenset[str]:
+    """Return the normalization flags that ``assay.normed`` can apply.
+
+    Args:
+        assay: Assay whose configured ``normMethod`` is checked.
+
+    Returns:
+        The applicable names out of ``log_transform`` and ``renormalize_subset``.
+    """
+    return assay._normalization_flags()
+
+
+def default_normalization_flags(assay: "Assay") -> frozenset[str]:
+    """Return the flags that an operation's default turns on for ``assay``.
+
+    Args:
+        assay: Assay whose configured ``normMethod`` is checked.
+
+    Returns:
+        The applicable flags for library-size normalizers, otherwise an empty set.
+    """
+    method = assay.normMethod
+    if method is norm_lib_size or method is norm_lib_size_log:
+        return applicable_normalization_flags(assay)
+    return frozenset()
+
+
+def _inapplicable_flag_message(assay: "Assay", name: str) -> str:
+    method = assay.normMethod
+    method_name = getattr(method, "__name__", type(method).__name__)
+    if name == _LOG_TRANSFORM:
+        reason = (
+            "log_transform takes log1p of values that are not logarithms, those "
+            "of norm_lib_size, norm_dummy, and custom normalizers, and ATAC "
+            "values are never log transformed"
+        )
+    else:
+        reason = (
+            "renormalize_subset hands totals over the selected features only to "
+            "RNA library-size and custom normalizers and to ATAC TF-IDF and "
+            "custom normalizers"
+        )
+    return (
+        f"{type(assay).__name__} {getattr(assay, 'name', '')!r} normalizes with "
+        f"{method_name}, which does not support {name}=True: {reason}. "
+        f"Pass {name}=False."
+    )
+
+
+def check_normalization_flags(
+    assay: "Assay",
+    *,
+    log_transform: object,
+    renormalize_subset: object,
+) -> tuple[bool, bool]:
+    """Validate the flags requested for ``assay.normed`` and return them as bools."""
+    flags = {_LOG_TRANSFORM: log_transform, _RENORMALIZE_SUBSET: renormalize_subset}
+    for name, value in flags.items():
+        if not isinstance(value, bool | np.bool_):
+            raise TypeError(f"{name} must be a boolean")
+    requested = [name for name, value in flags.items() if value]
+    if requested:
+        applicable = applicable_normalization_flags(assay)
+        for name in requested:
+            if name not in applicable:
+                raise ValueError(_inapplicable_flag_message(assay, name))
+    return bool(log_transform), bool(renormalize_subset)
+
+
+def resolve_normalization_params(
+    assay: "Assay",
+    params: Mapping[str, Any],
+    *,
+    caller: str,
+    default: bool = False,
+) -> dict[str, bool]:
+    """Return the validated ``log_transform`` and ``renormalize_subset`` flags.
+
+    An omitted or None flag is ``default`` if it is in
+    ``default_normalization_flags(assay)``, and False otherwise.
+    """
+    reject_unknown_normalization_params(dict(params), caller=caller)
+    requested = {
+        name: (
+            default and name in default_normalization_flags(assay)
+            if params.get(name) is None
+            else params[name]
+        )
+        for name in (_LOG_TRANSFORM, _RENORMALIZE_SUBSET)
+    }
+    log_transform, renormalize_subset = check_normalization_flags(
+        assay,
+        log_transform=requested[_LOG_TRANSFORM],
+        renormalize_subset=requested[_RENORMALIZE_SUBSET],
+    )
+    return {
+        _LOG_TRANSFORM: log_transform,
+        _RENORMALIZE_SUBSET: renormalize_subset,
+    }
 
 
 def _feature_group_positions(
@@ -480,6 +638,11 @@ def iter_feature_group_means(
         yield means
 
 
+def _feature_subset_source(assay: "Assay") -> str:
+    """Name the totals of a subset renormalization in errors."""
+    return f"The feature subset of {assay.name}"
+
+
 @njit(cache=True, nogil=True)
 def _normalize_rows(
     block: np.ndarray,
@@ -510,10 +673,16 @@ def _normalize_count_block(
     *,
     scaleFactor: float,
     logTransform: bool,
+    source: str,
 ) -> np.ndarray:
-    """Return float32 library-size values of ``block`` over its own row totals."""
-    row_sum = block.sum(axis=1, dtype=np.float64)
-    row_sum[row_sum == 0] = 1
+    """Return float32 library-size values of ``block`` over its own row totals.
+
+    ``source`` names the totals in the error that ``library_size_divisors``
+    raises for a negative or non-finite row total.
+    """
+    row_sum = library_size_divisors(
+        block.sum(axis=1, dtype=np.float64), source=source, copy=False
+    )
     normalized = np.empty(block.shape, dtype=np.float32)
     _normalize_rows(block, row_sum, float(scaleFactor), bool(logTransform), normalized)
     return normalized
@@ -615,6 +784,7 @@ def _counts_t_renormalized_batches(
             raw_values,
             scaleFactor=scaleFactor,
             logTransform=logTransform,
+            source=_feature_subset_source(assay),
         )
         next_row += int(normalized.shape[0])
         yield normalized
@@ -635,10 +805,45 @@ def write_renorm_subset_to_zarr(
     msg: str | None = None,
     mirror: zarr.Array | None = None,
     stats_group: zarr.Group | None = None,
+    *,
+    requireFinite: bool = False,
+    operation: str | None = None,
 ) -> None:
+    """Write library-size values of ``assay`` renormalized over ``feat_idx``.
+
+    Args:
+        assay: Assay that normalizes with ``norm_lib_size`` and a size factor.
+        cell_idx: Sorted, unique indices of the cells to write.
+        feat_idx: Indices of the features to write; each cell's total is over them.
+        root: Zarr group to write into.
+        loc: Path of the new array within ``root``.
+        nthreads: Maximum number of threads.
+        log_transform: Whether to write ``log1p`` of the values.
+        msg: Progress message. Defaults to one that names ``loc``.
+        mirror: Optional second array that receives the same values.
+        stats_group: Optional group that receives each feature's sum and ``m2``.
+        requireFinite: Whether to raise on a value that is not finite in float32.
+        operation: Name of the producing operation, required with ``requireFinite``.
+
+    Raises:
+        ValueError: If ``assay`` does not normalize with ``norm_lib_size`` and a
+            size factor, or a cell's subset total is negative or not finite.
+        NonFiniteArtifactError: With ``requireFinite``, if a value is not finite.
+    """
+    if requireFinite and not operation:
+        raise ValueError("requireFinite needs the operation that produced the values")
+    if not uses_library_size_normalization(assay):
+        method = assay.normMethod
+        method_name = getattr(method, "__name__", type(method).__name__)
+        raise ValueError(
+            "write_renorm_subset_to_zarr writes library-size values, but "
+            f"{type(assay).__name__} {getattr(assay, 'name', '')!r} normalizes "
+            f"with {method_name}"
+            + ("" if method is not norm_lib_size else " without a size factor")
+            + "; save its values with DataStore.run_normalization"
+        )
     scale_factor = assay.sf
-    if scale_factor is None:
-        raise ValueError("Library-size normalization requires a size factor")
+    assert scale_factor is not None
     read_dataset_fingerprint(assay.z)
     resources = ResourceBudget(
         assay.resources.memoryBytes, min(max(1, nthreads), assay.resources.workers)
@@ -654,8 +859,8 @@ def write_renorm_subset_to_zarr(
     output = create_numeric_array(root, loc, spec)
 
     if assay.rawDataT is not None and mirror is None:
-        summary: tuple[np.ndarray, np.ndarray] | None = None
-        summary_bytes = 2 * len(feat_idx) * np.dtype(np.float64).itemsize
+        summary: ColumnMoments | None = None
+        summary_bytes = feature_summary_bytes(len(feat_idx))
         writer_resident = summary_bytes if stats_group is not None else 0
         single_writer = plan_dense_write(
             output,
@@ -715,6 +920,8 @@ def write_renorm_subset_to_zarr(
             residentBytes=summary_bytes if stats_group is not None else 0,
             io=assay.storageIo,
             msg=msg,
+            requireFinite=requireFinite,
+            operation=operation,
         )
         _write_feature_summaries(stats_group, summary)
         return
@@ -724,6 +931,7 @@ def write_renorm_subset_to_zarr(
             np.asarray(block),
             scaleFactor=float(scale_factor),
             logTransform=log_transform,
+            source=_feature_subset_source(assay),
         )
 
     summary = write_dense_in_shard_rows(
@@ -740,9 +948,13 @@ def write_renorm_subset_to_zarr(
             # Float64 row totals and their zero mask.
             + array_shard_rows(output) * (np.dtype(np.float64).itemsize + 1)
         ),
-        resultBytes=2 * len(feat_idx) * 8 if stats_group is not None else 0,
+        resultBytes=(
+            feature_summary_bytes(len(feat_idx)) if stats_group is not None else 0
+        ),
         summarize=_feature_summary if stats_group is not None else None,
         merge_summary=(_merge_feature_summaries if stats_group is not None else None),
         io=assay.storageIo,
+        requireFinite=requireFinite,
+        operation=operation,
     )
     _write_feature_summaries(stats_group, summary)

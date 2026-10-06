@@ -14,6 +14,23 @@ wnn = ds.integrate_assays([rna_neighbors, adt_neighbors])
 snn = ds.integrate_assays([rna_graph, adt_graph], method="snn")
 ```
 
+WNN also rejects neighbours built on normalized values, as a pipeline run with `pca_dims=0`
+builds them, because it weighs each assay by its reduced coordinates; SNN integrates such graphs.
+
+Integration holds its inputs in memory: SNN every source graph with a float64 matrix of
+shared-neighbour fractions per graph, about `16 * n_graphs + 20` bytes per edge, and WNN every
+assay's neighbours and coordinates with the integrated graph and its modality weights. Both
+compare that estimate with the datastore's memory budget before they load a graph or coordinate
+and raise `MemoryError` over it, naming the bytes, the cells, the neighbours, the dimensions, and
+the limit. `run_harmony` does the same before it reads coordinates: it holds the float64
+coordinates several times over and float64 matrices of soft cluster assignments, about 5 KB per
+cell with 30 dimensions and 100 clusters, so `nclust` in `harmony_params` and the dimensions set
+its memory. Its admission also counts the batch labels, which it reads before it admits the fit and
+holds until the fit ends, at the size of their text objects: about 60 bytes per cell for each batch
+column of short labels. These estimates are near-exact counts of what each step allocates, as
+traced while it runs, plus stated allowances; the budget compares them with its limit, and they
+are not a cap on the memory of the process (see {ref}`memory_and_execution`).
+
 The default WNN artifact stores one per-cell weight for each input assay. Plot those values with
 {py:func}`scarf.plotting.modality_weights` or the bound
 `ds.plots.modality_weights(graph=wnn, layout=wnn_layout)` accessor. An explicit SNN artifact does

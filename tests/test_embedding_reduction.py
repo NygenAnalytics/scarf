@@ -151,6 +151,47 @@ def test_gram_pca_matches_full_svd_and_preserves_model_contract():
     assert model.n_samples_seen_ == values.shape[0]
 
 
+def test_unscaled_gram_pca_does_not_cancel_large_means():
+    rng = np.random.default_rng(29)
+    spread = rng.normal(size=(600, 6)) * np.linspace(1.0, 3.0, 6)
+    # Means of a million beside unit spreads: the Gram matrix minus
+    # n * mean * mean^T loses about twelve digits of the covariance.
+    values = (1e6 + spread).astype(np.float32)
+    original = values.copy()
+    data = ChunkedArray.from_numpy(values, block_size=100)
+
+    _, model = fit_incremental_pca(
+        data,
+        dims=2,
+        batch_size=100,
+        use_for_pca=np.ones(len(values), dtype=bool),
+        scale=None,
+        nthreads=1,
+    )
+
+    widened = values.astype(np.float64)
+    covariance = np.cov(widened, rowvar=False)
+    expected = np.sort(np.linalg.eigvalsh(covariance))[::-1][:3]
+    np.testing.assert_allclose(model.explained_variance_, expected, rtol=1e-9)
+    np.testing.assert_allclose(
+        model.explained_variance_ratio_, expected / np.trace(covariance), rtol=1e-9
+    )
+    np.testing.assert_array_equal(model.mean_, widened.mean(axis=0))
+    # The source matrix is read, never shifted in place.
+    np.testing.assert_array_equal(values, original)
+    # Nor is a float64 source, whose last block of one row is a view of it.
+    rows = widened[:201].copy()
+    fit_incremental_pca(
+        ChunkedArray.from_numpy(rows, block_size=100),
+        dims=2,
+        batch_size=100,
+        use_for_pca=np.ones(len(rows), dtype=bool),
+        scale=None,
+        nthreads=1,
+    )
+    np.testing.assert_array_equal(rows, widened[:201])
+
+
 def test_gram_pca_matches_selected_scaled_rows():
     values = np.random.default_rng(19).normal(size=(36, 5))
     data = ChunkedArray.from_numpy(values, block_size=6)

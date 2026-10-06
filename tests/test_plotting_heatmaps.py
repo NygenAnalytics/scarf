@@ -369,6 +369,7 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(marker_sto
         cluster_rows=False,
         cluster_columns=False,
         row_annotations={"marker set": row_annotation},
+        column_annotations={"kind": {group: "cluster" for group in column_order}},
         annotation_scales={
             "marker set": splt.CategoricalScale(
                 order=("first", "second"), palette=palette
@@ -380,8 +381,14 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(marker_sto
     )
 
     assert result.owns_figure is False
-    assert result.tables["matrix"].index.tolist() == row_order
-    assert result.tables["matrix"].columns.tolist() == column_order
+    matrix = result.tables["matrix"]
+    assert matrix.index.tolist() == row_order
+    assert matrix.columns.tolist() == column_order
+    # Tables name their axes like matrixplot's; the drawn axes stay unlabelled.
+    assert (matrix.index.name, matrix.columns.name) == ("feature", "group")
+    assert result.tables["row_annotations"].index.name == "feature"
+    assert result.tables["column_annotations"].index.name == "group"
+    assert (ax.get_xlabel(), ax.get_ylabel()) == ("", "")
     np.testing.assert_allclose(
         ax.images[0].get_array(),
         oracle.loc[row_order, column_order].to_numpy(),
@@ -445,11 +452,11 @@ def test_matrixplot_orders_clusters_and_annotates_axes(marker_store):
     )
 
     matrix = ordered.tables["matrix"]
-    assert matrix["feature"].tolist() == feature_order
-    assert matrix.columns[1:].tolist() == group_order
+    assert matrix.index.tolist() == feature_order
+    assert matrix.columns.tolist() == group_order
     expected = means.loc[feature_order, [2, 1, 0]].to_numpy()
     np.testing.assert_allclose(
-        matrix.iloc[:, 1:].to_numpy(dtype=float), expected, rtol=_FLOAT32_RTOL
+        matrix.to_numpy(dtype=float), expected, rtol=_FLOAT32_RTOL
     )
     axis = ordered.axes["matrixplot"]
     np.testing.assert_allclose(axis.images[0].get_array(), expected, rtol=_FLOAT32_RTOL)
@@ -475,8 +482,8 @@ def test_matrixplot_orders_clusters_and_annotates_axes(marker_store):
         groups=data.clusters,
         show=False,
     )
-    assert input_ordered.tables["matrix"]["feature"].tolist() == requested
-    assert input_ordered.tables["matrix"].columns[1:].tolist() == ["0", "1", "2"]
+    assert input_ordered.tables["matrix"].index.tolist() == requested
+    assert input_ordered.tables["matrix"].columns.tolist() == ["0", "1", "2"]
     input_ordered.close()
 
     clustered = splt.matrixplot(
@@ -489,8 +496,8 @@ def test_matrixplot_orders_clusters_and_annotates_axes(marker_store):
     )
     rows = _optimal_leaves(means.to_numpy(), "average")
     clustered_columns = _optimal_leaves(means.to_numpy().T, "average")
-    assert clustered.tables["matrix"]["feature"].tolist() == [genes[i] for i in rows]
-    assert clustered.tables["matrix"].columns[1:].tolist() == [
+    assert clustered.tables["matrix"].index.tolist() == [genes[i] for i in rows]
+    assert clustered.tables["matrix"].columns.tolist() == [
         str(means.columns[i]) for i in clustered_columns
     ]
     assert clustered.provenance.extras["cluster_features"] is True
@@ -977,6 +984,113 @@ def test_heatmap_clustering_orders_constant_rows_under_correlation():
         assert set(ordered.index) == set(matrix.index)
 
 
+class _UnreadableStore:
+    """A store whose every read fails, so a check must run before any read."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the store was read through {name!r}")
+
+
+# The message names the remedy for other metrics.
+_WARD_CORRELATION = (
+    "ward",
+    "correlation",
+    "cluster_method='ward' requires cluster_metric='euclidean'.*"
+    "Use cluster_method='average' or 'complete'",
+)
+
+
+@pytest.mark.parametrize(
+    ("method", "metric", "message"),
+    [
+        _WARD_CORRELATION,
+        ("centroid", "cosine", "cluster_method='centroid' requires"),
+        ("median", "cityblock", "cluster_method='median' requires"),
+        ("wards", "euclidean", "cluster_method must be one of"),
+    ],
+)
+def test_heatmap_ordering_rejects_invalid_linkage(method, metric, message):
+    matrix = pd.DataFrame(
+        [[0.0, 1.0, 2.0], [2.0, 3.0, 1.0], [1.0, 0.5, 4.0]],
+        index=["r1", "r2", "r3"],
+        columns=["c1", "c2", "c3"],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        order_heatmap(
+            matrix,
+            row_order=None,
+            column_order=None,
+            cluster_rows=True,
+            cluster_columns=False,
+            method=method,
+            metric=metric,
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "metric"),
+    [("ward", "euclidean"), ("complete", "correlation"), ("average", "cosine")],
+)
+def test_heatmap_ordering_accepts_valid_linkage(method, metric):
+    matrix = pd.DataFrame(
+        [[0.0, 1.0, 2.0], [2.0, 3.0, 1.0], [1.0, 0.5, 4.0]],
+        index=["r1", "r2", "r3"],
+        columns=["c1", "c2", "c3"],
+    )
+
+    ordered, row_linkage, _ = order_heatmap(
+        matrix,
+        row_order=None,
+        column_order=None,
+        cluster_rows=True,
+        cluster_columns=False,
+        method=method,
+        metric=metric,
+    )
+
+    assert row_linkage is not None
+    assert sorted(ordered.index) == ["r1", "r2", "r3"]
+
+
+@pytest.mark.parametrize("clustered", [True, False])
+def test_heatmaps_reject_invalid_linkage_before_reading_the_store(clustered):
+    method, metric, message = _WARD_CORRELATION
+    # An axis that is not clustered still records the pair, so it is checked.
+    with pytest.raises(ValueError, match=message):
+        splt.matrixplot(
+            _UnreadableStore(),
+            features=["CD3E", "LYZ"],
+            group_by="clusters",
+            cluster_features=clustered,
+            cluster_groups=clustered,
+            cluster_method=method,
+            cluster_metric=metric,
+            show=False,
+        )
+    with pytest.raises(ValueError, match=message):
+        splt.marker_heatmap(
+            _UnreadableStore(),
+            marker=_plot_ref("marker_table", "4"),
+            cluster_rows=clustered,
+            cluster_columns=clustered,
+            cluster_method=method,
+            cluster_metric=metric,
+            show=False,
+        )
+    # The legacy seaborn keywords name the same controls.
+    with pytest.raises(ValueError, match=message):
+        splt.marker_heatmap(
+            _UnreadableStore(),
+            marker=_plot_ref("marker_table", "4"),
+            row_cluster=clustered,
+            col_cluster=clustered,
+            method=method,
+            metric=metric,
+            show=False,
+        )
+
+
 def test_heatmap_clustering_rejects_infinite_values():
     matrix = pd.DataFrame(
         [[0.0, np.inf], [1.0, 2.0], [3.0, 4.0]],
@@ -1201,6 +1315,7 @@ def test_marker_heatmap_categorical_legend_serializes_and_preserves_target(
             "clusters_ref": _plot_ref("cluster_labels", "4"),
             "cell_selection": _plot_ref("cell_selection", "5", assay=None),
             "n_cells": 4,
+            "unmeasured_cells": {},
         },
     )
     annotation_scale = splt.CategoricalScale(

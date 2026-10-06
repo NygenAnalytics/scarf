@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from numpy.typing import DTypeLike
 
 from .arrays import canonicalize_sparse
 
@@ -22,6 +23,11 @@ from .arrays import canonicalize_sparse
 # pointer per window value adds 8 more.
 _SCAN_BYTES_PER_VALUE = 72
 _SCAN_WINDOW_VALUES = 1 << 20
+
+
+def is_real_count_dtype(dtype: DTypeLike) -> bool:
+    """Return whether ``dtype`` holds real count values."""
+    return np.dtype(dtype).kind in "biuf"
 
 
 @dataclass(slots=True)
@@ -49,9 +55,9 @@ class CountValueRange:
         block = np.asarray(values)
         if block.size == 0:
             return
-        kind = block.dtype.kind
-        if kind not in "biuf":
+        if not is_real_count_dtype(block.dtype):
             raise TypeError(f"Count values must be real numbers, not {block.dtype}")
+        kind = block.dtype.kind
         if kind == "f" and not np.isfinite(block).all():
             raise ValueError(
                 "Count matrices must hold finite values; found NaN or infinity"

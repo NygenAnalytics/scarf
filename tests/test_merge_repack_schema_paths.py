@@ -19,6 +19,7 @@ from scarf.assay import ADTassay, ATACassay, RNAassay
 from scarf.merge import DataStoreMerge
 from scarf.merge.features import align_features
 from scarf.metadata import MetaData
+from scarf.metadata.membership import membership_attributes
 from scarf.storage.arrays import create_metadata_column
 from scarf.storage.count_matrix import CountMatrixPolicy, create_product_counts_array
 from scarf.storage.identity import CountSummary, finalize_counts
@@ -27,7 +28,8 @@ from scarf.tools import repack_zarr
 from scarf.tools.repack_zarr import repack_store
 from scarf.utils import digest
 from scarf.utils.logging import logger
-from scarf.writers import create_zarr_count_assay
+from scarf.writers import SubsetZarr, create_zarr_count_assay
+from scarf.writers._store import write_membership_column
 from scarf.writers.counts_t import finalize_writer_counts_t
 from tests.storage_helpers import finalize_test_counts
 
@@ -343,17 +345,153 @@ def test_only_cell_and_feature_tables_protect_prepared_columns(tmp_path, prepare
         MetaData(root["cellData"]).insert(
             "RNA_nCounts", np.zeros(n_cells), overwrite=True
         )
+    # RNA measured every cell, so it has no membership column, but the cell
+    # table still reserves the name.
+    with pytest.raises(ValueError, match=_RESERVED.format(assay="RNA")):
+        MetaData(root["cellData"]).insert("RNA_I", np.ones(n_cells, dtype=bool))
+    assert "RNA_I" not in root["cellData"]
 
     annotations = root.create_group("annotations")
     for column, values in (
         ("ids", np.asarray([f"c{index}" for index in range(n_cells)])),
         ("I", np.ones(n_cells, dtype=bool)),
         ("RNA_nCounts", np.zeros(n_cells)),
+        ("RNA_I", np.ones(n_cells, dtype=bool)),
     ):
         create_metadata_column(annotations, column, data=values, dtype=values.dtype)
     table = MetaData(annotations)
     table.insert("RNA_nCounts", np.ones(n_cells), overwrite=True)
     np.testing.assert_array_equal(table.fetch_all("RNA_nCounts"), np.ones(n_cells))
+    # Only a cell table reserves the membership names of the store's assays.
+    table.insert("RNA_I", np.zeros(n_cells, dtype=bool), overwrite=True)
+    table.drop("RNA_I")
+    features = MetaData(root["RNA/featureData"])
+    features.insert("RNA_I", np.ones(_COUNTS.shape[1], dtype=bool))
+    features.drop("RNA_I")
+
+
+_RESERVED = "Cell column '{assay}_I' is reserved for the membership of assay '{assay}'"
+_UNDROPPABLE = "Cell column '{assay}_I' records which cells assay '{assay}' measured"
+# Cells c1 and c4 were not measured with ADT, so their ADT counts are zero.
+_ADT_MEMBERS = np.asarray([True, False, True, True, False, True])
+
+
+def _partial_adt_source(location: str | MemoryStore) -> str | MemoryStore:
+    """Write a fresh import whose ADT measured only the cells of ``_ADT_MEMBERS``.
+
+    The membership column is written as an import writes it.
+    """
+    adt = ((_COUNTS[:, :2] + 1) * _ADT_MEMBERS[:, None]).astype(np.uint16)
+    _write_source(location, {"RNA": _COUNTS, "ADT": adt})
+    write_membership_column(
+        load_zarr(location, mode="r+")["cellData"], "ADT", _ADT_MEMBERS
+    )
+    return location
+
+
+@pytest.mark.parametrize("workspace", [None, "ws"])
+def test_cell_tables_reserve_the_membership_column_of_each_assay(
+    tmp_path, workspace, merged_in_workspace
+):
+    if workspace is None:
+        location = str(_partial_adt_source(str(tmp_path / "partial.zarr")))
+    else:
+        # The merge wrote the membership column of RNA into the workspace.
+        location = _copy(merged_in_workspace, tmp_path)
+    store = DataStore(
+        location,
+        workspace=workspace,
+        default_assay="RNA",
+        min_features_per_cell=0,
+        nthreads=1,
+    )
+    assay = "ADT" if workspace is None else "RNA"
+    column = f"{assay}_I"
+    cells = store.cells
+    before = cells.fetch_all(column)
+    restriction = np.zeros(cells.N, dtype=bool)
+    for write in (
+        lambda: cells.insert(column, ~before),
+        lambda: cells.insert(column, ~before, overwrite=True),
+        lambda: cells.update_key(restriction, column),
+        lambda: cells.reset_key(column),
+    ):
+        with pytest.raises(ValueError, match=_RESERVED.format(assay=assay)):
+            write()
+    with pytest.raises(ValueError, match=_UNDROPPABLE.format(assay=assay)):
+        cells.drop(column)
+    np.testing.assert_array_equal(cells.fetch_all(column), before)
+    assert cells._get_array(column).attrs.asdict() == membership_attributes(assay)
+
+    if workspace is None:
+        # RNA measured every cell; its absent membership column is reserved too.
+        for write in (
+            lambda: cells.insert("RNA_I", np.ones(cells.N, dtype=bool)),
+            lambda: cells.update_key(restriction, "RNA_I"),
+            lambda: cells.reset_key("RNA_I"),
+        ):
+            with pytest.raises(ValueError, match=_RESERVED.format(assay="RNA")):
+                write()
+        assert "RNA_I" not in cells.columns
+        # A plain column that took the name, as an earlier release could leave
+        # it, is not a membership column and can be dropped to repair the store.
+        create_metadata_column(
+            cells.locations["primary"], "RNA_I", data=np.ones(cells.N, dtype=bool)
+        )
+        cells.drop("RNA_I")
+        assert "RNA_I" not in cells.columns
+    # A name that is not the membership column of an assay stays ordinary.
+    cells.insert("ATAC_I", ~before)
+    cells.drop("ATAC_I")
+
+
+def test_subsets_keep_only_the_membership_of_their_assays(tmp_path):
+    store = _open(_partial_adt_source(MemoryStore()))
+    rows = np.asarray([4, 0, 1])
+
+    only_rna = str(tmp_path / "rna.zarr")
+    SubsetZarr(only_rna, [store.RNA], cell_idx=rows, nthreads=1).dump()
+    both = str(tmp_path / "both.zarr")
+    SubsetZarr(both, [store.RNA, store.ADT], cell_idx=rows, nthreads=1).dump()
+
+    # A subset without ADT holds no ADT membership.
+    assert "ADT_I" not in zarr.open_group(only_rna, mode="r")["cellData"]
+    # A copy of ADT keeps the membership of the cells it copies.
+    column = zarr.open_group(both, mode="r")["cellData/ADT_I"]
+    np.testing.assert_array_equal(column[:], _ADT_MEMBERS[rows])
+    assert column.attrs.asdict() == membership_attributes("ADT")
+
+    # A store without an assayTypes record still has ADT's columns left out.
+    del store.zw.attrs["assayTypes"]
+    untyped = DataStore(store.zw.store, zarr_mode="r", default_assay="RNA")
+    rna_only = str(tmp_path / "untyped.zarr")
+    SubsetZarr(rna_only, [untyped.RNA], cell_idx=rows, nthreads=1).dump()
+    cells = zarr.open_group(rna_only, mode="r")["cellData"]
+    assert [name for name in cells.array_keys() if name.startswith("ADT_")] == []
+
+
+@pytest.mark.slow
+def test_merge_drops_the_membership_of_assays_it_leaves_out(tmp_path):
+    partial = _open(_partial_adt_source(MemoryStore()))
+    full = _open(
+        _write_source(MemoryStore(), {"RNA": _COUNTS + 1, "ADT": _COUNTS[:, :2] + 2})
+    )
+    rna_only = str(tmp_path / "rna_only.zarr")
+
+    DataStoreMerge(
+        [partial, full],
+        rna_only,
+        ["partial", "full"],
+        assays=["RNA"],
+        seed=0,
+        nthreads=1,
+    ).dump()
+
+    # Before, the partial source's ADT_I was merged as the ordinary column
+    # orig_ADT_I, or as ADT_I without a prefix.
+    root = zarr.open_group(rna_only, mode="r")
+    assert "ADT" not in root
+    assert not [name for name in root["cellData"].array_keys() if "ADT_I" in name]
 
 
 # Merge planning and writing

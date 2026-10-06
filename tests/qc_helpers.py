@@ -120,15 +120,10 @@ def create_labelled_qc_store(path):
     store = DataStore(
         str(path), default_assay="RNA", min_features_per_cell=0, nthreads=1
     )
+    # insert flags the None labels in the linked mask __scarf_missing__label.
     store.cells.insert(
         "label", np.array(["a", None, "b", "a", None, "b"], dtype=object)
     )
-    cells = store.zw["cellData"]
-    cells.create_array(
-        "__scarf_missing__label",
-        data=np.array([False, True, False, False, True, False]),
-    )
-    cells["label"].attrs["missing_mask"] = "__scarf_missing__label"
     return store
 
 

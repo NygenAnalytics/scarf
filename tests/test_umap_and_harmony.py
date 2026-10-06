@@ -8,11 +8,14 @@ from scipy.stats import norm
 from scarf.embeddings.initialization import initial_embedding
 from scarf.embeddings.umap import (
     calc_dens_map_params,
+    densmap_distance_graph,
     fit_transform,
     fuzzy_simplicial_set,
+    layout_threads,
     simplicial_set_embedding,
 )
 from scarf.embeddings.harmony import fit_harmony
+from scarf.utils.logging import logger
 
 
 def _ring_graph(n: int) -> coo_matrix:
@@ -56,6 +59,48 @@ def test_calc_dens_map_params():
     )
 
 
+def _complete_graph(n: int) -> coo_matrix:
+    rows, cols = np.nonzero(~np.eye(n, dtype=bool))
+    return coo_matrix((np.ones(rows.size), (rows, cols)), shape=(n, n))
+
+
+def _equidistant_knn(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Every other cell as a neighbor at distance sqrt(2), as for unit axes."""
+    indices = np.stack([np.delete(np.arange(n), cell) for cell in range(n)])
+    distances = np.full(indices.shape, np.sqrt(2), dtype=np.float32)
+    return indices, distances
+
+
+def test_calc_dens_map_params_treats_float32_rounding_as_equal_radii():
+    # Eight cells on the unit axes are all sqrt(2) apart, and distances one
+    # float32 step apart differ by rounding only, so every local radius is
+    # equal. Standardizing them would stretch that rounding to unit variance.
+    indices, distances = _equidistant_knn(8)
+    distances[::2] = np.nextafter(distances[::2], np.float32(np.inf))
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        _, r_term = calc_dens_map_params(
+            _complete_graph(8), densmap_distance_graph(indices, distances)
+        )
+    finally:
+        logger.remove(sink)
+
+    np.testing.assert_array_equal(r_term, np.zeros(8, dtype=np.float32))
+    assert any("local radii are equal" in message for message in messages)
+
+
+def test_calc_dens_map_params_rejects_undefined_radii():
+    # Cell 3 has no graph edge, so its local radius is 0 / 0.
+    graph = coo_matrix(
+        ([1.0] * 6, ([0, 1, 0, 2, 1, 2], [1, 0, 2, 0, 2, 1])), shape=(4, 4)
+    )
+    distances = np.ones((4, 4), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="densMAP local radii are not finite"):
+        calc_dens_map_params(graph, distances)
+
+
 def test_simplicial_embedding_restores_numba_threads_on_failure(monkeypatch):
     import numba
     import umap.layouts
@@ -83,6 +128,17 @@ def test_simplicial_embedding_restores_numba_threads_on_failure(monkeypatch):
             False,
         )
     assert numba.get_num_threads() == previous_threads
+
+
+def test_layout_threads_follow_the_parallel_flag_and_the_numba_pool():
+    import numba
+
+    pool = numba.config.NUMBA_NUM_THREADS
+    # A serial layout runs on one thread, whatever the request.
+    assert layout_threads(False, pool + 3) == 1
+    assert layout_threads(True, 1) == 1
+    assert layout_threads(True, pool) == pool
+    assert layout_threads(True, pool + 3) == pool
 
 
 def test_fuzzy_simplicial_set_produces_coo_graph():

@@ -80,7 +80,7 @@ expression by default. We will adjust the display scale later if a few high valu
 ## 2. Summarize markers across groups
 
 A dotplot shows two summaries: color is mean expression, and dot size is the fraction of cells
-where the gene is detected.
+where the gene is detected. The size legend draws its dots at the same areas as the plot.
 
 ```{code-cell} ipython3
 # Compare marker expression and detection across the selected groups.
