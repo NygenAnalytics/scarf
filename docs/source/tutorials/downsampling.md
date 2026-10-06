@@ -13,6 +13,16 @@ kernelspec:
 ---
 # Cell downsampling (primer)
 
+A large dataset is often easier to explore, or easier to pass to another tool, when you work with
+a smaller set of representative cells. Random subsampling is a poor way to do this: it can drop
+rare populations and thin out the structure you wanted to keep. SCARF's TopACeDo instead uses the neighbourhood graph, built as in {doc}`graph_construction`, together with a Paris clustering to
+choose cells that cover that structure and thus effectively downsample. It selects seed cells within each cluster and then adds the cells that connect those seeds through the graph. The selection is saved as an artifact, so the source data is never changed.
+
+This page walks the full path: open the graph and the Paris cut the sampler requires, run the
+sampler, inspect what it selected, and export the chosen cells into a separate store. The sample
+is chosen to preserve topology, not to be statistically interchangeable; the caveats at the end
+state what it can and cannot support.
+
 A smaller set of representative cells can make a large dataset easier to explore or pass to
 another tool. TopACeDo uses the neighbourhood graph and a Paris clustering to choose cells that
 cover its structure. It saves the selected cells as an artifact; it does not change the source data.
@@ -137,9 +147,8 @@ The artifact also contains seed cells, density estimates, shared-neighbour summa
 selected graph edges. These are available through `load_artifact` when you need to inspect how
 the sampler made its choices.
 
-## Common mistakes
+## Important caveats to consider regarding downsampling
 
-- Passing clusters that do not come from `run_paris_clustering`
-- Passing a Paris cut built from a different graph or cell selection
-- Looking for sampler-created cell columns instead of loading the returned ref
-- Interpreting a topology-preserving sample as an unbiased quantitative subsample
+- **Conflating topological coverage with quantitative frequency representation:** TopACeDo samples cluster seeds and graph-connecting paths to preserve global and local manifold geometry, which deliberately inflates the representation of rare cell states and underrepresents dense populations. Treating this topology-preserving subset as a statistically representative subsample will severely distort cell-type proportions, differential abundance testing, and donor-level cell frequency comparisons.
+- **Treating max_sampling_rate as a fixed target sample size:** The sampling rate parameter (default 5%) only controls initial seed selection within each Paris cluster. Because TopACeDo enforces a minimum seed count per cluster and subsequently pulls in intermediate graph neighbors to preserve structural connectivity, the final exported sample size frequently and unpredictably exceeds the nominal percentage, especially in datasets with numerous clusters or fragmented graphs.
+- **Graph-cluster artifact decoupling and selection-order indexing errors:** TopACeDo requires a dedicated Paris hierarchy cut (cluster_cut) derived from the exact same graph artifact; supplying Leiden partitions or cuts from an alternate graph will fail. Furthermore, the resulting boolean mask aligns with the graph's compact cell selection rather than the raw datastore rows, so exporting directly without mapping back to physical store indices (run.cells.fetch_all("I")) corrupts cell identities in the exported subset store.

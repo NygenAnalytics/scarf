@@ -11,7 +11,6 @@ kernelspec:
   language: python
   name: python3
 ---
-
 # Diagnose multimodal integration
 
 After the core {doc}`cite_seq` workflow, check whether RNA and ADT support similar populations.
