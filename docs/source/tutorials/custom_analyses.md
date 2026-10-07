@@ -15,17 +15,7 @@ kernelspec:
 
 # Extending Scarf with custom analyses
 
-Scarf exposes graphs, bounded count streams, metadata tables, and export formats so an external algorithm can participate in an analysis without depending on private storage internals.
-
-
-Generally, today, we will simply solve a c
-
-## What you will learn
-
-- Load a supported neighbourhood graph and calculate a cell statistic
-- Stream selected count blocks when the matrix cannot fit in memory
-- Save a custom cell selection
-- Choose an exit path for another analysis system
+With the unique way Scarf handles the data in a memory efficient manner, it would not be an ill assumption to make that SCARF has limited support for external tools and data formats. However, since Scarf is able to expose the graph information, the count streams, and the metadata tables used, exporting to alternative formats so that external algorithms can participate in analysis is not a difficult task. This enables Scarf to be flexible. In the tutorial today, we will generally learn how to perform the analysis in a more memory efficient manner, select a custom group of cells, and then learn how to export various selections/ the dataset in general to other formats for other analysis systems.
 
 ## Import an existing store
 
@@ -47,11 +37,9 @@ graph_ref = run["connectivity_map"]
 ds
 ```
 
-## 2. Calculate from the graph
+## Calculate from the graph
 
-`load_graph` returns the selected neighbourhood graph as a SciPy CSR matrix.
-Here the row sum measures each cell's total edge weight in the symmetric graph.
-It is a graph statistic, not a biological confidence score.
+Say we need to first calculate specific statistics about the graph, for example each cell's total edge weight in the graph. This can tell us which cells sit in dense, well-connected neighborhoods versus cells that are weakly connected and similar to other cells based on the graph. To calculate this, we can use `load_graph`, which returns the selected neighbourhood graph as a SciPy CSR matrix, in which the metric can then actually be calculated. Here the row sum measures each cell's total edge weight in the graph; this is not a biological metric.
 
 ```{code-cell} ipython3
 graph = ds.load_graph(graph=graph_ref, symmetric=True, upper_only=False)
@@ -66,17 +54,15 @@ ds.cells.insert(
 }
 ```
 
-The insert writes one value per active cell in graph row order.
-The summary shows the graph size and the mean of the new column.
+The insert writes one value per active cell in graph row order, with the summar showing the  graph size and the mean of the new column.
 
 ```{code-cell} ipython3
 ds.plots.embedding(layout=run["umap"], color_by="customGraphStrength")
 ```
 
-The plot asks where cells have stronger or weaker weighted connectivity in this specific graph.
-Rebuilds with another feature set or neighbour count need a new statistic.
+The plot simply lets us visualize which cells have stronger or weaker weighted connectivity in this specific graph.
 
-## 3. Stream count blocks
+## Stream count blocks
 
 Avoid `.compute()` on a matrix that may exceed memory.
 Slice to the frozen run's cell and highly variable feature indexes, then process ordered row
