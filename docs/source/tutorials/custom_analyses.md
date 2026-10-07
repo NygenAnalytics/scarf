@@ -15,7 +15,7 @@ kernelspec:
 
 # Extending Scarf with custom analyses
 
-With the unique way Scarf handles the data in a memory efficient manner, it would not be an ill assumption to make that SCARF has limited support for external tools and data formats. However, since Scarf is able to expose the graph information, the count streams, and the metadata tables used, exporting to alternative formats so that external algorithms can participate in analysis is not a difficult task. This enables Scarf to be flexible. In the tutorial today, we will generally learn how to perform the analysis in a more memory efficient manner, select a custom group of cells, and then learn how to export various selections/ the dataset in general to other formats for other analysis systems.
+With the unique way Scarf handles the data in a memory efficient manner, it would not be an ill assumption to make that Scarf has limited support for external tools and data formats. However, since Scarf is able to expose the graph information, the count streams, and the metadata tables used, exporting to alternative formats so that external algorithms can participate in analysis is not a difficult task. This enables Scarf to be flexible. In the tutorial today, we will generally learn how to perform the analysis in a more memory efficient manner, select a custom group of cells, and then learn how to export various selections/ the dataset in general to other formats for other analysis systems.
 
 ## Import an existing store
 
@@ -39,7 +39,7 @@ ds
 
 ## Calculate from the graph
 
-Say we need to first calculate specific statistics about the graph, for example each cell's total edge weight in the graph. This can tell us which cells sit in dense, well-connected neighborhoods versus cells that are weakly connected and similar to other cells based on the graph. To calculate this, we can use `load_graph`, which returns the selected neighbourhood graph as a SciPy CSR matrix, in which the metric can then actually be calculated. Here the row sum measures each cell's total edge weight in the graph; this is not a biological metric.
+Say we need to first calculate specific statistics about the graph, for example each cell's total edge weight in the graph. This can tell us which cells sit in dense, well-connected neighborhoods versus cells that are weakly connected and similar to other cells based on the graph. To calculate this, we can use `load_graph`, which returns the selected neighborhood graph as a SciPy CSR matrix, in which the metric can then actually be calculated. Here the row sum measures each cell's total edge weight in the graph; this is not a biological metric.
 
 ```{code-cell} ipython3
 graph = ds.load_graph(graph=graph_ref, symmetric=True, upper_only=False)
@@ -54,7 +54,7 @@ ds.cells.insert(
 }
 ```
 
-The insert writes one value per active cell in graph row order, with the summar showing the  graph size and the mean of the new column.
+The insert writes one value per active cell in graph row order, with the summary showing the graph size and the mean of the new column.
 
 ```{code-cell} ipython3
 ds.plots.embedding(layout=run["umap"], color_by="customGraphStrength")
@@ -64,7 +64,7 @@ The plot simply lets us visualize which cells have stronger or weaker weighted c
 
 ## Stream count blocks
 
-If you are under heavier memory constraints, you can also stream the count information to make SCARF even more memory efficient. One way to do this is to avoid using `.compute()` on a matrix that may exceed memory. We can also slice blocks to the frozen run's cell and highly variable feature indexes, then process the ordered row blocks.
+If you are under heavier memory constraints, you can also stream the count information to make Scarf even more memory efficient. One way to do this is to avoid using `.compute()` on a matrix that may exceed memory. We can also slice blocks to the frozen run's cell and highly variable feature indexes, then process the ordered row blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
@@ -101,7 +101,7 @@ ds.cells.insert(
 }
 ```
 
-The `stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with hat key keeps each streamed value aligned with its metadata row and doesn't make realigning things an issue.
+The `stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with that key keeps each streamed value aligned with its metadata row and doesn't make realigning things an issue.
 
 ## Create custom selections
 
@@ -132,7 +132,7 @@ The first panel checks where the streamed count statistic varies. The second sho
 
 ## Pass a small selection to another tool
 
-Say for example we have created our selection now, and would liek to pass it to another analysis tool such as Scanpy. We can use the `to_anndata` function create an in-memory AnnData object. Note, by doing this, you often will need memory or need to be careful as this can be memory intensive. Select the cells and genes you need before actually executing it; here we only pass the cells alongside information of the 6 genes listed:
+Say for example we have created our selection now, and would like to pass it to another analysis tool such as Scanpy. We can use the `to_anndata` function create an in-memory AnnData object. Note, by doing this, you often will need memory or need to be careful as this can be memory intensive. Select the cells and genes you need before actually executing it; here we only pass the cells alongside information of the 6 genes listed:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
@@ -140,9 +140,9 @@ adata = ds.to_anndata(cell_key="wellConnected", feature_names=panel_genes)
 adata.shape, adata.var_names.tolist()
 ```
 
-If you persay wanted to export all of the genes, then simply leave out `feature_names`, and it will automatically default to including them all.
+If you per se wanted to export all of the genes, then simply leave out `feature_names`, and it will automatically default to including them all.
 
-When transfering using `to_anndata`, it functions (for transfering genes) by indexing `var` by gene ids (Ensembl here); gene symbols stay in`var["names"]`. Therefore `adata.var_names`after`feature_names=panel_genes` lists ids, not the panel symbols, and would need to be translated back possible. Check`adata.var["names"]`when you need the symbols.
+When transferring using `to_anndata`, it functions (for transferring genes) by indexing `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`. Therefore `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols, and would need to be translated back possible. Check `adata.var["names"]` when you need the symbols.
 
 If you want to subset and stay inside of the Scarf ecosystem, instead use `SubsetZarr` to write selected cells to a Scarf store instead.
 
