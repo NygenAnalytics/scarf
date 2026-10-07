@@ -43,9 +43,9 @@ _COORDINATE_OPERATIONS = {
     "normalized": ("run_normalization", "run_normalization"),
 }
 # The silhouette's distance chunks fill its working memory, and the sums per
-# cluster of each chunk and its Python objects add less than a quarter more,
-# as measured.
-_SILHOUETTE_WORKING_MEMORY_FACTOR = 1.25
+# cluster of each chunk and its Python objects add up to about a quarter
+# more, as measured from the oldest supported NumPy and scikit-learn on.
+_SILHOUETTE_WORKING_MEMORY_FACTOR = 1.3
 
 
 def cluster_label_array(root: zarr.Group, ref: ArtifactRef) -> zarr.Array:

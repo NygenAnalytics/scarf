@@ -477,12 +477,13 @@ def _ann_index_transfer_bytes(payload_bytes: int) -> int:
     Zarr and a temporary file in windows of ``ANN_INDEX_IO_BYTES``. A save
     holds the window it read from the file, Zarr's copies of its chunks, and
     their encoded bytes; a load holds the window it fills beside the one
-    before it and the chunks Zarr decodes into it. Four windows and two
-    chunks bound both.
+    before it and the chunks Zarr decodes into it. Four windows and four
+    chunks bound both, since Zarr 3.2 holds two more copies of a chunk while
+    saving it than later releases do.
     """
     window = min(int(payload_bytes), ANN_INDEX_IO_BYTES)
     chunk = min(int(payload_bytes), ANN_INDEX_CHUNK_BYTES)
-    return 4 * window + 2 * chunk
+    return 4 * window + 4 * chunk
 
 
 def _float32_copy_bytes(data: ChunkedArray, dims: int) -> int:

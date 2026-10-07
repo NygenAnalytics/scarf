@@ -1044,7 +1044,7 @@ def _assert_legend_rows_hold_their_markers(legend) -> None:
     """Markers fit their handle boxes and stack centered beside their labels."""
     from matplotlib.transforms import Bbox
 
-    figure = legend.get_figure(root=True)
+    figure = legend.figure
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
     fontsize = legend.prop.get_size_in_points() / 72.0 * figure.dpi

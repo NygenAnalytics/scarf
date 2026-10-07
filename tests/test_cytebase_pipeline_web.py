@@ -327,7 +327,7 @@ def test_only_the_deployed_web_function_receives_the_api_secret(pipeline_app):
     from modal._utils.async_utils import synchronizer
 
     def secrets(function) -> list:
-        return list(synchronizer._translate_in(function)._spec_.secrets)
+        return list(synchronizer._translate_in(function)._spec.secrets)
 
     api_secret = synchronizer._translate_in(pipeline_app.api_secret)
     env_secret = synchronizer._translate_in(pipeline_app.secret)
