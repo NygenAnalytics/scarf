@@ -12,18 +12,16 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (agent_workflow)=
 
 # Automate an RNA analysis
 
-Scarf agents run an RNA analysis, compare a small set of analysis settings, and propose cell
-identities from the measured markers. The result includes clusters, UMAP, marker tables,
-provisional annotations, and a report explaining the choices.
+Scarf agents can run a sc-RNA seq analysis, compare a small set of analysis settings, and propose cell identities from the measured markers. The result includes clusters, UMAP, marker tables,
+provisional annotations, and a report explaining the choices. For this analysis, you need your own model provider you can provide. Start with a prepared store (downloaded dataset); the first sections show how to run the analysis and review its results. Here, it is even more key that during the annotation process towards the end, you need to review it manually with true biology.
 
-Start with a prepared store and a model provider. The first sections show how to run the analysis
-and review its results; {doc}`garrido_trigo_agents` is a worked example on real data. An optional
-developer example at the end runs without a provider. Annotation still needs biological review.
+A real worked example can be found in {doc}`garrido_trigo_agents` where agents analyzed changes in gene expression profiles from an intestinal inflammatory bowel disease study with healthy paired controls.
+
+Towards the end of this document you can inspect how the structured decision enter the agent when synthethic example data is utilized
 
 ## Prepare your input and model
 
@@ -35,7 +33,7 @@ uv pip install "scarf[agent]"
 
 Import or mount the data before calling the agent. Follow {doc}`import_and_export` for count
 files and {doc}`remote_stores` for Cytebase mounts. The agent does not download, convert, mount,
-or publish a dataset. A local mount may still read remote count bytes during numerical work.
+or publish a dataset. The agent simply proceeds through the barebones analysis. A local mount may still read remote count bytes during numerical work.
 
 During development, a new analysis rejects complete numerical artifacts from earlier analyses,
 including artifacts inherited from a mount's source. Imported labels and embeddings are allowed.
@@ -43,10 +41,7 @@ Prepare a clean input separately if needed; `repack_store(..., data_only=True)` 
 and rebuilds preparation metadata without the old analysis artifacts. The agent does not delete
 old results. Its own completed artifacts can be reused during the same run and explicit resume.
 
-Pass a Pydantic AI model object or a supported `provider:model-name` identifier. Configure
-credentials on the provider or in the environment, not in saved study text or runtime settings.
-Provider calls may incur charges. The model receives no shell, web retrieval, scientific tools,
-or permission to execute generated code.
+Pass a Pydantic AI model object or a supported `provider:model-name` identifier to use other providers. Configure credentials on the provider or in the environment, not in saved study text or runtime settings, and make sure you don't push that information to them public. Provider calls may incur charges thus keep this in mind during the analysis process.
 
 ## Start a real analysis
 
@@ -76,22 +71,17 @@ print(run.run_dir)
 print(run.report())
 ```
 
-Use `analyze_rna` in a normal Python script. Both interfaces execute numerical stages sequentially.
-By default, the complete audit and report live in `agent_runs/<runId>` under the current working
-directory. Set `run_dir="analyses/my-study"` to choose another new directory outside the numerical
-store. An existing directory is rejected; resume is a separate operation.
+Use `analyze_rna` in a normal Python script for this use case. Both interfaces execute numerical stages sequentially. By default, the complete audit and report live in `agent_runs/<runId>` under the current working directory. Set `run_dir="analyses/my-study"` to choose another new directory outside the numerical store. An existing directory is rejected; resume is a separate operation that we discuss below.
 
 `Study` separates supplied facts from scientific configuration. Declare `sampleColumn`,
-`captureColumn`, `technicalBatchColumns`, and `protectedColumns` when supported by the experimental
-design. Repeated samples are not independent biological replicates. Hold evaluation labels out
+`captureColumn`, `technicalBatchColumns`, and `protectedColumns` when supported by the experimental design so the agent doesn't make mistakes and modify/use values it should not. Repeated samples are not independent biological replicates. Hold evaluation labels out
 with `excludedColumns`. Local UTF-8 excerpts in `referenceFiles` have a combined 16 KiB limit.
 Missing replication does not block descriptive population discovery.
 
 ## Read and continue a run
 
-The returned status is `running`, `needsInput`, `completed`, `failed`, or `interrupted`.
-Inspect it before using finalized numerical results. Every persisted outcome supports a report,
-including questions and failures. A report error does not downgrade scientific status.
+The returned status when checking a run will be one of the following: `running`, `needsInput`, `completed`, `failed`, or `interrupted`.
+Inspect it before using finalized results. Every outcome supports a report, including questions and failures that you can go back and comb through. 
 
 ```python
 from scarf.agent import open_analysis, resume_rna_async
@@ -111,75 +101,43 @@ run.report()  # Saved evidence only; no provider or numerical computation.
 run = await resume_rna_async(run.run_dir, model=model)
 ```
 
-For a pending question, pass `answers={questionId: answer}` for every exact pending ID. Answers
-cannot replace fixed scientific settings. Resume requires matching scientific inputs and Scarf
-procedure/prompt identity. Operational settings or the provider may change for unfinished
-choices. A relocated source must match the fingerprint and saved pipeline/artifact history.
-Prototype histories cannot be resumed.
+For a pending question that the model may have during the process, pass `answers={questionId: answer}` for every exact pending ID. Answers cannot replace fixed scientific settings. Resume requires matching scientific inputs and Scarf procedure/prompt identity. When Scarf shows a pending question, it means there is something you as the user need to specify, such as which RNA assay to use in the data. To answer it, you pass `answers={questionId: answer}`, where the key is the exact question ID Scarf gave you and the value is your answer. At this point Scarf simply pauses the analysis and saves it; it does not keep running or wait for you. Once you add your answer, you resume the analysis yourself by calling resume, and Scarf continues from where it stopped. Your answer can only fill in a detail that is still missing, and it cannot change a scientific setting you already fixed.
 
-Completed results expose `run.pipeline`, `run.artifacts`, `run.get_markers()`,
-`run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies
-the source and exact final artifacts. Annotations remain provisional and do not overwrite cell
-metadata. A named identity requires observed supporting markers, but this validation cannot
-establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
+Completed results expose the results and values used during  `run.pipeline`, `run.artifacts`, `run.get_markers()`, `run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies the source and exact final artifacts. Annotations remain provisional and do not overwrite cell metadata. A named identity requires observed supporting markers, but this validation cannot establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
 
-The external directory retains `run.json`, immutable events, evidence, visible model exchanges,
-annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the
-local Zarr store links to the exact final core pipeline and its workspace, selected configuration,
-rationale, and external audit location. Read it through `run.compact_result`. It does not duplicate the
-full history or make the external audit disposable. See {doc}`../reference/api/agent` for details.
+The external directory retains `run.json`, the events that took place, their evidence, visible model exchanges, annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the local Zarr store links to the exact final core pipeline and its workspace, selected configuration, rationale, and external audit location. Read it through for a summarized version`run.compact_result`. 
 
 ## What the agent compares
 
-The baseline uses 1,000 variable genes, 21 PCs, and 11 neighbors. Scarf then measures alternatives
-that change one of these settings at a time. It compares clusterings on the same retained cells,
-checks markers for up to two finalists, and makes a final UMAP.
+The baseline uses 1,000 variable genes, 21 PCs, and 11 neighbors. Scarf then measures alternatives that change one of these settings at a time. It compares clusterings on the same retained cells, checks markers for up to two finalists, and makes a final UMAP.
 
-The model interprets those measurements and proposes labels. Scarf executes the numerical
-operations and checks the returned decisions. A clean UMAP or many marker genes does not, by
-itself, establish that the chosen identities are correct.
+The model interprets those measurements and proposes labels to those clusters. Scarf executes the numerical operations and checks the returned decisions. A clean UMAP or many marker genes does not, by itself, establish that the chosen identities are correct; this is one of the portions where human input becomes more valuable. 
 
 The main analysis uses every retained cell. Some diagnostics use bounded samples: up to 10,000
 cells for covariate checks and 2,000 for silhouette assessment. See the
-{doc}`../reference/api/agent` reference for the full comparison rules and execution limits.
+{doc}`../reference/api/agent` reference for the full comparison rules and execution limits currently in place.
 
 ## QC, correction, and uncertainty
 
-The default `qcPolicy="retain"` keeps the supplied cohort and records outlier flags. Projected
-retention under other supported policies is evidence, not additional filtering. Global manual
-thresholds or the gentle five-MAD profile require explicit configuration. High counts/features
-remain flags under the gentle profile. Optional missing metrics stay unknown.
+The default `qcPolicy="retain"` keeps the supplied dataset, runs the quality control, flags the outliers, but does not remove any cells. Projected retention under other supported policies is evidence, not additional filtering. Global manual thresholds or the gentle five-MAD profile require explicit configuration. This is an automated mild, and automatic filter that drops very clear, low-quality outliers. High counts/features remain flags under the gentle profile. Optional missing metrics stay unknown.
 
-The workflow explicitly supplies its HVG blacklist, normally excluding mitochondrial names
-matching `^mt-` case-insensitively. HLA/H2, sex-linked, cell-cycle, and reporter features are
-preserved unless explicitly excluded. An organism name alone does not resolve gene identifiers.
 
-Harmony requires declared technical batches, complete labels, protected biological variables,
-and supplied evidence separating technical variation from biology. The current design check
-requires protected groups across technical batches. Unknown or confounded roles retain native
-analysis. A corrected finalist needs its exact native counterpart at the same resolution, plus
-measured mixing, preservation, marker, and doublet evidence. Checks use a `0.05` tolerance and
-require improvement in at least one mixing measure.
+The workflow explicitly supplies its HVG blacklist, normally excluding mitochondrial names matching `^mt-` case-insensitively. HLA/H2, sex-linked, cell-cycle, and reporter features are
+preserved unless explicitly instructed to be excluded. An organism name alone does not resolve gene identifiers that are linked to ensembl ids
+
+For the batch correction process, Harmony requires declared technical batches, complete labels, protected biological variables, and supplied evidence separating technical variation from biology. The current design check requires protected groups across technical batches. Unknown or confounded roles retain native analysis parameters. A corrected dataset needs its exact native counterpart at the same resolution, plus measured mixing, preservation, marker, and doublet evidence. Checks use a `0.05` tolerance and require improvement in at least one mixing measure.
 
 **Doublet scoring is always opt-in.** With `scoreDoublets=False`, correction requiring doublet
 evidence is unavailable. The agent never enables scoring implicitly, and scoring never removes
-cells automatically.
+cells automatically. It is reccomended however, that you perform doublet removal on your dataset.
 
-The default `interactionMode="lenient"` applies recorded conservative policies to supported
-ambiguities. Optional unknown metadata stays unknown. A tie among model-declared acceptable
-partitions prefers native analysis, then frozen trial and resolution order. This is a disclosed
-tie rule, not evidence of biological superiority. Strict mode keeps such questions pending.
-Essential missing facts produce `needsInput` in either mode. Provider failures, invalid output
-after bounded repair, and unknown numerical failures still stop work.
+By default Scarf runs in `interactionMode="lenient"`. This means that when the model is unsure about something optional, Scarf does not stop to ask you; it simply applies a saved, conservative rule to settle it. Anything it cannot know for sure stays unknown, so Scarf never invents information. If the model says several partitions are all acceptable and they tie, Scarf breaks the tie in a fixed way: it prefers the native analysis first, then follows the frozen trial and resolution order. This is just a disclosed rule to keep the choice consistent, not proof that the native option is biologically better. If you switch to strict mode, Scarf leaves those same questions pending for you to answer instead. Either way, if a truly essential fact is missing, the run pauses with `needsInput` so you can supply it with the answer. 
 
-## Optional: a developer example without a provider
+## See how model decisions enter the agent
 
-The user workflow above is complete. This optional section is for readers who want to inspect
-how structured model decisions enter the agent. It uses a scripted provider and synthetic data;
-it does not teach biological annotation or evaluate a live model.
+The user workflow above is general overview of how the agent workflow goes. This section is more of an optional bit for you if you want to understand how the structured model decisions enter the agent. It uses a scripted provider and synthetic data; it does not teach biological annotation or evaluate a live model.
 
-The fixture has 120 cells and 2,102 features, with three planted expression patterns. It is small
-enough to construct in memory and needs no dataset download or provider credentials.
+The fixture has 120 cells and 2,102 features (genes), with three planted expression patterns. It is small enough to construct in memory and needs no dataset download or provider credentials.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -266,10 +224,11 @@ del prepared, counts
 }
 ```
 
-The local `FunctionModel` receives the same schemas and measured evidence as a provider. It
-chooses the registered 30-PC probe, compares two measured baseline resolutions, selects the first
-eligible finalist, and leaves every synthetic cluster unassigned. These scripted preferences
-demonstrate the interface; they are not a scientific selection algorithm.
+The example uses a local `FunctionMode`l instead of a real provider. A `FunctionModel `is simply a stand-in model: it receives the exact same structured prompts, schemas, and measured evidence that Scarf would send to a live provider, but instead of calling an API it runs a small Python function that you wrote. That function returns fixed, scripted answers, so the whole production workflow still runs end to end, including the numerical pipeline, the evidence checks, the validation, and the saved results, without any provider or credentials.
+
+In this example the scripted answers just walk through the decision stages: it asks for the registered 30-PC (principal compoent) probe, shortlists two measured baseline resolutions, picks the first eligible finalist, and labels every synthetic cluster as unassigned. These choices are hardcoded only to show how a decision enters the agent and how the workflow reacts to it. They are not a real selection algorithm, and they do not mean those were the best scientific decisions.
+
+The results may vary with an actual API provider.
 
 ```{code-cell} ipython3
 import json
@@ -505,9 +464,4 @@ np.testing.assert_array_equal(after.cells.fetch_all("I"), initial_selection)
 Open the generated `report.html` during your own run to review its six steps: study and input,
 quality and preparation, exploration, final selection, numerical results, and provisional
 identities. Export aligned labels, coordinates, markers, and annotations with
-`result.export("a-new-export-directory")`. Archive both the numerical store and external audit.
-
-Every live decision requests reasoning off and has structured validation, one semantic repair,
-one transient retry, and recorded request budgets. Provider support varies; always-on reasoning
-cannot be disabled universally. The teaching provider demonstrates workflow mechanics without
-evaluating live-model reliability or annotation accuracy.
+`result.export("a-new-export-directory")`.
