@@ -112,7 +112,7 @@ ds.cells.to_pandas_dataframe(
 ds.plots.embedding(layout=analysis_run["umap"], color_by="is_first_cluster")
 ```
 
-The new column marks one cluster on the same active cells used for the insert. The `fetch` function returns values for the active subset (default column `I`), whereas `fetch_all` returns every row in the store. With every cell active the lengths match. If you want to select a specific cluster, you can pass the new Boolean column as `key` to select one cluster without changing `I`:
+The new column marks one cluster on the same active cells used for the insert. The `fetch` function returns values for the active subset (default column `I`), whereas `fetch_all` returns every row in the store. With every cell active the lengths match. If you want to select a specific cluster, you can pass the new boolean column as `key` to select one cluster without changing `I`:
 
 ```{code-cell} ipython3
 print(
@@ -163,7 +163,7 @@ These helpers return masks or indexes aligned with the metadata table, and they 
 
 ## Count matrices and normalization
 
-Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row. In this store the array is at `RNA/counts`. RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages. 
+Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row. In this store the array is at `RNA/counts`. RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages.
 
 Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts. `run_normalization(cell_selection, features)` is what saves the normalized counts into the Zarr path and requires exact stored cell- and feature-selection references. The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created store the physical feature `I` column is all true. Inspect the shapes without loading the complete matrix:
 
@@ -247,7 +247,6 @@ Count matrices are Zarr arrays, often sharded. This store keeps RNA counts at `R
 ```{code-cell} ipython3
 ds.show_zarr_tree(start="RNA", depth=1)
 ```
-
 
 ## Zarr versions and storage profiles
 
