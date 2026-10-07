@@ -1,5 +1,5 @@
 ---
-description: Order pancreas cell states and find genes associated with pseudotime.
+description: Score an explicit graph for pseudotime and load immutable trajectory marker artifacts.
 jupytext:
   text_representation:
     extension: .md
@@ -11,164 +11,122 @@ kernelspec:
   language: python
   name: python3
 ---
-# Order cell states with pseudotime
+# Pseudotime Primer
 
-A single-cell experiment measures cells at one time point, but it may capture several
-stages of a process. **Pseudotime** places those cells along a graph-based coordinate.
-In Scarf, chosen starting and terminal populations orient that coordinate. It does not
-measure elapsed time or establish which cells give rise to others.
+Pseudotime analysis refers to modeling and testing how molecular features, primarily gene expression, transcription factor activity, or pathway scores, change continuously along a reconstructed trajectory coordinate. Pseudotime lets us view cells not as a static discrete cluster, but instead enables us to dynamically model cellular processes as continuous gene regulatory programs unfolding across a developmental, activation, or perturbation axis.
 
-We use a developing-pancreas dataset to order cells from Ductal-like progenitors toward
-Alpha, Beta, and Delta populations, then find genes associated with that ordering.
+Pseudotime more specifically is a summary of the existing graph structure and the distance of a cell's transcriptional profile from a defined starting population along the graph.
 
-## Open the prepared analysis
+## Open the prepared graph
 
 ```{code-cell}
-# Work with numeric arrays and cell masks.
 import numpy as np
-# Summarize cells and results in tables.
 import pandas as pd
 
-# Open count stores and run Scarf analyses.
 import scarf
 
-# Keep routine logs and progress bars out of the results.
 scarf.configure_output(level="WARNING", progress=False)
 
-# Download the prepared example store.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-# Open the count store for this analysis.
-ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
-# Open the saved pancreas analysis.
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
+    nthreads=4,
+)
 analysis_run = ds.pipeline.open(label="docs_default")
-# Keep the graph from the saved analysis.
 graph = analysis_run["connectivity_map"]
-# Keep the full feature selection for marker testing.
 all_features = analysis_run["feature_universe"]
-# Inspect the opened store's cells and features.
-ds
 ```
 
-The saved analysis supplies the graph, UMAP, and feature selection. The store's live
-`clusters` column contains the published cell-type annotations; these differ from the
-numbered clusters calculated by the pipeline.
+From the completed analysis, we grab the existing computed graph, feature universe, and the UMAP.
 
-## Choose a start and endpoints
-
-We use the published Ductal annotation as the source and pool Alpha, Beta, and Delta
-as sinks. This is a biological assumption to check with marker evidence, not something
-pseudotime discovers for us.
-
-The vector below assigns a total of -1 to the source and +1 to the pooled sinks.
-All other cells receive zero. Sharing each total across its cells keeps source and sink
-mass balanced despite their different sizes.
+For pseudotime analysis, we need to select a starting point for what we can use to calculate the distance of a cell from the starting population. For our dataset, based on the biological context, our starting population would be the Ductal progenitor cells. If you'd like to gain a more technical understanding of what the source & the sink vectors are, refer to {doc}`fate_mapping`.
 
 ```{code-cell}
-# Read the published cell types for the selected cells.
 labels = ds.cells.fetch("clusters", key="I")
-# Choose Ductal cells as the starting population.
 source = labels == "Ductal"
-# Choose the pooled endocrine endpoints.
 sink = np.isin(labels, ["Alpha", "Beta", "Delta"])
-# Stop if either chosen endpoint population is absent.
 if not source.any() or not sink.any():
     raise ValueError("Source and sink labels must both be present")
-# Start with zero weight for cells outside the endpoints.
 source_sink_vector = np.zeros(len(labels), dtype=float)
-# Share a total weight of minus one across the source cells.
 source_sink_vector[source] = -1.0 / source.sum()
-# Share a total weight of plus one across the sink cells.
 source_sink_vector[sink] = 1.0 / sink.sum()
-# Check the endpoint sizes and balanced total weights.
+float(source_sink_vector.sum())
+```
+
+We define our sink vectors, or our endpoints, as Alpha, Beta, or Delta cells to define the endpoint of our axis, in which Ductal cells are the starting point. With this supervised axis, each cell can then be scored: low means Ductal-like, high means terminus-like (Alpha/Beta/Delta). To go a step further and determine if a cell is likely to be an Alpha/Beta/Delta, access {doc}`fate_mapping`.
+
+## Scoring Pseudotime
+
+```{code-cell}
+pseudotime_ref = ds.run_pseudotime_scoring(
+    graph,
+    ss_vec=source_sink_vector,
+)
+pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
 {
-    "source cells": int(source.sum()),
-    "sink cells": int(sink.sum()),
-    "source weight": round(float(source_sink_vector[source].sum()), 6),
-    "sink weight": round(float(source_sink_vector[sink].sum()), 6),
+    "artifact": pseudotime.ref,
+    "graph": pseudotime.graph,
+    "valid cells": int(pseudotime.valid.sum()),
 }
 ```
 
-## Score and view pseudotime
+We can now visualize the pseudotime results.
 
 ```{code-cell}
-# Score pseudotime using the chosen source and sink weights.
-pseudotime_ref = ds.run_pseudotime_scoring(graph, ss_vec=source_sink_vector)
-# Load pseudotime scores and their validity mask.
-pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
-# Save the calculated values in the cell table.
 ds.cells.insert("pseudotime", pseudotime.values, key="I", overwrite=True)
-# Show how pseudotime changes across the pancreas UMAP.
-ds.plots.embedding(layout=analysis_run['umap'], color_by='pseudotime', sort_values=True)
+ds.plots.embedding(
+    layout=analysis_run["umap"],
+    color_by="pseudotime",
+    sort_values=True,
+)
 ```
 
-Low values should lie toward the Ductal region and high values toward the endocrine
-endpoints. The default rescales the score from zero to one. Intermediate values are
-expected for intermediate populations; the spacing is not a clock.
-
-Check the score within each annotation, using only cells marked valid:
+With our known biological context, values should progress from the Ductal region toward our endocrine cell endpoints. A disconnected or reversed pattern is something that's important to investigate. Remember, to assign our endpoints and our starting points, use gene markers to characterize these bits.
 
 ```{code-cell}
-# Summarize the selected values and their spread.
 pd.DataFrame(
     {
-        "cell type": labels[pseudotime.valid],
+        "cluster": labels[pseudotime.valid],
         "pseudotime": pseudotime.values[pseudotime.valid],
     }
-).groupby("cell type")["pseudotime"].describe()
+).groupby("cluster")["pseudotime"].describe()
 ```
 
-In this example, Ductal cells have low scores, endocrine endpoints have high scores,
-and Ngn3-high progenitors occupy the middle. A pattern that disagrees with known markers
-is a reason to revisit the graph or endpoint choice.
+For each cluster, the table above reports how many cells it holds and how their pseudotime values distribute in comparison to the starting population, letting you validate that your starting Ductal cells sit near zero, while our terminal cells like Alpha, Beta, and Delta cells sit near one. A cluster whose mean lands mid-axis, or whose spread spans the full range, deserves digging into the data further.
 
-## Find genes associated with the ordering
-
-The full result includes untested features, which have missing p-values. The first few rows
-may therefore contain `NaN`. Multiple-testing correction covers only the tested features;
-we select those after previewing the table.
+## Search for pseudotime-associated features
 
 ```{code-cell}
-# Test the selected genes for association with pseudotime.
-marker_ref = ds.run_pseudotime_marker_search(pseudotime_ref, features=all_features)
-# Load the marker table and adjusted p-values.
+marker_ref = ds.run_pseudotime_marker_search(
+    pseudotime_ref,
+    features=all_features,
+)
 markers = ds.load_pseudotime_markers(marker_ref)
-# Inspect the first few rows of the result.
-markers.table.head()
+markers.table[["p_value", "p_value_adjusted"]].notna().sum()
 ```
 
-Keep tested genes, then compare the strongest increasing and decreasing associations:
+Untested features retain `NaN` p-values. For p value correction, Benjamini-Hochberg is only applied on tested features.
 
-```{code-cell} ipython3
-# Keep genes with an adjusted p-value.
+```{code-cell}
 tested = markers.table.loc[
     markers.table["p_value_adjusted"].notna(),
     ["feature_name", "r_value", "p_value_adjusted"],
 ]
-# Select the ten strongest positive correlations.
 increasing = tested.loc[tested["r_value"] > 0].nlargest(10, "r_value")
-# Select the ten strongest negative correlations.
 decreasing = tested.loc[tested["r_value"] < 0].nsmallest(10, "r_value")
-# Display increasing and decreasing genes together.
 pd.concat({"increasing": increasing, "decreasing": decreasing})
 ```
 
-Positive correlations identify genes whose expression tends to increase along the
-chosen axis; negative correlations identify decreasing genes. These are candidates to
-inspect, not evidence that they drive development.
+Conceptually, the table shows the trajectory's two ends in gene form, with increasing genes switching on as cells move toward the termini, whereas the decreasing genes switch off as progenitors are left behind. The pseudotime associated features reveal the clearest candidates for what could be driving this effect.
 
-## Check the limits
+## Important caveats to consider regarding pseudotime
 
-- Source and sink choices supervise the ordering. Try plausible alternatives before
-  making a developmental claim.
-- By default, Scarf scores the largest connected graph component. Other cells have
-  `valid=False` and undefined values. Use the validity mask for your own summaries;
-  Scarf's marker and aggregation methods apply it automatically.
-- Correlation can miss genes that rise and fall along the path. Use
-  {doc}`expression_dynamics` to inspect such profiles.
+- **Misdefining source and sink boundaries:** Mistaking an intermediate cell state for an endpoint compresses the dynamic range, while an incorrect root inverts the axis entirely. Always verify that progenitor markers sit near 0 and mature markers sit near 1 using cluster summary statistics and ground truth biology based on the context of your project.
+- **Ignoring the pseudotime.valid mask:** Cells in disconnected graph components cannot be reached by diffusion scoring and receive undefined values. Failing to filter by pseudotime.valid causes silent NaN propagation, skews cluster distributions, and corrupts downstream marker searches. This is more of a technical issue, but it's important to keep in mind.
+- **Equating linear correlation with causality:** Ranking features strictly by `r_value` only captures monotonic gene expression. This completely misses transient regulators, such as transcription factors that spike during lineage commitment and shut off at maturity, and flags passenger programs (e.g., cell cycle exit) as causal drivers. Thus, take other values into account as well.
 
-Continue to {doc}`fate_mapping` for several candidate terminal outcomes, or
-{doc}`trajectory_validation` for checks across graph and endpoint choices.
+Use {doc}`expression_dynamics` for smoothed feature profiles and modules, {doc}`fate_mapping` for multiple terminal outcomes and probabilities of endpoints, and {doc}`trajectory_validation` for component and endpoint checks.
