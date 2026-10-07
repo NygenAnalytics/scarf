@@ -13,8 +13,10 @@ kernelspec:
 ---
 # Import and export
 
-Scarf reads common single-cell count formats, writes a Zarr store for analysis, and exports counts or metadata to interoperable formats.
-Most imports follow the same pattern: inspect when the source layout can vary, open a reader, then call a matching `*ToZarr` writer.
+Scarf reads common single-cell count formats, writes a Zarr store for analysis, and exports counts or metadata to interoperable formats that you can run the analysis on.
+Most imports follow the same general pattern.
+
+Importing data from other tools or modalities follows the general pattern and required function calls discussed below.
 
 
 | Source              | Inspect              | Reader         | Writer         |
@@ -26,9 +28,7 @@ Most imports follow the same pattern: inspect when the source layout can vary, o
 | Dense CSV           |                      | `CSVReader`    | `CSVtoZarr`    |
 | SciPy CSR           |                      |                | `SparseToZarr` |
 
-Export paths write Matrix Market or H5AD.
-Scarf does not write Seurat `.rds` or `.h5seurat` files.
-See {doc}`../scanpy` or {doc}`../seurat` for ecosystem-specific workflow mapping.
+Export paths write matrix or H5AD file; Scarf does not write Seurat `.rds` or `.h5seurat` files. If you want to learn more about the ecosystem-specific workflow mapping for Scanpy or Seurat, see {doc}`../scanpy` or {doc}`../seurat` .
 
 Start with the Matrix Market example below. The later sections cover other input formats and
 show how to keep supplied analysis results or handle a larger import.

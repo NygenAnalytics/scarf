@@ -11,32 +11,15 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (data_organization)=
 
 # Data organization
 
-Scarf stores counts, metadata, graphs, and analysis results in a Zarr directory.
-Start with cell and feature metadata, then explore how counts and saved results are organized.
-Low-level layout details for contributors live in {doc}`../developers/zarr_internals`.
-
-## Prerequisites
-
-- Scarf installed with the `extra` optional dependencies
-- Basic familiarity with cell and feature metadata
-
-## What you will learn
-
-- Read and write cell or feature metadata
-- Inspect a persisted normalization result
-- Inspect the Zarr hierarchy when you need to locate stored data
+A datastore is where everything in a Scarf analysis lives, from the raw counts to the cell and gene metadata, and the graphs built from them, and every saved result. Everything is all stored in one Zarr directory on disk rather than in memory. Scarf keeps the data on disk in chunks and streams only the chunks required at each step to ensure that the analysis can be performed in a memory efficient manner. In the tutorial, you will come to gain a sense of how data organization inside of Scarf works, how to inspect results, and then inspect the Zarr folder hierarchy when you need to pull specific data.
 
 ## Dataset
 
-`DataStore` is the main entry point.
-Each assay owns feature metadata, normalization, and feature selection.
-Cell-level columns are shared across assays. The Boolean cell column `I` marks the active cells
-used by live-metadata methods. Saved runs keep their own frozen cell selection.
+For each new dataset, your `DataStore` is the main entry point of analysis. Each assay contains the counts, the feature metadata, the computationally guided results, and feature selection subset. Cell-level columns are shared across assays. The boolean cell column `I` marks the active cells used by live-metadata methods. Saved runs keep their own frozen cell selection.
 
 ```{mermaid}
 flowchart TB
@@ -49,8 +32,7 @@ flowchart TB
     ds --> atac
 ```
 
-The default assay supplies method defaults when `from_assay` is omitted.
-It does not merge assay-specific feature tables or results.
+By design, Scarf selects the default assay (typically RNA) whenever the user command omits `from_assay`, and this only picks which assay the method acts on; it never merges the assay-specific feature tables, selections, or results into a combined view.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -60,10 +42,8 @@ import scarf
 scarf.configure_output(level="WARNING", progress=False)
 ```
 
-This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
-The rebuilt store uses the current layout and contains a completed pipeline run named
-`docs_default`. Open it directly and reuse that run's exact selections, clustering, UMAP, and
-markers.
+This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`. The rebuilt store uses the current layout and contains a completed pipeline run named `docs_default`. Here, we open it directly and reuse the run's exact selections, clustering, UMAP, and
+markers to demonstrate how Scarf works.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -80,22 +60,18 @@ ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 analysis_run = ds.pipeline.open(label="docs_default")
 
 ds
-```
 
-```{code-cell} ipython3
 cluster_values = analysis_run.cells.fetch("clusters")
 cluster_counts = pd.Series(cluster_values, name="cluster").value_counts()
 cluster_counts.sort_index().to_frame("cells")
 ```
 
-The selected clustering remains in its exact artifact. The catalog's literal `clusters` column is
-an imported cell-type annotation, not a copy of this analytical result. Opening the run does not
-modify either one.
+The selected clustering is completed and remains in its exact artifact. The catalog's literal `clusters` column is
+an imported cell-type annotation.
 
-## 1. Read cell and feature metadata
+## Read cell and feature metadata
 
-Cell and feature tables are `MetaData` objects (`ds.cells`, `ds.RNA.feats`), not pandas DataFrames.
-Use `head` for a quick look, `to_pandas_dataframe` to export selected columns, and `fetch` / `fetch_all` for single columns.
+Cell and feature tables are `MetaData` objects (`ds.cells`, `ds.RNA.feats`), not pandas DataFrames, thus manipulating them takes a different path. Use `head` for a quick look at the information, `to_pandas_dataframe` to export selected columns for more detail, and `fetch` / `fetch_all` to pull data for specific (singular) columns.
 
 ```{code-cell} ipython3
 ds.cells.head()[["ids", "I", "clusters"]]
@@ -112,11 +88,10 @@ cell_qc = ds.cells.to_pandas_dataframe(
 cell_qc.set_index("ids").head()
 ```
 
-`insert` writes a new column and aligns values to the active subset unless you override `key`.
-Re-inserting an existing column requires `overwrite=True`.
+The `insert` function writes a new column and aligns values to the active subset unless you override `key`. Re-inserting an existing column requires `overwrite=True`.
 In this prepared store, every cell is active and the saved run contains the same cells, so its
 cluster labels align with the values we insert. For another analysis, check the cell selection
-before copying results into live metadata.
+before copying results into live metadata to minimize error.
 
 ```{code-cell} ipython3
 first_run_cluster = cluster_values[0]
@@ -137,12 +112,7 @@ ds.cells.to_pandas_dataframe(
 ds.plots.embedding(layout=analysis_run["umap"], color_by="is_first_cluster")
 ```
 
-The new column marks one cluster on the same active cells used for the insert.
-
-`fetch` returns values for the active subset (default column `I`).
-`fetch_all` returns every row in the store.
-With every cell active the lengths match. Pass the new Boolean column as `key` to select one
-cluster without changing `I`:
+The new column marks one cluster on the same active cells used for the insert. The `fetch` function returns values for the active subset (default column `I`), whereas `fetch_all` returns every row in the store. With every cell active the lengths match. If you want to select a specific cluster, you can pass the new Boolean column as `key` to select one cluster without changing `I`:
 
 ```{code-cell} ipython3
 print(
@@ -153,10 +123,9 @@ print(
 )
 ```
 
-## 2. Select cells from metadata
+## Select cells from metadata
 
-`sift` returns a boolean mask for one numeric range.
-`multi_sift` combines several ranges, and `get_index_by` locates exact categorical values:
+The `sift` function returns a boolean mask for one numeric range selecting cells; `multi_sift` combines several ranges, and `get_index_by` locates exact categorical values of where cells or values are located:
 
 ```{code-cell} ipython3
 active_before = int(ds.cells.fetch_all("I").sum())
@@ -175,7 +144,7 @@ joint_range = ds.cells.multi_sift(
 {"cells in both QC ranges": int(joint_range.sum())}
 ```
 
-Find rows by their published annotation.
+Find rows based on their published annotations.
 
 ```{code-cell} ipython3
 ductal_rows = ds.cells.get_index_by(["Ductal"], "clusters")
@@ -190,36 +159,22 @@ ds.cells.insert(column_name="in_count_range", values=count_range, overwrite=True
 ds.plots.embedding(layout=analysis_run["umap"], color_by="in_count_range")
 ```
 
-These helpers return masks or indexes aligned with the metadata table.
-They do not modify `I` until you explicitly insert or update a cell key.
-See the `MetaData` API in {doc}`../reference/api/assays` for update and delete helpers.
+These helpers return masks or indexes aligned with the metadata table, and they do not modify `I` until you explicitly insert or update a cell key. They can serve as useful tools when subsetting data. See the `MetaData` API in {doc}`../reference/api/assays` for more information on how the helpers work.
 
-## 3. Count matrices and normalization
+## Count matrices and normalization
 
-Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row.
-In this store the array is at `RNA/counts`.
-RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages.
-Routine analysis does not need to touch either array directly.
+Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row. In this store the array is at `RNA/counts`. RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages. 
 
-Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts.
-`run_normalization(cell_selection, features)` is the public persisted path and requires exact stored cell- and feature-selection references.
-The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created
-store the physical feature `I` column is all true. Inspect the shapes without loading the
-complete matrix:
+Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts. `run_normalization(cell_selection, features)` is what saves the normalized counts into the Zarr path and requires exact stored cell- and feature-selection references. The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created store the physical feature `I` column is all true. Inspect the shapes without loading the complete matrix:
 
 ```{code-cell} ipython3
 print("Raw shape:", ds.RNA.rawData.shape)
 print("Normed shape:", ds.RNA.normed().shape)
 ```
 
-For a worked example that reads count blocks for an external calculation, see
-{doc}`custom_analyses`.
+## Inspect saved analysis results
 
-## 4. Inspect saved analysis results
-
-Analysis methods return lightweight references to results stored in Zarr.
-The completed `docs_default` run retained the HVG and normalization references it created.
-Asking for the same normalization again reuses that result rather than recomputing:
+Analysis methods return lightweight references to results stored in Zarr. The completed run retained the HVG and normalization references it created; if you seek to ask for the same normalization results again, Scarf can simply reuse the results rather than recomputing:
 
 ```{code-cell} ipython3
 reused_normalized = ds.run_normalization(
@@ -230,7 +185,7 @@ print("Reused:", reused_normalized == analysis_run["normalized"])
 reused_normalized
 ```
 
-Inspect its status and open the underlying group only when a custom method needs direct access:
+Inspect its status and open the underlying group only when a custom method or analysis needs direct access to the information.
 
 ```{code-cell} ipython3
 status = ds.inspect_artifact(reused_normalized)
@@ -247,18 +202,12 @@ print("Arrays:", list(group.array_keys())[:5])
 pd.Series(normalization_settings, name="value").rename_axis("setting").to_frame()
 ```
 
-Identical inputs and parameters {term}`reuse` a complete result.
-Branching, invalidation, and lineage are covered in {doc}`reuse_and_tracing`.
+## Look inside the store
 
-## 5. Look inside the store
+Scarf uses [Zarr](https://zarr.readthedocs.io/en/stable/) for chunked on-disk arrays, with the central Zarr store being a directory tree with the following tidbits to it: counts, cell and feature attributes, and unchangeable artifacts live
+under named groups. Relative to a single HDF5 file, the layout supports parallel reads and writes, fast compression codecs, and automatic persistence of intermediate results.
 
-Scarf uses [Zarr](https://zarr.readthedocs.io/en/stable/) for chunked on-disk arrays.
-The store is a directory tree: counts, cell and feature attributes, and immutable artifacts live
-under named groups.
-Relative to a single HDF5 file, the layout supports parallel reads and writes, fast compression codecs, and automatic persistence of intermediate results.
-
-`show_zarr_tree` prints the hierarchy.
-With `depth=0` you see the top-level assays and `cellData`.
+Running `show_zarr_tree` prints the hierarchy so you can visualize it yourself. Modulating the depth allows you to see the tree in different levels of detail, with `depth=0` you see the top-level assays and `cellData`.
 
 ```{code-cell} ipython3
 ds.show_zarr_tree(depth=0)
@@ -281,17 +230,15 @@ pd.DataFrame({
 }).T.rename_axis("cellData column")
 ```
 
-**The `I` column** is the default user-owned {term}`cell key`, tracking which cells are active for
-live-metadata APIs. Values are boolean.
-Use `snapshot_cell_selection("I")` to capture this live column before passing it to an analytical
-producer. Some metadata, mapping, and export utilities still accept `cell_key` directly.
+**The `I` column** is the default {term}`cell key`, which once again, tracks which cells are active for
+live-metadata APIs. Values are boolean, so instead of deleting cells, they simply are not loaded in for use. You can see the number of cells by:
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(["I"])["I"].value_counts()
 ```
 
-This store keeps every barcode active (`True`). Analytical filtering returns a separate immutable
-selection artifact and leaves this column unchanged. If you deliberately author a live selection
+This store keeps every barcode active (`True`). Analytical filtering returns a separate
+selection artifact and leaves this column unchanged. If you deliberately modify a live selection
 column, its `False` rows also remain in the table rather than being deleted.
 
 Each assay group holds `featureData` and its persisted artifacts.
@@ -301,39 +248,23 @@ Count matrices are Zarr arrays, often sharded. This store keeps RNA counts at `R
 ds.show_zarr_tree(start="RNA", depth=1)
 ```
 
-For feature arrays, pass `start="RNA/featureData"` to the same method.
 
-Each persisted result is an {term}`artifact`. Assay-scoped results live under
-`{assay}/artifacts/{kind}/{artifact_id}`; datastore-scoped selections and integrated results live
-under `artifacts/{kind}/{artifact_id}`.
-The kind names the operation family and the identifier is derived from the inputs and parameters, which is what lets Scarf recognise an equivalent result instead of recomputing it.
-Nothing here encodes parameters in the path, so a second PCA at different dimensionality becomes a sibling entry rather than a new branch of the tree.
+## Zarr versions and storage profiles
 
-To inspect saved result groups, use `ds.show_zarr_tree(start="RNA/artifacts", depth=1)`.
+Current Scarf versions write new datasets as Zarr v3. RNA assays also write a gene-major `countsT` copy next to `counts` (`countsT` is simply a transposed version of the counts). If you have older stores with Scarf, then re-import older RNA stores that use Zarr v2 or lack `countsT` before analysis.
 
-{doc}`../developers/zarr_internals` covers the complete on-disk layout.
+Count matrices from the writers use sharded arrays (default profile `fast_local`). You can modify this with `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`. Selecting cloud simply switches the arrays to a different level of compression regardless of whether the store is on cloud storage or not.
 
-## 6. Zarr versions and storage profiles
-
-Current Scarf versions write new datasets as Zarr v3.
-RNA assays also write a gene-major `countsT` copy next to `counts`.
-The catalog dataset used here was rebuilt from its raw source with this codebase, so it already has
-the current layout. Re-import older RNA stores that use Zarr v2 or lack `countsT` before analysis.
-
-Count matrices from the writers use sharded arrays (default profile `fast_local`).
-Set the profile with `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
-
-Storage profiles and conversion belong to the physical store, while `mem_budget` and `nthreads` control execution.
-See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations, and {doc}`remote_stores` for object storage and local scratch.
+Storage profiles and conversion belong to the physical store, while `mem_budget` and `nthreads` control the budget of executing cells.
 
 ## Common mistakes
 
-- Expecting filtering to delete rows or rewrite live `I`
-- Treating `MetaData` as an in-memory pandas DataFrame
-- Using `fetch` when values for inactive cells are also required (`fetch_all`)
-- Treating a result reference as an in-memory matrix
-- Editing artifact groups directly instead of using Scarf's analysis methods
-- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without re-importing it
+- Expecting filtering to delete rows or rewrite live `I`. Filtering only returns a separate selection artifact and leaves `I` unchanged, so check the returned artifact or explicitly update a live column with `insert` when you actually want to change the active set.
+- Treating `MetaData` as an in-memory pandas DataFrame. `ds.cells` and `ds.RNA.feats` are on-disk metadata objects, so preview them with `head` and pull values out with `to_pandas_dataframe`, `fetch`, or `fetch_all` instead of applying pandas operations directly.
+- Using `fetch` when values for inactive cells are also required. `fetch` returns only the active subset while `fetch_all` returns every row in the store, so switch to `fetch_all` whenever your question covers cells outside the current selection.
+- Treating a result reference as an in-memory matrix. Analysis methods hand back a lightweight `ArtifactRef`, so pass that reference along or open its values with `load_artifact` instead of indexing it like an array.
+- Editing artifact groups directly instead of using Scarf's analysis methods. Direct edits bypass provenance tracking and break reuse, so rerun the corresponding method or producer to create a new recorded artifact.
+- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without re-importing it. The current version requires the Zarr v3 layout with both count orientations, so re-import the source data through the matching writer before analysis.
 
 Metadata changes and artifacts are written into the Zarr store.
 Low-level layout details intended for contributors remain in {doc}`../developers/zarr_internals`.

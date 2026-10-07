@@ -1,5 +1,3 @@
- .
-
 ---
 description: Choose informative RNA genes, understand Scarf's default exclusions, and compare feature-set sizes.
 jupytext:
@@ -15,7 +13,7 @@ kernelspec:
 ---
 # Feature selection: choosing informative features
 
-Feature selection decides which measured genes define the downstream dimensionality reduction steps and the neighborhood graph. Feature selection is often performed to find the most highly variable genes (HVGs) across the entire dataset, as these are the genes with the most variance in terms of their expression. Reducing our dataset to a small subset of genes not only reduces the computational cost, but makes the analysis more interpretable by filtering out noise. More specifically, in Scarf, `select_hvgs` models the relationship between mean expression and variance, then selects genes
+Feature selection decides which measured genes define the downstream dimensionality reduction steps and the neighborhood graph. Feature selection is often performed to find the most highly variable genes (HVGs) across the entire dataset, as these are the genes with the most variance in terms of their expression. Reducing your dataset to a small subset of genes not only reduces the computational cost, but makes the analysis more interpretable by filtering out noise. More specifically, in Scarf, `select_hvgs` models the relationship between mean expression and variance, then selects genes
 whose corrected variance is high relative to genes with similar abundance.
 
 ## Fit the mean-variance model
