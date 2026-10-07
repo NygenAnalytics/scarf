@@ -17,7 +17,7 @@ kernelspec:
 
 With sc-RNA seq only capturing a snapshot of a cell at a certain point in time, it can often be useful to determine what stage of the cell-cycle a cell is in based on that snapshot. With cell division happening in a cycle, growth in G1, replication of their DNA in S phase, preparation in G2 for the split during mitosis, we can estimate their stage based on the gene programs associated with the states. Each stage switches on a characteristic gene program, so measuring S-phase and G2M-phase program activity reveals which cells are cycling: information that matters twice over, because cycling cells can cluster together regardless of cell type (a confounder to check) and because proliferation itself is often the biology of interest.
 
-Scarf infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, reducing the influence of background expression without eliminating technical effects or dropout. Built-in human and mouse S/G2M gene lists come inbuilt. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
+Scarf infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, reducing the influence of background expression without eliminating technical effects or dropout. Built-in human and mouse S/G2M gene lists are included. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
 
 Here, we score the prepared pancreas store, and then map phases and scores onto its UMAP.
 

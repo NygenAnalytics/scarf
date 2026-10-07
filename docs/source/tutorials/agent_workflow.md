@@ -81,7 +81,7 @@ Missing replication does not block descriptive population discovery.
 ## Read and continue a run
 
 The returned status when checking a run will be one of the following: `running`, `needsInput`, `completed`, `failed`, or `interrupted`.
-Inspect it before using finalized results. Every outcome supports a report, including questions and failures that you can go back and comb through. 
+Inspect it before using finalized results. Every outcome supports a report, including questions and failures that you can go back and comb through.
 
 ```python
 from scarf.agent import open_analysis, resume_rna_async
@@ -105,13 +105,13 @@ For a pending question that the model may have during the process, pass `answers
 
 Completed results expose the results and values used during  `run.pipeline`, `run.artifacts`, `run.get_markers()`, `run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies the source and exact final artifacts. Annotations remain provisional and do not overwrite cell metadata. A named identity requires observed supporting markers, but this validation cannot establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
 
-The external directory retains `run.json`, the events that took place, their evidence, visible model exchanges, annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the local Zarr store links to the exact final core pipeline and its workspace, selected configuration, rationale, and external audit location. Read it through for a summarized version in `run.compact_result`. 
+The external directory retains `run.json`, the events that took place, their evidence, visible model exchanges, annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the local Zarr store links to the exact final core pipeline and its workspace, selected configuration, rationale, and external audit location. Read it through for a summarized version in `run.compact_result`.
 
 ## What the agent compares
 
 The baseline uses 1,000 variable genes, 21 PCs, and 11 neighbors. Scarf then measures alternatives that change one of these settings at a time. It compares clusterings on the same retained cells, checks markers for up to two finalists, and makes a final UMAP.
 
-The model interprets those measurements and proposes labels to those clusters. Scarf executes the numerical operations and checks the returned decisions. A clean UMAP or many marker genes does not, by itself, establish that the chosen identities are correct; this is one of the portions where human input becomes more valuable. 
+The model interprets those measurements and proposes labels to those clusters. Scarf executes the numerical operations and checks the returned decisions. A clean UMAP or many marker genes does not, by itself, establish that the chosen identities are correct; this is one of the portions where human input becomes more valuable.
 
 The main analysis uses every retained cell. Some diagnostics use bounded samples: up to 10,000
 cells for covariate checks and 2,000 for silhouette assessment. See the
@@ -120,7 +120,6 @@ cells for covariate checks and 2,000 for silhouette assessment. See the
 ## QC, correction, and uncertainty
 
 The default `qcPolicy="retain"` keeps the supplied dataset, runs the quality control, flags the outliers, but does not remove any cells. Projected retention under other supported policies is evidence, not additional filtering. Global manual thresholds or the gentle five-MAD profile require explicit configuration. The five-MAD profile places each metric's bounds at the cohort median plus or minus five scaled median absolute deviations (1.4826 times the median distance of cells from the median), so only cells far outside the typical range are flagged or removed. This is a mild, automatic filter that drops very clear, low-quality outliers. High counts/features remain flags under the gentle profile. Optional missing metrics stay unknown.
-
 
 The workflow explicitly supplies its HVG blacklist, normally excluding mitochondrial names matching `^mt-` case-insensitively. HLA/H2, sex-linked, cell-cycle, and reporter features are
 preserved unless explicitly instructed to be excluded. An organism name alone does not resolve gene identifiers that are linked to Ensembl IDs.
@@ -131,7 +130,7 @@ For the batch correction process, Harmony requires declared technical batches, c
 evidence is unavailable. The agent never enables scoring implicitly, and scoring never removes
 cells automatically. It is recommended, however, that you perform doublet removal on your dataset.
 
-By default Scarf runs in `interactionMode="lenient"`. This means that when the model is unsure about something optional, Scarf does not stop to ask you; it simply applies a saved, conservative rule to settle it. Anything it cannot know for sure stays unknown, so Scarf never invents information. If the model says several partitions are all acceptable and they tie, Scarf breaks the tie in a fixed way: it prefers the native analysis first, then follows the frozen trial and resolution order. This is just a disclosed rule to keep the choice consistent, not proof that the native option is biologically better. If you switch to strict mode, Scarf leaves those same questions pending for you to answer instead. Either way, if a truly essential fact is missing, the run pauses with `needsInput` so you can supply it with the answer. 
+By default Scarf runs in `interactionMode="lenient"`. This means that when the model is unsure about something optional, Scarf does not stop to ask you; it simply applies a saved, conservative rule to settle it. Anything it cannot know for sure stays unknown, so Scarf never invents information. If the model says several partitions are all acceptable and they tie, Scarf breaks the tie in a fixed way: it prefers the native analysis first, then follows the frozen trial and resolution order. This is just a disclosed rule to keep the choice consistent, not proof that the native option is biologically better. If you switch to strict mode, Scarf leaves those same questions pending for you to answer instead. Either way, if a truly essential fact is missing, the run pauses with `needsInput` so you can supply it with the answer.
 
 ## See how model decisions enter the agent
 
