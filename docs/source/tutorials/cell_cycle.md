@@ -17,7 +17,7 @@ kernelspec:
 
 With sc-RNA seq only capturing a snapshot of a cell at a certain point in time, it can often be useful to determine what stage of the cell-cycle a cell is in based on that snapshot. With cell division happening in a cycle, growth in G1, replication of their DNA in S phase, preparation in G2 for the split during mitosis, we can estimate their stage based on the gene programs associated with the states. Each stage switches on a characteristic gene program, so measuring S-phase and G2M-phase program activity reveals which cells are cycling: information that matters twice over, because cycling cells can cluster together regardless of cell type (a confounder to check) and because proliferation itself is often the biology of interest.
 
-SCARF infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, reducing the influence of background expression without eliminating technical effects or dropout. Built-in human and mouse S/G2M gene lists come inbuilt. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
+Scarf infers the cell cycle by scoring each program by averaging its marker genes and subtracting matched control genes sampled from the same expression range, reducing the influence of background expression without eliminating technical effects or dropout. Built-in human and mouse S/G2M gene lists come inbuilt. Each cell is then assigned one phase: G1 when both scores are negative, otherwise whichever program scores higher.
 
 Here, we score the prepared pancreas store, and then map phases and scores onto its UMAP.
 
@@ -65,7 +65,7 @@ Scarf's scorer follows the same general strategy as [Scanpy's cell-cycle scorer]
 - Sample control genes from the same expression bins as each phase's markers.
 - Subtract mean control expression from mean marker expression for each cell and phase.
 
-As stated earlier, in SCARF, cells with two negative scores are assigned G1; Otherwise, the G2M phase is assigned when its score exceeds the S score, and the remaining cells are assigned S.
+As stated earlier, in Scarf, cells with two negative scores are assigned G1; Otherwise, the G2M phase is assigned when its score exceeds the S score, and the remaining cells are assigned S.
 
 ```{code-cell}
 # Score S and G2M programs in the saved analysis cells.
@@ -82,7 +82,7 @@ phase = np.asarray(cell_cycle_values["phase"][:]).astype(str)
 pd.DataFrame({"S score": s_score, "G2M score": g2m_score, "phase": phase}).head()
 ```
 
-Two markers in the bundled G2M list are absent from this assay; The warning is expected, and SCARF scores the cells with the remaining markers.
+Two markers in the bundled G2M list are absent from this assay; The warning is expected, and Scarf scores the cells with the remaining markers.
 
 ## Visualize cell-cycle phases
 

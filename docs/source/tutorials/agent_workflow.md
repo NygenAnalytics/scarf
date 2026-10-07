@@ -17,11 +17,11 @@ kernelspec:
 # Automate an RNA analysis
 
 Scarf agents can run a sc-RNA seq analysis, compare a small set of analysis settings, and propose cell identities from the measured markers. The result includes clusters, UMAP, marker tables,
-provisional annotations, and a report explaining the choices. For this analysis, you need your own model provider you can provide. Start with a prepared store (downloaded dataset); the first sections show how to run the analysis and review its results. Here, it is even more key that during the annotation process towards the end, you need to review it manually with true biology.
+provisional annotations, and a report explaining the choices. For this analysis, you need to provide your own model provider. Start with a prepared store (downloaded dataset); the first sections show how to run the analysis and review its results. Here, it is even more key that you manually review the annotation process toward the end with true biology.
 
 A real worked example can be found in {doc}`garrido_trigo_agents` where agents analyzed changes in gene expression profiles from an intestinal inflammatory bowel disease study with healthy paired controls.
 
-Towards the end of this document you can inspect how the structured decision enter the agent when synthethic example data is utilized
+Towards the end of this document, you can inspect how the structured decisions enter the agent when synthetic example data is utilized.
 
 ## Prepare your input and model
 
@@ -41,7 +41,7 @@ Prepare a clean input separately if needed; `repack_store(..., data_only=True)` 
 and rebuilds preparation metadata without the old analysis artifacts. The agent does not delete
 old results. Its own completed artifacts can be reused during the same run and explicit resume.
 
-Pass a Pydantic AI model object or a supported `provider:model-name` identifier to use other providers. Configure credentials on the provider or in the environment, not in saved study text or runtime settings, and make sure you don't push that information to them public. Provider calls may incur charges thus keep this in mind during the analysis process.
+Pass a Pydantic AI model object or a supported `provider:model-name` identifier to use other providers. Configure credentials on the provider or in the environment, not in saved study text or runtime settings, and make sure you don't make that information public. Provider calls may incur charges, thus keep this in mind during the analysis process.
 
 ## Start a real analysis
 
@@ -105,7 +105,7 @@ For a pending question that the model may have during the process, pass `answers
 
 Completed results expose the results and values used during  `run.pipeline`, `run.artifacts`, `run.get_markers()`, `run.plot_embedding()`, `run.plot_markers()`, and `run.annotations`. Numerical access verifies the source and exact final artifacts. Annotations remain provisional and do not overwrite cell metadata. A named identity requires observed supporting markers, but this validation cannot establish that the biological identity is correct. Explicit `unassigned` clusters are permitted.
 
-The external directory retains `run.json`, the events that took place, their evidence, visible model exchanges, annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the local Zarr store links to the exact final core pipeline and its workspace, selected configuration, rationale, and external audit location. Read it through for a summarized version`run.compact_result`. 
+The external directory retains `run.json`, the events that took place, their evidence, visible model exchanges, annotations, reports, and previews. A compact summary in `agent_results/<runId>` inside the local Zarr store links to the exact final core pipeline and its workspace, selected configuration, rationale, and external audit location. Read it through for a summarized version in `run.compact_result`. 
 
 ## What the agent compares
 
@@ -119,23 +119,23 @@ cells for covariate checks and 2,000 for silhouette assessment. See the
 
 ## QC, correction, and uncertainty
 
-The default `qcPolicy="retain"` keeps the supplied dataset, runs the quality control, flags the outliers, but does not remove any cells. Projected retention under other supported policies is evidence, not additional filtering. Global manual thresholds or the gentle five-MAD profile require explicit configuration. This is an automated mild, and automatic filter that drops very clear, low-quality outliers. High counts/features remain flags under the gentle profile. Optional missing metrics stay unknown.
+The default `qcPolicy="retain"` keeps the supplied dataset, runs the quality control, flags the outliers, but does not remove any cells. Projected retention under other supported policies is evidence, not additional filtering. Global manual thresholds or the gentle five-MAD profile require explicit configuration. The five-MAD profile places each metric's bounds at the cohort median plus or minus five scaled median absolute deviations (1.4826 times the median distance of cells from the median), so only cells far outside the typical range are flagged or removed. This is a mild, automatic filter that drops very clear, low-quality outliers. High counts/features remain flags under the gentle profile. Optional missing metrics stay unknown.
 
 
 The workflow explicitly supplies its HVG blacklist, normally excluding mitochondrial names matching `^mt-` case-insensitively. HLA/H2, sex-linked, cell-cycle, and reporter features are
-preserved unless explicitly instructed to be excluded. An organism name alone does not resolve gene identifiers that are linked to ensembl ids
+preserved unless explicitly instructed to be excluded. An organism name alone does not resolve gene identifiers that are linked to Ensembl IDs.
 
 For the batch correction process, Harmony requires declared technical batches, complete labels, protected biological variables, and supplied evidence separating technical variation from biology. The current design check requires protected groups across technical batches. Unknown or confounded roles retain native analysis parameters. A corrected dataset needs its exact native counterpart at the same resolution, plus measured mixing, preservation, marker, and doublet evidence. Checks use a `0.05` tolerance and require improvement in at least one mixing measure.
 
 **Doublet scoring is always opt-in.** With `scoreDoublets=False`, correction requiring doublet
 evidence is unavailable. The agent never enables scoring implicitly, and scoring never removes
-cells automatically. It is reccomended however, that you perform doublet removal on your dataset.
+cells automatically. It is recommended, however, that you perform doublet removal on your dataset.
 
 By default Scarf runs in `interactionMode="lenient"`. This means that when the model is unsure about something optional, Scarf does not stop to ask you; it simply applies a saved, conservative rule to settle it. Anything it cannot know for sure stays unknown, so Scarf never invents information. If the model says several partitions are all acceptable and they tie, Scarf breaks the tie in a fixed way: it prefers the native analysis first, then follows the frozen trial and resolution order. This is just a disclosed rule to keep the choice consistent, not proof that the native option is biologically better. If you switch to strict mode, Scarf leaves those same questions pending for you to answer instead. Either way, if a truly essential fact is missing, the run pauses with `needsInput` so you can supply it with the answer. 
 
 ## See how model decisions enter the agent
 
-The user workflow above is general overview of how the agent workflow goes. This section is more of an optional bit for you if you want to understand how the structured model decisions enter the agent. It uses a scripted provider and synthetic data; it does not teach biological annotation or evaluate a live model.
+The user workflow above is a general overview of how the agent workflow goes. This section is more of an optional bit for you if you want to understand how the structured model decisions enter the agent. It uses a scripted provider and synthetic data; it does not teach biological annotation or evaluate a live model.
 
 The fixture has 120 cells and 2,102 features (genes), with three planted expression patterns. It is small enough to construct in memory and needs no dataset download or provider credentials.
 
@@ -224,9 +224,9 @@ del prepared, counts
 }
 ```
 
-The example uses a local `FunctionMode`l instead of a real provider. A `FunctionModel `is simply a stand-in model: it receives the exact same structured prompts, schemas, and measured evidence that Scarf would send to a live provider, but instead of calling an API it runs a small Python function that you wrote. That function returns fixed, scripted answers, so the whole production workflow still runs end to end, including the numerical pipeline, the evidence checks, the validation, and the saved results, without any provider or credentials.
+The example uses a local `FunctionModel` instead of a real provider. A `FunctionModel` is simply a stand-in model: it receives the exact same structured prompts, schemas, and measured evidence that Scarf would send to a live provider, but instead of calling an API it runs a small Python function that you wrote. That function returns fixed, scripted answers, so the whole production workflow still runs end to end, including the numerical pipeline, the evidence checks, the validation, and the saved results, without any provider or credentials.
 
-In this example the scripted answers just walk through the decision stages: it asks for the registered 30-PC (principal compoent) probe, shortlists two measured baseline resolutions, picks the first eligible finalist, and labels every synthetic cluster as unassigned. These choices are hardcoded only to show how a decision enters the agent and how the workflow reacts to it. They are not a real selection algorithm, and they do not mean those were the best scientific decisions.
+In this example the scripted answers just walk through the decision stages: it asks for the registered 30-PC (principal component) probe, shortlists two measured baseline resolutions, picks the first eligible finalist, and labels every synthetic cluster as unassigned. These choices are hardcoded only to show how a decision enters the agent and how the workflow reacts to it. They are not a real selection algorithm, and they do not mean those were the best scientific decisions.
 
 The results may vary with an actual API provider.
 

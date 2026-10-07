@@ -14,7 +14,7 @@ kernelspec:
 
 # Analyze Garrido-Trigo RNA with Scarf agents
 
-This tutorial serves more as an example of what the automated analysis wiht a SCARF agentw ould look like. Use Scarf agents to explore RNA profiles from an intestinal IBD and healthy-control study. We will prepare a local copy, describe the study, run the analysis with default scientific settings, and inspect the proposed identities the agent suggests.
+This tutorial serves more as an example of what the automated analysis with a Scarf agent would look like. Use Scarf agents to explore RNA profiles from an intestinal IBD and healthy-control study. We will prepare a local copy, describe the study, run the analysis with default scientific settings, and inspect the identities the agent proposes.
 
 The input preparation is longer than the analysis call because this published store needs
 local preparation before the current agent can use it. Do this once; later visits can resume
@@ -22,7 +22,7 @@ the saved analysis. For the shorter general API example, start with {doc}`agent_
 
 {nb-download}`Download the notebook <garrido_trigo_agents.ipynb>`.
 The general workflow and an example without provider credentials are in
-{doc}`agent_workflow` towards the end.
+{doc}`agent_workflow` toward the end.
 
 ## Set up the notebook folder
 
@@ -71,10 +71,10 @@ run_dir = work_dir / "agent_runs" / "garrido-trigo"
 
 ## Prepare the input once
 
-As discussed in the {doc}`agent_workflow`, the biggest prequisite to starting the automated analysis is preparing the the dataset itself. `Catalog.mount_datastore()`creates a writable local mount whose counts remain remote. It has no full-copy option. The published version used here also predates the preparation metadata required by current Scarf mounts. To obtain a complete local copy, resolve the source through Cytebase, download its files read-only, and use the public`repack_store(data_only=True)`operation to prepare `data.zarr` on the dataset of your choice.
-This preparation leaves published data unchanged (meaning if you need to revert its possible) and excludes prior numerical analysis artifacts from the working copy.
+As discussed in the {doc}`agent_workflow`, the biggest prerequisite to starting the automated analysis is preparing the dataset itself. `Catalog.mount_datastore()` creates a writable local mount whose counts remain remote. It has no full-copy option. The published version used here also predates the preparation metadata required by current Scarf mounts. To obtain a complete local copy, resolve the source through Cytebase, download its files read-only, and use the public `repack_store(data_only=True)` operation to prepare `data.zarr` on the dataset of your choice.
+This preparation leaves published data unchanged (meaning if you need to revert, it's possible) and excludes prior numerical analysis artifacts from the working copy.
 
-The downloaded snapshot stays in assigned directory, in our case `scarf_datasets/`. On subsequent notebook runs, the existing prepared `data.zarr` is retained and its saved analysis can be resumed. A different source (dataset) or scientific methodology should use a new notebook folder.
+The downloaded snapshot stays in the assigned directory, in our case `scarf_datasets/`. On subsequent notebook runs, the existing prepared `data.zarr` is retained and its saved analysis can be resumed. A different source (dataset) or scientific methodology should use a new notebook folder.
 
 ```{code-cell} ipython3
 from huggingface_hub import BucketFile, download_bucket_files, get_token, list_bucket_tree
@@ -130,7 +130,7 @@ print({"dataset": dataset_id, "cells": int(input_cells.sum()), "genes": len(inpu
 This is descriptive population discovery in the supplied IBD and healthy-control cohort.
 The dataset name contains `hc`, but its disease metadata includes Crohn disease,
 ulcerative colitis, and healthy controls; the full supplied cohort is retained.
-Author cell-type annotations are held out for this example. Donor or sample names do not authorize technical correction, and cells are not independent biological replicates, the donors are. The default QC policy retains the supplied cells with advisory outlier flags.
+Author cell-type annotations are held out for this example. Donor or sample names do not authorize technical correction, and cells are not independent biological replicates; the donors are. The default QC policy retains the supplied cells with advisory outlier flags.
 Doublet scoring is opt-in and is left disabled here.
 
 ```{code-cell} ipython3
@@ -199,7 +199,7 @@ print({"status": run.status, "pipelineInvocations": len(run.pipeline_runs)})
 
 ## Inspect coverage and provisional identities
 
-The native baseline analysis includes finding the the HVGs, the PCs, and probing for the the neighbors. Every probe is compared with its actual parent at matching resolutions.
+The native baseline analysis includes finding the HVGs, the PCs, and probing for the neighbors. Every probe is compared with its actual parent at matching resolutions.
 Marker evidence is collected for at most two finalists; finalization reuses the
 selected marker artifacts and adds UMAP. These are descriptive markers rather than
 replicated differential-expression tests. 
@@ -216,7 +216,7 @@ display(Image(filename=str(run.run_dir / "marker_dotplot.png")))
 
 An `unassigned` cluster is an explicit uncertainty outcome. Review its measured
 markers and QC evidence before assigning a biological name. A separated UMAP
-island alone does not establish a distinct lineage, thus go in further depth to validate the proposed annotations.
+island alone does not establish a distinct lineage, thus you need to go into further depth to validate the proposed annotations.
 
 The saved execution retained all 46,700 cells and completed all four native
 representations, two marker assessments, and finalization in one uninterrupted
