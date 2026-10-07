@@ -19,7 +19,7 @@ With the unique way Scarf handles the data in a memory efficient manner, it woul
 
 ## Import an existing store
 
-The tutorial uses a prepared analysis of PBMCs as an example. 
+The tutorial uses a prepared analysis of PBMCs as an example.
 
 ```{code-cell} ipython3
 import numpy as np
@@ -64,9 +64,7 @@ The plot simply lets us visualize which cells have stronger or weaker weighted c
 
 ## Stream count blocks
 
-Avoid `.compute()` on a matrix that may exceed memory.
-Slice to the frozen run's cell and highly variable feature indexes, then process ordered row
-blocks.
+If you are under heavier memory constraints, you can also stream the count information to make SCARF even more memory efficient. One way to do this is to avoid using `.compute()` on a matrix that may exceed memory. We can also slice blocks to the frozen run's cell and highly variable feature indexes, then process the ordered row blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
@@ -103,16 +101,14 @@ ds.cells.insert(
 }
 ```
 
-`stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with
-that key keeps each streamed value aligned with its metadata row.
-The summary checks that every streamed cell received a detection count.
+The `stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with hat key keeps each streamed value aligned with its metadata row and doesn't make realigning things an issue.
 
-## 4. Create custom selections
+## Create custom selections
 
-A boolean cell column can become a `cell_key`.
-Use `fill_value=False` when the new key is defined only for currently active cells.
-Here we keep cells above the lowest quarter of graph strength as an example of making a selection.
-This is an illustration of the API, not a recommended quality-control filter:
+It can also be useful during parts of the analysis to create custom selections for a group of cells. To do this, we can create a boolean cell column that is `cell_key`. We can then use `fill_value=False` when the new key is defined only for currently active cells. This is one of the strong benefits of Scarf, is that any cells we select or deselect do not have their information deleted; it is simply no longer read into memory and still saved if we need to revert in the future.
+
+For our example here, we keep cells above the lowest quarter of graph strength as an example.
+This is simply an illustration of the API, not a recommended quality-control filter that you can or should implement:
 
 ```{code-cell} ipython3
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
@@ -132,13 +128,11 @@ ds.plots.embedding(
 )
 ```
 
-The first panel checks where the streamed count statistic varies.
-The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
+The first panel checks where the streamed count statistic varies. The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
 
-## 5. Pass a small selection to another tool
+## Pass a small selection to another tool
 
-`to_anndata` creates an in-memory AnnData object. Select the cells and genes you need before
-materializing it. Here we pass the custom cell selection and the six-gene panel:
+Say for example we have created our selection now, and would liek to pass it to another analysis tool such as Scanpy. We can use the `to_anndata` function create an in-memory AnnData object. Note, by doing this, you often will need memory or need to be careful as this can be memory intensive. Select the cells and genes you need before actually executing it; here we only pass the cells alongside information of the 6 genes listed:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
@@ -146,20 +140,31 @@ adata = ds.to_anndata(cell_key="wellConnected", feature_names=panel_genes)
 adata.shape, adata.var_names.tolist()
 ```
 
-`to_anndata` drops unselected features.
-It indexes `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`.
-So `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols.
-Check `adata.var["names"]` when you need the symbols.
-Use `SubsetZarr` to write selected cells to a Scarf store instead; it retains every feature in
-the chosen assays. See {doc}`downsampling` for an example and {doc}`import_and_export` for H5AD
-and Matrix Market export.
-Use {doc}`remote_stores` when the count source itself must remain remote.
+If you persay wanted to export all of the genes, then simply leave out `feature_names`, and it will automatically default to including them all.
 
-## Extension boundary
+When transfering using `to_anndata`, it functions (for transfering genes) by indexing `var` by gene ids (Ensembl here); gene symbols stay in`var["names"]`. Therefore `adata.var_names`after`feature_names=panel_genes` lists ids, not the panel symbols, and would need to be translated back possible. Check`adata.var["names"]`when you need the symbols.
 
-Direct arbitrary artifact writing is not a stable public extension API.
-Do not mutate `ds.z`, `ds.zw`, `_matrix_z`, or other private storage attributes from analysis code.
-Those objects expose implementation layout and can change as storage contracts evolve.
+If you want to subset and stay inside of the Scarf ecosystem, instead use `SubsetZarr` to write selected cells to a Scarf store instead.
 
-Use public metadata insertion, result-returning methods, graph loading, block streams, and export APIs.
-Pipeline callbacks provide read-only execution events; their contract is documented in {doc}`../reference/api/pipeline`.
+Write the `wellConnected` cells into a separate Scarf store and confirm what the subset kept.
+
+```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+export_directory = TemporaryDirectory()
+subset_path = Path(export_directory.name) / "well_connected.zarr"
+writer = scarf.SubsetZarr(
+    zarr_loc=str(subset_path),
+    assays=[ds.RNA],
+    cell_key="wellConnected",
+    reset_cell_filter=False,
+    overwrite_existing_file=True,
+)
+writer.dump()
+
+subset = scarf.DataStore(str(subset_path))
+{"exported cells": subset.cells.N, "retained genes": subset.RNA.feats.N}
+```
+
+`SubsetZarr` keeps every gene in the listed assays and writes only the selected cells, so the subset stays a full Scarf store rather than a reduced in-memory object.
