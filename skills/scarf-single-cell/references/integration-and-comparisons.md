@@ -1,9 +1,9 @@
 # Study design, integration, and condition comparisons
 
 Identify donors, samples, batches and conditions, correct a technical batch with Harmony and score
-it, then compare composition and expression at the donor level. Docs: `docs/source/tutorials/`
-`batch_correction.md`, `pseudobulk_and_differential_expression.md`, `condition_comparisons.md`,
-`dataset_merging.md`, `mapping_and_label_transfer.md`, `downsampling.md`.
+it, then compare composition and expression at the donor level. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/batch_correction.html>, and in the same folder
+`pseudobulk_and_differential_expression.html`, `condition_comparisons.html`,
+`dataset_merging.html`, `mapping_and_label_transfer.html`, `downsampling.html`.
 
 ## When to use
 
@@ -165,14 +165,18 @@ def exact_tests(props, arm, g1, g2):
     for pop in props.columns:
         x = props[pop].reindex(arm.index[arm == g1]).dropna()   # units without a value drop out
         y = props[pop].reindex(arm.index[arm == g2]).dropna()
-        exact = comb(len(x) + len(y), len(x)) <= 100_000    # Scarf's switch to asymptotic
-        method = PermutationMethod(n_resamples=np.inf) if exact else "asymptotic"
-        u = mannwhitneyu(x, y, method=method)               # the exact null counts ties
-        rows.append({"population": pop, "n_1": len(x), "n_2": len(y), "median_1": x.median(),
-                     "median_2": y.median(), "auc": u.statistic / (len(x) * len(y)),
-                     "p_exact": u.pvalue})
+        row = {"population": pop, "n_1": len(x), "n_2": len(y), "median_1": x.median(),
+               "median_2": y.median(), "auc": np.nan, "p_exact": np.nan}
+        if min(len(x), len(y)) >= 2:   # as in Scarf: fewer than 2 units in a group is not tested
+            exact = comb(len(x) + len(y), len(x)) <= 100_000    # Scarf's switch to asymptotic
+            method = PermutationMethod(n_resamples=np.inf) if exact else "asymptotic"
+            u = mannwhitneyu(x, y, method=method)               # the exact null counts ties
+            row.update(auc=u.statistic / (len(x) * len(y)), p_exact=u.pvalue)
+        rows.append(row)
     table = pd.DataFrame(rows)
-    table["p_bh"] = false_discovery_control(table["p_exact"], method="bh")   # across populations
+    tested = table["p_exact"].notna()   # untested rows keep NaN and stay out of the correction
+    table["p_bh"] = np.nan
+    table.loc[tested, "p_bh"] = false_discovery_control(table.loc[tested, "p_exact"], method="bh")
     return table
 
 print(exact_tests(per_donor, arm, "ctrl", "case").round(4))

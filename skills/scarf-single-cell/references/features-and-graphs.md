@@ -1,9 +1,9 @@
 # Features and graphs
 
 Select features, normalize, reduce with PCA and build the neighbourhood graph as an explicit
-chain of artifacts, then branch or subcluster it safely. Docs: `docs/source/tutorials/`
-(feature_selection, graph_construction, dimensionality_reduction) and
-`docs/source/reference/api/graph_construction.md`.
+chain of artifacts, then branch or subcluster it safely. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/feature_selection.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/graph_construction.html>, <https://scarf.readthedocs.io/en/latest/tutorials/dimensionality_reduction.html> and
+<https://scarf.readthedocs.io/en/latest/reference/api/graph_construction.html>.
 
 ## When to use
 

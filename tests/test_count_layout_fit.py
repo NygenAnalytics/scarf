@@ -17,7 +17,7 @@ from scarf.storage.count_matrix import (
     load_count_matrix_plan,
     policy_from_payload,
 )
-from scarf.storage.sharding import fit_count_layout
+from scarf.storage.sharding import CountLayoutMemoryError, fit_count_layout
 from scarf.writers import H5adToZarr
 
 
@@ -46,8 +46,13 @@ def test_fit_uses_an_explicit_policy_exactly():
     def refuse(specs, resources: ResourceBudget) -> None:
         raise MemoryError("does not fit")
 
-    with pytest.raises(MemoryError, match="requested count-matrix policy"):
+    with pytest.raises(
+        CountLayoutMemoryError, match="requested count-matrix policy"
+    ) as refused:
         _fit(refuse, requested=explicit)
+    assert isinstance(refused.value, MemoryError)
+    assert type(refused.value.__cause__) is MemoryError
+    assert str(refused.value.__cause__) == "does not fit"
 
 
 def test_fit_halves_the_default_policy_until_the_counts_write_fits():
@@ -77,8 +82,13 @@ def test_fit_names_the_largest_halving_of_a_requested_policy_that_fits():
         if specs[0].shards[0] > 100_000:
             raise MemoryError("band too tall")
 
-    with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+    with pytest.raises(
+        CountLayoutMemoryError, match="default count-matrix policy"
+    ) as refused:
         _fit(admit, requested=DEFAULT_COUNT_MATRIX_POLICY)
+    assert isinstance(refused.value, MemoryError)
+    assert type(refused.value.__cause__) is MemoryError
+    assert str(refused.value.__cause__) == "band too tall"
     # The same halving that a fit without a policy chooses.
     assert _named_policy(refused.value) == _fit(admit)
 
@@ -107,8 +117,9 @@ def test_fit_stops_at_count_shards_of_one_row():
         seen.append(specs[0].shards[0])
         raise MemoryError("does not fit")
 
-    with pytest.raises(MemoryError, match="count shards of one row"):
+    with pytest.raises(MemoryError, match="count shards of one row") as refused:
         _fit(refuse)
+    assert type(refused.value) is MemoryError
     assert seen[-1] == 1
     assert seen.count(1) == 1
 
@@ -161,10 +172,31 @@ def test_h5ad_import_names_the_count_layout_that_fits_its_budget(wide_counts, tm
     # The import keeps the default layout, which writes the whole matrix as
     # one band. That does not fit this budget, so it fails before the
     # destination exists and names the layout that fits.
-    with pytest.raises(MemoryError, match="default count-matrix policy") as refused:
+    with pytest.raises(
+        CountLayoutMemoryError, match="default count-matrix policy"
+    ) as refused:
         _build(path, tmp_path / "default.zarr", mem_budget=budget, nthreads=1)
+    assert isinstance(refused.value, MemoryError)
     assert not (tmp_path / "default.zarr").exists()
     named = _named_policy(refused.value)
+
+    explicit = CountMatrixPolicy(
+        unitBytes=DEFAULT_COUNT_MATRIX_POLICY.unitBytes // 2,
+        chunkBytes=DEFAULT_COUNT_MATRIX_POLICY.chunkBytes // 2,
+    )
+    with pytest.raises(
+        CountLayoutMemoryError, match="requested count-matrix policy"
+    ) as refused_explicit:
+        _build(
+            path,
+            tmp_path / "explicit.zarr",
+            mem_budget=budget,
+            nthreads=1,
+            policy=explicit,
+        )
+    assert isinstance(refused_explicit.value, MemoryError)
+    assert not (tmp_path / "explicit.zarr").exists()
+    assert _named_policy(refused_explicit.value) == named
 
     roomy = _build(path, tmp_path / "roomy.zarr", mem_budget="1G", nthreads=1)
     fitted = _build(

@@ -487,6 +487,7 @@ def _check_processing(
             CYTEBASE_ID,
             "fc-process",
             {"collectionId": COLLECTION_ID, "approvedDeletionPaths": []},
+            0,
         )
     ]
     # Processing refreshes the catalog, then updates it from the committed record.

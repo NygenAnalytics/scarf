@@ -1,9 +1,9 @@
 # Performance and export
 
 Resource budgets, out-of-core rules, remote I/O on mounts, and exporting counts, metadata,
-markers, and pipeline-run results. Docs: `docs/source/concepts/memory_and_execution.md`,
-`docs/source/tutorials/remote_stores.md`, `docs/source/tutorials/import_and_export.md`,
-`docs/source/tutorials/custom_analyses.md`, `docs/source/concepts/benchmarks.md`.
+markers, and pipeline-run results. Docs: <https://scarf.readthedocs.io/en/latest/concepts/memory_and_execution.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/remote_stores.html>, <https://scarf.readthedocs.io/en/latest/tutorials/import_and_export.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/custom_analyses.html>, <https://scarf.readthedocs.io/en/latest/concepts/benchmarks.html>.
 
 ## When to use
 
@@ -22,6 +22,9 @@ markers, and pipeline-run results. Docs: `docs/source/concepts/memory_and_execut
   `"512M"` (binary units, G = 1024^3 bytes), or a fraction of detected memory such as `"0.6"`.
   A bare `"8"` is rejected as ambiguous.
 - More workers mean more concurrent buffers and remote requests; pair them with a `mem_budget`.
+- Converters need a `mem_budget` that fits the default count layout and refuse before writing
+  when it does not (`references/data-access.md`). Prefer more memory over the smaller layout the
+  refusal names: smaller layouts slow every later gene-major read.
 - A `DataStore` is not thread-safe: call it from one thread at a time. Use separate stores or
   separate mount targets for independent parallel analyses.
 - Opt-in parallel UMAP and ANN builds are faster but not reproducible: runs on several threads
@@ -109,12 +112,12 @@ print("DONE", flush=True)
 ```
 
 Start it detached with a timeout and keep the PID in a file (shell variables do not survive between
-agent tool calls). Put `timeout` inside `uv run` so its SIGTERM reaches Python: Scarf then recorded
+agent tool calls). Make sure `timeout`'s SIGTERM reaches Python. Behind a wrapper such as `uv run`, put `timeout` inside it: Scarf then recorded
 the run as `interrupted` in 6 of 7 tests; `timeout 1800 uv run ...` left it `running` both times.
 
 ```bash
 mkdir -p logs
-nohup uv run timeout 1800 python step_baseline.py > logs/baseline.log 2>&1 &
+nohup timeout 1800 python step_baseline.py > logs/baseline.log 2>&1 &
 echo $! > logs/baseline.pid
 ```
 

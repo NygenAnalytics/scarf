@@ -2,8 +2,8 @@
 
 Find cluster markers, turn marker evidence into cautious cell-type labels, separate progenitors
 from multiplets, score gene sets and the cell cycle, and run a final comparison with existing
-labels. Docs: `docs/source/tutorials/annotation.md`, `docs/source/tutorials/gene_set_scoring.md`,
-`docs/source/tutorials/cell_cycle.md`, `docs/source/reference/api/datastore.md`.
+labels. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/annotation.html>, <https://scarf.readthedocs.io/en/latest/tutorials/gene_set_scoring.html>,
+<https://scarf.readthedocs.io/en/latest/tutorials/cell_cycle.html>, <https://scarf.readthedocs.io/en/latest/reference/api/datastore.html>.
 
 ## When to use
 

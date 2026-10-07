@@ -17,7 +17,9 @@ from zarr.storage import LocalStore
 
 import scarf
 from scarf.cytebase.pipeline import build
-from scarf.cytebase.pipeline.models import DatasetRecord, Manifest
+from scarf.cytebase.pipeline.models import AttemptResources, DatasetRecord, Manifest
+from scarf.cytebase.pipeline.resources import PROCESS_RESOURCES, ImportMemoryRefusal
+from scarf.storage.sharding import CountLayoutMemoryError
 from scarf.utils.logging import logger
 from tests.fixtures_cytebase import (
     COLLECTION_ID,
@@ -313,15 +315,24 @@ class _Closable:
 
 @pytest.mark.parametrize(
     ("failing_step", "opened"),
-    [("writer", set()), ("dump", {"writer"}), ("summary", {"writer", "datastore"})],
+    [
+        ("writer", set()),
+        ("dump", {"writer"}),
+        ("datastore", {"writer"}),
+        ("summary", {"writer", "datastore"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, MemoryError, CountLayoutMemoryError]
 )
 def test_convert_local_closes_open_handles_when_a_step_fails(
-    tmp_path, monkeypatch, failing_step, opened
+    tmp_path, monkeypatch, failing_step, opened, error_type
 ):
     source, manifest = _source(tmp_path)
     readers = []
     stores: dict[str, _Closable] = {}
     original = scarf.H5adReader.from_inspect
+    error = error_type(f"{failing_step} failed")
 
     def from_inspect(inspection, **overrides):
         readers.append(original(inspection, **overrides))
@@ -329,7 +340,7 @@ def test_convert_local_closes_open_handles_when_a_step_fails(
 
     def step(name: str) -> None:
         if name == failing_step:
-            raise RuntimeError(f"{name} failed")
+            raise error
 
     class Writer:
         def __init__(self, reader, **options):
@@ -341,6 +352,7 @@ def test_convert_local_closes_open_handles_when_a_step_fails(
 
     class Datastore:
         def __init__(self, location, **options):
+            step("datastore")
             self.z = SimpleNamespace(store=stores.setdefault("datastore", _Closable()))
 
         def summary(self):
@@ -349,8 +361,15 @@ def test_convert_local_closes_open_handles_when_a_step_fails(
     monkeypatch.setattr(scarf.H5adReader, "from_inspect", from_inspect)
     monkeypatch.setattr(scarf, "H5adToZarr", Writer)
     monkeypatch.setattr(scarf, "DataStore", Datastore)
-    with pytest.raises(RuntimeError, match=f"{failing_step} failed"):
+    retryable = failing_step == "writer" and error_type is CountLayoutMemoryError
+    expected = ImportMemoryRefusal if retryable else error_type
+    with pytest.raises(expected, match=f"{failing_step} failed") as caught:
         build.convert_local(source, tmp_path / "data.zarr", manifest)
+    if retryable:
+        assert caught.value.__cause__ is error
+        assert not (tmp_path / "data.zarr").exists()
+    else:
+        assert caught.value is error
     assert len(readers) == 1
     assert not readers[0].h5
     assert set(stores) == opened
@@ -384,6 +403,47 @@ def test_convert_local_preserves_dense_counts_without_embeddings(dense_build):
 
 
 # build_local
+
+
+@pytest.mark.parametrize("resources", PROCESS_RESOURCES)
+def test_build_local_uses_worker_resources_for_conversion_and_qc(
+    tmp_path, monkeypatch, resources
+):
+    source = write_h5ad(tmp_path / "source.h5ad")
+    record = DatasetRecord.model_validate(dataset_record())
+    writer, datastore = scarf.H5adToZarr, scarf.DataStore
+    settings = {}
+
+    def create_writer(*args, **kwargs):
+        settings["writer"] = (kwargs["nthreads"], kwargs["mem_budget"])
+        return writer(*args, **kwargs)
+
+    def open_datastore(*args, **kwargs):
+        settings["datastore"] = (kwargs["nthreads"], kwargs["mem_budget"])
+        return datastore(*args, **kwargs)
+
+    monkeypatch.setattr(scarf, "H5adToZarr", create_writer)
+    monkeypatch.setattr(scarf, "DataStore", open_datastore)
+    manifest, converted = build.build_local(
+        record,
+        source,
+        tmp_path / "data.zarr",
+        {"raw_data_location": "X"},
+        *source_details(source),
+        noop,
+        resources=resources,
+    )
+
+    assert settings == {
+        "writer": (resources.cpu, resources.memBudget),
+        "datastore": (resources.cpu, resources.memBudget),
+    }
+    assert converted["status"] == "done"
+    assert converted["qcSummary"]["active_cells"] == manifest.nObs
+    verification = build.verify_store(
+        str(tmp_path / "data.zarr"), manifest.model_dump(mode="json")
+    )
+    assert verification["countsTMatches"] is True
 
 
 def test_build_local_inspects_and_converts_a_registered_source(cytebase_build):
@@ -568,8 +628,8 @@ def test_build_local_prefers_registration_metadata(tmp_path, monkeypatch):
     )
     calls = []
 
-    def convert(source_path, destination, manifest, *, progress):
-        calls.append((source_path, destination, manifest, progress))
+    def convert(source_path, destination, manifest, *, progress, resources):
+        calls.append((source_path, destination, manifest, progress, resources))
         return {"status": "needsInput", "needsInput": QUESTION}
 
     monkeypatch.setattr(build, "convert_local", convert)
@@ -588,7 +648,13 @@ def test_build_local_prefers_registration_metadata(tmp_path, monkeypatch):
         progress,
     )
     assert calls == [
-        (source, tmp_path / "data.zarr", manifest.model_dump(mode="json"), progress)
+        (
+            source,
+            tmp_path / "data.zarr",
+            manifest.model_dump(mode="json"),
+            progress,
+            PROCESS_RESOURCES[0],
+        )
     ]
     assert manifest.title == "Registered title"
     assert manifest.organism == "Homo sapiens, Mus musculus"
@@ -1049,6 +1115,28 @@ def test_publish_store_publishes_a_verified_ready_dataset(
     assert ingest["verification"] == receipt["verification"]
     assert ingest["completedAt"] == receipt["verifiedAt"]
     assert record.model_dump(mode="json") == ready
+
+
+@pytest.mark.parametrize("built_in", [None, PROCESS_RESOURCES[1]])
+def test_publish_store_receipt_names_the_container_that_built_it(
+    fake_hub, publish, cytebase_build, built_in
+):
+    record = cytebase_build.record()
+    if built_in is not None:
+        record.resources = AttemptResources(
+            cpu=built_in.cpu,
+            memoryMiB=built_in.memoryMiB,
+            memBudget=built_in.memBudget,
+            peakMemoryBytes=123,
+        )
+    assert publish(record) == {"outcome": "succeeded"}
+
+    receipt = fake_hub.read_json(RECORD_PATH)["buildReceipt"]
+    assert receipt["resources"] == (
+        None
+        if built_in is None
+        else {"cpu": 8, "memoryMiB": 32_768, "memBudget": "24G"}
+    )
 
 
 def test_publish_store_records_a_needs_input_result_without_uploading(

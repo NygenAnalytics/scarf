@@ -95,6 +95,17 @@ class DatasetVersion(BaseModel):
     sourceSha256: str | None = None
 
 
+class AttemptResources(BaseModel):
+    """The container one dataset worker attempt ran in."""
+
+    cpu: int
+    memoryMiB: int
+    memBudget: str
+    # Highest resident memory of the worker and its child processes, sampled
+    # while the attempt runs. None until the attempt finishes.
+    peakMemoryBytes: int | None = None
+
+
 class DatasetRecord(BaseModel):
     """Latest registered metadata and the identity of the verified stored files."""
 
@@ -113,6 +124,9 @@ class DatasetRecord(BaseModel):
     cellCount: int | None = None
     primaryCellCount: int | None = None
     nGenes: int | None = None
+    # CELLxGENE's mean genes per cell. None, as in records registered before
+    # the field existed, makes processing start in the smallest resource tier.
+    meanGenesPerCell: float | None = None
     schemaVersion: str | None = None
     status: DatasetState = "registered"
     sourceUrl: str
@@ -138,3 +152,4 @@ class DatasetRecord(BaseModel):
     error: str | None = None
     needsInput: dict | None = None
     timings: dict[str, float] = Field(default_factory=dict)
+    resources: AttemptResources | None = None

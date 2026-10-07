@@ -378,6 +378,7 @@ def cellxgene_dataset(**overrides: Any) -> dict[str, Any]:
         "primary_cell_count": 4,
         "is_primary_data": [True, False],
         "feature_count": 5,
+        "mean_genes_per_cell": 3.5,
         "explorer_url": "https://cellxgene.cziscience.com/e/lung.cxg/",
         "assay": [{"label": "10x 3' v3", "ontology_term_id": "EFO:0009922"}],
         "organism": [{"label": "Homo sapiens", "ontology_term_id": "NCBITaxon:9606"}],
@@ -450,6 +451,7 @@ def dataset_record(**overrides: Any) -> dict[str, Any]:
         "cellCount": 6,
         "primaryCellCount": 4,
         "nGenes": 5,
+        "meanGenesPerCell": 3.5,
         "schemaVersion": "5.3.0",
         "status": "registered",
         "sourceUrl": SOURCE_URL,
@@ -745,14 +747,23 @@ class FakeFunction:
         self.target = target
         self.name = name
         self.spawned: list[tuple[Any, ...]] = []
+        self.spawn_options: list[dict[str, Any]] = []
+        self._options: dict[str, Any] = {}
         self._spawn_error = spawn_error
         self._get_errors = list(get_errors or [])
         self.spawn = SimpleNamespace(aio=self._spawn)
+
+    def with_options(self, **options: Any) -> "FakeFunction":
+        variant = copy.copy(self)
+        variant._options = self._options | options
+        variant.spawn = SimpleNamespace(aio=variant._spawn)
+        return variant
 
     async def _spawn(self, *args: Any) -> SimpleNamespace:
         if self._spawn_error is not None:
             raise self._spawn_error
         self.spawned.append(args)
+        self.spawn_options.append(dict(self._options))
         object_id = f"fc-{self.name}-{len(self.spawned)}"
         error = self._get_errors.pop(0) if self._get_errors else None
 

@@ -2,9 +2,9 @@
 name: scarf-single-cell
 description: Analyze single-cell data with core Scarf, the out-of-core Zarr DataStore library with immutable artifacts and pipeline runs. Covers opening, converting and mounting stores (including Cytebase datasets), QC with removal audits, HVG/PCA/neighbour graphs, Leiden/Paris clustering, UMAP, markers and cautious annotation, batch correction and donor-level comparisons, headless plotting, provenance and export. Use when a task involves a Scarf .zarr store, a Cytebase dataset, scarf.DataStore, ds.pipeline, or converting H5AD/10x/MTX/Seurat data for Scarf. Does not cover scarf.agent (the automated agent package).
 license: BSD-3-Clause
-compatibility: Requires Python 3.12+ and scarf 1.0.0 or newer (pip install "scarf[extra]"; add the cytebase extra and network access for Cytebase datasets).
+compatibility: Requires Python 3.12+ and scarf 1.0.0rc20 or newer (pip install "scarf[extra]>=1.0.0rc20"; add the cytebase extra and network access for Cytebase datasets, and the tsne extra for t-SNE).
 metadata:
-  version: "0.2"
+  version: "0.4"
 ---
 
 # Scarf single-cell analysis
@@ -15,15 +15,16 @@ RNA analysis: which calls to make, in what order, what evidence to check, and wh
 It does not use or describe `scarf.agent`.
 
 Read this file first. Then open only the reference modules you need (index below). Paths in this
-skill are relative to the skill directory (`skills/scarf-single-cell/` in the Scarf repository).
+skill are relative to the skill directory. The maintained copy lives in the Scarf repository at
+<https://github.com/NygenAnalytics/scarf/tree/master/skills/scarf-single-cell>.
 Every recipe in the modules was run against a real store. Numbers quoted there come from the 10x
 5K PBMC documentation dataset and are illustrations, not thresholds.
 
 ## Setup
 
-- In the Scarf repository run Python as `uv run python ...`. Elsewhere use the environment that has
-  `scarf` installed (`pip install "scarf[extra]"`, plus `scarf[cytebase]` for Cytebase and
-  `scarf[tsne]` for t-SNE).
+- Install into the environment you run Python from: `pip install "scarf[extra]>=1.0.0rc20"`, plus
+  `scarf[cytebase]` for Cytebase and `scarf[tsne]` for t-SNE. The explicit pre-release floor matters: a
+  bare `scarf[extra]` resolves to the old 0.32 series, whose API this skill does not describe.
 - Set resources per process before importing Scarf. Defaults claim all detected RAM and every CPU:
   `SCARF_MEM_BUDGET=8G SCARF_WORKERS=8` (memory specs need a unit; a bare `8` is rejected).
 - Headless: `MPLBACKEND=Agg`, call plots with `show=False`, then `result.save(path)` and
@@ -36,8 +37,8 @@ Every recipe in the modules was run against a real store. Numbers quoted there c
 - Long steps (a pipeline run on tens of thousands of cells over remote counts can take many
   minutes): write the step as a script that logs to a file and ends with a `DONE` or `FAILED` line,
   run it in the background, and wait with a bounded loop that also stops on a `Traceback` or a dead
-  process. Put the timeout inside `uv run` (`uv run timeout N python step.py`; the reverse can
-  leave stale `running` records), and track the process by `$!` rather than `pgrep -f`. See
+  process. If you launch through a wrapper such as `uv run`, put `timeout` inside it
+  (`uv run timeout N python step.py`; the reverse can leave stale `running` records), and track the process by `$!` rather than `pgrep -f`. See
   `references/performance-and-export.md`. Never poll without a time limit.
 
 ## Mental model
@@ -144,11 +145,11 @@ Work in this order. After each step, write the decision and its evidence to an a
 A complete first pass on an RNA store. Every step after the run reuses the run's artifacts.
 
 ```python
-import os
-
-os.environ.setdefault("MPLBACKEND", "Agg")
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")  # headless; select the backend before importing scarf
 import numpy as np
 import pandas as pd
 import scarf
@@ -236,6 +237,7 @@ any changes you make after seeing the comparison as such.
 | Plot raises with `run=` and a gene or live column | run mode reads only frozen run fields and run outputs, and genes need an explicit normalization | gene: add `normalization=scarf.plotting.NormalizationSpec()`; live column: freeze it with `snapshot_columns=` or use `layout=run["umap"]` |
 | `TypeError` from `distribution(grouping="col")` | grouping needs a ref or `CellField` | `grouping=scarf.plotting.CellField("col")` |
 | Very slow steps on a mount | each count pass is a network read | fewer passes; repack locally (rule 8) |
+| `MemoryError` (`CountLayoutMemoryError` after 1.0.0rc19) from a converter | default count layout does not fit `mem_budget` | larger `mem_budget`; else the `policy=` the message names (`references/data-access.md`) |
 | `ValueError` plotting after reopening the store | a `PipelineRun` is bound to the store object that opened it | reopen the run from the new `ds` |
 | `list_artifacts(kind="cell_selection")` is empty | cell selections are datastore-scoped | add `scope="datastore"` |
 | `KeyError` for a grouping column of a dot or matrix plot table | summary tables name grouping columns by role: `group`, `subgroup`, `sample` | `res.tables["aggregate"]["group"]`; `res.provenance.extras["group_by"]` names the source columns |
@@ -252,14 +254,13 @@ any changes you make after seeing the comparison as such.
 | Merge raises `Cell column '<assay>_I' is reserved for the membership of assay ...` | a plain `<assay>_I` column, from an earlier import of an exported file or inserted by hand | import the H5AD again with this release, or drop the plain column in the source with `cells.drop("<assay>_I")` |
 | `cells.insert`/`update_key`/`reset_key`/`drop` raises `Cell column '<assay>_I' is reserved ...` or `... records which cells assay ... measured` | only imports, merges, and derived assays write membership | store values under another name; select measured cells with `select_measured_cells("<assay>")` |
 | `UnmeasuredCellsError: ... reads assay '<assay>' over N of M selected cells that it did not measure` | a merged store whose assay measured only some cells; their zero counts are no measurement | narrow first: `ds.select_measured_cells("<assay>", cell_selection=...)`, which `make_bulk`, `run_statistical_testing`, and QC filters take as `cell_selection=`; labels: `snapshot_cluster_labels(labels, cell_selection=...)` of that; graphs: rebuild over it; pipeline: a `cell_key` column of the cells of `I` that the assay measured, `ds.cells.insert("RNA_measured", ds.cells.fetch_all("I") & ds.cells.fetch_all("RNA_I"))` |
+| `ValueError: None of the s_genes match the assay feature names` from `ds.pipeline.run` | feature names are not gene symbols (Ensembl IDs, synthetic names); matching ignores case, so mouse symbols work | `cell_cycle=False`, or pass lists in the store's naming via `params={"cell_cycle": {"s_genes": [...], "g2m_genes": [...]}}` |
 
 ## Documentation map
 
-The docs hold the full explanations. Outside the repository, read them online at
-https://scarf.readthedocs.io/en/latest/ (the same page names with `.html`). In the repository:
-`docs/source/quickstart.md`,
-`docs/source/tutorials/` (one page per step, for example `quality_control.md`,
-`graph_construction.md`, `clustering.md`, `annotation.md`, `batch_correction.md`,
-`pseudobulk_and_differential_expression.md`, `cytebase.md`), `docs/source/concepts/`
-(`provenance.md`, `memory_and_execution.md`), `docs/source/analysis_with_agents.md` (scientific
-decision loop, task routing, handoff) and `docs/source/reference/api/` (exact signatures).
+The docs hold the full explanations, online at <https://scarf.readthedocs.io/en/latest/>:
+`quickstart.html`, `tutorials/<step>.html` (one page per step, for example `quality_control`,
+`graph_construction`, `clustering`, `annotation`, `batch_correction`,
+`pseudobulk_and_differential_expression`, `cytebase`), `concepts/` (`provenance`,
+`memory_and_execution`, `benchmarks`), `analysis_with_agents.html` (scientific decision loop, task
+routing, handoff) and `reference/api/<module>.html` (exact signatures).

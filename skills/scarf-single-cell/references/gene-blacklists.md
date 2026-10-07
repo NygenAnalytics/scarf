@@ -2,7 +2,7 @@
 
 What `select_hvgs(blacklist=...)` removes, how to check it on your store, the corrected strings to
 pass today, and when to add the clonotype or haemoglobin add-ons. Docs:
-`docs/source/tutorials/feature_selection.md`, `docs/source/reference/api/pipeline.md`.
+<https://scarf.readthedocs.io/en/latest/tutorials/feature_selection.html>, <https://scarf.readthedocs.io/en/latest/reference/api/pipeline.html>.
 
 ## When to use
 

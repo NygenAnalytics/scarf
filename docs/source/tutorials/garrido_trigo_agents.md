@@ -30,7 +30,7 @@ The general workflow and an example without provider credentials are in
 ## Set up the notebook folder
 
 Use an environment with Scarf's `agent`, `cytebase`, `docs`, and `extra` extras.
-Configure `BASETEN_API_KEY` in your environment or a local `.env` file. This example
+Configure `AGENT_API_KEY` in your environment or a local `.env` file. This example
 uses the OpenAI-compatible Baseten endpoint and `deepseek-ai/DeepSeek-V4.1-Flash`;
 model calls send supplied metadata and measured marker evidence to that provider.
 Scarf requests disabled reasoning on every call. Provider calls incur usage, and
@@ -192,7 +192,7 @@ This example supplies a memorable `run_dir`. Omitting it creates
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-api_key = os.environ.get("BASETEN_API_KEY")
+api_key = os.environ.get("AGENT_API_KEY")
 model = None
 if api_key:
     model = OpenAIChatModel(
@@ -204,7 +204,7 @@ if run_dir.exists():
     run = await resume_rna_async(run_dir, model=model, runtime=runtime)
 else:
     if model is None:
-        raise RuntimeError("Configure BASETEN_API_KEY before starting a fresh analysis")
+        raise RuntimeError("Configure AGENT_API_KEY before starting a fresh analysis")
     run = await analyze_rna_async(
         data_path, run_dir=run_dir, model=model, study=study,
         config=AnalysisConfig(assay="RNA"), runtime=runtime,

@@ -3,6 +3,8 @@
 import hashlib
 import json
 import logging
+import os
+import subprocess
 import sys
 import threading
 from contextlib import contextmanager
@@ -27,6 +29,7 @@ from scarf.cytebase.pipeline import build as pipeline_build
 from scarf.cytebase.pipeline import catalog as pipeline_catalog
 from scarf.cytebase.pipeline import download as pipeline_download
 from scarf.cytebase.pipeline.models import DatasetRecord
+from scarf.cytebase.pipeline.resources import PROCESS_RESOURCES, ImportMemoryRefusal
 from tests.fixtures_cytebase import (
     BUCKET_ID,
     CALL_ID,
@@ -140,6 +143,7 @@ class Worker:
     events: list[SimpleNamespace] = field(default_factory=list)
     write_source: bool = True
     download_error: Exception | None = None
+    build_errors: list[Exception | None] = field(default_factory=list)
     conversion: str = "done"
     result: dict[str, Any] = field(default_factory=lambda: {"outcome": "succeeded"})
 
@@ -168,7 +172,9 @@ class Worker:
             destination.write_bytes(b"h5ad")
         return 4, "checksum"
 
-    def build_local(self, record, source, store, raw, size, checksum, progress):
+    def build_local(
+        self, record, source, store, raw, size, checksum, progress, *, resources
+    ):
         self.events.append(
             SimpleNamespace(
                 step="build",
@@ -179,8 +185,11 @@ class Worker:
                 size=size,
                 checksum=checksum,
                 progress=progress,
+                resources=resources,
             )
         )
+        if self.build_errors and (error := self.build_errors.pop(0)) is not None:
+            raise error
         store.mkdir()
         return "manifest", {"status": self.conversion}
 
@@ -330,10 +339,14 @@ def _catalog_rows(hub) -> list[tuple[str, str]]:
         ).fetchall()
 
 
-def _process_worker(harness, request: dict | None = None) -> dict[str, Any]:
+def _process_worker(
+    harness, request: dict | None = None, *, resource_tier: int = 0
+) -> dict[str, Any]:
     """Run the real ``process_dataset`` body as the reserved Modal call."""
     with _as_call(WORKER_ID):
-        return harness.process_dataset.target(CYTEBASE_ID, RUN_ID, request or {})
+        return harness.process_dataset.target(
+            CYTEBASE_ID, RUN_ID, request or {}, resource_tier
+        )
 
 
 def _format(message: str, *args: Any, exc_info: Any = None) -> str:
@@ -864,6 +877,7 @@ def test_run_dataset_downloads_builds_and_publishes_in_a_private_workspace(
         "checksum",
     )
     assert build.progress is progress
+    assert build.resources == PROCESS_RESOURCES[0]
     assert publish.record is record
     assert publish.request is request_
     assert publish.storage is storage
@@ -925,8 +939,9 @@ def test_run_dataset_cleans_up_after_a_failed_step(fake_hub, worker, failure):
     assert set(record.timings) == {"downloadSeconds", "cleanupSeconds"}
 
 
+@pytest.mark.parametrize("resource_tier", range(3))
 def test_process_dataset_records_the_attempt_before_and_after_work(
-    modal_harness, monkeypatch
+    modal_harness, monkeypatch, resource_tier
 ):
     hub = modal_harness.hub
     _register(
@@ -939,19 +954,22 @@ def test_process_dataset_records_the_attempt_before_and_after_work(
     _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
     seen = {}
 
-    def run_dataset(record, request, storage, progress, check):
+    def run_dataset(record, request, storage, progress, check, *, resources):
         check()
         seen.update(
             request=request,
             storage=storage,
             started=hub.read_json(RECORD_PATH),
             bound=storage.progress is progress,
+            resources=resources,
         )
         progress("downloading", completed=1, total=2, unit="bytes")
         return {"outcome": "succeeded"}
 
     monkeypatch.setattr(app, "_run_dataset", run_dataset)
-    result = _process_worker(modal_harness, {"force": True})
+    result = _process_worker(
+        modal_harness, {"force": True}, resource_tier=resource_tier
+    )
 
     started, saved = seen["started"], hub.read_json(RECORD_PATH)
     assert {
@@ -978,6 +996,7 @@ def test_process_dataset_records_the_attempt_before_and_after_work(
     }
     assert started["startedAt"] is not None
     assert seen["request"] == {"force": True}
+    assert seen["resources"] == PROCESS_RESOURCES[resource_tier]
     assert seen["bound"]
     assert seen["storage"].progress is None
     assert result == {
@@ -998,6 +1017,85 @@ def test_process_dataset_records_the_attempt_before_and_after_work(
         (PROGRESS_KEY, "process", 3, WORKER_ID),
         (PROGRESS_KEY, "downloading", 3, WORKER_ID),
     ]
+
+
+@pytest.mark.parametrize("resource_tier", range(3))
+@pytest.mark.parametrize("status", ["registered", "ready"])
+def test_process_dataset_keeps_the_status_when_a_refusal_is_retried(
+    modal_harness, monkeypatch, resource_tier, status
+):
+    hub = modal_harness.hub
+    _register(hub, **(READY if status == "ready" else {}))
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
+
+    def run_dataset(record, *args, **kwargs):
+        # The worker commits processing before it downloads the source.
+        record.status = "processing"
+        raise ImportMemoryRefusal("count layout exceeds budget")
+
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = _process_worker(modal_harness, resource_tier=resource_tier)
+
+    saved = hub.read_json(RECORD_PATH)
+    retried = resource_tier < len(PROCESS_RESOURCES) - 1
+    assert (result["outcome"], result["_retryableMemory"]) == ("failed", True)
+    assert saved["status"] == result["status"] == (status if retried else "failed")
+    assert (saved["stageOutcome"], saved["error"]) == (
+        "failed",
+        "ImportMemoryRefusal: count layout exceeds budget",
+    )
+
+
+def test_process_dataset_records_its_container_and_peak_memory(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+    _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
+    seen = {}
+
+    @contextmanager
+    def peak_memory():
+        yield lambda: 3 * GIB
+
+    def run_dataset(record, request, storage, progress, check, *, resources):
+        seen["started"] = hub.read_json(RECORD_PATH)
+        return {"outcome": "succeeded"}
+
+    monkeypatch.setattr(app, "_peak_memory", peak_memory)
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = _process_worker(modal_harness, resource_tier=1)
+
+    container = {"cpu": 8, "memoryMiB": 32_768, "memBudget": "24G"}
+    assert seen["started"]["resources"] == container | {"peakMemoryBytes": None}
+    saved = hub.read_json(RECORD_PATH)
+    assert saved["resources"] == result["record"]["resources"]
+    assert saved["resources"] == container | {"peakMemoryBytes": 3 * GIB}
+
+
+@pytest.mark.skipif(not Path("/proc/self/statm").exists(), reason="needs /proc")
+def test_peak_memory_includes_child_processes():
+    size = 64 * MIB
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"import sys, time; block = b'x' * {size}; print('ready', flush=True); "
+            "time.sleep(60)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == "ready\n"
+        assert app._process_tree_bytes(child.pid) >= size
+        with app._peak_memory(interval=0.01) as peak:
+            assert app._process_tree_bytes(os.getpid()) >= size
+        assert peak() is not None and peak() >= size
+    finally:
+        child.kill()
+        child.wait()
 
 
 @pytest.mark.parametrize(
@@ -1028,7 +1126,7 @@ def test_process_dataset_saves_unfinished_outcomes_as_errors(
     hub = modal_harness.hub
     _register(hub)
     _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
-    monkeypatch.setattr(app, "_run_dataset", lambda *args: dict(outcome))
+    monkeypatch.setattr(app, "_run_dataset", lambda *args, **kwargs: dict(outcome))
     result = _process_worker(modal_harness)
     saved = hub.read_json(RECORD_PATH)
     assert result == outcome | {
@@ -1044,7 +1142,7 @@ def test_process_dataset_saves_a_redacted_failure(modal_harness, monkeypatch, ap
     _register(hub)
     _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
 
-    def run_dataset(*args: Any) -> None:
+    def run_dataset(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("aria2c rejected hf_offlineTestToken")
 
     monkeypatch.setattr(app, "_run_dataset", run_dataset)
@@ -1095,7 +1193,7 @@ def test_process_dataset_does_not_save_results_after_losing_ownership(
     _register(hub)
     _seed_runs(modal_harness.run_store, _run_file({PROCESS_KEY: _process_child()}))
 
-    def run_dataset(*args: Any) -> dict:
+    def run_dataset(*args: Any, **kwargs: Any) -> dict:
         # An operator resets the run while this worker is still busy.
         _seed_runs(
             modal_harness.run_store,
@@ -1464,9 +1562,241 @@ def test_process_run_publishes_a_ready_store_and_catalog_row(
     }
 
 
-def _succeed(record, request, storage, progress, check) -> dict:
+def _succeed(record, request, storage, progress, check, *, resources=None) -> dict:
     check()
     return {"outcome": "succeeded"}
+
+
+@pytest.mark.parametrize("refusals", range(4))
+def test_process_run_escalates_only_to_the_available_resource_tiers(
+    modal_harness, worker, refusals
+):
+    hub = modal_harness.hub
+    _register(hub, attempt=5)
+    worker.build_errors = [
+        ImportMemoryRefusal("count layout exceeds budget")
+    ] * refusals
+
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    attempts = min(refusals + 1, 3)
+    outcome = "failed" if refusals == 3 else "succeeded"
+    workers = modal_harness.process_dataset
+    assert [args[3] for args in workers.spawned] == list(range(attempts))
+    assert workers.spawn_options == [
+        {"cpu": resource.cpu, "memory": resource.memoryMiB}
+        for resource in PROCESS_RESOURCES[:attempts]
+    ]
+    builds = [event for event in worker.events if event.step == "build"]
+    downloads = [event for event in worker.events if event.step == "download"]
+    assert [build.resources for build in builds] == list(PROCESS_RESOURCES[:attempts])
+    assert len(downloads) == attempts
+    assert len({event.destination.parent for event in downloads}) == attempts
+    assert all(not event.destination.parent.exists() for event in downloads)
+    assert worker.steps.count("publish") == (0 if refusals == 3 else 1)
+
+    saved = hub.read_json(RECORD_PATH)
+    assert (saved["attempt"], saved["callId"], saved["stageOutcome"]) == (
+        5 + attempts,
+        f"fc-process-{attempts}",
+        outcome,
+    )
+    assert result["state"] == "completed"
+    assert len(result["datasets"]) == 1
+    assert result["datasets"][0]["outcome"] == outcome
+    assert result["successes"] == ([] if refusals == 3 else [CYTEBASE_ID])
+    assert result["failures"] == ([CYTEBASE_ID] if refusals == 3 else [])
+    assert "_retryableMemory" not in json.dumps(result)
+    assert "_retryableMemory" not in json.dumps(saved)
+    # Neither a retryable failure nor its record reaches a catalog update.
+    assert [args[0] for args in modal_harness.build_catalog.spawned] == [
+        {"updates": []},
+        {"updates": [saved]},
+    ]
+    children = [
+        child
+        for key, child in modal_harness.run_store.puts
+        if key == f"{RUN_ID}:{PROCESS_KEY}"
+    ]
+    assert [child["state"] for child in children] == [
+        state
+        for attempt in range(attempts)
+        for state in (
+            "pending",
+            "running",
+            outcome if attempt == attempts - 1 else "failed",
+        )
+    ]
+    assert [child["callId"] for child in children if child["state"] == "running"] == [
+        f"fc-process-{attempt + 1}" for attempt in range(attempts)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("shape", "start"),
+    [
+        ({"meanGenesPerCell": None}, 0),
+        ({"cellCount": 100_000, "nGenes": 36_601, "meanGenesPerCell": 5_000.0}, 1),
+        ({"cellCount": 79_631, "nGenes": 18_736, "meanGenesPerCell": 5_519.0}, 2),
+    ],
+)
+@pytest.mark.parametrize("refusals", range(3))
+def test_process_run_starts_in_the_estimated_tier_and_escalates_from_it(
+    modal_harness, worker, shape, start, refusals
+):
+    _register(modal_harness.hub, **shape)
+    worker.build_errors = [
+        ImportMemoryRefusal("count layout exceeds budget")
+    ] * refusals
+
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    tiers = list(range(start, len(PROCESS_RESOURCES)))[: refusals + 1]
+    workers = modal_harness.process_dataset
+    assert [args[3] for args in workers.spawned] == tiers
+    assert workers.spawn_options == [
+        {
+            "cpu": PROCESS_RESOURCES[tier].cpu,
+            "memory": PROCESS_RESOURCES[tier].memoryMiB,
+        }
+        for tier in tiers
+    ]
+    builds = [event for event in worker.events if event.step == "build"]
+    assert [build.resources for build in builds] == [
+        PROCESS_RESOURCES[tier] for tier in tiers
+    ]
+    refused = refusals >= len(tiers)
+    assert result["state"] == "completed"
+    assert result["datasets"][0]["outcome"] == ("failed" if refused else "succeeded")
+
+
+@pytest.mark.parametrize("step", ["download", "build", "publish"])
+@pytest.mark.parametrize("error_type", [MemoryError, RuntimeError])
+def test_process_run_does_not_retry_other_failures(
+    modal_harness, worker, monkeypatch, step, error_type
+):
+    _register(modal_harness.hub)
+    error = error_type("operation failed")
+    if step == "download":
+        worker.download_error = error
+    elif step == "build":
+        worker.build_errors = [error]
+    else:
+
+        def fail_publication(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(pipeline_build, "publish_store", fail_publication)
+
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    assert len(modal_harness.process_dataset.spawned) == 1
+    assert result["state"] == "completed"
+    assert result["failures"] == [CYTEBASE_ID]
+    assert (
+        result["datasets"][0]["message"] == f"{error_type.__name__}: operation failed"
+    )
+    assert "_retryableMemory" not in result["datasets"][0]
+
+
+@pytest.mark.parametrize(
+    "outcome", ["succeeded", "skipped", "needsInput", "needsApproval"]
+)
+def test_process_run_requires_failed_outcome_to_retry(
+    modal_harness, monkeypatch, outcome
+):
+    _register(modal_harness.hub)
+
+    def run_dataset(*args, **kwargs):
+        return {"outcome": outcome, "_retryableMemory": True}
+
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    assert len(modal_harness.process_dataset.spawned) == 1
+    assert result["datasets"][0]["outcome"] == outcome
+    assert "_retryableMemory" not in json.dumps(result)
+
+
+def test_process_run_does_not_retry_after_losing_memory_refusal_ownership(
+    modal_harness, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+
+    def run_dataset(*args, **kwargs):
+        modal_harness.run_store.put(
+            app.CURRENT_RUN, {"runId": RUN_ID, "state": "reset"}
+        )
+        raise ImportMemoryRefusal("count layout exceeds budget")
+
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    assert len(modal_harness.process_dataset.spawned) == 1
+    assert result["state"] == "blocked"
+    assert result["datasets"][0]["message"] == f"RuntimeError: {UNOWNED}"
+    assert hub.read_json(RECORD_PATH)["stageOutcome"] == "running"
+    assert [args[0] for args in modal_harness.build_catalog.spawned] == [
+        {"updates": []}
+    ]
+
+
+def test_process_run_does_not_publish_a_refusal_when_the_retry_result_is_unknown(
+    modal_harness, worker, monkeypatch
+):
+    _register(modal_harness.hub)
+    worker.build_errors = [ImportMemoryRefusal("count layout exceeds budget")]
+    workers = FakeFunction(
+        modal_harness.process_dataset.target,
+        "process",
+        get_errors=[None, RuntimeError("retry result unavailable")],
+    )
+    monkeypatch.setattr(app, "process_dataset", workers)
+
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    assert [args[3] for args in workers.spawned] == [0, 1]
+    assert result["state"] == "blocked"
+    assert result["datasets"] == [
+        {
+            "cytebaseId": CYTEBASE_ID,
+            "outcome": "failed",
+            "message": "RuntimeError: retry result unavailable",
+        }
+    ]
+    assert [args[0] for args in modal_harness.build_catalog.spawned] == [
+        {"updates": []}
+    ]
+
+
+def test_a_pacing_error_before_a_retry_fails_the_run(
+    modal_harness, worker, monkeypatch
+):
+    hub = modal_harness.hub
+    _register(hub)
+    worker.build_errors = [ImportMemoryRefusal("count layout exceeds budget")]
+
+    class Pacer:
+        def __init__(self, interval: float) -> None:
+            self.waits = 0
+
+        async def wait(self) -> None:
+            self.waits += 1
+            if self.waits > 1:
+                raise RuntimeError("pacer unavailable")
+
+    monkeypatch.setattr(app, "_StartPacer", Pacer)
+    result = modal_harness.run("process", {"cytebaseIds": [CYTEBASE_ID]}, run_id=RUN_ID)
+
+    # The refused attempt finished, so no outcome is unknown when the
+    # orchestrator fails before the retry: the run fails instead of blocking.
+    assert [args[3] for args in modal_harness.process_dataset.spawned] == [0]
+    assert (result["state"], result["error"]) == (
+        "failed",
+        "RuntimeError: pacer unavailable",
+    )
+    assert hub.read_json(RECORD_PATH)["status"] == "registered"
 
 
 def test_process_run_reports_unregistered_datasets_without_stopping_others(
@@ -1579,11 +1909,13 @@ def test_process_run_keeps_at_most_the_container_limit_running(
     keys = _three_datasets(modal_harness.hub)
     lock, running, peak = threading.Lock(), [0], [0]
 
-    def run_dataset(record, request, storage, progress, check):
+    def run_dataset(record, request, storage, progress, check, *, resources):
         with lock:
             running[0] += 1
             peak[0] = max(peak[0], running[0])
         try:
+            if resources == PROCESS_RESOURCES[0]:
+                raise ImportMemoryRefusal("count layout exceeds budget")
             return _succeed(record, request, storage, progress, check)
         finally:
             with lock:
@@ -1595,6 +1927,11 @@ def test_process_run_keeps_at_most_the_container_limit_running(
 
     assert (result["state"], sorted(result["successes"])) == ("completed", sorted(keys))
     assert peak[0] == 1
+    spawned = modal_harness.process_dataset.spawned
+    assert len(spawned) == 6
+    # A dataset retains its slot between attempts, ahead of every queued dataset.
+    assert all(spawned[index][0] == spawned[index + 1][0] for index in (0, 2, 4))
+    assert [args[3] for args in spawned] == [0, 1] * 3
 
 
 def test_process_run_paces_every_dataset_start(modal_harness, monkeypatch):
@@ -1609,20 +1946,32 @@ def test_process_run_paces_every_dataset_start(modal_harness, monkeypatch):
             events.append("wait")
 
     workers = modal_harness.process_dataset
-    spawn = workers.spawn.aio
+    with_options = workers.with_options
 
-    async def spawn_after_pacing(*args):
-        events.append("spawn")
-        return await spawn(*args)
+    def paced_options(**options):
+        variant = with_options(**options)
+        spawn = variant.spawn.aio
+
+        async def spawn_after_pacing(*args):
+            events.append("spawn")
+            return await spawn(*args)
+
+        variant.spawn = SimpleNamespace(aio=spawn_after_pacing)
+        return variant
+
+    def run_dataset(*args, resources):
+        if resources == PROCESS_RESOURCES[0]:
+            raise ImportMemoryRefusal("count layout exceeds budget")
+        return _succeed(*args, resources=resources)
 
     monkeypatch.setattr(app, "_StartPacer", Pacer)
     monkeypatch.setattr(app, "DATASET_START_INTERVAL", 15.0)
-    monkeypatch.setattr(workers, "spawn", SimpleNamespace(aio=spawn_after_pacing))
-    monkeypatch.setattr(app, "_run_dataset", _succeed)
+    monkeypatch.setattr(workers, "with_options", paced_options)
+    monkeypatch.setattr(app, "_run_dataset", run_dataset)
     modal_harness.run("process", {"cytebaseIds": keys}, run_id=RUN_ID)
 
     assert events[0] == "interval=15.0"
-    assert events.count("wait") == events.count("spawn") == 3
+    assert events.count("wait") == events.count("spawn") == 6
     # Each start waits for the pacer before its worker is spawned.
     assert all(
         events[: index + 1].count("wait") > events[:index].count("spawn")
@@ -1682,6 +2031,7 @@ def test_process_run_forwards_only_each_datasets_approved_paths(
             CYTEBASE_ID,
             RUN_ID,
             {"cytebaseIds": [CYTEBASE_ID], "approvedDeletionPaths": approved[:1]},
+            0,
         )
     ]
     assert result["datasets"] == [
@@ -1753,7 +2103,7 @@ def _periodic_run(modal_harness, monkeypatch, *, fail_update: bool):
     clock, released, published = Clock(), threading.Event(), []
     monkeypatch.setattr(app, "monotonic", clock)
 
-    def run_dataset(record, request, storage, progress, check):
+    def run_dataset(record, request, storage, progress, check, *, resources):
         if record.cytebaseId == CYTEBASE_ID:
             clock.advance(61)
         elif not released.wait(5):

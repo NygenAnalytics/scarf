@@ -26,11 +26,13 @@ from scarf.readers._h5ad_columns import (
 from scarf.storage.count_matrix import require_count_matrix_layout
 from scarf.storage.metadata_keys import metadata_column_keys
 from scarf.storage.profiles import is_remote_zarr_location
+from scarf.storage.sharding import CountLayoutMemoryError
 from scarf.storage.stores import make_store
 from scarf.utils.logging import logger
 
 from .._storage import Bucket, dataset_prefix, retry
 from .models import DatasetRecord, Manifest
+from .resources import PROCESS_RESOURCES, ImportMemoryRefusal, ProcessResources
 
 _BLOCK_VALUES = 1_000_000
 _VALIDATION_ROWS = 100
@@ -668,6 +670,7 @@ def convert_local(
     manifest: dict,
     *,
     progress: Callable | None = None,
+    resources: ProcessResources = PROCESS_RESOURCES[0],
 ) -> dict:
     """Convert the explicit count selection from a current, validated manifest."""
     manifest = _validated_manifest(manifest)
@@ -782,14 +785,17 @@ def convert_local(
     try:
         if progress is not None:
             progress("converting", message="Building RNA counts and countsT")
-        writer = scarf.H5adToZarr(
-            reader,
-            zarr_loc=str(destination),
-            assay_name="RNA",
-            profile="cloud",
-            nthreads=8,
-            mem_budget="12G",
-        )
+        try:
+            writer = scarf.H5adToZarr(
+                reader,
+                zarr_loc=str(destination),
+                assay_name="RNA",
+                profile="cloud",
+                nthreads=resources.cpu,
+                mem_budget=resources.memBudget,
+            )
+        except CountLayoutMemoryError as error:
+            raise ImportMemoryRefusal(str(error)) from error
         imported = writer.dump()
     finally:
         reader.h5.close()
@@ -802,8 +808,8 @@ def convert_local(
         str(destination),
         default_assay="RNA",
         min_features_per_cell=-1,
-        nthreads=8,
-        mem_budget="12G",
+        nthreads=resources.cpu,
+        mem_budget=resources.memBudget,
     )
     try:
         record["qcSummary"] = datastore.summary().to_dict()
@@ -954,6 +960,8 @@ def build_local(
     size: int,
     checksum: str,
     progress: Callable,
+    *,
+    resources: ProcessResources = PROCESS_RESOURCES[0],
 ) -> tuple[Manifest, dict]:
     """Inspect and convert one verified source in a caller-owned workspace."""
     step = perf_counter()
@@ -987,7 +995,11 @@ def build_local(
     record.timings["inspectSeconds"] = perf_counter() - step
     step = perf_counter()
     converted = convert_local(
-        source, store, manifest.model_dump(mode="json"), progress=progress
+        source,
+        store,
+        manifest.model_dump(mode="json"),
+        progress=progress,
+        resources=resources,
     )
     record.timings["convertSeconds"] = perf_counter() - step
     converted.update(
@@ -1110,6 +1122,11 @@ def publish_store(
         "zarrUri": zarr_uri,
         "verifiedAt": completed.isoformat(),
         "verification": converted["verification"],
+        # The container that built the store; reprocessing this version
+        # starts in a tier at least this large.
+        "resources": None
+        if record.resources is None
+        else record.resources.model_dump(include={"cpu", "memoryMiB", "memBudget"}),
     }
     ready = record.model_copy(
         update={"status": "ready", "stageOutcome": "succeeded", "updatedAt": completed}
