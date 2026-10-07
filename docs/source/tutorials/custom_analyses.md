@@ -17,6 +17,9 @@ kernelspec:
 
 Scarf exposes graphs, bounded count streams, metadata tables, and export formats so an external algorithm can participate in an analysis without depending on private storage internals.
 
+
+Generally, today, we will simply solve a c
+
 ## What you will learn
 
 - Load a supported neighbourhood graph and calculate a cell statistic
@@ -26,11 +29,7 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 
 ## Import an existing store
 
-The prepared PBMC store supplies counts and a saved example run labeled `docs_default`.
-Open the downloaded store directly because the examples write custom artifacts and metadata, then
-reuse the run's frozen selection, graph, feature selection, and UMAP. The prepared store's active
-`I` matches the run's analysis selection.
-See {doc}`graph_construction` to build a graph by hand.
+The tutorial uses a prepared analysis of PBMCs as an example. 
 
 ```{code-cell} ipython3
 import numpy as np
@@ -42,11 +41,6 @@ scarf.configure_output(level="WARNING", progress=False)
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-```
-
-Open the downloaded store and its saved analysis.
-
-```{code-cell} ipython3
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
 run = ds.pipeline.open(label="docs_default")
 graph_ref = run["connectivity_map"]

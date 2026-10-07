@@ -218,29 +218,28 @@ unless they obscure the data; if these need to be fixed, then pass information w
 
 ```{code-cell} ipython3
 ds.plots.embedding(layout=layout, color_by=cell_types)
-ds.plots.embedding(layout=layout, color_by=cell_type, legend_loc="on_data)
+ds.plots.embedding(layout=layout, color_by=cell_types, legend_loc="on_data")
 ```
 
 ## Plot large datasets as pixels
 
-`embedding_raster` summarizes a continuous metadata column into pixels instead of large splots of each individual cell. It also avoids loading the full column into memory, and is useful when a scatter plot has too many overlapping points. 
+`embedding_raster` summarizes a continuous metadata column into pixels instead of large splots of each individual cell. It also avoids loading the full column into memory, and is useful when a scatter plot has too many overlapping points.
 
 ```{code-cell} ipython3
 ds.plots.embedding_raster(layout=layout, color_by="RNA_nCounts")
 ```
 
-This small dataset illustrates the call; the memory benefit matters on larger datasets.
-Use `embedding` for gene expression. Empty raster pixels are white by default.
+Just for reference, empty raster pixels are white by default.
 
 ## Where to find analysis diagnostics
 
-Keep diagnostics near the analysis they help evaluate:
+Keep each diagnostic close to the analysis it helps evaluate.
 
-- {doc}`feature_selection`: the mean-variance plot used to select genes.
-- {doc}`graph_construction`: graph degree and edge-weight distributions.
-- {doc}`dimensionality_reduction`: PCA and layout comparisons.
-- {doc}`clustering`: membership strength and cluster relationships.
-- {doc}`annotation`: marker heatmaps and cell-type evidence.
+- {doc}`feature_selection` shows the mean-variance plot that guides how many genes to keep before a graph is built.
+- {doc}`graph_construction` reports graph degree and edge-weight distributions, so you can confirm the neighborhood graph is connected before you cluster.
+- {doc}`dimensionality_reduction` compares PCA and layout choices, which is where you judge how many components carry real structure.
+- {doc}`clustering` covers membership strength and cluster relationships, helping you decide whether a cluster is a stable group or a boundary artifact.
+- {doc}`annotation` presents marker heatmaps and cell-type evidence, which is how you check that a cluster label matches its biology.
 
 Before interpreting a figure, check its cells, grouping, and expression scale. Add a panel when
 it answers a new question, rather than only changing the decoration.
