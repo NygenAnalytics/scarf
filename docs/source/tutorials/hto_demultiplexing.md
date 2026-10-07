@@ -1,11 +1,11 @@
 ---
 description: Assign sample identities from hashtag oligo counts and interpret singlet, negative, and doublet labels.
 ---
-
 (hto_demultiplexing)=
 (hto_demultiplexing_guide)=
 
 # Demultiplexing cells with HTOs
+
 
 Hashtag oligo (HTO) counts identify the sample assigned to each droplet in a pooled experiment.
 This is separate from integrating RNA and ADT measurements: demultiplexing classifies droplets as one sample, negative, or doublet before sample-level comparisons.
