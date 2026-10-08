@@ -11,71 +11,42 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (custom_analyses)=
 
 # Extending Scarf with custom analyses
 
-Scarf exposes graphs, bounded count streams, metadata tables, and export formats so an external algorithm can participate in an analysis without depending on private storage internals.
+With the unique way Scarf handles the data in a memory efficient manner, it would not be an ill assumption to make that Scarf has limited support for external tools and data formats. However, since Scarf is able to expose the graph information, the count streams, and the metadata tables used, exporting to alternative formats so that external algorithms can participate in analysis is not a difficult task. This enables Scarf to be flexible. In the tutorial today, we will generally learn how to perform the analysis in a more memory efficient manner, select a custom group of cells, and then learn how to export various selections/ the dataset in general to other formats for other analysis systems.
 
-## What you will learn
+## Import an existing store
 
-- Load a supported neighbourhood graph and calculate a cell statistic
-- Stream selected count blocks when the matrix cannot fit in memory
-- Save a custom cell selection
-- Choose an exit path for another analysis system
-
-## 1. Prepare a store
-
-The prepared PBMC store supplies counts and a saved example run labeled `docs_default`.
-Open the downloaded store directly because the examples write custom artifacts and metadata, then
-reuse the run's frozen selection, graph, feature selection, and UMAP. The prepared store's active
-`I` matches the run's analysis selection.
-See {doc}`graph_construction` to build a graph by hand.
+The tutorial uses a prepared analysis of PBMCs as an example.
 
 ```{code-cell} ipython3
 import numpy as np
 
 import scarf
 
-# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="WARNING", progress=False)
 
-# Download the prepared example, including its saved analysis.
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-```
-
-Open the downloaded store and its saved analysis.
-
-```{code-cell} ipython3
-# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{dataset}/data.zarr", nthreads=4)
-# Open the saved analysis and retain its exact results.
 run = ds.pipeline.open(label="docs_default")
-# Keep the reference to the saved connectivity graph.
 graph_ref = run["connectivity_map"]
-# Inspect the opened assays and their dimensions.
 ds
 ```
 
-## 2. Calculate from the graph
+## Calculate from the graph
 
-`load_graph` returns the selected neighbourhood graph as a SciPy CSR matrix.
-Here the row sum measures each cell's total edge weight in the symmetric graph.
-It is a graph statistic, not a biological confidence score.
+Say we need to first calculate specific statistics about the graph, for example each cell's total edge weight in the graph. This can tell us which cells sit in dense, well-connected neighborhoods versus cells that are weakly connected and similar to other cells based on the graph. To calculate this, we can use `load_graph`, which returns the selected neighborhood graph as a SciPy CSR matrix, in which the metric can then actually be calculated. Here the row sum measures each cell's total edge weight in the graph; this is not a biological metric.
 
 ```{code-cell} ipython3
-# Load the symmetric connectivity graph as a sparse matrix.
 graph = ds.load_graph(graph=graph_ref, symmetric=True, upper_only=False)
-# Sum the edge weights connected to each cell.
 graph_strength = np.asarray(graph.sum(axis=1)).ravel()
-# Save the values in cell metadata using the stated selection.
 ds.cells.insert(
     column_name="customGraphStrength", values=graph_strength, key="I", overwrite=True
 )
-# Summarize the graph size and the new per-cell connectivity statistic.
 {
     "cells": int(graph.shape[0]),
     "edges": int(graph.nnz),
@@ -83,63 +54,46 @@ ds.cells.insert(
 }
 ```
 
-The insert writes one value per active cell in graph row order.
-The summary shows the graph size and the mean of the new column.
+The insert writes one value per active cell in graph row order, with the summary showing the graph size and the mean of the new column.
 
 ```{code-cell} ipython3
-# Locate high and low graph connectivity on the saved embedding.
 ds.plots.embedding(layout=run["umap"], color_by="customGraphStrength")
 ```
 
-The plot asks where cells have stronger or weaker weighted connectivity in this specific graph.
-Rebuilds with another feature set or neighbour count need a new statistic.
+The plot simply lets us visualize which cells have stronger or weaker weighted connectivity in this specific graph.
 
-## 3. Stream count blocks
+## Stream count blocks
 
-Avoid `.compute()` on a matrix that may exceed memory.
-Slice to the frozen run's cell and highly variable feature indexes, then process ordered row
-blocks.
+If you are under heavier memory constraints, you can also stream the count information to make Scarf even more memory efficient. One way to do this is to avoid using `.compute()` on a matrix that may exceed memory. We can also slice blocks to the frozen run's cell and highly variable feature indexes, then process the ordered row blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
-# Locate the run's cells on the stored count-matrix axis.
 cell_index = np.flatnonzero(run.cells.fetch_all("I"))
-# Read the run's highly variable gene selection.
 hvg_values = np.asarray(run.features.fetch_all("highly_variable_features"), dtype=bool)
-# Locate those genes on the stored feature axis.
 feature_index = np.flatnonzero(hvg_values)
-# Create a lazy view of the selected cells and genes.
 selected_counts = ds.RNA.rawData[:, feature_index][cell_index, :]
 
-# Check the selected matrix dimensions before streaming counts.
 {"selected cells": len(cell_index), "selected genes": len(feature_index)}
 ```
 
 Count detected genes one block at a time.
 
 ```{code-cell} ipython3
-# Collect one small vector of detection counts per block.
 detected_blocks = []
-# Process a bounded count block without loading the full matrix.
 for count_block in selected_counts.stream_blocks(
     nthreads=4, msg="Calculating custom detection statistic"
 ):
-    # Keep this result in its original processing order.
     detected_blocks.append(np.count_nonzero(count_block, axis=1))
-# Check how many cell results were collected across the blocks.
 sum(len(block) for block in detected_blocks)
 ```
 
 Collect the per-cell results and save them in metadata.
 
 ```{code-cell} ipython3
-# Join the block results in their original cell order.
 detected_hvgs = np.concatenate(detected_blocks)
-# Save the values in cell metadata using the stated selection.
 ds.cells.insert(
     column_name="customDetectedHVGs", values=detected_hvgs, key="I", overwrite=True
 )
-# Summarize the per-cell detected-gene counts.
 {
     "cells": int(detected_hvgs.size),
     "customDetectedHVGs mean": float(detected_hvgs.mean()),
@@ -147,22 +101,17 @@ ds.cells.insert(
 }
 ```
 
-`stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with
-that key keeps each streamed value aligned with its metadata row.
-The summary checks that every streamed cell received a detection count.
+The `stream_blocks` preserves row order. Because active `I` is the frozen run selection, inserting with that key keeps each streamed value aligned with its metadata row and doesn't make realigning things an issue.
 
-## 4. Create custom selections
+## Create custom selections
 
-A boolean cell column can become a `cell_key`.
-Use `fill_value=False` when the new key is defined only for currently active cells: the inactive
-cells then hold `False`. Without it they are recorded as missing, which a key never selects either.
-Here we keep cells above the lowest quarter of graph strength as an example of making a selection.
-This is an illustration of the API, not a recommended quality-control filter:
+It can also be useful during parts of the analysis to create custom selections for a group of cells. To do this, we can create a boolean cell column that is `cell_key`. We can then use `fill_value=False` when the new key is defined only for currently active cells. This is one of the strong benefits of Scarf, is that any cells we select or deselect do not have their information deleted; it is simply no longer read into memory and still saved if we need to revert in the future.
+
+For our example here, we keep cells above the lowest quarter of graph strength as an example.
+This is simply an illustration of the API, not a recommended quality-control filter that you can or should implement:
 
 ```{code-cell} ipython3
-# Keep cells above the lowest quarter of graph strength.
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
-# Save the values in cell metadata using the stated selection.
 ds.cells.insert(
     column_name="wellConnected",
     values=well_connected,
@@ -170,48 +119,52 @@ ds.cells.insert(
     key="I",
     overwrite=True,
 )
-# Check how many active cells pass the custom selection.
 {"selected cells": int(well_connected.sum()), "active cells": len(well_connected)}
 ```
 
 ```{code-cell} ipython3
-# Compare detected-gene counts and the custom cell selection.
 ds.plots.embedding(
     layout=run["umap"], color_by=["customDetectedHVGs", "wellConnected"], n_columns=2
 )
 ```
 
-The first panel checks where the streamed count statistic varies.
-The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
+The first panel checks where the streamed count statistic varies. The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
 
-## 5. Pass a small selection to another tool
+## Pass a small selection to another tool
 
-`to_anndata` creates an in-memory AnnData object. Select the cells and genes you need before
-materializing it. Here we pass the custom cell selection and the six-gene panel:
+Say for example we have created our selection now, and would like to pass it to another analysis tool such as Scanpy. We can use the `to_anndata` function create an in-memory AnnData object. Note, by doing this, you often will need memory or need to be careful as this can be memory intensive. Select the cells and genes you need before actually executing it; here we only pass the cells alongside information of the 6 genes listed:
 
 ```{code-cell} ipython3
-# Choose a small marker panel for the comparison.
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
-# Materialize only the selected cells and marker panel.
 adata = ds.to_anndata(cell_key="wellConnected", feature_names=panel_genes)
-# Check the exported dimensions and feature identifiers.
 adata.shape, adata.var_names.tolist()
 ```
 
-`to_anndata` drops unselected features.
-It indexes `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`.
-So `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols.
-Check `adata.var["names"]` when you need the symbols.
-Use `SubsetZarr` to write selected cells to a Scarf store instead; it retains every feature in
-the chosen assays. See {doc}`downsampling` for an example and {doc}`import_and_export` for H5AD
-and Matrix Market export.
-Use {doc}`remote_stores` when the count source itself must remain remote.
+If you per se wanted to export all of the genes, then simply leave out `feature_names`, and it will automatically default to including them all.
 
-## Extension boundary
+When transferring using `to_anndata`, it functions (for transferring genes) by indexing `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`. Therefore `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols, and would need to be translated back possible. Check `adata.var["names"]` when you need the symbols.
 
-Direct arbitrary artifact writing is not a stable public extension API.
-Do not mutate `ds.z`, `ds.zw`, `_matrix_z`, or other private storage attributes from analysis code.
-Those objects expose implementation layout and can change as storage contracts evolve.
+If you want to subset and stay inside of the Scarf ecosystem, instead use `SubsetZarr` to write selected cells to a Scarf store instead.
 
-Use public metadata insertion, result-returning methods, graph loading, block streams, and export APIs.
-Pipeline callbacks provide read-only execution events; their contract is documented in {doc}`../reference/api/pipeline`.
+Write the `wellConnected` cells into a separate Scarf store and confirm what the subset kept.
+
+```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+export_directory = TemporaryDirectory()
+subset_path = Path(export_directory.name) / "well_connected.zarr"
+writer = scarf.SubsetZarr(
+    zarr_loc=str(subset_path),
+    assays=[ds.RNA],
+    cell_key="wellConnected",
+    reset_cell_filter=False,
+    overwrite_existing_file=True,
+)
+writer.dump()
+
+subset = scarf.DataStore(str(subset_path))
+{"exported cells": subset.cells.N, "retained genes": subset.RNA.feats.N}
+```
+
+`SubsetZarr` keeps every gene in the listed assays and writes only the selected cells, so the subset stays a full Scarf store rather than a reduced in-memory object.

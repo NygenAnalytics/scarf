@@ -11,36 +11,24 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (integration_guide)=
 
 # Integrating datasets by merging
 
-Dataset integration starts by placing compatible assays in one datastore.
-`DataStoreMerge` aligns their feature order, carries selected metadata, and records the source of each cell.
-It does not alter expression values or correct the joint representation.
-This guide builds that uncorrected baseline first.
+When you have multiple different datasets, and you seek to combine them into one, integration is usually the path to take. Dataset integration starts by placing compatible assays in one datastore. `DataStoreMerge` aligns their genes, carries selected metadata, and records the source of each cell so you can verify what data came from what dataset. It does not alter expression values or correct the joint representation. For correction of the joint representation, refer to {doc}`batch_correction`. This guide builds that uncorrected, merged dataset first.
 
-## 1. Load compatible source stores
+## Load compatible source stores
 
-The control and interferon beta stimulated Kang PBMC stores use the same RNA feature space.
-These prepared stores contain cells with author-provided cell-type labels.
-Their `I` columns mark the cells that passed quality control.
+The control and interferon beta stimulated Kang PBMC stores use the same cell types and genes; the prepared stores contain cells with existing cell-type labels, and the `I` columns mark the cells that are still used for analysis as they passed the quality control.
 
 ```{code-cell} ipython3
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
 import pandas as pd
 
 import scarf
 
-# Keep routine progress messages out of the teaching output.
 scarf.configure_output(level="ERROR", progress=False)
 
-# Connect to the repository of prepared documentation datasets.
 repository = scarf.cytebase.connect("scarf_docs")
-# Download the control PBMC store.
 ctrl_path = repository.download_dataset(
     name="kang_15K_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
@@ -49,7 +37,6 @@ ctrl_path = repository.download_dataset(
 Download the stimulated sample from the same repository.
 
 ```{code-cell} ipython3
-# Download the interferon-stimulated PBMC store.
 stim_path = repository.download_dataset(
     name="kang_14K_ifnb-pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
@@ -58,19 +45,13 @@ stim_path = repository.download_dataset(
 Open both source stores before checking their axes.
 
 ```{code-cell} ipython3
-# Open the control sample.
 ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
-# Open the stimulated sample.
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Confirm assay type, cell counts, and feature counts before merging. `DataStoreMerge` validates the
-feature axes and requires every source to declare the same assay type, which the merged assay
-keeps; matching gene symbols alone do not establish compatible genome builds or quantification
-conventions.
+Confirm assay type, cell counts, and feature counts before merging. Ensure that all of the data you would like to analyze is present in one specific spot. `DataStoreMerge` validates the feature axes; matching gene symbols alone do not establish fully compatible genome builds.
 
 ```{code-cell} ipython3
-# Compare assay types and cell and feature counts before merging.
 pd.DataFrame(
     [
         {
@@ -85,86 +66,58 @@ pd.DataFrame(
 )
 ```
 
-## 2. Merge counts and metadata
+## Merge counts and metadata
 
-`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text`
-keeps imported metadata names distinct from columns authored in the merged store.
-`reset_cell_filter=False` preserves the source quality-control selections.
-A merge never replaces a store that a `DataStore` has opened, even with `overwrite=True`, so this
-example writes into a new temporary folder each time it runs.
+When merging, the `names` supply the source labels, `source_column` names their metadata column, and `prepend_text` keeps imported metadata names distinct from columns authored in the merged store. `reset_cell_filter=False` preserves the source quality-control selections, and doesn't merge the cells that were filtered out into the active selection (still merged, just not selected).
 
 ```{code-cell} ipython3
-# Keep the merged example in a temporary folder.
-merge_directory = TemporaryDirectory()
-# Choose a new path for the merged counts.
-merged_path = Path(merge_directory.name) / "kang_dataset_merging.zarr"
-# Write the prepared counts and metadata to the new store.
+merged_path = "scarf_datasets/kang_dataset_merging.zarr"
 scarf.DataStoreMerge(
     datasets=[ds_ctrl, ds_stim],
-    zarr_path=str(merged_path),
+    zarr_path=merged_path,
     names=["ctrl", "stim"],
     assays=["RNA"],
     prepend_text="orig",
     reset_cell_filter=False,
     source_column="sample_id",
+    overwrite=True,
 ).dump()
 
-# Open the completed merge to inspect its cells and features.
-merged = scarf.DataStore(str(merged_path), nthreads=4)
-# Check the merged cell and feature dimensions.
+merged = scarf.DataStore(merged_path, nthreads=4)
 merged
 ```
 
-`sample_id` records the source label.
-Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
-`RNA_I` marks the cells that the merged RNA assay measured; every cell here comes from an RNA
-source, so it is True for all of them. When a source lacks an assay, or measured only some of its
-cells with it, the merged `<assay>_I` column keeps that per-cell membership. Operations that read
-that assay's values then refuse the cells it did not measure, whose counts are zero-filled, and
-`merged.select_measured_cells("<assay>", cell_selection=...)` keeps the measured ones; here it
-returns the selection unchanged, because RNA measured every cell.
+The `sample_id` records the dataset source label; columns that are imported from the sources keep the `orig_` prefix so their origin remains explicit and interpretable.
 
-The merged active population contains labelled cells from both sources.
+The merged active population contains labeled cells from both sources.
 
 ```{code-cell} ipython3
-# Read source labels and imported cell types for active cells.
 merged_labels = merged.cells.to_pandas_dataframe(
     ["sample_id", "orig_cluster_labels"], key="I"
 )
-# Count active cells and distinct imported cell types from each source.
 merged_labels.groupby("sample_id")["orig_cluster_labels"].agg(
     cells="count", cell_types="nunique"
 )
 ```
 
-## 3. Inspect a prepared joint analysis
+## Inspect a prepared joint analysis
 
-The merge is complete. To see what these datasets look like together, open the catalog's prepared
-merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP.
-This is a separate store from `merged`, so the following plots do not run an analysis on the store
-you just created. The saved example run is named `docs_default`.
+Now that the merge is complete, we can see what these datasets look like together by opening the prepared merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP. The UMAP we visualize has had no batch corrections applied to it, and is thus simply the raw results of merging, and rerunning the analysis pipeline.
+
+For context, this is a separate store from `merged`, so the following plots do not run an analysis on the store we just created.
 
 ```{code-cell} ipython3
-# Download the separate, pre-analyzed joint example.
 prepared_path = repository.download_dataset(
     name="kang_29K_ctrl-ifnb_pbmc_rnaseq", destination="scarf_datasets", zarr=True
 )
-# Open the datastore for the following analysis.
 ds = scarf.DataStore(f"{prepared_path}/data.zarr", nthreads=4)
-# Open the prepared baseline for the comparisons below.
 baseline = ds.pipeline.open(label="docs_default")
-# List the results available in the separate prepared analysis.
 sorted(baseline)
 ```
 
-The durable run maps each output name to its exact {term}`artifact`.
-Requested metadata and results remain in its frozen view.
-
-One plotting call compares source identity, imported cell types, and the exact clustering artifact
-on the same layout.
+The durable run maps each output name to its exact {term}`artifact`. The plot below compares source identity, imported cell types, and the exact clustering artifact on the same layout.
 
 ```{code-cell} ipython3
-# Compare source labels, imported cell types, and computed clusters.
 ds.plots.embedding(
     layout=baseline["umap"],
     color_by=["sample_id", "orig_cluster_labels", baseline["clusters"]],
@@ -175,7 +128,6 @@ ds.plots.embedding(
 A table of proportions shows whether each Leiden cluster contains cells from both sources.
 
 ```{code-cell} ipython3
-# Compare source proportions within each computed cluster.
 pd.crosstab(
     baseline.cells.fetch("clusters"),
     baseline.cells.fetch("sample_id"),
@@ -185,9 +137,6 @@ pd.crosstab(
 ).round(3)
 ```
 
-The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
-Source-associated structure can therefore include biological response as well as technical variation.
+The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment, thus source-associated structure can therefore include biological response as well as technical variation.
 
-The next page, {doc}`batch_correction`, uses a different dataset with measured sequencing batches
-to compare an uncorrected analysis with Harmony. It also introduces metrics for batch mixing.
-Keep uncorrected counts for condition-level differential expression.
+The next step would be found in {doc}`batch_correction`, which teaches how to correct technical variation between both datasets with Harmony. It also introduces metrics for batch mixing.

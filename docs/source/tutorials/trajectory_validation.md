@@ -3,76 +3,49 @@ description: Check trajectory assumptions, changing genes, and candidate fate pr
 ---
 (trajectory_validation)=
 
-# Check a trajectory interpretation
+# Trajectory validation checklist
 
-A plausible UMAP is only a starting point. Use these checks after {doc}`pseudotime`,
-{doc}`expression_dynamics`, or {doc}`fate_mapping` to decide which conclusions the result
-supports. The snippets below continue those examples; this page does not run a separate
-analysis.
+A plausible UMAP is only a starting point in the journey of pseudotime and trajectory inference. In this tutorial, we can learn about the general checks to perform after {doc}`pseudotime`, {doc}`expression_dynamics`, or {doc}`fate_mapping`, to then decide which conclusions each result supports. We can see if early [source] markers sit towards the start of the inference, and the terminal towards the ends; all the while we allow for the intermediate populations to stay intermediate by ruling out cell quality, batch effects, or some other process driving the issues.
 
-## Check the biological orientation
-
-Ask whether known early markers occur toward the start and terminal markers toward the
-end. Intermediate populations should be allowed intermediate scores. Also check whether
-batch, cell quality, or another process could explain the ordering.
-
-Try plausible alternative endpoints and modest graph changes. If they give different
-orderings, describe that uncertainty instead of treating one smooth map as a unique
-answer. The custom source/sink weighting in the pancreas examples is part of their
-assumptions; changing it can change the scores.
+Furthermore, because the custom source/sink weighting in the pancreas examples is itself an assumption, try plausible alternative endpoints and modest graph changes to see if they give different orderings. Visualizing these uncertainties can allow you to rule out other plausible branches that may be invalid. This tutorial simply serves as a checker
 
 ## Count the cells that were scored
 
-```python
-# Load pseudotime scores and their validity mask.
+```Python
 pseudotime = ds.load_pseudotime_scoring(pseudotime_ref)
-# Report the fraction of cells with valid pseudotime scores.
 float(pseudotime.valid.mean())
 ```
 
-By default, pseudotime uses the largest connected graph component. Other cells receive
+By default, pseudotime uses the largest connected graph component, with other cells receiving
 undefined values and `valid=False`. A separate component may reflect biology, filtering,
 or graph settings. Report how many cells were excluded and investigate where they lie.
-Use the validity mask for summaries you write yourself; Scarf applies it internally
-when searching for pseudotime markers or aggregating expression.
+The validity mask simply tells us what cells the pseudotime results actually speak fors.
 
 ## Inspect changing genes and modules
 
 ```python
-# Load the marker table and adjusted p-values.
 markers = ds.load_pseudotime_markers(marker_ref)
-# Inspect the first few rows of the result.
 markers.table.head()
 ```
 
-Inspect the expression profiles with the module plots in {doc}`expression_dynamics`.
-Load the aggregation result when you need its values for further checks:
+To inspect the changes within theexpression profiles with the module plots in {doc}`expression_dynamics`, you can run the below to load the aggregration results when you need its values for further checks:
 
 ```python
-# Load the saved aggregation of changing genes.
 modules = ds.load_pseudotime_aggregation(modules_ref)
-# Inspect the loaded aggregation result.
 modules
 ```
 
-Correlations can miss transient or branch-specific changes. Inspect the profiles and
-several genes in a module, not just its name or size. Compare smoothing widths and
-feature choices. Module numbers are identifiers, not developmental stages.
+Correlations can miss transient or branch-specific changes as previously discussed, thus inspect the profiles and genes in a module. Compare smoothing widths and feature choices to find what describes your data best. 
 
-Untested marker features have missing p-values, and correction covers tested features
-only. The aggregation result contains features that passed its expression and variance
-checks. Neither result establishes that a gene causes the process.
+Remember, untested marker features have missing p-values, and correction covers tested features
+only.
 
 ## Separate probability checks from biological evidence
 
 ```python
-# Load the saved fate probabilities and validity mask.
 fate = ds.load_fate_mapping(fate_ref)
-# Restrict probability checks to scored cells.
 valid_probabilities = fate.values[fate.valid]
-# Measure the largest deviation from a row sum of one.
 row_sum_error = abs(valid_probabilities.sum(axis=1) - 1.0).max()
-# Show the largest probability row-sum error.
 row_sum_error
 ```
 
@@ -87,25 +60,17 @@ reflect graph geometry even when the underlying biological decision is abrupt.
 ## Keep the inputs with the results
 
 Record which graph, cells, features, and endpoints produced the result. Saved references
-let you check this directly:
+let you check this directly, and then then inspect how those inputs connect:
 
 ```python
-# Inspect the saved result's parameters and inputs.
 ds.inspect_artifact(fate_ref)
-```
-
-Then inspect how those inputs connect:
-
-```python
-# Display the saved result and its upstream inputs.
 ds.lineage(fate_ref)
 ```
 
-The trajectory results should refer to the intended graph and cell selection. Marker
-and module results should use the intended feature selection and pseudotime result.
-Keep alternatives separate when comparing graph or endpoint changes; see
-{doc}`reuse_and_tracing` for following saved analyses.
+The trajectory results should refer to the intended graph and cell selection. Marker and module results should use the intended feature selection and pseudotime result. Keep alternatives (other trajectories) separate when comparing graph or endpoint changes to avoid confusion, and refer to {doc}`reuse_and_tracing` for following saved analyses.
 
-When reporting a trajectory, include the endpoint evidence, graph and smoothing
-choices, valid-cell counts, sensitivity checks, and remaining uncertainty alongside
-the saved result references.
+## Important caveats to consider regarding trajectory validation
+
+- **Mistaking technical covariates or circular endpoints for true progression:** A smooth trajectory across a low-dimensional embedding often tracks technical confounders, such as sequencing depth, mitochondrial read percentage, or uncorrected batch variation, rather than developmental time. Furthermore, validating an axis using only the manually chosen source and sink markers is circular; the scoring algorithm mathematically guarantees those populations sit at the extremes. Validating the trajectory requires testing alternative endpoint definitions, inspecting intermediate transition markers, and ensuring the axis does not merely correlate with library quality metrics, which is why thorough quality control is required.
+- **Ignoring graph fragmentation and the valid-cell fraction (pseudotime.valid):** SCARF calculates trajectory metrics exclusively across the largest connected graph component, assigning valid=False and undefined values to disconnected cells. Omitting the validity check (pseudotime.valid.mean()) risks silently discarding substantial cell populations or entire uncharacterized lineages. Custom summaries and external exports that fail to filter by pseudotime.valid will propagate NaN values, distort statistical distributions, and misrepresent dataset representation.
+- **Conflating mathematical solver convergence with biological commitment:** Verifying that fate probabilities sum to one across rows confirms the numerical calculation worked, not that the biological model is complete or correct. Graph diffusion models inherently generate smooth, continuous gradients across continuous manifolds, which can obscure abrupt, threshold-driven transcriptional switches (such as bistable transcription factor cross-repression). Treating a continuous mathematical probability gradient as proof of gradual, reversible biological plasticity risks misinterpreting discrete commitment checkpoints.
