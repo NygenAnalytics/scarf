@@ -15,13 +15,11 @@ kernelspec:
 
 # Integrating datasets by merging
 
-When you have multiple different datasets, and you seek to combine them into one, integration is usually the path to take. Dataset integration starts by placing compatible assays in one datastore.`DataStoreMerge` aligns their genes, carries selected metadata, and records the source of each cell so you can verify what data came from what dataset. It does not alter expression values or correct the joint representation. For correction of the joint representation, refer to {doc}`batch_correction`. This guide builds that uncorrected, merged dataset first.
+When you have multiple different datasets, and you seek to combine them into one, integration is usually the path to take. Dataset integration starts by placing compatible assays in one datastore. `DataStoreMerge` aligns their genes, carries selected metadata, and records the source of each cell so you can verify what data came from what dataset. It does not alter expression values or correct the joint representation. For correction of the joint representation, refer to {doc}`batch_correction`. This guide builds that uncorrected, merged dataset first.
 
-## 1. Load compatible source stores
+## Load compatible source stores
 
-The control and interferon beta stimulated Kang PBMC stores use the same RNA feature space.
-These prepared stores contain cells with author-provided cell-type labels.
-Their `I` columns mark the cells that passed quality control.
+The control and interferon beta stimulated Kang PBMC stores use the same cell types and genes; the prepared stores contain cells with existing cell-type labels, and the `I` columns mark the cells that are still used for analysis as they passed the quality control.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -51,9 +49,7 @@ ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Confirm assay type, cell counts, and feature counts before merging. `DataStoreMerge` validates the
-feature axes; matching gene symbols alone do not establish compatible genome builds or
-quantification conventions.
+Confirm assay type, cell counts, and feature counts before merging. Ensure that all of the data you would like to analyze is present in one specific spot. `DataStoreMerge` validates the feature axes; matching gene symbols alone do not establish fully compatible genome builds.
 
 ```{code-cell} ipython3
 pd.DataFrame(
@@ -70,11 +66,9 @@ pd.DataFrame(
 )
 ```
 
-## 2. Merge counts and metadata
+## Merge counts and metadata
 
-`names` supplies the source labels, `source_column` names their metadata column, and `prepend_text`
-keeps imported metadata names distinct from columns authored in the merged store.
-`reset_cell_filter=False` preserves the source quality-control selections.
+When merging, the `names` supply the source labels, `source_column` names their metadata column, and `prepend_text` keeps imported metadata names distinct from columns authored in the merged store. `reset_cell_filter=False` preserves the source quality-control selections, and doesn't merge the cells that were filtered out into the active selection (still merged, just not selected).
 
 ```{code-cell} ipython3
 merged_path = "scarf_datasets/kang_dataset_merging.zarr"
@@ -93,10 +87,9 @@ merged = scarf.DataStore(merged_path, nthreads=4)
 merged
 ```
 
-`sample_id` records the source label.
-Columns imported from the sources keep the `orig_` prefix so their origin remains explicit.
+The `sample_id` records the dataset source label; columns that are imported from the sources keep the `orig_` prefix so their origin remains explicit and interpretable.
 
-The merged active population contains labelled cells from both sources.
+The merged active population contains labeled cells from both sources.
 
 ```{code-cell} ipython3
 merged_labels = merged.cells.to_pandas_dataframe(
@@ -107,12 +100,11 @@ merged_labels.groupby("sample_id")["orig_cluster_labels"].agg(
 )
 ```
 
-## 3. Inspect a prepared joint analysis
+## Inspect a prepared joint analysis
 
-The merge is complete. To see what these datasets look like together, open the catalog's prepared
-merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP.
-This is a separate store from `merged`, so the following plots do not run an analysis on the store
-you just created. The saved example run is named `docs_default`.
+Now that the merge is complete, we can see what these datasets look like together by opening the prepared merged store. It uses the same merge recipe and already contains PCA, clustering, and UMAP. The UMAP we visualize has had no batch corrections applied to it, and is thus simply the raw results of merging, and rerunning the analysis pipeline.
+
+For context, this is a separate store from `merged`, so the following plots do not run an analysis on the store we just created.
 
 ```{code-cell} ipython3
 prepared_path = repository.download_dataset(
@@ -123,11 +115,7 @@ baseline = ds.pipeline.open(label="docs_default")
 sorted(baseline)
 ```
 
-The durable run maps each output name to its exact {term}`artifact`.
-Requested metadata and results remain in its frozen view.
-
-One plotting call compares source identity, imported cell types, and the exact clustering artifact
-on the same layout.
+The durable run maps each output name to its exact {term}`artifact`. The plot below compares source identity, imported cell types, and the exact clustering artifact on the same layout.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -149,9 +137,6 @@ pd.crosstab(
 ).round(3)
 ```
 
-The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment.
-Source-associated structure can therefore include biological response as well as technical variation.
+The stimulated sample received interferon beta, and PBMC cell types do not all respond identically to that treatment, thus source-associated structure can therefore include biological response as well as technical variation.
 
-The next page, {doc}`batch_correction`, uses a different dataset with measured sequencing batches
-to compare an uncorrected analysis with Harmony. It also introduces metrics for batch mixing.
-Keep uncorrected counts for condition-level differential expression.
+The next step would be found in {doc}`batch_correction`, which teaches how to correct technical variation between both datasets with Harmony. It also introduces metrics for batch mixing.
