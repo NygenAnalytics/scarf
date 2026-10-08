@@ -22,8 +22,7 @@ from a local notebook or a Python session on cloud compute.
 
 Scarf reads metadata and count blocks over the network as needed. Computation
 runs where your Python session runs; connecting to Cytebase does not provision
-a cloud worker. Shared stores are read-only. A mount lets you save new analysis
-results on your execution machine while the counts stay in Cytebase.
+a cloud worker, so the session still runs locally. Shared stores are read-only. A mount lets you save new analysis results on your execution machine while the counts stay in Cytebase.
 
 This tutorial uses datasets sourced from CELLxGENE. It searches the catalog,
 reads cell annotations, and plots the UMAP coordinates supplied by CELLxGENE.
@@ -53,17 +52,10 @@ by default. To use another bucket, set `CYTEBASE_BUCKET` before starting Jupyter
 or pass `bucket=` to `Catalog`. The explicit argument takes precedence over the
 environment variable. For a private bucket, supply `HF_TOKEN` through your
 environment or use your existing Hugging Face login. Keep credentials and
-private bucket names out of notebook source and outputs.
+private bucket names out of notebook source and outputs to make sure these don't get stolen!
 
-## What you will learn
 
-- Search by text or exact ontology labels
-- Open an RNA assay read-only and read selected cell metadata
-- Plot imported UMAP coordinates by cell type and gene expression
-- Save a figure and mount a datastore for writable analysis
-- Use exact labels or SQL for more detailed searches
-
-## 1. Connect and search
+## Connect and search
 
 ```{code-cell} ipython3
 import logging
@@ -106,7 +98,7 @@ Displaying it reads the catalog and dataset record. It does not open the remote
 Zarr hierarchy. The citation and CELLxGENE links identify the original study;
 retain these when using the data.
 
-## 2. Open the remote DataStore
+## Open the remote DataStore
 
 `catalog.open_datastore(entry.id)` validates the published dataset version and
 build receipt, then returns a `DataStore` with `zarr_mode="r"`. Counts remain
@@ -134,7 +126,7 @@ umap_ref = cytebase.embedding(ds, "X_umap")
 The current pipeline imports `obsm/X_umap`. An `X_pca` key in the source list
 alone does not mean its coordinates are available in the Scarf store.
 
-## 3. Read cell metadata
+## Read cell metadata
 
 CELLxGENE annotations are stored beside Scarf's QC columns, such as
 `RNA_nCounts` and `RNA_nFeatures`. Request only the columns needed for a figure:
@@ -166,12 +158,9 @@ Compare cell-type composition between the donor groups:
 pd.crosstab(meta["cell_type"], meta["disease"])
 ```
 
-## 4. Plot the stored UMAP
+## Plot the stored UMAP
 
-`ds.plots.embedding(layout=umap_ref, ...)` uses the exact imported coordinates
-without recomputing UMAP. With a moderate number of cell types, the default
-legend placement writes each label on its cluster. A large atlas with many
-labels is better viewed with selected groups or `legend_loc="none"`.
+`ds.plots.embedding(layout=umap_ref, ...)` uses the exact imported coordinates without recomputing UMAP. With a moderate number of cell types, the default legend placement writes each label on its cluster. A large atlas with many labels is better viewed with selected groups or `legend_loc="none"`.
 
 ```{code-cell} ipython3
 cell_type_plot = ds.plots.embedding(
@@ -193,19 +182,13 @@ ds.plots.embedding(
 
 ### Gene expression
 
-Scarf looks up gene symbols without regard to case. Here we use UMOD for the thick ascending
-limb of the loop of Henle, SLC34A1 for the proximal tubule, NPHS1 for podocytes, and PECAM1 for
-endothelial cells. An unknown or ambiguous name raises an error, so check the feature metadata
-when adapting this panel to another dataset.
+Scarf looks up gene symbols without regard to case. Here we use UMOD for the thick ascending limb of the loop of Henle, SLC34A1 for the proximal tubule, NPHS1 for podocytes, and PECAM1 for endothelial cells. An unknown or ambiguous name raises an error, so check the feature metadata when adapting this panel to another dataset. For resources on choosing markers, refer to {doc}`annotation`.
 
 ```{code-cell} ipython3
 genes = ["UMOD", "SLC34A1", "NPHS1", "PECAM1"]
 ```
 
-Expression values are normalized on read; this example explicitly requests a
-`log1p` transform. Neither the count matrix nor the imported coordinates are
-modified. Drawing high values last makes expressing cells easier to see. Each
-gene is read from the remote counts, so every panel adds network reads.
+Expression values are normalized on read; this example explicitly requests a `log1p` transform. Neither the count matrix nor the imported coordinates are modified. Drawing high values last makes expressing cells easier to see. Each gene is read from the remote counts, so every panel adds network reads.
 
 ```{code-cell} ipython3
 from scarf.plotting import NormalizationSpec
@@ -220,10 +203,9 @@ ds.plots.embedding(
 )
 ```
 
-## 5. Other plots from the same assay
+## Other plots from the same assay
 
-The read-only DataStore also supports plots from existing metadata and counts.
-For example, compare a QC measure across cell types:
+The read-only DataStore also supports plots from existing metadata and counts. For example, compare a QC measure across cell types:
 
 ```{code-cell} ipython3
 from scarf.plotting import CellField
@@ -236,8 +218,7 @@ ds.plots.distribution(
 )
 ```
 
-Gene distributions use the same interface; this optional example reads
-additional expression values:
+Gene distributions use the same interface; this optional example reads additional expression values:
 
 ```python
 ds.plots.distribution(
@@ -248,7 +229,7 @@ ds.plots.distribution(
 )
 ```
 
-## 6. Coordinates for custom plots
+## Coordinates for custom plots
 
 Coordinates follow the embedding artifact's frozen cell selection and are
 indexed by cell ID. Join on those IDs instead of assuming the same row order as
@@ -264,7 +245,7 @@ with pd.option_context("display.max_colwidth", None):
 The joined table is ready for a custom figure or for export. For most views, the Scarf plotting
 calls above already handle group selection and legends.
 
-## 7. Save a figure
+## Save a figure
 
 Scarf returns a `PlotResult`. Save the first cell-type figure without repeating
 its remote reads, and close the result when finished. For a new figure that
@@ -280,7 +261,7 @@ cell_type_plot.close()
 print("Saved figures/cytebase_cell_types.png")
 ```
 
-## 8. Writable analysis and larger datasets
+## Writable analysis and larger datasets
 
 The snippets in this section are optional and were not executed for this page.
 Run them in your local Python environment or on cloud compute. Create a mount
@@ -319,7 +300,7 @@ if atlases:
     )
 ```
 
-## 9. Search by exact labels or SQL
+## Search by exact labels or SQL
 
 `search` matches words without regard to case. `find_datasets` matches exact
 ontology labels. `list_terms` supplies the available labels in natural order;
@@ -366,14 +347,8 @@ examples and a survey of the collection, see the catalog tour linked below.
 
 ## Example notebooks
 
-The bucket's
-[`notebooks` folder](https://huggingface.co/buckets/Nygen/cytebase/tree/notebooks)
-holds three executed notebooks that extend this walkthrough. Each one opens
-public datasets without credentials and keeps its outputs, so you can read the
-results before running anything. The Hugging Face file viewer does not display
-notebooks of this size, so the links below open rendered copies on
-[nbviewer](https://nbviewer.org). The case study is also available as the
-{doc}`cytebase_covid19` page in this documentation.
+The bucket's [`notebooks` folder](https://huggingface.co/buckets/Nygen/cytebase/tree/notebooks) holds three executed notebooks that extend this walkthrough. Each one opens public datasets without credentials and keeps its outputs, so you can read the
+results before running anything. The Hugging Face file viewer does not display notebooks of this size, so the links below open rendered copies on [nbviewer](https://nbviewer.org). The case study is also available as the {doc}`cytebase_covid19` page in this documentation.
 
 
 | Notebook                                                                                                                                           | What it shows                                                                                                                                                                                                            |
@@ -405,13 +380,7 @@ network. Their saved outputs reflect the catalog when they were executed.
 - **Unexpected expression costs:** count blocks are remote, and a single-gene
   request may read a larger storage chunk. Start with a small dataset and a few genes.
 - **Writing to a read-only store:** use a local mount for analysis that saves results.
-- **`429 Too Many Requests`:** anonymous Hugging Face access allows 500 API
-  requests per 5 minutes per IP address, and opening a store and reading its
-  metadata uses a share of them. Wait for the window to reset and rerun the
-  cell, or sign in with `hf auth login`. `Catalog()` then reads with your token,
+- **429 Too Many Requests Error:** anonymous Hugging Face access allows 500 API requests per 5 minutes per IP address, and opening a store and reading its metadata uses a share of them. Wait for the window to reset and rerun the cell, or sign in with `hf auth login`. `Catalog()` then reads with your token,
   which has a higher limit.
 
-See the [Cytebase API reference](../reference/api/cytebase.md) for the full SDK
-and [Remote stores](remote_stores.md) for mounted analysis mechanics. Saved
-documentation outputs are a snapshot; rerunning checks the current catalog and
-may produce different discovery results as the bucket changes.
+See the [Cytebase API reference](../reference/api/cytebase.md) for the full SDK and [Remote stores](remote_stores.md) for mounted analysis mechanics. Saved documentation outputs are a snapshot; rerunning checks the current catalog and may produce different discovery results as the bucket changes.
