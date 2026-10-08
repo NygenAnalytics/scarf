@@ -11,7 +11,6 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (cytebase_tutorial)=
 
 # Explore Cytebase
@@ -425,11 +424,12 @@ notebooks of this size, so the links below open rendered copies on
 [nbviewer](https://nbviewer.org). The case study is also available as the
 {doc}`cytebase_covid19` page in this documentation.
 
-| Notebook | What it shows |
-| --- | --- |
-| [Catalog tour](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_01_catalog_tour.ipynb) | The collection at a glance by organism, assay, tissue, disease and publication year; search by text, exact labels and SQL across studies; then one dataset's UMAP |
-| [COVID-19 case study](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_02_covid19_pbmc_case_study.ipynb) | COVID-19 and healthy blood from Wilk et al. (2020): study design from metadata, composition per donor, a marker dot plot that checks the published labels, and an interferon response compared between donors |
-| [UMAP gallery](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_03_umap_gallery.ipynb) | Published UMAPs from several tissues and species in one figure; labels, palettes, highlights, facets, density contours and themes; blockwise rasters of 1.1 million Tabula Sapiens cells; and a custom matplotlib figure |
+
+| Notebook                                                                                                                                           | What it shows                                                                                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Catalog tour](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_01_catalog_tour.ipynb)                   | The collection at a glance by organism, assay, tissue, disease and publication year; search by text, exact labels and SQL across studies; then one dataset's UMAP                                                        |
+| [COVID-19 case study](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_02_covid19_pbmc_case_study.ipynb) | COVID-19 and healthy blood from Wilk et al. (2020): study design from metadata, composition per donor, a marker dot plot that checks the published labels, and an interferon response compared between donors            |
+| [UMAP gallery](https://nbviewer.org/urls/huggingface.co/buckets/Nygen/cytebase/resolve/notebooks/cytebase_03_umap_gallery.ipynb)                   | Published UMAPs from several tissues and species in one figure; labels, palettes, highlights, facets, density contours and themes; blockwise rasters of 1.1 million Tabula Sapiens cells; and a custom matplotlib figure |
 
 Download a notebook from the folder and open it in the environment from the
 prerequisites above:
