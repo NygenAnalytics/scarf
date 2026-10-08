@@ -11,8 +11,15 @@ kernelspec:
   language: python
   name: python3
 ---
-
 (dimensionality_reduction_and_clustering)=
+
+# Dimensionality reduction primer
+
+Single-cell data lives in thousands of gene dimensions, which can be neither drawn nor directly searched for neighbors. Dimensionality reduction compresses the selected features into a small coordinate set that preserves neighborhood structure, principal component analysis (PCA) builds those coordinates from the genes, and the neighbor graph is then built from them.
+
+UMAP, densMAP, and t-SNE then turn that lower dimension graph into a 2D image we can interpret. Layouts are simpyl visual summaries for the eye, and the parameters and method choice change appearance of visualization, without changing the underlying graph. Choosing how many PCA dimensions to keep is the consequential decision, since too few merge distinct populations while too many feed technical noise back in.
+
+Here, we compare PCA dimension counts, UMAP packing, and the three layout methods on the prepared PBMC analysis, judging each view by whether known populations stay visible rather than by how tidy it looks.
 
 # Choosing dimensionality reductions
 
@@ -20,13 +27,9 @@ PCA compresses selected features into the coordinates used to find neighbours.
 UMAP, densMAP, and t-SNE then turn the resulting graph into a two-dimensional view.
 They are visual summaries, not alternative cluster assignments.
 
-```{raw} html
-<span id="clustering"></span>
-```
-
 Clustering guidance from the former combined page now lives in {doc}`clustering`.
 
-## 1. Standalone setup
+## Standalone setup
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -69,7 +72,7 @@ genes, and normalization fixed so we can explore what changing the number of PCs
 ds.plots.embedding(run=baseline, color_by="clusters")
 ```
 
-## 2. Compare PCA dimension counts
+## Compare PCA dimension counts
 
 Build each candidate from the same normalized data and cluster each graph by passing it explicitly.
 Retain the 15-component graph and initialization for the layout comparisons below.
@@ -146,7 +149,7 @@ The adjusted Rand index measures partition agreement without requiring matching 
 It does not identify the biologically correct dimension count. Inspect markers and QC metrics
 where the partitions disagree. See {doc}`clustering` for more on cluster evidence.
 
-## 3. Compare UMAP packing
+## Compare UMAP packing
 
 The layout below uses the explicit 15-component graph.
 Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
