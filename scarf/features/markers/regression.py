@@ -31,9 +31,12 @@ def _regression_r_batch(
     """Calculate Pearson r per feature and return per-feature status codes.
 
     ``x_centered`` is the centered regressor and ``ssxm`` its mean square.
-    Each feature's values are scaled by a power of two below one in magnitude
-    before they are summed: the scale is exact and r does not depend on it,
-    and it keeps the centered sums finite.
+    A feature whose values span no more than ``eps`` times their largest
+    magnitude is constant and untested; a power-of-two scale of the feature
+    does not change the outcome while its values stay normal floats. Each
+    tested feature's values are scaled by a power of two below one in
+    magnitude before they are summed: the scale is exact and r does not
+    depend on it, and it keeps the centered sums finite.
     """
     n_cells = data.shape[0]
     n_genes = data.shape[1]
@@ -61,20 +64,26 @@ def _regression_r_batch(
             r_out[g] = 0.0
             status[g] = _REG_NONFINITE
             continue
-        if nz < min_cells or (vmax - vmin) <= eps:
+        magnitude = max(-vmin, vmax)
+        if nz < min_cells or (vmax - vmin) <= eps * magnitude:
             r_out[g] = 0.0
             status[g] = _REG_SENTINEL
             continue
-        # The values span more than eps, so the scale is at most 2**52.
-        scale = math.ldexp(1.0, -math.frexp(max(-vmin, vmax))[1])
+        # Values below 2**-1024 need a scale above 2**1023, the largest power
+        # of two in float64, so the scale is applied in two steps. Both steps
+        # then enlarge the values by powers of two, which rounds nothing;
+        # for larger values the second step multiplies by one.
+        exponent = -math.frexp(magnitude)[1]
+        scale = math.ldexp(1.0, min(exponent, 1023))
+        scale_rest = math.ldexp(1.0, max(exponent - 1023, 0))
         y_sum = 0.0
         for c in range(n_cells):
-            y_sum += v[c] * scale
+            y_sum += v[c] * scale * scale_rest
         y_mean = y_sum * inv_n
         ssym = 0.0
         ssxym = 0.0
         for c in range(n_cells):
-            yd = v[c] * scale - y_mean
+            yd = v[c] * scale * scale_rest - y_mean
             ssym += yd * yd
             ssxym += x_centered[c] * yd
         ssym *= inv_n
@@ -123,7 +132,9 @@ def _regression_batch_results(
                     f"Feature {feature_labels[g]!r} contains non-finite "
                     "normalized values"
                 )
-            if (v > 0).sum() >= min_cells and np.ptp(v) > eps:
+            # The constant rule of the kernel: a span within eps of the
+            # values' magnitude is no variation.
+            if (v > 0).sum() >= min_cells and np.ptp(v) > eps * np.abs(v).max():
                 # Two distinct points correlate exactly along their slope.
                 r_vals[g] = float(
                     np.sign(regressor[1] - regressor[0]) * np.sign(v[1] - v[0])

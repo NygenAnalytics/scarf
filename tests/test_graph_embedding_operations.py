@@ -7,14 +7,14 @@ import numpy as np
 import pytest
 from scipy.sparse import coo_matrix
 
+import scarf.embeddings.sgtsne as sgtsne_module
 from scarf.datastore.datastore import DataStore
 from scarf.embeddings.umap import (
-    DENSMAP_ALGORITHM_VERSION,
     calc_dens_map_params,
     densmap_distance_graph,
 )
 from scarf.graph.arguments import OperationArguments
-from scarf.metadata.arguments import UmapArguments
+from scarf.metadata.arguments import TsneArguments, UmapArguments
 from scarf.storage.artifacts import (
     ArtifactRef,
     fingerprint_array,
@@ -52,7 +52,18 @@ _STANDARD_UMAP_PARAMETERS = {
     "dens_var_shift": 0.1,
     "random_seed": 4444,
     "parallel": False,
-    "parallel_threads": None,
+}
+
+
+_STANDARD_TSNE_PARAMETERS = {
+    "symmetric_graph": False,
+    "graph_upper_only": False,
+    "tsne_dims": 2,
+    "lambda_scale": 1.0,
+    "max_iter": 500,
+    "early_iter": 200,
+    "alpha": 10,
+    "box_h": 0.7,
 }
 
 
@@ -166,6 +177,110 @@ def test_run_tsne_rejects_invalid_numpy_initialization(store) -> None:
         store.run_tsne(graph, np.zeros((n_cells, 2), dtype=bool))
 
 
+def _fake_tsne_backend(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Replace sgtsnepi with a recorder, so the tests run without the package."""
+    calls: list[dict[str, object]] = []
+
+    def run_sgtsne(graph, initial, **kwargs):
+        calls.append(kwargs)
+        return np.asarray(initial, dtype=np.float64).T + len(calls)
+
+    monkeypatch.setattr(sgtsne_module, "require_sgtsnepi", lambda: run_sgtsne)
+    monkeypatch.setattr(sgtsne_module, "run_sgtsne", run_sgtsne)
+    return calls
+
+
+def test_run_tsne_validates_settings_before_reading_or_planning(
+    store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unchecked settings were recorded as given, including infinity and NaN.
+    # test_sgtsne.py checks each setting; run_tsne checks them all at once.
+    graph = _graph(store)
+    initialization = _initialization(store)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("invalid settings must fail before any store access")
+
+    monkeypatch.setattr(store, "_embedding_inputs", fail)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.embeddings.plan_cell_data_artifact", fail
+    )
+    with pytest.raises(ValueError, match="lambda_scale must be finite"):
+        store.run_tsne(graph, initialization, lambda_scale=float("inf"))
+
+
+def test_tsne_identity_holds_canonical_settings_only(
+    store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph(store)
+    initialization = _initialization(store)
+    calls = _fake_tsne_backend(monkeypatch)
+
+    ref = store.run_tsne(
+        graph,
+        initialization,
+        lambda_scale=1,
+        max_iter=np.int64(30),
+        box_h=np.float32(0.5),
+        verbose=False,
+    )
+
+    status = store.inspect_artifact(ref)
+    # Thread counts and temporary-file locations never identify an embedding.
+    assert status.parameters == {
+        **_STANDARD_TSNE_PARAMETERS,
+        "max_iter": 30,
+        "box_h": 0.5,
+    }
+    assert type(status.parameters["lambda_scale"]) is float
+    assert status.execution_options == {"verbose": False, "invalidate_cache": False}
+    assert calls == [
+        {
+            "tsne_dims": 2,
+            "max_iter": 30,
+            "early_iter": 200,
+            "alpha": 10,
+            "lambda_scale": 1.0,
+            "box_h": 0.5,
+            "verbose": False,
+        }
+    ]
+    assert (
+        store.run_tsne(graph, initialization, max_iter=30, box_h=0.5, lambda_scale=1.0)
+        == ref
+    )
+    assert len(calls) == 1
+
+
+def test_standard_tsne_arguments_keep_their_recorded_identity() -> None:
+    arguments = TsneArguments(
+        graph=ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="connectivity_map",
+            artifact_id="1" * 64,
+        ),
+        initialization=ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="embedding_initialization",
+            artifact_id="2" * 64,
+        ),
+        verbose=True,
+        invalidate_cache=False,
+        **_STANDARD_TSNE_PARAMETERS,
+    )
+
+    record = arguments.to_record()
+    assert record.parameters == _STANDARD_TSNE_PARAMETERS
+    assert record.execution_options == {"verbose": True, "invalidate_cache": False}
+    assert _identity(arguments) == (
+        "3b3310238140ed212e02eda7328eb7db43bccb5f4304e6ef06c813b625c1c307"
+    )
+
+
 def test_embedding_graph_flags_reach_the_graph_loader_as_booleans(
     store,
     monkeypatch: pytest.MonkeyPatch,
@@ -187,19 +302,27 @@ def test_embedding_graph_flags_reach_the_graph_loader_as_booleans(
         initialization,
         n_epochs=5,
         symmetric_graph=np.True_,
-        graph_upper_only=np.False_,
+        nthreads=3,
         invalidate_cache=True,
     )
 
     assert loads == [(True, False)]
     assert all(type(flag) is bool for flag in loads[0])
-    assert store.inspect_artifact(ref).parameters["symmetric_graph"] is True
+    parameters = store.inspect_artifact(ref).parameters
+    assert parameters["symmetric_graph"] is True
+    # The omitted flag records False: None loaded the graph as False under a
+    # second identity.
+    assert parameters["graph_upper_only"] is False
+    # A serial layout runs on one thread whatever the request.
+    assert store.inspect_artifact(ref).execution_options["layout_threads"] == 1
     for method, flag in (
         (store.run_umap, "symmetric_graph"),
+        (store.run_umap, "graph_upper_only"),
         (store.run_tsne, "graph_upper_only"),
     ):
-        with pytest.raises(TypeError, match=f"{flag} must be a boolean"):
-            method(graph, initialization, **{flag: 1})
+        for value in (1, None):
+            with pytest.raises(TypeError, match=f"{flag} must be a boolean"):
+                method(graph, initialization, **{flag: value})
 
 
 def test_reused_umap_neither_loads_the_graph_nor_expands_initialization(
@@ -218,7 +341,7 @@ def test_reused_umap_neither_loads_the_graph_nor_expands_initialization(
     assert store.run_umap(graph, initialization, n_epochs=5) == ref
 
 
-def test_standard_umap_arguments_keep_their_recorded_identity() -> None:
+def test_standard_umap_arguments_record_no_thread_count_in_their_identity() -> None:
     arguments = UmapArguments(
         graph=ArtifactRef(
             scope="assay",
@@ -232,16 +355,43 @@ def test_standard_umap_arguments_keep_their_recorded_identity() -> None:
             kind="embedding_initialization",
             artifact_id="2" * 64,
         ),
+        nthreads=8,
+        layout_threads=1,
         invalidate_cache=False,
         **_STANDARD_UMAP_PARAMETERS,
     )
 
-    assert arguments.to_record().parameters == _STANDARD_UMAP_PARAMETERS
+    record = arguments.to_record()
+    assert record.parameters == _STANDARD_UMAP_PARAMETERS
+    assert record.execution_options == {
+        "nthreads": 8,
+        "layout_threads": 1,
+        "invalidate_cache": False,
+    }
+    # Releases before 1.0.0 also recorded parallel_threads, so their standard
+    # embeddings had other identities.
     assert _identity(arguments) == (
-        "69bc2f0b8b33b09e4cce0f2a73d1b3cd4ef1f5002a409a2e042c9ec8f671aed5"
+        "dcb87841b695f253f8efa2564f0e6b8d6a33370b29d01272e71da9d36af6291b"
     )
-    with pytest.raises(ValueError, match="densmap_algorithm_version"):
-        dataclasses.replace(arguments, use_density_map=True)
+    # The requested and the resolved thread counts depend on the machine, so
+    # they never identify an embedding; the parallel flag does.
+    for threads in (1, 2, 64):
+        assert _identity(
+            dataclasses.replace(
+                arguments,
+                parallel=True,
+                nthreads=threads,
+                layout_threads=min(threads, 4),
+            )
+        ) == _identity(dataclasses.replace(arguments, parallel=True))
+    assert _identity(dataclasses.replace(arguments, parallel=True)) != _identity(
+        arguments
+    )
+    densmap = dataclasses.replace(arguments, use_density_map=True)
+    assert densmap.to_record().parameters == {
+        **_STANDARD_UMAP_PARAMETERS,
+        "use_density_map": True,
+    }
 
 
 def test_umap_parameter_spellings_share_one_canonical_identity(store) -> None:
@@ -278,7 +428,8 @@ def test_umap_parameter_spellings_share_one_canonical_identity(store) -> None:
             store.run_umap(graph, initialization, **kwargs)
 
 
-def test_densmap_records_its_revision_and_reuses_without_reading_neighbors(
+@pytest.mark.slow
+def test_densmap_identity_differs_only_by_its_flag_and_reuses_without_neighbors(
     store,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,12 +444,11 @@ def test_densmap_records_its_revision_and_reuses_without_reading_neighbors(
         use_density_map=True,
     )
 
-    assert set(store.inspect_artifact(standard).parameters) == set(
-        _STANDARD_UMAP_PARAMETERS
-    )
+    standard_parameters = store.inspect_artifact(standard).parameters
+    assert set(standard_parameters) == set(_STANDARD_UMAP_PARAMETERS)
     parameters = store.inspect_artifact(densmap).parameters
-    assert parameters["use_density_map"] is True
-    assert parameters["densmap_algorithm_version"] == DENSMAP_ALGORITHM_VERSION
+    # Releases before 1.0.0 also recorded densmap_algorithm_version.
+    assert parameters == {**standard_parameters, "use_density_map": True}
     values = store.load_artifact(densmap)["values"][:]
     assert np.all(np.isfinite(values))
     # The density term changes the layout from the same start and seed.
@@ -374,6 +524,51 @@ def test_densmap_parameters_read_reverse_only_edges_and_match_a_loop() -> None:
     np.testing.assert_array_equal(dense_mu_sum, mu_sum)
     np.testing.assert_array_equal(dense_standardized, standardized)
     assert mu_sum.dtype == standardized.dtype == np.float32
+
+
+def test_ann_thread_counts_are_execution_options(
+    store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scarf.neighbors.stages import AnnIndexStage
+
+    reduction = _reduction(store)
+    monkeypatch.setattr(store, "nthreads", 3)
+    serial = store.build_ann_index(reduction, ann_efc=41)
+
+    status = store.inspect_artifact(serial)
+    assert status.parameters["ann_parallel"] is False
+    assert status.parameters["parallel_threads"] is None
+    # A serial index is built on one thread whatever the datastore's count.
+    assert status.execution_options["nthreads"] == 1
+
+    parallel = store.build_ann_index(reduction, ann_efc=41, ann_parallel=True)
+
+    parallel_status = store.inspect_artifact(parallel)
+    # Only the flag identifies a parallel index; earlier releases also
+    # recorded the build's thread count as parallel_threads.
+    assert parallel_status.parameters == {**status.parameters, "ann_parallel": True}
+    assert parallel_status.execution_options["nthreads"] == 3
+    # Another machine's thread count requests the same index.
+    monkeypatch.setattr(store, "nthreads", 2)
+    assert store.build_ann_index(reduction, ann_efc=41, ann_parallel=True) == parallel
+
+    configured: list[int] = []
+    configure = AnnIndexStage.configure
+
+    def recording(index, *, ef, threads):
+        configured.append(threads)
+        return configure(index, ef=ef, threads=threads)
+
+    monkeypatch.setattr(AnnIndexStage, "configure", staticmethod(recording))
+    parallel_neighbors = store.query_neighbors(parallel, k=4)
+    serial_neighbors = store.query_neighbors(serial, k=4)
+
+    # Queries of a parallel index use the querying datastore's threads.
+    assert configured == [2, 1]
+    assert store.inspect_artifact(parallel_neighbors).execution_options["nthreads"] == 2
+    assert store.inspect_artifact(serial_neighbors).execution_options["nthreads"] == 1
+    assert "nthreads" not in store.inspect_artifact(parallel_neighbors).parameters
 
 
 def test_load_graph_validates_use_k(store) -> None:

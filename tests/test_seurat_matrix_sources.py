@@ -1,3 +1,4 @@
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -1594,10 +1595,12 @@ def test_peak_matrix_modes_match_bpcells_endpoint_semantics(
             ],
         ),
         (
+            # c1's [4, 12) on chr2 and c2's [5, 15) on chr1 have their two
+            # insertions in neighboring tiles of one range, so both tiles count.
             "fragments",
             [
-                [1, 1, 0, 1, 0],
-                [1, 0, 1, 0, 0],
+                [1, 1, 0, 1, 1],
+                [1, 1, 1, 0, 0],
                 [0, 1, 0, 1, 0],
             ],
         ),
@@ -1621,6 +1624,144 @@ def test_tile_matrix_modes_match_bpcells_duplicate_endpoint_handling(
         sidecar_root=tmp_path,
     )
     np.testing.assert_array_equal(source.read_cells(0, 3).toarray(), expected)
+
+
+class _RecordFragments:
+    """Fragments from (chromosome, cell, start, end) records, read in small blocks.
+
+    Like BPCells, each chromosome lists its fragments in start order.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[tuple[int, int, int, int]],
+        chromosomes: Sequence[str],
+        cells: Sequence[str],
+        *,
+        block_records: int = 4,
+    ) -> None:
+        ordered = sorted(records, key=lambda record: (record[0], record[2], record[3]))
+        self.chromosomeNames = tuple(chromosomes)
+        self.cellNames = tuple(cells)
+        self.recordCount = len(ordered)
+        self.residentBytes = 0
+        self.metadataBytes = 0
+        self.blockWorkingBytes = 1024
+        self._records = [
+            [record[1:] for record in ordered if record[0] == chromosome]
+            for chromosome in range(len(chromosomes))
+        ]
+        self._blockRecords = block_records
+
+    def iter_chromosome(self, chromosome_id: int) -> Any:
+        from scarf.readers._seurat.fragments import FragmentBlock
+
+        records = self._records[chromosome_id]
+        for offset in range(0, len(records), self._blockRecords):
+            block = np.asarray(
+                records[offset : offset + self._blockRecords], dtype=np.uint32
+            )
+            yield FragmentBlock(block[:, 0], block[:, 1], block[:, 2])
+
+
+def _tiles(
+    ranges: Sequence[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """BPCells tiles: tile k of range [s, e) covers [s + k w, min(s + (k + 1) w, e))."""
+    return [
+        (chromosome, tile_start, min(tile_start + width, end))
+        for chromosome, start, end, width in ranges
+        for tile_start in range(start, end, width)
+    ]
+
+
+def _fragment_matrix(
+    fragments: _RecordFragments,
+    ranges: Sequence[tuple[int, int, int, int]],
+    *,
+    matrix_type: str,
+    mode: str,
+    transpose: bool,
+) -> MatrixSource:
+    regions = (
+        [range_[:3] for range_ in ranges]
+        if matrix_type == "TileMatrix"
+        else _tiles(ranges)
+    )
+    specification: dict[str, Any] = {
+        "operation": "fragment-derived",
+        "matrixType": matrix_type,
+        "fragments": fragments,
+        "chrId": [region[0] for region in regions],
+        "start": [region[1] for region in regions],
+        "end": [region[2] for region in regions],
+        "chrLevels": list(fragments.chromosomeNames),
+        "mode": mode,
+        "transpose": transpose,
+    }
+    if matrix_type == "TileMatrix":
+        specification["tileWidths"] = [range_[3] for range_ in ranges]
+    return build_matrix_operation(specification)
+
+
+@pytest.mark.parametrize("transpose", [True, False])
+@pytest.mark.parametrize("mode", ["insertions", "fragments"])
+def test_tile_matrix_counts_equal_peak_counts_over_its_tiles(
+    mode: str,
+    transpose: bool,
+) -> None:
+    # chr1 holds two ranges with a gap, the first ending in a partial tile.
+    # chr2 has no range, and chr3 holds a range with a partial last tile next
+    # to a one-base range.
+    ranges = [(0, 0, 23, 5), (0, 30, 42, 4), (2, 3, 20, 7), (2, 20, 21, 3)]
+    chromosomes = ("chr1", "chr2", "chr3")
+    cells = tuple(f"c{index}" for index in range(5))
+    rng = np.random.default_rng(0)
+    records = []
+    for _ in range(90):
+        start = int(rng.integers(0, 48))
+        records.append(
+            (
+                int(rng.integers(0, len(chromosomes))),
+                int(rng.integers(0, len(cells))),
+                start,
+                start + int(rng.integers(1, 15)),
+            )
+        )
+    fragments = _RecordFragments(records, chromosomes, cells)
+    tiles = _tiles(ranges)
+    # Each fragment inserts at start and end - 1. Insertions count every
+    # insertion; fragments count each tile that holds at least one.
+    expected = np.zeros((len(cells), len(tiles)), dtype=np.int64)
+    for chromosome, cell, start, end in records:
+        hits = [
+            index
+            for site in (start, end - 1)
+            for index, (tile_chromosome, tile_start, tile_end) in enumerate(tiles)
+            if tile_chromosome == chromosome and tile_start <= site < tile_end
+        ]
+        for index in hits if mode == "insertions" else set(hits):
+            expected[cell, index] += 1
+    if not transpose:
+        # Untransposed, the tiles are the columns that windows select.
+        expected = expected.T
+    windows = [(0, expected.shape[0]), (1, 3), (2, expected.shape[0] - 1)]
+    windows += [(index, index + 1) for index in range(expected.shape[0])]
+
+    for matrix_type in ("TileMatrix", "PeakMatrix"):
+        source = _fragment_matrix(
+            fragments,
+            ranges,
+            matrix_type=matrix_type,
+            mode=mode,
+            transpose=transpose,
+        )
+        for start, stop in windows:
+            np.testing.assert_array_equal(
+                source.read_cells(start, stop).toarray(),
+                expected[start:stop],
+                err_msg=f"{matrix_type} window {start}:{stop}",
+            )
 
 
 def test_fragment_matrix_honors_native_storage_orientation(tmp_path: Path) -> None:
@@ -5750,3 +5891,64 @@ def test_fragment_matrix_without_cells_prepares_no_storage(tmp_path: Path) -> No
     assert source._rowStore is None
     assert list(tmp_path.iterdir()) == []
     assert source.read_cells(0, 0).shape == (0, 1)
+
+
+# A mapping where the factory reads a vector raises MatrixSourceError at the
+# node's path, never a KeyError from slicing the mapping. Vector reads share the
+# check that test_seurat_values.py tests; dimnames are checked where they enter.
+_SLOT_VALUES = np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+
+def _dense_slots(*, names: bool = False) -> dict[str, Any]:
+    slots: dict[str, Any] = {
+        ".Data": _SLOT_VALUES.reshape(-1, order="F").tolist(),
+        "dim": list(_SLOT_VALUES.shape),
+    }
+    if names:
+        slots["dimnames"] = [["f0", "f1"], ["c0", "c1", "c2"]]
+    return slots
+
+
+def _dense(*, names: bool = False) -> dict[str, Any]:
+    return {"class": ["matrix", "array"], "slots": _dense_slots(names=names)}
+
+
+def _node(classes: str | list[str], **slots: Any) -> dict[str, Any]:
+    return {"class": classes, "slots": slots}
+
+
+_DELAYED = _node(["DelayedMatrix", "DelayedArray"], seed=_dense(names=True))
+
+_MAPPING_VALUES: dict[str, tuple[dict[str, Any], str]] = {
+    "dimnames_row_axis": (
+        _node(
+            "DelayedMatrix",
+            seed={
+                "class": "matrix",
+                "slots": {**_dense_slots(), "dimnames": [{"f0": 1}, None]},
+            },
+        ),
+        "row names in dimnames at assays/RNA/counts@seed must be a vector, "
+        "not a mapping",
+    ),
+    "rename_column_axis": (
+        _node(
+            ["RenameDims", "IterableMatrix"],
+            matrix=_dense(),
+            dimnames=[["x", "y"], {"p": 1}],
+            transpose=False,
+        ),
+        "column names in dimnames at assays/RNA/counts must be a vector, not a mapping",
+    ),
+    "subset_index": (
+        _node("DelayedSubset", seed=_DELAYED, index=[{"rows": 1}, None]),
+        "vector at index[[1]] at assays/RNA/counts is a mapping, not a vector",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MAPPING_VALUES))
+def test_mapping_values_raise_matrix_source_errors(case: str) -> None:
+    spec, message = _MAPPING_VALUES[case]
+    with pytest.raises(MatrixSourceError, match=re.escape(message)):
+        matrix_source_from_slots(spec, object_path="assays/RNA/counts")

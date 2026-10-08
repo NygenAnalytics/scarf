@@ -29,15 +29,38 @@ The full stage order is:
 1. {py:meth}`~scarf.DataStore.snapshot_cell_selection` and an exact feature-selection ref
 2. {py:meth}`~scarf.DataStore.run_normalization`
 3. {py:meth}`~scarf.DataStore.run_pca`, {py:meth}`~scarf.DataStore.run_lsi`, or
-   {py:meth}`~scarf.DataStore.run_custom_reduction`
+   {py:meth}`~scarf.DataStore.run_custom_reduction`, or none
 4. Optional {py:meth}`~scarf.DataStore.run_harmony`
 5. {py:meth}`~scarf.DataStore.build_ann_index`
 6. {py:meth}`~scarf.DataStore.query_neighbors`
 7. {py:meth}`~scarf.DataStore.build_connectivity_map`
 
-{py:meth}`~scarf.DataStore.build_embedding_initialization` depends on explicit reduction or Harmony
-coordinates. It is needed for UMAP unless an initialization array is supplied, but is not part of
-connectivity construction.
+Without a reduction, `build_ann_index(normalized)` builds the graph on the normalized artifact
+itself: its float32 values of the selected features are the coordinates, one per feature, as in a
+pipeline run with `pca_dims=0`. Every later stage, including the embedding initialization and
+an SNN integration, accepts such a graph. Harmony corrects reduced coordinates only, and WNN
+integration, mapping references, and doublet scoring need them too, so each rejects normalized
+coordinates with an error that names a reduction such as `run_pca`. Because normalized values can
+be coordinates, `run_normalization` writes them with a checked writer: a value that is NaN or
+infinite once rounded to float32, such as one from a custom normalizer or the `log1p` of a
+negative count, raises `NonFiniteArtifactError`, a `ValueError` that names `run_normalization`,
+and no complete artifact is saved.
+
+The hnswlib index holds every cell in memory, about `4 * dims + 8 * ann_m + 130` bytes per cell on
+x86-64 Linux (`scarf.neighbors.index.ann_index_peak_bytes`), where `dims` is the number of
+coordinate dimensions: the PCA dimensions, or the selected features of normalized coordinates.
+`build_ann_index` holds it while it adds the coordinate blocks and while it saves it, and
+`query_neighbors` while it loads and queries it, beside the indices and distances of every cell's
+neighbours, 8 bytes per neighbour. Each compares what it holds with the datastore's memory budget
+before it creates or loads the index and raises `MemoryError` over it, naming the bytes, the cells,
+the dimensions, and the limit. The index moves between the store and memory through a temporary
+file of about `4 * dims + 8 * ann_m + 20` bytes per cell
+(`scarf.neighbors.index.ann_index_file_bytes`) in the system's temporary directory, which needs
+that much free space.
+
+{py:meth}`~scarf.DataStore.build_embedding_initialization` depends on explicit reduction, Harmony,
+imported, or normalized coordinates. It is needed for UMAP unless an initialization array is
+supplied, but is not part of connectivity construction.
 
 `query_neighbors` reads the coordinate ref named by the ANN artifact. Its optional `coordinates=`
 argument is only an equality check; it cannot redirect an index to different coordinates.

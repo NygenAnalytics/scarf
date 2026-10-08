@@ -390,12 +390,12 @@ def test_statistical_design_is_validated_before_planning(
 def test_statistical_design_rules_reject_unusable_requests(
     method, groups, comparisons, message
 ):
-    from scarf.datastore._operations.features import _validate_statistical_design
+    from scarf.features.statistical import validate_statistical_design
 
     with pytest.raises(ValueError, match=message):
-        _validate_statistical_design(method, groups, comparisons)
+        validate_statistical_design(method, groups, comparisons)
     assert (
-        _validate_statistical_design("mann_whitney", ["a", "b"], (("a", "b"),)) is None
+        validate_statistical_design("mann_whitney", ["a", "b"], (("a", "b"),)) is None
     )
 
 

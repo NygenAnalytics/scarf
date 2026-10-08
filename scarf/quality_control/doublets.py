@@ -28,6 +28,7 @@ from ..storage.geometry import array_geometry
 from ..storage.parallel import stream_shards
 from ..storage.partition import affordable_width, row_band
 from ..storage.types import as_zarr_array
+from ..utils.arguments import float_argument, integer_argument
 from ..utils.arrays import sparse_matrix_bytes
 from ..utils.logging import logger
 
@@ -62,19 +63,46 @@ def simulate_doublet_pairs(
     n_sim: int,
     heterotypic_fraction: float,
     rng: np.random.Generator,
-    max_tries: int = 20,
 ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Generate index pairs into the candidate pool for simulated doublets."""
+    """Generate index pairs into the candidate pool for simulated doublets.
+
+    Raises:
+        ValueError: If ``heterotypic_fraction`` is above 0 with one cluster.
+    """
+    n_sim = integer_argument(n_sim, "n_sim", minimum=0)
+    fraction = float_argument(heterotypic_fraction, "heterotypic_fraction")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("heterotypic_fraction must be from 0 to 1")
+    pool_clusters = np.asarray(pool_clusters)
+    if pool_clusters.ndim != 1 or len(pool_clusters) == 0:
+        raise ValueError("pool_clusters must be a non-empty one-dimensional array")
+    _, codes, counts = np.unique(pool_clusters, return_inverse=True, return_counts=True)
+    if fraction > 0 and len(counts) < 2:
+        raise ValueError(
+            "Heterotypic doublets pair cells from two clusters, but the pool "
+            "holds one cluster; pass heterotypic_fraction=0 to pair any two cells"
+        )
     pool_size = len(pool_clusters)
     left = rng.integers(0, pool_size, size=n_sim)
-    right = rng.integers(0, pool_size, size=n_sim)
-    if heterotypic_fraction > 0 and len(np.unique(pool_clusters)) > 1:
-        want_hetero = rng.random(n_sim) < heterotypic_fraction
-        for _ in range(max_tries):
-            clash = want_hetero & (pool_clusters[left] == pool_clusters[right])
-            if not clash.any():
-                break
-            right[clash] = rng.integers(0, pool_size, size=int(clash.sum()))
+    if fraction == 0:
+        return left, rng.integers(0, pool_size, size=n_sim)
+    forced = rng.random(n_sim) < fraction
+    own = codes[left]
+    # A forced doublet draws its partner among the cells outside its first
+    # parent's cluster; any other doublet draws it from the whole pool.
+    high = np.full(n_sim, pool_size, dtype=np.int64)
+    high[forced] -= counts[own[forced]]
+    right = rng.integers(0, high)
+    del high
+    # Ordered by cluster, the pool holds each cluster as one block. A forced
+    # draw indexes that order with its first parent's block left out, so a
+    # draw at or past the block's start moves past the block's end.
+    rows = np.flatnonzero(forced)
+    blocks = own[rows]
+    positions = right[rows]
+    past = positions >= (np.cumsum(counts) - counts)[blocks]
+    positions[past] += counts[blocks[past]]
+    right[rows] = np.argsort(codes, kind="stable")[positions]
     return left, right
 
 
@@ -291,14 +319,6 @@ def score_synthetic_doublets(
         )
     )
     n_sim = max(1, int(round(simulation_ratio * len(active_indices))))
-    # Pair generation temporarily gathers both label vectors and rejection masks.
-    admit_stream(
-        resources,
-        nBlocks=1,
-        blockBytes=n_sim * (48 + 2 * labels.dtype.itemsize),
-        residentBytes=resident + 64 * len(active_indices),
-        requested=1,
-    )
     rng = np.random.default_rng(random_seed)
     pool_positions = sample_cluster_pool(
         labels,
@@ -306,12 +326,24 @@ def score_synthetic_doublets(
         max_cells_per_cluster,
         rng,
     )
+    pool_labels = labels[pool_positions]
+    # Pair generation holds both parent indices, the forced-doublet mask, and
+    # integer scratch for the forced doublets, at most 72 bytes per doublet,
+    # and sorts the pool labels into cluster codes and a cluster order.
+    admit_stream(
+        resources,
+        nBlocks=1,
+        blockBytes=72 * n_sim + (2 * labels.dtype.itemsize + 48) * len(pool_labels),
+        residentBytes=resident + 64 * len(active_indices) + pool_labels.nbytes,
+        requested=1,
+    )
     left, right = simulate_doublet_pairs(
-        labels[pool_positions],
+        pool_labels,
         n_sim,
         heterotypic_fraction,
         rng,
     )
+    del pool_labels
     resident += left.nbytes + right.nbytes + 16 * len(pool_positions)
     pool = _load_parent_counts(
         assay.rawData,
@@ -397,6 +429,7 @@ def score_synthetic_doublets(
                 raw,
                 size_factor=parameters["size_factor"],
                 log_transform=parameters["log_transform"],
+                source=f"The doublet simulation of {assay.name}",
                 denominator=(
                     None
                     if parameters["renormalize_subset"]

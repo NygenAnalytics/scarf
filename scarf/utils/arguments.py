@@ -26,6 +26,14 @@ def float_argument(value: object, name: str) -> float:
     return resolved
 
 
+def clip_fraction_argument(value: object, name: str = "clip_fraction") -> float:
+    """Return a two-sided clipping fraction as a Python float."""
+    resolved = float_argument(value, name)
+    if not 0.0 <= resolved < 0.5:
+        raise ValueError(f"{name} must be at least 0 and less than 0.5")
+    return resolved
+
+
 def integer_argument(
     value: object,
     name: str,

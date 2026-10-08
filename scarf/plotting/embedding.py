@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from ..metadata.rows import apply_missing_mask
-from ..metadata.selection import GROUPING_VALUE_NAMES, CellFieldKind
+from ..metadata.selection import CellFieldKind, cell_value_spec
 from ..storage.artifacts import ArtifactRef
 from ._contracts import (
     CategoricalScale,
@@ -28,8 +28,11 @@ from ._data import (
     _resolve_grouping,
     _resolve_layout,
     fetch_normalized_feature_matrix,
+    has_finite_values,
     resolve_cell_selection,
     resolve_feature,
+    unmeasured_cell_counts,
+    unmeasured_extras,
 )
 from ._deps import require_matplotlib
 from ._display import (
@@ -44,6 +47,7 @@ from ._figure import (
     close_figures_on_error,
     normalize_axes_target,
 )
+from ..utils.arguments import clip_fraction_argument
 from ..utils.arrays import sort_categories
 from ._style import (
     DEFAULT_PANEL_INCHES,
@@ -400,11 +404,14 @@ def _prefetch_colors(
     n_cells: int,
     normalization: NormalizationSpec,
     cell_indices: np.ndarray | None = None,
+    unmeasured: dict[str, np.ndarray] | None = None,
 ) -> list[tuple[np.ndarray, str, bool, bool]]:
     """Return list of (values, label, is_categorical, is_uniform).
 
     ``metadata_columns`` lists the cell-metadata columns that a plain string
     item may name; any other string item is resolved as a feature.
+    ``unmeasured`` receives the cells that each feature assay did not
+    measure, as the value layer records them.
     """
     out: list[tuple[np.ndarray, str, bool, bool]] = []
 
@@ -435,7 +442,7 @@ def _prefetch_colors(
                     values,
                     item.kind,
                     # Label artifacts are categorical whatever their dtype.
-                    item.kind in GROUPING_VALUE_NAMES
+                    cell_value_spec(item.kind).categorical
                     or _is_categorical(pd.Series(values), "auto"),
                     False,
                 )
@@ -487,6 +494,7 @@ def _prefetch_colors(
             resolved,
             cell_idx,
             normalization=normalization,
+            unmeasured=unmeasured,
         )
         for col_i, (slot_i, _) in enumerate(feature_slots):
             feat = resolved[col_i]
@@ -1007,6 +1015,22 @@ def _add_on_data_labels(
     return omitted
 
 
+def _no_automatic_scale(values: np.ndarray, scale: ColorScale) -> bool:
+    """Whether a continuous color has neither a value nor an explicit limit.
+
+    Such a color, such as a feature whose assay measured none of the drawn
+    cells, gets no colorbar; its points take the scale's missing color.
+    """
+    return scale.vmin is None and scale.vmax is None and not has_finite_values(values)
+
+
+def _placeholder_limits(scale: ColorScale) -> tuple[float, float]:
+    """Limits that build a valid norm for a color without values."""
+    if scale.scale == "log":
+        return (1.0, 10.0)
+    return resolve_color_limits(np.empty(0), scale)
+
+
 def _draw_continuous(
     ax: Any,
     fig: Any,
@@ -1099,10 +1123,9 @@ def _draw_continuous(
 
 
 def _soft_clip(values: np.ndarray, clip_fraction: float) -> np.ndarray:
+    """Clip finite values to their quantiles; ``embedding`` validated the fraction."""
     if clip_fraction <= 0:
         return values
-    if clip_fraction >= 0.5:
-        raise ValueError("clip_fraction must be in [0, 0.5)")
     v = np.asarray(values, dtype=np.float64).copy()
     finite = np.isfinite(v)
     if not finite.any():
@@ -1193,6 +1216,7 @@ def embedding(
     Returns a :class:`PlotResult`. Access ``.figure`` in notebooks, or call
     ``.save(...)`` / ``.close()`` when you own the figure.
     """
+    clip_fraction = clip_fraction_argument(clip_fraction)
     if (layout_key is None) == (layout is None):
         raise ValueError("Provide exactly one of layout_key or layout")
     if layout is None:
@@ -1340,6 +1364,8 @@ def embedding(
             None if column is None else stored_display_metadata(store, column)
         )
     metadata_columns = _cell_metadata_columns(store, color_items)
+    # The cells of the layout that each feature assay did not measure.
+    unmeasured: dict[str, np.ndarray] = {}
     color_cache = _prefetch_colors(
         store,
         color_items,
@@ -1349,6 +1375,7 @@ def embedding(
         n_cells=n,
         normalization=normalization,
         cell_indices=artifact_cell_indices,
+        unmeasured=unmeasured,
     )
     classified_cache: list[tuple[np.ndarray, str, bool, bool]] = []
     for index, entry in enumerate(color_cache):
@@ -1482,6 +1509,8 @@ def embedding(
         return label if label_counts[label] == 1 else f"{index}:{label}"
 
     limit_map: dict[int, tuple[float, float]] = {}
+    # Continuous colors without a value or an explicit limit: no colorbar.
+    unscaled: set[int] = set()
     categorical_maps: dict[int, CategoricalScale] = {}
     resolved_color_scales: dict[int, ColorScale] = {}
     shared_limits: tuple[float, float] | None = None
@@ -1491,7 +1520,9 @@ def embedding(
             for values, _, is_categorical, is_uniform in color_cache
             if not is_categorical and not is_uniform
         ]
-        if shared_values:
+        if shared_values and not _no_automatic_scale(
+            np.concatenate(shared_values), color_scale
+        ):
             shared_limits = resolve_color_limits(
                 np.concatenate(shared_values),
                 color_scale,
@@ -1525,14 +1556,16 @@ def embedding(
         active_color_scale = stored_color_scales.get(color_index, color_scale)
         resolved_color_scales[color_index] = active_color_scale
         if active_color_scale.scope != "panel":
-            limit_map[color_index] = (
-                shared_limits
-                if shared_limits is not None and color_scale_was_explicit
-                else resolve_color_limits(
+            if shared_limits is not None and color_scale_was_explicit:
+                limit_map[color_index] = shared_limits
+            elif _no_automatic_scale(np.asarray(vals)[base_mask], active_color_scale):
+                limit_map[color_index] = _placeholder_limits(active_color_scale)
+                unscaled.add(color_index)
+            else:
+                limit_map[color_index] = resolve_color_limits(
                     np.asarray(vals)[base_mask],
                     active_color_scale,
                 )
-            )
 
     legend_locs: dict[int, LegendLoc] = {
         color_index: (
@@ -1565,13 +1598,9 @@ def embedding(
         figsize = (width, height)
 
     legends: list[LegendSpec] = []
-    scales_out: list[Any] = [
-        resolved_color_scales[index] for index in sorted(resolved_color_scales)
-    ]
-    if not scales_out:
-        scales_out.append(color_scale)
+    categorical_scales: list[Any] = []
     for color_index, scale in categorical_maps.items():
-        scales_out.append(scale)
+        categorical_scales.append(scale)
         legends.append(
             LegendSpec(
                 kind="categorical",
@@ -1580,9 +1609,11 @@ def embedding(
             )
         )
     panel_limit_specs: dict[int, dict[str, list[float]]] = {}
+    colorbar_colors: list[int] = []
     for color_index, (_, label, is_categorical, is_uniform) in enumerate(color_cache):
-        if is_categorical or is_uniform:
+        if is_categorical or is_uniform or color_index in unscaled:
             continue
+        colorbar_colors.append(color_index)
         limits = limit_map.get(color_index)
         if limits is None:
             panel_limit_specs[color_index] = {}
@@ -1595,7 +1626,8 @@ def embedding(
         legends.append(LegendSpec(kind="colorbar", label=label, extras=extras))
 
     rng = np.random.default_rng(seed) if seed is not None else None
-    panel_limit_map: dict[str, tuple[float, float]] = {}
+    # None for a panel without a finite value to scale.
+    panel_limit_map: dict[str, tuple[float, float] | None] = {}
     panel_point_sizes: dict[str, float] = {}
     panel_edgewidths: dict[str, float] = {}
     omitted_labels: dict[str, list[Any]] = {}
@@ -1719,17 +1751,27 @@ def embedding(
                     vnum = pd.to_numeric(pd.Series(vv), errors="coerce").to_numpy(
                         dtype=np.float64
                     )
+                    panel_unscaled = False
                     if is_uniform:
                         limits = (0.0, 1.0)
                     elif active_color_scale.scope == "panel":
-                        limits = resolve_color_limits(vnum, active_color_scale)
-                        panel_limit_map[str(panel_key)] = limits
-                        panel_limit_specs[color_index][str(panel_key)] = list(limits)
+                        if _no_automatic_scale(vnum, active_color_scale):
+                            limits = _placeholder_limits(active_color_scale)
+                            panel_limit_map[str(panel_key)] = None
+                            panel_unscaled = True
+                        else:
+                            limits = resolve_color_limits(vnum, active_color_scale)
+                            panel_limit_map[str(panel_key)] = limits
+                            panel_limit_specs[color_index][str(panel_key)] = list(
+                                limits
+                            )
                     else:
                         limits = limit_map[color_index]
                     add_cb = (
                         show_legend
                         and (not is_uniform)
+                        and not panel_unscaled
+                        and color_index not in unscaled
                         and (
                             active_color_scale.scope == "panel"
                             or facet_by is None
@@ -1866,8 +1908,14 @@ def embedding(
     if color_scale.scope == "panel":
         color_limits = panel_limit_map
     else:
+        # A color without a value among the drawn cells, such as a feature
+        # whose assay measured none of them, has no limits.
         color_limits = {
-            display_key(index, labels[index]): limits
+            display_key(index, labels[index]): (
+                limits
+                if has_finite_values(np.asarray(color_cache[index][0])[base_mask])
+                else None
+            )
             for index, limits in limit_map.items()
         }
     feature_assays: set[str] = set()
@@ -1885,6 +1933,27 @@ def embedding(
         if assay_name is not None:
             feature_assays.add(assay_name)
 
+    # A panel-scope colorbar that no panel gave limits has no scale to show.
+    legends = [
+        legend
+        for legend in legends
+        if not (
+            legend.kind == "colorbar"
+            and legend.extras.get("scope") == "panel"
+            and not legend.extras.get("panel_limits")
+        )
+    ]
+    # Each shown colorbar keeps its color's scale, in order, so composed
+    # figures pair them; a color without a colorbar keeps no scale.
+    shown = [
+        index
+        for index in colorbar_colors
+        if index not in panel_limit_specs or panel_limit_specs[index]
+    ]
+    scales_out: list[Any] = [resolved_color_scales[index] for index in shown] or [
+        color_scale
+    ]
+    scales_out.extend(categorical_scales)
     result = PlotResult(
         figure=fig,
         axes=axes,
@@ -1970,6 +2039,7 @@ def embedding(
                     "transform": normalization.transform,
                 },
                 "assays": sorted(feature_assays),
+                **unmeasured_extras(unmeasured_cell_counts(unmeasured, base_mask)),
             },
         ),
         owns_figure=owns,

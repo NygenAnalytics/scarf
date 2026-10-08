@@ -13,9 +13,9 @@ from ..storage.artifact_writer import (
     AttributeRequirement,
     PlannedArtifact,
     discard_artifact,
-    finish_artifact,
     plan_artifact,
     start_artifact,
+    validate_artifact_payload,
 )
 from ..storage.artifacts import (
     ArtifactRef,
@@ -255,11 +255,14 @@ class ProjectionWriter:
                 self._group,
                 validated,
             )
-            finish_artifact(self._group, self._plan.artifact)
+            validate_artifact_payload(self._group, self._plan.artifact)
         except BaseException:
             self._discard()
             raise
+        # Set before the publication write, so abort never deletes a projection
+        # whose publication started.
         self._finished = True
+        self._group.attrs["complete"] = True
         return self._plan.ref
 
     def abort(self) -> None:

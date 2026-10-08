@@ -729,11 +729,32 @@ def test_composition_renders_deduplicated_size_legend():
         "67%",
         "100%",
     ]
-    # Areas 16, 144, 272 and 400 for the four ticks, scaled so the largest
-    # handle has area 180, then drawn with marker size sqrt(area).
+    # Without recorded values the legend spans the domain in four steps, at
+    # the scale's own areas 16, 144, 272 and 400, drawn as sqrt(area) markers.
     observed_sizes = [handle.get_markersize() for handle in legend.legend_handles]
-    assert observed_sizes == pytest.approx(np.sqrt([7.2, 64.8, 122.4, 180.0]))
+    assert observed_sizes == pytest.approx(np.sqrt([16.0, 144.0, 272.0, 400.0]))
     assert result.legends == (legend_spec,)
+    plt.close(figure)
+
+    # Legends that record different values stay apart.
+    figure, axes = plt.subplots(1, 2, figsize=(6, 4), layout="constrained")
+    children = [
+        _child_result(
+            figure,
+            axis,
+            legends=(
+                splt.LegendSpec(
+                    kind="size", label="Detection", extras={"values": values}
+                ),
+            ),
+            scales=(size_scale,),
+        )
+        for axis, values in zip(axes, ([0.5, 1.0], [0.25, 1.0]), strict=True)
+    ]
+    compose_results(figure, children, panel_labels=False)
+    assert [
+        [text.get_text() for text in legend.get_texts()] for legend in figure.legends
+    ] == [["50%", "100%"], ["25%", "100%"]]
     plt.close(figure)
 
 
@@ -752,10 +773,16 @@ def test_composition_renders_marker_legend_and_skips_malformed_specs():
         label="Malformed",
         extras={"values": ("one", "two"), "markers": ("o",)},
     )
+    no_sizes = splt.LegendSpec(kind="size", label="Empty", extras={"values": []})
     children = [
         _child_result(figure, axes[0], legends=(marker_spec,)),
         _child_result(figure, axes[1], legends=(marker_spec,)),
-        _child_result(figure, axes[2], legends=(malformed,)),
+        _child_result(
+            figure,
+            axes[2],
+            legends=(malformed, no_sizes),
+            scales=(splt.SizeScale(),),
+        ),
     ]
 
     result = compose_results(figure, children, panel_labels=False)
@@ -768,7 +795,7 @@ def test_composition_renders_marker_legend_and_skips_malformed_specs():
         "treated",
     ]
     assert [handle.get_marker() for handle in legend.legend_handles] == ["s", "^"]
-    assert result.legends == (marker_spec, malformed)
+    assert result.legends == (marker_spec, malformed, no_sizes)
     plt.close(figure)
 
 
@@ -987,6 +1014,52 @@ def test_tall_shared_legends_merge_instead_of_overlapping():
     labels = [text.get_text() for text in figure.legends[0].get_texts()]
     assert labels[0] == "scale0: value0"
     assert labels[-1] == "scale2: value17"
+    result.close()
+    plt.close(figure)
+
+
+def test_merged_shared_legends_hold_the_largest_size_marker():
+    from tests.test_plotting_modernization import (
+        _assert_legend_rows_hold_their_markers,
+    )
+
+    figure, axes = plt.subplots(2, 2, figsize=(4, 2.5), layout="constrained")
+    flat = axes.ravel()
+    values = tuple(f"value{index}" for index in range(6))
+    sized = [
+        _child_result(
+            figure,
+            axis,
+            legends=(
+                splt.LegendSpec(
+                    kind="size", label=label, extras={"values": [0.5, 1.0]}
+                ),
+            ),
+            scales=(splt.SizeScale(size_min=1.0, size_max=size_max),),
+        )
+        for axis, label, size_max in (
+            (flat[2], "Small", 100.0),
+            (flat[3], "Large", 900.0),
+        )
+    ]
+    children = [
+        _categorical_child(figure, flat[0], "scale0", values),
+        _categorical_child(figure, flat[1], "scale1", values),
+        *sized,
+    ]
+
+    result = compose_results(figure, children, panel_labels=False)
+
+    # The fourth block merges into the third, and the crowded blocks then
+    # merge into one legend whose rows hold the largest marker.
+    (legend,) = figure.legends
+    assert [text.get_text() for text in legend.get_texts()][-4:] == [
+        "Small: 50%",
+        "Small: 100%",
+        "Large: 50%",
+        "Large: 100%",
+    ]
+    _assert_legend_rows_hold_their_markers(legend)
     result.close()
     plt.close(figure)
 

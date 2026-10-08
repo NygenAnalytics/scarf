@@ -7,6 +7,7 @@ import pytest
 
 from scarf.assay import ATACassay, RNAassay
 from scarf.datastore.datastore import DataStore
+from scarf.features.variability import HVG_OPTION_NAMES, HvgOptions, hvg_options
 from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import snapshot_run_metadata
@@ -408,6 +409,79 @@ def test_select_hvgs_rejects_empty_result_without_metadata_mutation(
     after = set(store.list_artifacts(kind="feature_selection", from_assay="RNA"))
     assert after == before
     assert set(store.RNA.feats.columns) == columns_before
+
+
+def _all_artifacts(store: DataStore) -> set[ArtifactRef]:
+    return set(store.list_artifacts()) | set(store.list_artifacts(scope="datastore"))
+
+
+# hvg_options checks every option; fit_lowess and the argument helpers test each rule.
+@pytest.mark.parametrize(
+    ("arguments", "error", "message"),
+    [
+        ({"min_cells": 20.0}, TypeError, "min_cells must be an integer"),
+        ({"min_cells": -1}, ValueError, "min_cells must be at least 0"),
+        ({"top_n": 0}, ValueError, "top_n must be at least 1"),
+        ({"n_bins": 0}, ValueError, "n_bins must be at least 1"),
+        ({"lowess_frac": 1.5}, ValueError, "lowess_frac must be between 0 and 1"),
+        ({"keep_bounds": 1}, TypeError, "keep_bounds must be a boolean"),
+        ({"bin_strategy": "loess"}, ValueError, "bin_strategy must be either"),
+    ],
+    ids=[
+        "min_cells",
+        "negative_min_cells",
+        "top_n",
+        "n_bins",
+        "lowess_frac",
+        "keep_bounds",
+        "bin_strategy",
+    ],
+)
+def test_select_hvgs_checks_counts_and_trend_options_before_writing(
+    hvg_store, arguments, error, message
+) -> None:
+    store = hvg_store
+    active = np.asarray(store.cells.fetch_all("I"), dtype=bool)
+    subset = active.copy()
+    subset[np.flatnonzero(active)[::2]] = False
+    store.cells.insert("hvg_subset", subset)
+    # New feature names and a selection without a feature summary, whose
+    # snapshot and summary a late check would write.
+    names = np.asarray([f"GENE_{index}" for index in range(store.RNA.feats.N)])
+    store.RNA.feats.insert("names", names, overwrite=True)
+    cells = store.snapshot_cell_selection("hvg_subset")
+    before = _all_artifacts(store)
+
+    with pytest.raises(error, match=re.escape(message)):
+        store.select_hvgs(cells, show_plot=False, **arguments)
+
+    assert _all_artifacts(store) == before
+
+
+def test_hvg_options_return_the_values_selections_record() -> None:
+    defaults = {
+        "min_cells": 20,
+        "top_n": 1000,
+        "n_bins": 200,
+        "lowess_frac": 0.1,
+        "keep_bounds": False,
+        "bin_strategy": "adaptive",
+    }
+    assert tuple(defaults) == HVG_OPTION_NAMES
+    assert hvg_options(**defaults) == HvgOptions(**defaults)
+    checked = hvg_options(
+        min_cells=np.int64(0),
+        top_n=np.int32(5),
+        n_bins=np.uint8(20),
+        lowess_frac=1,
+        keep_bounds=np.bool_(True),
+        bin_strategy=np.str_("fixed"),
+    )
+    assert checked == (0, 5, 20, 1, True, "fixed")
+    # lowess_frac keeps its type, so 1 and 1.0 keep their own identities.
+    assert [type(value) for value in checked] == [int, int, int, int, bool, str]
+    # Zero gives each trend its smallest window.
+    assert hvg_options(**{**defaults, "lowess_frac": 0}).lowess_frac == 0
 
 
 def test_select_hvgs_rejects_unknown_keywords_before_saving(

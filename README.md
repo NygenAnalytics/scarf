@@ -69,7 +69,7 @@ AI-assisted and autonomous workflows should start with **[Analysis with AI agent
 | Area | Methods |
 | :-- | :-- |
 | Modalities | scRNA-seq, scATAC-seq, CITE-seq, matched multi-omics |
-| Core workflow | Quality control, feature selection, normalization, PCA and LSI, KNN graph, UMAP, densMAP, t-SNE, Leiden, Paris, marker search |
+| Core workflow | Quality control, feature selection, normalization, PCA and LSI, KNN graph, UMAP, densMAP, t-SNE (optional `tsne` extra), Leiden, Paris, marker search |
 | Integration | Harmony, partial PCA, shared and weighted nearest neighbours, integration metrics |
 | Mapping | Symphony-style reference mapping, label transfer, projection diagnostics |
 | Trajectory | Population Balance Analysis pseudotime, expression dynamics and modules, multi-sink fate probabilities |

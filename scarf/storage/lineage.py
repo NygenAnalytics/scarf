@@ -251,7 +251,22 @@ def _status_label(status: ArtifactStatus | None) -> str:
         return "missing"
     if not status.complete:
         return "incomplete"
+    if status.superseded_by:
+        return "stale"
     return "complete"
+
+
+def _revision_detail(status: ArtifactStatus) -> str | None:
+    """Describe a recorded revision other than a current revision 1."""
+    revision, current = status.revision, status.current_revision
+    if not status.complete or revision is None or current is None:
+        return None
+    if revision < current:
+        changes = "; ".join(entry.change for entry in status.superseded_by)
+        return f"{revision}, current {current}: {changes}"
+    if revision > current:
+        return f"{revision}, newer than revision {current} of this Scarf release"
+    return None if revision == 1 else str(revision)
 
 
 def _located_ref(locator: ArtifactLocator) -> ArtifactRef:
@@ -298,6 +313,8 @@ def _detail_mapping(values: Mapping[str, Any]) -> str:
 
 
 class ArtifactLineage:
+    """A snapshot of the upstream lineage of artifact outputs."""
+
     __slots__ = ("_graph", "_outputs")
 
     def __init__(
@@ -364,7 +381,13 @@ class ArtifactLineage:
             if output_names:
                 label_parts.append(f"outputs: {', '.join(output_names)}")
             status_name = _status_label(status)
-            if status_name != "complete":
+            if status_name == "stale":
+                assert status is not None
+                label_parts.append(
+                    f"status: stale (revision {status.revision}, current "
+                    f"{status.current_revision})"
+                )
+            elif status_name != "complete":
                 label_parts.append(f"status: {status_name}")
             label = _mermaid_text(" | ".join(label_parts))
             lines.append(f'    {node_ids[locator]}["{label}"]')
@@ -414,6 +437,10 @@ class ArtifactLineage:
             lines.append(f"- Path: `{status.path}`")
             if status.operation is not None:
                 lines.append(f"- Operation: `{status.operation}`")
+            revision_detail = _revision_detail(status)
+            if revision_detail is not None:
+                text = " ".join(revision_detail.replace("`", "'").split())
+                lines.append(f"- Revision: `{text}`")
             output_names = cast(
                 tuple[str, ...],
                 self._graph.nodes[locator]["outputs"],

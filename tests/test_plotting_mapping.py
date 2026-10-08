@@ -1,4 +1,5 @@
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -712,7 +713,8 @@ def test_mapping_calibration_warns_when_threshold_retains_nothing(
     plotting_mapping_context,
 ):
     context = plotting_mapping_context
-    with pytest.warns(RuntimeWarning, match="retained no mapped cells"):
+    with pytest.warns(RuntimeWarning, match="retained no mapped cells") as caught:
+        call_line = sys._getframe().f_lineno + 1
         plot = splt.mapping_calibration(
             context["query"],
             context["transfer"],
@@ -722,6 +724,10 @@ def test_mapping_calibration_warns_when_threshold_retains_nothing(
             show=False,
         )
 
+    # The warning names this call, not the decorator that wraps the plot.
+    assert [(Path(item.filename).resolve(), item.lineno) for item in caught] == [
+        (Path(__file__).resolve(), call_line)
+    ]
     assert not any(
         "voteFraction =" in text.get_text()
         for text in plot.axes["mapping_calibration"].texts
@@ -993,6 +999,13 @@ def test_mapping_calibration_rejects_nonfinite_or_unretained_evidence():
 
     finite_evidence = evidence.assign(voteFraction=[0.8, 0.2])
     store = _controlled_mapping_store(evidence=finite_evidence)
+    with pytest.raises(ValueError, match="at least one known label"):
+        plotting_mapping.mapping_calibration(
+            store,
+            _TRANSFER_REF,
+            known_labels=np.asarray([None, None], dtype=object),
+            show=False,
+        )
     with pytest.raises(ValueError, match="No threshold retained"):
         plotting_mapping.mapping_calibration(
             store,
@@ -1052,16 +1065,17 @@ def test_mapping_calibration_marks_the_transfer_threshold_without_extra_rows():
 def test_mapping_calibration_keeps_the_transfers_other_rules():
     evidence = pd.DataFrame(
         {
-            "label": ["A", None, None],
-            "candidateLabel": ["A", "B", "A"],
-            "voteFraction": [0.9, 0.6, 0.95],
-            "topTwoMargin": [0.8, 0.2, 0.9],
-            "nearestDistance": [1.0, 1.0, 5.0],
+            "label": ["A", None, None, None],
+            "candidateLabel": ["A", "B", "A", None],
+            "voteFraction": [0.9, 0.6, 0.95, np.nan],
+            "topTwoMargin": [0.8, 0.2, 0.9, np.nan],
+            "nearestDistance": [1.0, 1.0, 5.0, np.nan],
         }
     )
-    known = np.asarray(["A", "A", "B"])
+    known = np.asarray(["A", "B", "B", None], dtype=object)
     # The second cell falls below the vote cutoff and the third lies beyond
-    # the distance limit, so the transfer labels only the first.
+    # the distance limit, so the transfer labels only the first. The fourth
+    # has neither a known label nor evidence.
     store = _controlled_mapping_store(
         evidence=evidence,
         threshold_fraction=0.8,
@@ -1085,7 +1099,7 @@ def test_mapping_calibration_keeps_the_transfers_other_rules():
     # Another metric is calibrated among the cells the transfer labelled.
     assert first_row("topTwoMargin") == {"coverage": 1 / 3, "accuracy": 1.0}
     # Sweeping a rule's own metric replaces that rule and keeps the other one.
-    assert first_row("voteFraction") == {"coverage": 2 / 3, "accuracy": 0.5}
+    assert first_row("voteFraction") == {"coverage": 2 / 3, "accuracy": 1.0}
     assert first_row("nearestDistance") == {"coverage": 2 / 3, "accuracy": 0.5}
 
     marked = plotting_mapping.mapping_calibration(
@@ -1096,7 +1110,102 @@ def test_mapping_calibration_keeps_the_transfers_other_rules():
         show=False,
     )
     assert marked.provenance.extras["marked_threshold"] == 2.0
+    # Default thresholds span every known cell's distance, also the cells
+    # that the vote rule leaves out.
+    expected = np.append(np.quantile([1.0, 1.0, 5.0], np.linspace(0, 1, 50)), 2.0)
+    np.testing.assert_allclose(
+        np.sort(marked.tables["calibration"]["threshold"]), np.unique(expected)
+    )
+    # Correctness covers every known cell with a candidate.
+    assert marked.tables["evidence"]["correct"].tolist() == [True, True, False, False]
+    assert marked.provenance.extras["n_without_evidence"] == 0
     marked.close()
+
+
+def _producer_evidence(uninformative: np.ndarray) -> pd.DataFrame:
+    """Evidence decided by the saved-transfer producer, as the loader frames it.
+
+    Every cell has two neighbors of class A at distance 1, so each informative
+    cell is labelled A and each uninformative cell abstains without evidence.
+    """
+    from scarf.mapping.label_transfer import (
+        ABSTENTION_REASONS,
+        ReferenceDistancePercentiles,
+        transfer_label_block,
+    )
+
+    n_cells = len(uninformative)
+    block = transfer_label_block(
+        np.zeros((n_cells, 2), dtype=np.int64),
+        np.ones((n_cells, 2)),
+        uninformative,
+        threshold_fraction=0.5,
+        max_distance=None,
+        distance_percentiles=ReferenceDistancePercentiles(
+            distances=np.array([0.0, 10.0]),
+            percentiles=np.array([0.0, 1.0]),
+        ),
+    )
+    classes = np.asarray(["A", "B"], dtype=object)
+
+    def labels(codes: np.ndarray) -> np.ndarray:
+        values = np.full(n_cells, None, dtype=object)
+        values[codes >= 0] = classes[codes[codes >= 0]]
+        return values
+
+    return pd.DataFrame(
+        {
+            "label": pd.Series(labels(block.label_codes), dtype=object),
+            "candidateLabel": pd.Series(labels(block.candidate_codes), dtype=object),
+            "voteFraction": block.vote_fraction,
+            "topTwoMargin": block.top_two_margin,
+            "voteEntropy": block.vote_entropy,
+            "nearestDistance": block.nearest_distance,
+            "referenceDistancePercentile": block.reference_distance_percentile,
+            "abstained": block.abstention_reason != 0,
+            "abstentionReason": pd.Series(
+                np.asarray((None, *ABSTENTION_REASONS), dtype=object)[
+                    block.abstention_reason
+                ],
+                dtype=object,
+            ),
+        }
+    )
+
+
+def test_mapping_calibration_counts_cells_without_evidence_in_coverage():
+    evidence = _producer_evidence(np.r_[False, np.ones(9, dtype=bool)])
+    assert evidence["abstentionReason"].tolist()[1:] == ["uninformative_cell"] * 9
+    assert evidence["candidateLabel"].isna().tolist() == [False] + [True] * 9
+    assert evidence["voteFraction"].isna().tolist() == [False] + [True] * 9
+    store = _controlled_mapping_store(evidence=evidence, threshold_fraction=0.5)
+    known = np.full(len(evidence), "A", dtype=object)
+
+    calibration = plotting_mapping.mapping_calibration(
+        store, _TRANSFER_REF, known_labels=known, show=False
+    )
+    confusion = plotting_mapping.mapping_confusion(
+        store, _TRANSFER_REF, known_labels=known, normalize="all", show=False
+    )
+
+    # The nine cells without evidence have known labels, so they stay in the
+    # denominator and are never retained.
+    table = calibration.tables["calibration"]
+    assert table["nEvaluated"].tolist() == [10] * len(table)
+    assert table["nAccepted"].tolist() == [1] * len(table)
+    np.testing.assert_allclose(table["coverage"], 0.1)
+    assert calibration.provenance.n_cells == 10
+    assert calibration.provenance.extras["n_without_evidence"] == 9
+    assert calibration.tables["evidence"]["correct"].tolist() == [True] + [False] * 9
+    # Coverage counts the same cells as the confusion matrix: the transfer
+    # labelled every cell that is not in its "Abstained" column.
+    abstained_share = confusion.tables["matrix"]["Abstained"].sum()
+    assert abstained_share == pytest.approx(0.9)
+    assert table["coverage"].max() == pytest.approx(1 - abstained_share)
+    own_rule = table.loc[np.isclose(table["threshold"], 0.5), "coverage"]
+    assert own_rule.tolist() == pytest.approx([1 - abstained_share])
+    for plot in (calibration, confusion):
+        plot.close()
 
 
 def test_label_transfer_plots_require_a_transfer_loader_and_label():

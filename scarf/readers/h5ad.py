@@ -618,6 +618,32 @@ class H5adReader:
         for name, values, missing in self._feature_columns():
             yield name, present_column(values, missing)
 
+    def assay_membership(self) -> dict[str, str]:
+        """Return the membership column of each assay that the file declares."""
+        from ..metadata.membership import (
+            MEMBERSHIP_UNS_KEY,
+            SCARF_UNS_KEY,
+            parse_membership_declaration,
+        )
+
+        location = f"uns/{SCARF_UNS_KEY}/{MEMBERSHIP_UNS_KEY}"
+        node = self.h5.get(location)
+        if node is None:
+            return {}
+        if not isinstance(node, h5py.Group):
+            raise ValueError(
+                f"{location} must be a mapping from assay name to membership column"
+            )
+        declared: dict[str, str] = {}
+        for assay, entry in node.items():
+            if not isinstance(entry, h5py.Dataset) or entry.shape != ():
+                raise ValueError(
+                    f"{location}/{assay} must hold one text value, the membership "
+                    "column of the assay"
+                )
+            declared[assay] = as_text(entry[()])
+        return parse_membership_declaration(declared)
+
     def feature_types(self, key: str) -> list[str]:
         """Return decoded feature types from a var column."""
         if not self._check_exists(self.featureAttrsKey, key):

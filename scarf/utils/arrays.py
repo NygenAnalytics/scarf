@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
 
+from .arguments import float_argument
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -286,6 +288,9 @@ def rescale_array(a: np.ndarray, frac: float = 0.9) -> np.ndarray:
     """Trim extreme values using a fitted normal distribution."""
     from scipy.stats import norm
 
+    frac = float_argument(frac, "frac")
+    if not 0.5 < frac <= 1.0:
+        raise ValueError("frac must be greater than 0.5 and at most 1")
     location = (np.median(a) + np.median(a[::-1])) / 2
     distribution = norm(location, np.std(a))
     minimum, maximum = distribution.ppf(1 - frac), distribution.ppf(frac)
@@ -305,18 +310,6 @@ def clean_array(
     )
     array[array == 0] = fill_val
     return array
-
-
-def sum_and_squared_sum(
-    array: np.ndarray, axis: int | None = 0
-) -> tuple[np.ndarray, np.ndarray]:
-    expressions = {None: "ij,ij->", 0: "ij,ij->j", 1: "ij,ij->i"}
-    return (
-        np.asarray(array.sum(axis=axis, dtype=np.float64)),
-        np.asarray(
-            np.einsum(expressions[axis], array, array, dtype=np.float64, optimize=False)
-        ),
-    )
 
 
 def array_digest(values: np.ndarray) -> str:

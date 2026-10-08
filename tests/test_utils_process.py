@@ -3,38 +3,123 @@
 import os
 import io
 import sys
-from unittest.mock import MagicMock
+import threading
 from pathlib import Path
 
 import pytest
 
+import scarf.utils.process as process_module
 from scarf.utils.process import (
     process_rss_mb,
     read_process_tree_rss_bytes,
+    rss_text,
     sample_process_tree_rss,
     suppress_native_output,
 )
 
 
+def _fake_proc_root(tmp_path: Path, status: bytes) -> Path:
+    proc_root = tmp_path / "proc"
+    (proc_root / "self").mkdir(parents=True)
+    (proc_root / "self" / "status").write_bytes(status)
+    return proc_root
+
+
 def test_process_rss_mb_reads_proc_status(tmp_path, monkeypatch):
-    status = tmp_path / "status"
-    status.write_text("Name:\tpython\nVmRSS:\t2048 kB\n")
-    monkeypatch.setattr("builtins.open", lambda *_a, **_k: status.open())
+    # A process name truncated inside a multibyte character is not UTF-8.
+    proc_root = _fake_proc_root(tmp_path, b"Name:\tpy\xe6\x97\nVmRSS:\t2048 kB\n")
+    monkeypatch.setattr(process_module, "_PROC_ROOT", proc_root)
     assert process_rss_mb() == pytest.approx(2.0)
+    assert rss_text() == "2 MiB"
 
 
-def test_process_rss_mb_falls_back_when_proc_unavailable(monkeypatch):
-    monkeypatch.setattr(
-        "builtins.open",
-        MagicMock(side_effect=OSError("no /proc")),
+@pytest.mark.parametrize("status", [None, b"Name:\tpython\nVmSize:\t2048 kB\n"])
+def test_process_rss_mb_is_none_without_proc_vmrss(tmp_path, monkeypatch, status):
+    # macOS and Windows have no /proc. Scarf reports nothing rather than the
+    # peak resident size from getrusage, which macOS reports in bytes.
+    proc_root = (
+        tmp_path / "missing" if status is None else _fake_proc_root(tmp_path, status)
     )
-    usage = MagicMock()
-    usage.ru_maxrss = 4096
-    monkeypatch.setattr(
-        "scarf.utils.process.resource.getrusage",
-        lambda *_a, **_k: usage,
-    )
-    assert process_rss_mb() == pytest.approx(4.0)
+    monkeypatch.setattr(process_module, "_PROC_ROOT", proc_root)
+    assert process_rss_mb() is None
+    assert rss_text() == "n/a"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux reports VmRSS in /proc")
+def test_process_rss_mb_reports_current_resident_memory_on_linux():
+    rss = process_rss_mb()
+    assert rss is not None and rss > 0
+    amount, unit = rss_text().split(" ")
+    assert unit == "MiB" and int(amount) > 0
+
+
+def test_rna_feature_stats_log_rss_without_proc(tmp_path, monkeypatch):
+    import numpy as np
+
+    from scarf.assay import RNAassay
+    from scarf.metadata import MetaData
+    from scarf.utils.logging import logger
+    from tests.test_counts_t import _memory_root, _write_small_assay
+
+    root = _memory_root()
+    values = np.array([[4, 0, 1], [3, 2, 1], [0, 5, 1]], dtype=np.uint32)
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
+    assay.sf = 1000
+    monkeypatch.setattr(process_module, "_PROC_ROOT", tmp_path / "missing")
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(message), level="DEBUG")
+    try:
+        assay._streaming_feature_stats(np.arange(3), np.arange(3))
+    finally:
+        logger.remove(sink)
+
+    bands = [message for message in messages if "feature stats band" in message]
+    assert bands
+    assert all(message.rstrip().endswith("rss n/a") for message in bands), bands
+
+
+def test_process_tree_sampler_starts_no_thread_without_proc(tmp_path, monkeypatch):
+    monkeypatch.setattr(process_module, "_PROC_ROOT", tmp_path / "missing")
+    started: list[str] = []
+    real_start = threading.Thread.start
+
+    def recording_start(thread: threading.Thread) -> None:
+        started.append(thread.name)
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", recording_start)
+    with sample_process_tree_rss(interval_seconds=0.01) as measurement:
+        during = measurement()
+    final = measurement()
+
+    assert "scarf-pipeline-rss" not in started
+    for observed in (during, final):
+        assert (observed.baseline_bytes, observed.peak_bytes) == (None, None)
+        assert observed.incremental_peak_bytes is None
+        assert (observed.sample_count, observed.sampling_error_count) == (0, 0)
+        assert observed.sample_interval_seconds == 0.01
+        assert observed.unavailable_reason == (
+            "process-tree RSS requires the Linux /proc filesystem"
+        )
+
+
+def test_process_tree_sampler_reads_the_patched_proc_root(tmp_path, monkeypatch):
+    proc_root = _fake_proc_root(tmp_path, b"PPid:\t1\nVmRSS:\t4 kB\n")
+    pid_status = proc_root / str(os.getpid()) / "status"
+    pid_status.parent.mkdir()
+    pid_status.write_bytes(b"PPid:\t1\nVmRSS:\t8 kB\n")
+    monkeypatch.setattr(process_module, "_PROC_ROOT", proc_root)
+
+    with sample_process_tree_rss(interval_seconds=3600.0) as measurement:
+        pass
+
+    final = measurement()
+    assert (final.baseline_bytes, final.peak_bytes) == (8 * 1024, 8 * 1024)
+    assert (final.sample_count, final.sampling_error_count) == (2, 0)
+    assert final.unavailable_reason is None
 
 
 def test_process_tree_rss_sums_only_root_and_descendants(tmp_path: Path) -> None:

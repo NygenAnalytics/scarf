@@ -70,6 +70,7 @@ def _write_complete_artifact(
     inputs: dict[str, object] | None = None,
     arrays: dict[str, np.ndarray] | None = None,
     operation: str | None = None,
+    parameters: dict[str, object] | None = None,
 ) -> ArtifactRef:
     ref = ArtifactRef(
         scope="assay" if assay is not None else "datastore",
@@ -84,7 +85,7 @@ def _write_complete_artifact(
             "kind": kind,
             "provenance": make_provenance(
                 operation=operation or f"test_{kind}",
-                parameters={},
+                parameters=parameters or {},
                 inputs=inputs or {},
             ),
             "execution_options": {},
@@ -275,12 +276,15 @@ def test_to_anndata_exports_an_empty_feature_selection() -> None:
         columns=["ids"],
         active_index=Mock(return_value=np.asarray([0, 1])),
         to_pandas_dataframe=Mock(return_value=pd.DataFrame({"ids": ["c0", "c1"]})),
+        # Export reads column attributes to declare membership columns.
+        _get_array=Mock(return_value=SimpleNamespace(attrs={})),
     )
 
     exported = store.to_anndata(feature_indexes=[])
 
     assert exported.shape == (2, 0)
     assert list(exported.obs_names) == ["c0", "c1"]
+    assert "scarf" not in exported.uns
     store.cells.active_index.assert_called_once_with("I")
 
 
@@ -319,21 +323,28 @@ def test_membership_strength_matches_reference_counts(
     )
     store._get_graph_ncells_k = Mock(return_value=(n_cells, k))
     _patch_graph_resolution(monkeypatch, graph_ref, selection=selection)
-    # Small blocks exercise several edge blocks and a partial final block.
-    monkeypatch.setattr(presentation, "_MEMBERSHIP_BLOCK_EDGES", 3 * k + 2)
+    agreement = presentation.neighbor_label_agreement
+
+    def small_blocks(edges, label_codes, *, k):
+        # Small blocks exercise several edge blocks and a partial final block.
+        return agreement(edges, label_codes, k=k, block_edges=3 * k + 2)
+
+    monkeypatch.setattr(presentation, "neighbor_label_agreement", small_blocks)
 
     ref = store.calc_membership_strength(clusters, graph_ref)
 
     stored = np.asarray(store.zw[artifact_path(ref)]["values"][:])
-    reference = np.asarray(
-        [
-            pd.Series(row).value_counts(dropna=False).iloc[0] / k
-            for row in labels[neighbours]
-        ],
-        dtype=np.float64,
-    ).round(3)
+    # The share of each cell's neighbours that carry its own label; NaN
+    # labels count as one label.
+    neighbour_labels = labels[neighbours]
+    own = labels[:, None]
+    shared = (neighbour_labels == own) | (pd.isna(neighbour_labels) & pd.isna(own))
+    reference = (np.count_nonzero(shared, axis=1) / k).round(3)
     assert stored.dtype == np.float64
     assert stored.tobytes() == reference.tobytes()
+    status = inspect_artifact(store.zw, ref)
+    assert status.revision == 2
+    assert status.parameters == {"algorithm_version": 2, "decimals": 3}
 
 
 def test_membership_strength_needs_a_writable_store_only_for_new_results(
@@ -486,7 +497,11 @@ def test_smart_label_suffixes_continue_past_z_without_merging_labels() -> None:
     suffixes = letters + [f"a{letter}" for letter in letters[:14]]
     # Larger clusters take earlier suffixes; z continues as aa, ab, ...
     assert by_label == {39 - rank: f"T{suffix}" for rank, suffix in enumerate(suffixes)}
-    assert inspect_artifact(store.zw, ref).parameters["algorithm_version"] == 3
+    # The frozen version parameter of earlier releases and how it names labels.
+    assert inspect_artifact(store.zw, ref).parameters == {
+        "algorithm_version": 3,
+        "suffix_style": "lowercase_letter",
+    }
 
 
 def test_smart_label_rejects_hyphen_joined_names_that_collide() -> None:
@@ -500,6 +515,32 @@ def test_smart_label_rejects_hyphen_joined_names_that_collide() -> None:
 
     with pytest.raises(ValueError, match="'T-Xa'"):
         store.smart_label(clusters, base)
+
+
+def test_smart_label_of_an_earlier_release_is_reused() -> None:
+    store, backing = _presentation_store()
+    clusters, base = _smart_label_inputs(
+        store, np.asarray([0, 0, 1, 1]), np.asarray(["A", "A", "B", "B"])
+    )
+    selection = inspect_artifact(store.zw, clusters).input_ref("cell_selection")
+    # What releases before 1.0.0 stored for the same labels, such as imported
+    # labels or label snapshots, whose identities this release keeps. The
+    # values are unchanged and smart_label has no revision, so the label is
+    # an exact match.
+    earlier = _write_complete_artifact(
+        store.zw,
+        "smart_label",
+        assay=None,
+        operation="smart_label",
+        parameters={"algorithm_version": 3, "suffix_style": "lowercase_letter"},
+        inputs={"values": clusters, "base_labels": base, "cell_selection": selection},
+        arrays={"values": np.asarray(["Aa", "Aa", "Ba", "Ba"])},
+    )
+    read_only = _PresentationStore(zarr.open_group(store=backing, mode="r"))
+
+    assert read_only.smart_label(clusters, base) == earlier
+    assert store.smart_label(clusters, base) == earlier
+    assert inspect_artifact(store.zw, earlier).is_current
 
 
 def test_smart_label_needs_a_writable_store_only_for_new_results() -> None:

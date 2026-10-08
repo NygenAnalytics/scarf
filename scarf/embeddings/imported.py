@@ -304,6 +304,8 @@ def _write_numeric_payload(
     )
     builder = storage.fingerprint_builder()
     builder.begin_array("values", source.shape, source.dtype)
+    # The checked writer refuses NaN and infinity before each block is written.
+    rows = storage.finite_rows(destination)
     start = 0
     blocks = source.produce()
     try:
@@ -317,15 +319,12 @@ def _write_numeric_payload(
                 raise ValueError(f"{name} block has an invalid shape or dtype")
             if block.shape[0] == 0:
                 continue
-            if not np.all(np.isfinite(block)):
-                raise ValueError(f"{name} contains non-finite values")
             stop = start + int(block.shape[0])
             if stop > source.shape[0]:
                 raise ValueError(f"{name} stream exceeds its declared row count")
             offset = (start,) + (0,) * (block.ndim - 1)
             builder.update_array_block("values", offset, block)
-            index = (slice(start, stop),) + (slice(None),) * (block.ndim - 1)
-            destination[index] = block
+            rows.write(block)
             start = stop
     finally:
         close = getattr(blocks, "close", None)
@@ -338,6 +337,7 @@ def _write_numeric_payload(
     builder.end_array("values")
     if builder.hexdigest() != expected_fingerprint:
         raise ValueError(f"{name} payload fingerprint does not match its source")
+    rows.close()
     return destination
 
 

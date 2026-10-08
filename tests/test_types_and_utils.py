@@ -1,17 +1,18 @@
 import gc
-import tracemalloc
 import weakref
 
 import numpy as np
 import pytest
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
+from zarr.errors import ContainsArrayError, GroupNotFoundError
 from zarr.storage import MemoryStore
 
 from scarf.storage.types import (
     array_metadata_shards,
     as_zarr_array,
     as_zarr_group,
+    read_fresh_group,
 )
 from scarf.utils import (
     array_digest,
@@ -24,7 +25,11 @@ from scarf.utils import (
     compute_with_progress,
     tqdmbar,
 )
-from scarf.utils.arguments import float_argument, integer_argument
+from scarf.utils.arguments import (
+    clip_fraction_argument,
+    float_argument,
+    integer_argument,
+)
 from scarf.utils.arrays import (
     _rolling_window_kernel,
     assay_feature_ranges,
@@ -34,7 +39,6 @@ from scarf.utils.arrays import (
     max_window_nnz,
     read_only_copy,
     sparse_matrix_bytes,
-    sum_and_squared_sum,
 )
 from scarf.utils.progress import iter_progress
 
@@ -71,6 +75,35 @@ def test_array_metadata_shards_returns_none_without_sharding():
     assert array_metadata_shards(arr) is None
 
 
+def test_read_fresh_group_reads_the_stored_record(tmp_path):
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    handle = root.create_group("child", attributes={"value": 1})
+    zarr.open_group(store=root.store, path="child", mode="r+").attrs["value"] = 2
+    root.create_array("array", shape=(1,), dtype="i4")
+
+    # An open handle keeps the attributes it read when it was opened.
+    assert handle.attrs["value"] == 1
+    assert read_fresh_group(root, "child").attrs["value"] == 2
+    assert read_fresh_group(handle).attrs["value"] == 2
+    # A missing group raises unless the caller expects one.
+    with pytest.raises(GroupNotFoundError):
+        read_fresh_group(root, "missing")
+    assert read_fresh_group(root, "missing", missing_ok=True) is None
+    with pytest.raises(ContainsArrayError):
+        read_fresh_group(root, "array", missing_ok=True)
+
+
+def test_read_fresh_group_opens_as_its_parent_unless_told_otherwise(tmp_path):
+    path = str(tmp_path / "store.zarr")
+    zarr.open_group(path, mode="w").create_group("child")
+    writable = zarr.open_group(path, mode="r+")
+    read_only = zarr.open_group(path, mode="r")
+
+    assert read_fresh_group(writable, "child").read_only is False
+    assert read_fresh_group(read_only, "child").read_only is True
+    assert read_fresh_group(writable, "child", mode="r").read_only is True
+
+
 @pytest.mark.parametrize("fill_val", [0.0, 1.0, -1.0])
 def test_clean_array_replaces_nan_inf_and_zero(fill_val):
     raw = np.array([1.0, np.nan, np.inf, -np.inf, 0.0])
@@ -79,22 +112,6 @@ def test_clean_array_replaces_nan_inf_and_zero(fill_val):
         cleaned, [1.0, fill_val, fill_val, fill_val, fill_val]
     )
     np.testing.assert_array_equal(raw, [1.0, np.nan, np.inf, -np.inf, 0.0])
-
-
-@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.uint32, np.uint64])
-@pytest.mark.parametrize("axis", [None, 0, 1])
-def test_squared_sum_avoids_matrix_sized_temporaries(dtype, axis):
-    values = (np.arange(1024 * 512).reshape(1024, 512) % 251).astype(dtype)
-    reference = values.astype(np.float64)
-    tracemalloc.start()
-    try:
-        total, squared = sum_and_squared_sum(values, axis)
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert peak < 512 * 1024
-    np.testing.assert_allclose(total, reference.sum(axis=axis))
-    np.testing.assert_allclose(squared, np.square(reference).sum(axis=axis))
 
 
 def test_rescale_array_trims_extreme_values():
@@ -108,6 +125,20 @@ def test_rescale_array_trims_extreme_values():
     trimmed = rescale_array(values, frac=0.9)
     assert trimmed is values
     np.testing.assert_allclose(trimmed, [-bound, -1.0, 0.0, 1.0, bound])
+
+
+def test_rescale_array_requires_an_upper_quantile_above_one_half():
+    values = np.array([-10.0, -1.0, 0.0, 1.0, 10.0])
+    # frac=1 puts the bounds at -/+ infinity, so nothing is trimmed.
+    np.testing.assert_array_equal(rescale_array(values.copy(), frac=1), values)
+    for frac in (0.1, 0.5, 1.5):
+        with pytest.raises(ValueError, match="frac must be greater than 0.5"):
+            rescale_array(values.copy(), frac=frac)
+    for frac in (True, "0.9", None):
+        with pytest.raises(TypeError, match="frac must be a real number"):
+            rescale_array(values.copy(), frac=frac)
+    with pytest.raises(ValueError, match="frac must be finite"):
+        rescale_array(values.copy(), frac=np.nan)
 
 
 def test_set_verbosity_rejects_invalid_level():
@@ -428,6 +459,24 @@ def test_float_argument_shares_one_value_across_numeric_spellings():
     for value in (float("nan"), float("inf"), np.float64(-np.inf)):
         with pytest.raises(ValueError, match="ratio must be finite"):
             float_argument(value, "ratio")
+
+
+def test_clip_fraction_argument_requires_a_finite_fraction_below_one_half():
+    for value, expected in ((0, 0.0), (np.int64(0), 0.0), (np.float32(0.25), 0.25)):
+        resolved = clip_fraction_argument(value)
+        assert type(resolved) is float
+        assert resolved == expected
+    for value in (True, np.bool_(False), "0.1", None, np.array(0.1)):
+        with pytest.raises(TypeError, match="clip_fraction must be a real number"):
+            clip_fraction_argument(value)
+    for value in (np.nan, np.inf):
+        with pytest.raises(ValueError, match="clip_fraction must be finite"):
+            clip_fraction_argument(value)
+    for value in (-0.1, 0.5, 0.75, 1):
+        with pytest.raises(
+            ValueError, match="tails must be at least 0 and less than 0.5"
+        ):
+            clip_fraction_argument(value, "tails")
 
 
 def test_read_only_copy_owns_its_values_and_stays_read_only():

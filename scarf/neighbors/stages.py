@@ -12,7 +12,7 @@ from threadpoolctl import threadpool_info, threadpool_limits
 from ..embeddings.harmony import HarmonyResult, fit_harmony
 from ..matrix import ChunkedArray
 from ..utils.logging import logger
-from ..utils.process import process_rss_mb
+from ..utils.process import rss_text
 from ..utils.shutdown import shutdown_checkpoint
 from .index import fix_knn_query, instantiate_knn_index
 
@@ -192,11 +192,15 @@ class BatchCorrectionStage:
         ):
             shutdown_checkpoint()
             values = np.asarray(block)
+            del block
             stop = start + int(values.shape[0])
             if values.shape != (stop - start, self.dims) or stop > self.n_cells:
                 raise ValueError("Coordinate block has an invalid shape")
             uncorrected[:, start:stop] = values.T
             start = stop
+            # A read plan reserves only the blocks in flight, so no block is
+            # held while the stream reads the next.
+            del values
         if start != self.n_cells:
             raise ValueError(
                 f"Coordinate source contains {start} rows, expected {self.n_cells}"
@@ -222,14 +226,26 @@ class CoordinateSource(Protocol):
 
 
 class ChunkedCoordinateStream:
-    def __init__(self, data: ChunkedArray, nthreads: int) -> None:
+    """Row blocks of a coordinate matrix, read under its memory budget."""
+
+    def __init__(
+        self,
+        data: ChunkedArray,
+        nthreads: int,
+        *,
+        resident_bytes: int = 0,
+    ) -> None:
         self.data = data
         self.nthreads = nthreads
+        self.resident_bytes = max(0, int(resident_bytes))
 
     def iter_coordinate_blocks(self, message: str) -> Iterator[np.ndarray]:
-        yield from self.data.stream_blocks(
+        yield from self.data._stream_blocks(
             nthreads=self.nthreads,
             msg=message,
+            prefetch=None,
+            row_mask=None,
+            resident_bytes=self.resident_bytes,
         )
 
 
@@ -265,9 +281,11 @@ class AnnIndexStage:
 
     @staticmethod
     def populate(index: Any, coordinates: CoordinateSource) -> Any:
+        """Add every coordinate block to ``index`` in order."""
         for block in coordinates.iter_coordinate_blocks("Fitting ANN"):
             shutdown_checkpoint()
             index.add_items(block)
+            del block
             shutdown_checkpoint()
         return index
 
@@ -346,6 +364,216 @@ class KMeansInitialization:
     labels: np.ndarray
 
 
+@dataclass(frozen=True, slots=True)
+class _KMeansSizes:
+    """Validated options of a k-means initialization and the sizes they give."""
+
+    batch_size: int
+    sampling: float
+    clusters: int
+    kmeans_batch_size: int
+    init_size: int
+
+
+def _kmeans_sizes(
+    n_rows: int,
+    *,
+    batch_size: int,
+    n_clusters: int,
+    kmeans_sampling: float,
+    kmeans_batch_size: int,
+) -> _KMeansSizes:
+    if n_rows == 0:
+        raise ValueError("K-means initialization requires at least one row")
+    if isinstance(batch_size, bool):
+        raise TypeError("batch_size must be a positive integer")
+    try:
+        resolved_batch_size = operator.index(batch_size)
+    except TypeError:
+        raise TypeError("batch_size must be a positive integer") from None
+    if resolved_batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if isinstance(kmeans_sampling, bool):
+        raise TypeError("kmeans_sampling must be a number")
+    try:
+        sampling = float(kmeans_sampling)
+    except (TypeError, ValueError):
+        raise TypeError("kmeans_sampling must be a number") from None
+    if not math.isfinite(sampling) or not 0 < sampling <= 1:
+        raise ValueError("kmeans_sampling must be greater than 0 and at most 1")
+    if isinstance(kmeans_batch_size, bool):
+        raise TypeError("kmeans_batch_size must be a positive integer")
+    try:
+        requested_kmeans_batch_size = operator.index(kmeans_batch_size)
+    except TypeError:
+        raise TypeError("kmeans_batch_size must be a positive integer") from None
+    if requested_kmeans_batch_size < 1:
+        raise ValueError("kmeans_batch_size must be a positive integer")
+    clusters = min(max(n_clusters, 2), n_rows)
+    if clusters < 2:
+        raise ValueError("K-means initialization requires at least two rows")
+    return _KMeansSizes(
+        batch_size=resolved_batch_size,
+        sampling=sampling,
+        clusters=clusters,
+        kmeans_batch_size=min(n_rows, max(requested_kmeans_batch_size, clusters)),
+        init_size=min(n_rows, max(clusters, math.ceil(n_rows * sampling))),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class KMeansFitMemory:
+    """Bytes ``KMeansInitializationStage.fit`` holds besides its stream's blocks."""
+
+    peakBytes: int
+    streamResidentBytes: int
+
+
+# Rows of distances to every centroid that each OpenMP thread of
+# scikit-learn's chunked k-means loops holds.
+_KMEANS_THREAD_CHUNK_ROWS = 256
+# Python objects a k-means fit holds whatever the data size, such as the
+# estimator's state and thread-limit records, measured below 80 KiB.
+_KMEANS_OBJECT_BYTES = 128 * 1024
+
+
+def _kmeans_plusplus_bytes(rows: int, dims: int, clusters: int, itemsize: int) -> int:
+    """Bytes scikit-learn's k-means++ holds to seed from ``rows`` points.
+
+    Besides the points, it holds their squared norms and weights, the
+    potentials it draws candidates from and float64 seeding probabilities,
+    the distances of ``2 + log(clusters)`` candidates to every point for the
+    current and the previous candidates (with a product temporary unless the
+    points are float32), and the seeds. It computes float32 distances in
+    float64 chunks of at most ``sqrt(M)`` points, where ``M`` is a tenth of
+    the elements involved and at least ``10 * 2**17``.
+    """
+    trials = 2 + int(math.log(clusters))
+    vectors = rows * (4 * itemsize + 16)
+    distances = (2 if itemsize == 4 else 3) * trials * rows * itemsize
+    seeds = clusters * (dims * itemsize + 8)
+    chunks = 0
+    if itemsize == 4:
+        elements = max(((trials + rows) * dims + trials * rows) // 10, 10 * 2**17)
+        chunk_rows = min(rows, math.isqrt(elements) + 1)
+        chunks = 8 * ((chunk_rows + trials) * (dims + 1) + 3 * trials * chunk_rows)
+    return vectors + distances + seeds + chunks
+
+
+def kmeans_fit_memory(
+    *,
+    n_rows: int,
+    dims: int,
+    dtype: Any,
+    batch_size: int,
+    n_clusters: int,
+    block_rows: int,
+    nthreads: int,
+    kmeans_sampling: float = 0.1,
+    kmeans_batch_size: int = 10_000,
+) -> KMeansFitMemory:
+    """Estimate the bytes ``KMeansInitializationStage.fit`` holds."""
+    sizes = _kmeans_sizes(
+        n_rows,
+        batch_size=batch_size,
+        n_clusters=n_clusters,
+        kmeans_sampling=kmeans_sampling,
+        kmeans_batch_size=kmeans_batch_size,
+    )
+    coordinate_dtype = np.dtype(dtype)
+    itemsize = coordinate_dtype.itemsize
+    # scikit-learn fits float32 and float64 values as they are and copies
+    # values of any other floating dtype to float64.
+    native = coordinate_dtype in (np.dtype(np.float32), np.dtype(np.float64))
+    fit_itemsize = itemsize if native else 8
+    copy_itemsize = 0 if native else 8
+    clusters = sizes.clusters
+    update_rows = sizes.kmeans_batch_size
+    init_size = sizes.init_size
+    block = min(max(1, int(block_rows)), n_rows)
+    # The seeds and the centroids updated from them, their counts, and the row
+    # indices of the seeds.
+    model = clusters * dims * (fit_itemsize + max(itemsize, fit_itemsize)) + (
+        clusters * (fit_itemsize + 8)
+    )
+    # Each thread holds the distances of up to 256 rows to every centroid,
+    # its own centroid sums, and the row indices of one update.
+    threads = max(1, int(nthreads)) * (
+        clusters * (_KMEANS_THREAD_CHUNK_ROWS + dims + 1) * fit_itemsize
+        + update_rows * 4
+    )
+    if sizes.batch_size >= n_rows:
+        matrix = n_rows * dims * (itemsize + copy_itemsize)
+        # Sample weights and squared norms of every row, and the validation
+        # sample with its weights, row indices, and labels.
+        held = 2 * n_rows * fit_itemsize + init_size * (
+            dims * fit_itemsize + fit_itemsize + 12
+        )
+        seed = init_size * (dims * fit_itemsize + 8) + _kmeans_plusplus_bytes(
+            init_size, dims, clusters, fit_itemsize
+        )
+        # Each mini-batch draw takes the cumulative sums of float64 row
+        # probabilities, converted from float32 weights, while the row
+        # indices of the previous mini-batch are still held.
+        draw = n_rows * (16 if fit_itemsize == 4 else 8) + update_rows * 32
+        # A mini-batch holds its rows, their indices, labels, and a
+        # permutation, and the rows that replace rarely used centroids.
+        minibatch = update_rows * (dims * fit_itemsize + 20) + min(
+            clusters, update_rows
+        ) * (dims * fit_itemsize + 9)
+        steps = (
+            n_rows * fit_itemsize + update_rows * fit_itemsize + max(draw, minibatch)
+        )
+        labelling = n_rows * (fit_itemsize + 4) + update_rows * (fit_itemsize + 8)
+        return KMeansFitMemory(
+            peakBytes=matrix
+            + held
+            + max(seed, steps, labelling)
+            + model
+            + threads
+            + _KMEANS_OBJECT_BYTES,
+            streamResidentBytes=_KMEANS_OBJECT_BYTES
+            + (0 if block >= n_rows else n_rows * dims * itemsize),
+        )
+    # The seeding sample and its sorted row indices, beside the unsorted
+    # indices or the indices of one block's sampled rows.
+    sampling = init_size * (dims * itemsize + 16)
+    # k-means++ checks a float64 copy of a sample of another dtype, then seeds
+    # from the sample as it is, which float64 seeding bounds.
+    seed = init_size * (dims * itemsize + 8) + max(
+        init_size * dims * copy_itemsize,
+        _kmeans_plusplus_bytes(
+            init_size, dims, clusters, itemsize if native else max(8, itemsize)
+        ),
+    )
+    # The first update seeds scikit-learn's state from a subsample of
+    # ``init_size`` of its rows when it holds more.
+    subsample = (
+        init_size * (dims * fit_itemsize + 2 * fit_itemsize + 8)
+        if init_size < update_rows
+        else 0
+    )
+    updating = (
+        update_rows * dims * itemsize
+        + update_rows * (dims * copy_itemsize + 2 * fit_itemsize + 8)
+        + subsample
+        + model
+        + threads
+    )
+    labelling = (
+        n_rows * 4
+        + update_rows * 4
+        + block * (dims * copy_itemsize + fit_itemsize + 4)
+        + model
+        + threads
+    )
+    resident = max(sampling, updating, labelling) + _KMEANS_OBJECT_BYTES
+    return KMeansFitMemory(
+        peakBytes=max(resident, seed + _KMEANS_OBJECT_BYTES),
+        streamResidentBytes=resident,
+    )
+
+
 class KMeansInitializationStage:
     @staticmethod
     def fit(
@@ -359,44 +587,23 @@ class KMeansInitializationStage:
         kmeans_sampling: float = 0.1,
         kmeans_batch_size: int = 10_000,
     ) -> KMeansInitialization:
-        if n_rows == 0:
-            raise ValueError("K-means initialization requires at least one row")
-        if isinstance(kmeans_sampling, bool):
-            raise TypeError("kmeans_sampling must be a number")
-        try:
-            resolved_kmeans_sampling = float(kmeans_sampling)
-        except (TypeError, ValueError):
-            raise TypeError("kmeans_sampling must be a number") from None
-        if (
-            not math.isfinite(resolved_kmeans_sampling)
-            or not 0 < resolved_kmeans_sampling <= 1
-        ):
-            raise ValueError("kmeans_sampling must be greater than 0 and at most 1")
-        if isinstance(kmeans_batch_size, bool):
-            raise TypeError("kmeans_batch_size must be a positive integer")
-        try:
-            requested_kmeans_batch_size = operator.index(kmeans_batch_size)
-        except TypeError:
-            raise TypeError("kmeans_batch_size must be a positive integer") from None
-        if requested_kmeans_batch_size < 1:
-            raise ValueError("kmeans_batch_size must be a positive integer")
+        """Fit mini-batch k-means centroids and label every row."""
+        sizes = _kmeans_sizes(
+            n_rows,
+            batch_size=batch_size,
+            n_clusters=n_clusters,
+            kmeans_sampling=kmeans_sampling,
+            kmeans_batch_size=kmeans_batch_size,
+        )
         from sklearn.cluster import MiniBatchKMeans, kmeans_plusplus
         from sklearn.utils.random import sample_without_replacement
 
-        effective_clusters = min(
-            max(n_clusters, 2),
-            n_rows,
-        )
-        if effective_clusters < 2:
-            raise ValueError("K-means initialization requires at least two rows")
-        effective_kmeans_batch_size = min(
-            n_rows,
-            max(requested_kmeans_batch_size, effective_clusters),
-        )
-        init_size = min(
-            n_rows,
-            max(effective_clusters, math.ceil(n_rows * resolved_kmeans_sampling)),
-        )
+        resolved_batch_size = sizes.batch_size
+        in_memory = resolved_batch_size >= n_rows
+        resolved_kmeans_sampling = sizes.sampling
+        effective_clusters = sizes.clusters
+        effective_kmeans_batch_size = sizes.kmeans_batch_size
+        init_size = sizes.init_size
 
         def make_model(
             *,
@@ -416,6 +623,8 @@ class KMeansInitializationStage:
         def timed_blocks(
             message: str,
         ) -> Generator[tuple[int, np.ndarray, float, float]]:
+            # A read plan reserves only the blocks in flight, so neither this
+            # generator nor its consumer holds a block while the next is read.
             blocks = iter(stream.iter_coordinate_blocks(message))
             block_idx = 0
             while True:
@@ -433,6 +642,7 @@ class KMeansInitializationStage:
                     time.perf_counter() - wall_started,
                     time.process_time() - cpu_started,
                 )
+                del block
 
         with threadpool_limits(limits=nthreads):
             pools = sorted(
@@ -445,7 +655,9 @@ class KMeansInitializationStage:
             )
             logger.debug(
                 f"KMeans initialization plan: rows={n_rows} "
-                f"readBatchSize={batch_size} clusters={effective_clusters} "
+                f"batchSize={resolved_batch_size} "
+                f"fit={'in memory' if in_memory else 'streamed'} "
+                f"clusters={effective_clusters} "
                 f"samplingFraction={resolved_kmeans_sampling:.4f} "
                 f"initSize={init_size} "
                 f"kmeansBatchSize={effective_kmeans_batch_size} "
@@ -453,32 +665,73 @@ class KMeansInitializationStage:
             )
             coordinate_blocks = timed_blocks("Loading kmeans coordinates")
             try:
-                first_block = next(coordinate_blocks)
+                block_idx, block, read_seconds, read_cpu_seconds = next(
+                    coordinate_blocks
+                )
             except StopIteration:
                 raise ValueError(
                     "K-means initialization coordinate source is empty"
                 ) from None
-            block_idx, block, read_seconds, read_cpu_seconds = first_block
             if block.ndim != 2:
                 raise ValueError("K-means coordinate blocks must be two-dimensional")
-            if block.shape[0] == n_rows:
-                try:
-                    next(coordinate_blocks)
-                except StopIteration:
-                    pass
+            if in_memory:
+                if block.shape[0] == n_rows:
+                    values = block
+                    try:
+                        next(coordinate_blocks)
+                    except StopIteration:
+                        pass
+                    else:
+                        coordinate_blocks.close()
+                        raise ValueError(
+                            "K-means coordinate source yielded rows after a "
+                            "complete block"
+                        )
                 else:
-                    coordinate_blocks.close()
-                    raise ValueError(
-                        "K-means coordinate source yielded rows after a complete block"
-                    )
+                    # The stream splits the rows into several blocks; gather
+                    # them, so the fit sees the same rows as for one block.
+                    values = np.empty((n_rows, int(block.shape[1])), dtype=block.dtype)
+                    gathered_rows = 0
+                    while True:
+                        shutdown_checkpoint()
+                        if (
+                            block.ndim != 2
+                            or block.shape[1] != values.shape[1]
+                            or block.dtype != values.dtype
+                        ):
+                            raise ValueError(
+                                "K-means coordinate block dimensions changed"
+                            )
+                        block_stop = gathered_rows + int(block.shape[0])
+                        if block_stop > n_rows:
+                            raise ValueError(
+                                "K-means coordinate source has too many rows"
+                            )
+                        values[gathered_rows:block_stop] = block
+                        gathered_rows = block_stop
+                        del block
+                        try:
+                            block_idx, block, block_seconds, block_cpu_seconds = next(
+                                coordinate_blocks
+                            )
+                        except StopIteration:
+                            break
+                        read_seconds += block_seconds
+                        read_cpu_seconds += block_cpu_seconds
+                    if gathered_rows != n_rows:
+                        raise ValueError(
+                            f"K-means coordinate source contains {gathered_rows} "
+                            f"rows, expected {n_rows}"
+                        )
                 model = make_model()
                 compute_started = time.perf_counter()
                 compute_cpu_started = time.process_time()
-                model.fit(block)
+                model.fit(values)
                 compute_seconds = time.perf_counter() - compute_started
                 compute_cpu_seconds = time.process_time() - compute_cpu_started
-                logger.debug(
-                    f"KMeans minibatch fit block {block_idx}: rows={block.shape[0]} "
+                logger.opt(lazy=True).debug(
+                    f"KMeans in-memory minibatch fit: blocks={block_idx} "
+                    f"rows={values.shape[0]} "
                     f"read={read_seconds:.3f}s readCpu={read_cpu_seconds:.3f}s "
                     f"readCores={read_cpu_seconds / max(read_seconds, 1e-12):.2f} "
                     f"compute={compute_seconds:.3f}s "
@@ -487,7 +740,8 @@ class KMeansInitializationStage:
                     f"{compute_cpu_seconds / max(compute_seconds, 1e-12):.2f} "
                     f"steps={model.n_steps_} iterations={model.n_iter_} "
                     f"inertiaPerRow={float(model.inertia_) / n_rows:.6f} "
-                    f"rss={process_rss_mb():.0f} MiB"
+                    "rss={rss}",
+                    rss=rss_text,
                 )
                 return KMeansInitialization(
                     model=model,
@@ -530,7 +784,17 @@ class KMeansInitializationStage:
                     np.searchsorted(sample_indices, block_stop, side="left")
                 )
                 local_indices = sample_indices[sample_start:sample_stop] - rows_seen
-                sample[sample_start:sample_stop] = block[local_indices]
+                # The sampled rows are copied straight into the sample, without
+                # a temporary; the indices lie within the block by construction,
+                # so clipping never changes them.
+                np.take(
+                    block,
+                    local_indices,
+                    axis=0,
+                    out=sample[sample_start:sample_stop],
+                    mode="clip",
+                )
+                del local_indices, block
                 rows_seen = block_stop
                 sample_blocks += 1
                 sample_read_seconds += read_seconds
@@ -548,7 +812,7 @@ class KMeansInitializationStage:
                 )
             sample_seconds = time.perf_counter() - sample_started
             sample_cpu_seconds = time.process_time() - sample_cpu_started
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"KMeans sampling pass: blocks={sample_blocks} rows={rows_seen} "
                 f"sampleRows={init_size} wall={sample_seconds:.3f}s "
                 f"cpu={sample_cpu_seconds:.3f}s "
@@ -556,7 +820,8 @@ class KMeansInitializationStage:
                 f"{sample_cpu_seconds / max(sample_seconds, 1e-12):.2f} "
                 f"read={sample_read_seconds:.3f}s "
                 f"readCpu={sample_read_cpu_seconds:.3f}s "
-                f"rss={process_rss_mb():.0f} MiB"
+                "rss={rss}",
+                rss=rss_text,
             )
 
             seed_started = time.perf_counter()
@@ -568,12 +833,13 @@ class KMeansInitializationStage:
             )
             seed_seconds = time.perf_counter() - seed_started
             seed_cpu_seconds = time.process_time() - seed_cpu_started
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"KMeans centroid seeding: sampleRows={init_size} "
                 f"compute={seed_seconds:.3f}s cpu={seed_cpu_seconds:.3f}s "
                 f"effectiveCores="
                 f"{seed_cpu_seconds / max(seed_seconds, 1e-12):.2f} "
-                f"rss={process_rss_mb():.0f} MiB"
+                "rss={rss}",
+                rss=rss_text,
             )
             del sample, sample_indices
 
@@ -631,6 +897,7 @@ class KMeansInitializationStage:
                         model.partial_fit(update_buffer)
                         update_count += 1
                         buffered_rows = 0
+                del block
                 fit_compute_seconds += time.perf_counter() - compute_started
                 fit_compute_cpu_seconds += time.process_time() - compute_cpu_started
             if fitted_rows != n_rows:
@@ -646,7 +913,7 @@ class KMeansInitializationStage:
                 fit_compute_seconds += time.perf_counter() - compute_started
                 fit_compute_cpu_seconds += time.process_time() - compute_cpu_started
             del update_buffer
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"KMeans streaming fit: blocks={fit_blocks} rows={fitted_rows} "
                 f"updates={update_count} read={fit_read_seconds:.3f}s "
                 f"readCpu={fit_read_cpu_seconds:.3f}s "
@@ -654,7 +921,8 @@ class KMeansInitializationStage:
                 f"computeCpu={fit_compute_cpu_seconds:.3f}s "
                 f"computeCores="
                 f"{fit_compute_cpu_seconds / max(fit_compute_seconds, 1e-12):.2f} "
-                f"rss={process_rss_mb():.0f} MiB"
+                "rss={rss}",
+                rss=rss_text,
             )
 
             labels = np.empty(n_rows, dtype=np.uint32)
@@ -684,6 +952,7 @@ class KMeansInitializationStage:
                 compute_started = time.perf_counter()
                 compute_cpu_started = time.process_time()
                 labels[predicted_rows:block_stop] = model.predict(block)
+                del block
                 predict_compute_seconds += time.perf_counter() - compute_started
                 predict_compute_cpu_seconds += time.process_time() - compute_cpu_started
                 predicted_rows = block_stop
@@ -692,7 +961,7 @@ class KMeansInitializationStage:
                     f"K-means coordinate source contains {predicted_rows} rows, "
                     f"expected {n_rows}"
                 )
-            logger.debug(
+            logger.opt(lazy=True).debug(
                 f"KMeans prediction pass: blocks={predict_blocks} "
                 f"rows={predicted_rows} read={predict_read_seconds:.3f}s "
                 f"readCpu={predict_read_cpu_seconds:.3f}s "
@@ -700,7 +969,8 @@ class KMeansInitializationStage:
                 f"computeCpu={predict_compute_cpu_seconds:.3f}s "
                 f"computeCores="
                 f"{predict_compute_cpu_seconds / max(predict_compute_seconds, 1e-12):.2f} "
-                f"rss={process_rss_mb():.0f} MiB"
+                "rss={rss}",
+                rss=rss_text,
             )
         return KMeansInitialization(
             model=model,

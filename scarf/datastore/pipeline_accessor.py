@@ -1,11 +1,9 @@
-import tempfile
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
 from ..storage.artifacts import ArtifactRef, artifact_group
-from ..storage.feature_selection import read_feature_selection_indices
 from ..storage.pipeline_runs import (
     PipelineOutputRecord,
     abandon_pipeline_label_claim,
@@ -41,6 +39,9 @@ from ._pipeline_ledger import (
     interruption_record,
 )
 from ._pipeline_recipe import (
+    HVG_COUNT_DEFAULT,
+    NEIGHBORS_K_DEFAULT,
+    PCA_DIMS_DEFAULT,
     ResolvedPipelineRecipe,
     resolve_pipeline_recipe,
 )
@@ -54,6 +55,15 @@ from .pipeline_run import (
 # Preserve the documented event type's import and pickle identity after moving
 # its implementation into the ledger module.
 PipelineEvent.__module__ = __name__
+
+# The settings that make doublet scoring possible when the saved clustering
+# has one cluster. Silhouette selection never picks such a partition.
+_ONE_CLUSTER_DOUBLET_REMEDY = (
+    "Select a Leiden partition with two or more clusters with "
+    "params['leiden']['selected'], or omit 'selected' so that cluster selection "
+    "chooses one; set params['doublets']['heterotypic_fraction'] to 0 to simulate "
+    "doublets from any two sampled cells; or pass doublets=False."
+)
 
 
 class PipelineAccessor:
@@ -119,9 +129,9 @@ class PipelineAccessor:
         cell_key: str = "I",
         filtering: bool | Mapping[str, object] = True,
         harmony_batch_columns: Sequence[str] | None = None,
-        hvg_count: int = 1000,
-        pca_dims: int = 21,
-        neighbors_k: int = 11,
+        hvg_count: int = HVG_COUNT_DEFAULT,
+        pca_dims: int = PCA_DIMS_DEFAULT,
+        neighbors_k: int = NEIGHBORS_K_DEFAULT,
         umap: bool = True,
         leiden: Mapping[str, object] | bool = True,
         cell_cycle: bool = True,
@@ -138,7 +148,7 @@ class PipelineAccessor:
         forwards to that stage's function, so one mapping can configure a run:
 
         ``{"filtering": {"method": "manual", "lows": [...], "highs": [...]},
-        "hvg": {"min_mean": 0.01, "keep_bounds": True}, "pca": {"dims": 0},
+        "hvg": {"min_mean": 0.01, "keep_bounds": True}, "pca": {"dims": 30},
         "umap": {"n_epochs": 400}, "leiden": {"partitions": [0.8, 1.0],
         "selected": 1.0}, "tsne": {"max_iter": 800}}``
 
@@ -150,7 +160,8 @@ class PipelineAccessor:
         - ``hvg``, ``normalization``, ``pca``, ``ann_index``, ``neighbors``,
           ``connectivity``, ``embedding_initialization``: settings for stages
           that always run. ``pca`` ``dims=0`` skips PCA and builds the graph
-          on the normalized values of the selected features.
+          on the normalized values of the selected features; it requires
+          ``doublets=False`` and no Harmony batch columns.
         - ``harmony``: ``batch_columns`` plus Harmony settings, or False.
         - ``leiden``: ``partitions``, an optional ``selected`` resolution that
           becomes the saved clustering in place of the silhouette choice, and
@@ -164,6 +175,9 @@ class PipelineAccessor:
         setting cannot also be given through its shortcut argument, such as
         ``hvg_count`` with ``params["hvg"]["top_n"]``. Each stage validates
         its own values. The run records the resolved settings.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a cell of ``cell_key``.
         """
         if callback is not None and not callable(callback):
             raise TypeError("callback must be callable")
@@ -371,22 +385,6 @@ class PipelineAccessor:
         ledger.run("normalization", normalization_stage)
 
         def pca_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            if recipe.pca_dims == 0:
-                # Without PCA the graph uses the normalized values of the
-                # selected features, registered as an identity reduction.
-                n_features = len(
-                    read_feature_selection_indices(
-                        store.zw,
-                        recipe.assay,
-                        artifacts["highly_variable_features"],
-                    )
-                )
-                ref = store.run_custom_reduction(
-                    np.eye(n_features, dtype=np.float64),
-                    artifacts["normalized"],
-                )
-                artifacts["reduction"] = ref
-                return (("reduction", ref),)
             ref = store.run_pca(
                 artifacts["normalized"],
                 dims=recipe.pca_dims,
@@ -395,9 +393,18 @@ class PipelineAccessor:
             artifacts["pca"] = ref
             return (("pca", ref),)
 
-        ledger.run("pca", pca_stage)
-        reduction = artifacts["pca"] if recipe.pca_dims else artifacts["reduction"]
-        coordinates = reduction
+        if recipe.pca_dims:
+            ledger.run("pca", pca_stage)
+            coordinates = artifacts["pca"]
+        else:
+            # Without PCA the graph is built on the normalized values of the
+            # selected features, one coordinate per feature. The recipe has
+            # refused Harmony and doublet scoring, which need a PCA graph.
+            ledger.skip("pca")
+            coordinates = artifacts["normalized"]
+        # The uncorrected coordinates: the PCA that Harmony corrects and that
+        # the doublet graph of a corrected run is built on.
+        reduction = coordinates
         if recipe.harmony_batch_columns:
 
             def harmony_stage() -> Sequence[tuple[str, ArtifactRef]]:
@@ -540,14 +547,12 @@ class PipelineAccessor:
             ledger.skip("membership_strength")
 
         def tsne_stage() -> Sequence[tuple[str, ArtifactRef]]:
-            with tempfile.TemporaryDirectory(prefix="scarf-tsne-") as work_dir:
-                ref = store.run_tsne(
-                    artifacts["connectivity_map"],
-                    artifacts["embedding_initialization"],
-                    temp_file_loc=work_dir,
-                    verbose=False,
-                    **recipe.params_for("tsne"),
-                )
+            ref = store.run_tsne(
+                artifacts["connectivity_map"],
+                artifacts["embedding_initialization"],
+                verbose=False,
+                **recipe.params_for("tsne"),
+            )
             artifacts["tsne"] = ref
             return (("tsne", ref),)
 
@@ -593,6 +598,7 @@ class PipelineAccessor:
                     cluster_values=cluster_label_values(store.zw, clusters),
                     connectivity=doublet_graph,
                     feature_snapshot=feature_snapshot,
+                    one_cluster_remedy=_ONE_CLUSTER_DOUBLET_REMEDY,
                     **recipe.params_for("doublets"),
                 )
                 artifacts["doublets"] = ref
@@ -630,7 +636,6 @@ class PipelineAccessor:
             "highly_variable_features",
             "normalized",
             "pca",
-            "reduction",
             "harmony",
             "ann_index",
             "neighbors",

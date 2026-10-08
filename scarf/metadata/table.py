@@ -10,7 +10,6 @@ from ..storage.stores import metadata_workers, run_concurrently
 from ..storage.types import as_zarr_array
 from ..storage.arrays import (
     MISSING_MASK_PREFIX,
-    create_zarr_obj_array,
     linked_missing_mask,
 )
 from ..storage.metadata_keys import (
@@ -20,8 +19,8 @@ from ..storage.metadata_keys import (
     validate_metadata_column_name,
 )
 from ..utils.logging import logger
+from .encoding import checked_fill_value, missing_placeholder, nullable_values
 from .queries import (
-    _all_true,
     grep as _grep,
     head as _head,
     multi_sift as _multi_sift,
@@ -219,7 +218,32 @@ class MetaData:
             block_rows=block_rows,
         )
 
-    def _save(self, column_name: str, values: np.ndarray) -> None:
+    def _protect(self, column: str) -> None:
+        """Refuse a write that the store protects, before any value is read.
+
+        Whether or not ``column`` exists, a cell table refuses the columns of
+        prepared data and the membership column ``<assay>_I`` of each of its
+        assays, and a feature table the columns of prepared data (see
+        :func:`~scarf.storage.identity.protect_metadata_column`).
+        """
+        from ..storage.identity import protect_metadata_column
+
+        protect_metadata_column(self._group, column)
+
+    def _save(
+        self,
+        column_name: str,
+        values: np.ndarray,
+        missing: np.ndarray | None = None,
+    ) -> None:
+        """Write one value per row, flagging the ``missing`` rows in a mask.
+
+        The column is replaced through
+        :func:`~scarf.storage.identity.replace_metadata_column`, so a failed
+        write leaves the previous column, its attributes, and its mask.
+        Callers run :meth:`_protect` for the column before they read any
+        value, so the replacement does not check protection again.
+        """
         validate_metadata_column_name(column_name)
         if isinstance(self._group.get(column_name), zarr.Group):
             raise nested_group_error(column_name)
@@ -228,56 +252,61 @@ class MetaData:
                 f"ERROR: Values are of shape: {values.shape}. "
                 f"Expected shape is: ({self.N},)"
             )
-        from ..storage.identity import clear_column
+        if missing is not None and np.shape(missing) != (self.N,):
+            raise ValueError(
+                f"ERROR: The missing mask is of shape: {np.shape(missing)}. "
+                f"Expected shape is: ({self.N},)"
+            )
+        from ..storage.identity import replace_metadata_column
 
-        clear_column(self._group, column_name)
-        create_zarr_obj_array(
-            self._group,
-            column_name,
-            values,
-            values.dtype,
-        )
+        replace_metadata_column(self._group, column_name, values, missing)
 
-    def _fill_to_index(
+    def _expand_to_rows(
         self,
-        values: np.ndarray,
-        fill_value: Any,
+        values: Any,
         key: str,
-        auto_fill_disable: bool = False,
-    ) -> np.ndarray:
-        """Fill values that do not cover every metadata row."""
-        if not isinstance(values, np.ndarray):
-            values = np.array(values)
-        if auto_fill_disable is False:
-            if values.dtype == bool:
-                # Only the default NaN fill is replaced; an explicit value stays.
-                if isinstance(fill_value, float) and np.isnan(fill_value):
-                    fill_value = False
-            elif np.issubdtype(values.dtype, np.integer):
-                try:
-                    if np.isnan(fill_value):
-                        if min(values) > -1:
-                            fill_value = 0
-                        else:
-                            raise ValueError("`fill_value` should be an integer value.")
-                except TypeError:
-                    raise ValueError("`fill_value` should be an integer value.")
+        fill_value: Any = None,
+        *,
+        name: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return one value per row and the rows that are missing.
 
-        n_values = values.shape[0]
+        Values are typed by
+        :func:`~scarf.metadata.encoding.nullable_values`, which also finds the
+        missing values among them. Values for every row are returned as they
+        are. Values for the rows that the boolean column ``key`` selects are
+        spread to those rows, and each other row holds ``fill_value``: with
+        None, the placeholder of the dtype, flagged as missing; otherwise the
+        fill as a real value, which
+        :func:`~scarf.metadata.encoding.checked_fill_value` checks against the
+        dtype.
+
+        Raises:
+            ValueError: If the values cover neither every row nor the rows
+                that ``key`` selects, or the fill does not fit their dtype.
+        """
+        supplied, supplied_missing = nullable_values(values, name=name)
+        n_values = supplied.shape[0]
         if n_values == self.N:
-            return values
-
-        selected = np.asarray(self._bool_array(key)[:])
-        selected_count = selected.sum()
-        if len(values) != selected_count:
+            return supplied, supplied_missing
+        selected = np.asarray(self._bool_array(key)[:], dtype=bool)
+        selected_count = int(np.count_nonzero(selected))
+        if n_values != selected_count:
             raise ValueError(
                 f"ERROR: `values`  are of incorrect length ({n_values}). "
                 f" Chosen key ({key}) has {selected_count} active rows"
             )
-        filled = np.empty(self.N, dtype=values.dtype)
-        filled[selected] = values
-        filled[~selected] = fill_value
-        return filled
+        if fill_value is None:
+            dtype = supplied.dtype
+            fill = missing_placeholder(dtype)
+            missing = ~selected
+        else:
+            fill, dtype = checked_fill_value(fill_value, supplied.dtype)
+            missing = np.zeros(self.N, dtype=bool)
+        expanded = np.full(self.N, fill, dtype=dtype)
+        expanded[selected] = supplied
+        missing[selected] = supplied_missing
+        return expanded, missing
 
     def get_index_by(
         self,
@@ -291,6 +320,7 @@ class MetaData:
         and every row that matches a target is returned, in target order. With
         ``key``, indices are positions among the rows that ``key`` selects. A
         target that matches no row adds no index and is counted in a warning.
+        Rows flagged by the column's missing mask never match.
         """
         if not isinstance(value_targets, Iterable) or isinstance(value_targets, str):
             raise TypeError("ERROR: Please provide the `value_targets` as list")
@@ -299,10 +329,19 @@ class MetaData:
         else:
             values = self.fetch(column, key)
         index = CaseInsensitiveIndex(values)
+        mask = self._get_missing_mask_array(column)
+        missing = None if mask is None else np.asarray(mask[:], dtype=bool)
+        if missing is not None and key is not None:
+            missing = missing[self.active_index(key)]
         result: list[int] = []
         missing_count = 0
         for target in value_targets:
             positions = index.positions(target)
+            if missing is not None:
+                # A missing row holds a placeholder, not a value.
+                positions = [
+                    position for position in positions if not missing[position]
+                ]
             if not positions:
                 missing_count += 1
             result.extend(positions)
@@ -324,8 +363,8 @@ class MetaData:
     def insert(
         self,
         column_name: str,
-        values: np.ndarray | list,
-        fill_value: Any = np.nan,
+        values: np.ndarray | list | pd.Series | pd.api.extensions.ExtensionArray,
+        fill_value: Any = None,
         key: str = "I",
         overwrite: bool = False,
         force: bool = False,
@@ -342,6 +381,7 @@ class MetaData:
             raise ValueError(
                 f"ERROR: {column_name} is a protected column name in MetaData class."
             )
+        self._protect(column_name)
         if overwrite is False and self._has_column(column_name):
             raise ValueError(
                 f"ERROR: {column_name} already exists. Please set `overwrite` to "
@@ -352,17 +392,35 @@ class MetaData:
                 "'values' parameter is of `list` type and not `np.ndarray` as "
                 "expected. The correct dtype may not be assigned to the column"
             )
-        filled = self._fill_to_index(np.array(values), fill_value, key)
-        self._save(column_name, filled)
+        expanded, missing = self._expand_to_rows(
+            values, key, fill_value, name=column_name
+        )
+        if column_name in _RESERVED_COLUMNS and missing.any():
+            raise ValueError(
+                f"ERROR: {column_name} cannot hold missing values. Pass a value "
+                "for every row, or a `fill_value` for the rows that `key` does "
+                "not select."
+            )
+        self._save(column_name, expanded, missing)
 
     def update_key(self, values: np.ndarray, key: str) -> None:
         """Restrict a boolean metadata key using the supplied values."""
-        filled = self._fill_to_index(values, False, key)
-        filled = _all_true(np.array([filled, self.fetch_all(key)]))
-        self._save(key, filled)
+        validate_metadata_column_name(key)
+        self._protect(key)
+        supplied, missing = nullable_values(values, name=key)
+        if supplied.dtype.kind != "b":
+            raise TypeError(
+                f"ERROR: `values` must be booleans to restrict key {key!r}; "
+                f"found dtype {supplied.dtype}"
+            )
+        restriction, _ = self._expand_to_rows(supplied & ~missing, key, False, name=key)
+        current = np.asarray(self._bool_array(key)[:], dtype=bool)
+        self._save(key, restriction & current)
 
     def reset_key(self, key: str) -> None:
         """Set every value in a boolean metadata key to true."""
+        validate_metadata_column_name(key)
+        self._protect(key)
         values = np.array([True for _ in range(self.N)]).astype(bool)
         self._save(key, values)
 

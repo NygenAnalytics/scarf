@@ -36,6 +36,12 @@ class ObjectDownload:
     eTag: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class DeletedObjects:
+    objectCount: int
+    totalBytes: int
+
+
 def _load_local_env(path: Path = _ENV_PATH) -> None:
     if not path.is_file():
         return
@@ -216,3 +222,22 @@ def upload_file(source: str | Path, uri: str, *, createOnly: bool = False) -> No
 def delete_object(uri: str) -> None:
     store, key = open_r2_object(uri)
     store.delete(key)
+
+
+def delete_prefix(uri: str) -> DeletedObjects:
+    """Delete every object below ``uri``, treated as a directory such as a Zarr store.
+
+    Keys match whole path segments, so ``s3://bucket/a.zarr`` deletes
+    ``a.zarr/zarr.json`` but keeps ``a.zarr2/zarr.json`` and ``a.zarr.json``. The
+    objects are listed first and then deleted in the bulk requests of the backend.
+    """
+    store, key = open_r2_object(uri)
+    paths: list[str] = []
+    total_bytes = 0
+    for batch in store.list(f"{key.rstrip('/')}/"):
+        for meta in batch:
+            paths.append(meta["path"])
+            total_bytes += int(meta["size"])
+    if paths:
+        store.delete(paths)
+    return DeletedObjects(objectCount=len(paths), totalBytes=total_bytes)

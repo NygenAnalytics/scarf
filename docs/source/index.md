@@ -145,7 +145,7 @@ Scarf implements a computational stage itself when an external implementation wo
 It uses established libraries where they fit the streaming and provenance model.
 The aim is one coherent execution path, not reimplementation for its own sake.
 
-- **Reduction and graph construction:** streamed normalization, covariance (Gram-matrix) PCA with an incremental fallback, randomized streaming {term}`LSI`, approximate nearest-neighbour search, UMAP, {term}`densMAP`, and graph-based t-SNE.
+- **Reduction and graph construction:** streamed normalization, covariance (Gram-matrix) PCA with an incremental fallback, randomized streaming {term}`LSI`, approximate nearest-neighbour search, UMAP, {term}`densMAP`, and graph-based t-SNE through the optional `tsne` extra (see {ref}`Optional t-SNE <installation_tsne>`).
 - **Batch correction and mapping:** Scarf implementations of [Harmony](https://doi.org/10.1038/s41592-019-0619-0) and [Symphony-style](https://doi.org/10.1038/s41467-021-25957-x) fixed-reference mapping, with label transfer and mapping diagnostics.
 - **Matched multi-omics:** {term}`SNN integration` and [Hao-inspired WNN](https://doi.org/10.1016/j.cell.2021.04.048) integration for two or more assays, with WNN reporting one per-cell weight per modality.
 - **Clustering and sampling:** [Leiden](https://doi.org/10.1038/s41598-019-41695-z), a native implementation of [Paris hierarchical clustering](https://doi.org/10.48550/arXiv.1806.01664) with fixed and branch-adaptive cuts, and manifold-preserving {term}`TopACeDo` downsampling described in the [Scarf paper](https://doi.org/10.1038/s41467-022-32097-3).

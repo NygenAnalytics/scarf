@@ -52,8 +52,14 @@ class _MergeAssay:
         feature_ids,
         feature_names,
         block_size,
+        *,
+        assay_type=None,
     ):
+        from scarf.assay import resolve_persisted_assay_type
+
         self.name = name
+        # An open source carries the type its DataStore resolved for the assay.
+        self.assayType = resolve_persisted_assay_type(name, assay_type)
         self.rawData = ChunkedArray.from_numpy(
             np.asarray(counts),
             block_size=block_size,
@@ -96,6 +102,8 @@ class _MergeDataStore:
         self.memoryBytes = 1024**3
         self.resources = ResourceBudget(self.memoryBytes, self.nthreads)
         self.zarr_loc = zarr_loc
+        # A merge reads a source's root group for pending derived assays.
+        self.z = zarr.open_group(store=MemoryStore(), mode="w")
         self.workspace = None
 
     def get_assay(self, name):
@@ -2638,7 +2646,7 @@ def test_dataset_merge_metadata_admission_shrinks_under_budget(monkeypatch):
         prepend_text="",
         reset_cell_filter=True,
         source_column=None,
-        membership_assays=["RNA"],
+        membership={"RNA": ["all", "all"]},
         block_rows=10,
     )
     row_plan = build_row_plan([20, 20], [10, 10], ["left", "right"], seed=0)
@@ -3799,19 +3807,77 @@ def test_dataset_merge_blocks_tampered_completed_assay_components(
     assert reason in plan.blockedReason
 
 
-def test_resolve_assay_type_classifies_rna_subclass_instances() -> None:
-    from types import SimpleNamespace
-
-    from scarf.assay.rna import RNAassay
-
-    class TinyRNA(RNAassay):
-        def __init__(self) -> None:
-            pass
-
-    assert (
-        DataStoreMerge._resolve_assay_type(SimpleNamespace(), "custom", [TinyRNA()])
-        == "RNA"
+def _typed_source(label, values=((1, 2), (3, 4)), **assay_types):
+    """Return a source whose assays, named by keyword, carry these types."""
+    return _MergeDataStore(
+        [
+            _MergeAssay(
+                name,
+                [list(row) for row in values],
+                ["c0", "c1"],
+                [f"{name}0", f"{name}1"],
+                [f"{name.upper()}0", f"{name.upper()}1"],
+                block_size=2,
+                assay_type=assay_type,
+            )
+            for name, assay_type in assay_types.items()
+        ],
+        zarr_loc=f"memory://{label}",
     )
+
+
+def test_merge_records_the_declared_type_of_a_custom_named_assay() -> None:
+    # GeneActivity and HTO keep their declarations instead of the preset of
+    # their assay class, RNA and ADT.
+    types = {"tags": "RNA", "genes": "GeneActivity", "hashtags": "HTO"}
+    output = MemoryStore()
+    merger = DataStoreMerge(
+        [
+            _typed_source("left", **types),
+            _typed_source("right", ((5, 6), (7, 8)), **types),
+        ],
+        output,
+        ["left", "right"],
+        seed=0,
+        nthreads=1,
+    )
+
+    plan = merger.plan()
+    assert {assay.assayName: assay.assayType for assay in plan.assays} == types
+    assert {assay.assayName: assay.writeCountsT for assay in plan.assays} == {
+        "tags": True,
+        "genes": True,
+        "hashtags": False,
+    }
+    assert plan.manifest["assayTypes"] == types
+    merger.dump()
+    root = zarr.open_group(store=output, mode="r")
+    assert root.attrs["assayTypes"] == types
+    assert root["tags/countsT"].attrs["complete"] is True
+
+
+@pytest.mark.parametrize(("first", "second"), [("RNA", "Assay"), ("ADT", "HTO")])
+def test_merge_rejects_sources_that_declare_different_assay_types(first, second):
+    destination = MemoryStore()
+    merger = DataStoreMerge(
+        [_typed_source("left", tags=first), _typed_source("right", tags=second)],
+        destination,
+        ["left", "right"],
+        seed=0,
+        nthreads=1,
+    )
+    message = (
+        rf"Sources declare different types for assay 'tags': 'left' declares "
+        rf"'{first}' and 'right' declares '{second}'.*zarr_mode='r\+' and "
+        rf"assay_types=\{{'tags': "
+    )
+
+    with pytest.raises(ValueError, match=message):
+        merger.plan()
+    with pytest.raises(ValueError, match=message):
+        merger.dump()
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")
 
 
 @pytest.mark.parametrize("feature_ids", [["a", "a"], ["different_a", "different_b"]])
@@ -4767,3 +4833,200 @@ def test_dataset_merge_below_one_feature_metadata_row_fails_before_the_destinati
     with pytest.raises(MemoryError, match=message):
         merger.dump()
     assert not path.exists()
+
+
+_MEMBERSHIP_ATTRIBUTES = {"role": "assay_membership", "assay": "ADT"}
+_PARTIAL_IDS = ["c0", "c1", "c2", "c3"]
+_PARTIAL_ADT = [[0, 0], [5, 1], [0, 0], [2, 7]]
+
+
+def _partial_adt_sources(
+    membership=(False, True, False, True),
+    *,
+    attributes=_MEMBERSHIP_ATTRIBUTES,
+    missing=None,
+    adt=_PARTIAL_ADT,
+    chunk_rows=None,
+):
+    """Return a left source whose ADT measures some cells and a right source.
+
+    The left source's cell table is a Zarr-backed table, as a DataStore holds
+    it, whose ``ADT_I`` column carries ``membership`` with ``attributes`` and,
+    when ``missing`` is given, a linked missing mask. Its columns have chunks
+    of ``chunk_rows`` rows when given. The right source measures every cell
+    with both assays.
+    """
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    columns = {
+        "ids": np.asarray(_PARTIAL_IDS),
+        "names": np.asarray(_PARTIAL_IDS),
+        "I": np.ones(len(_PARTIAL_IDS), dtype=bool),
+        "ADT_I": np.asarray(membership),
+        "ADT_nCounts": np.asarray(adt).sum(axis=1).astype(np.float64),
+        "ADT_nFeatures": (np.asarray(adt) > 0).sum(axis=1).astype(np.float64),
+    }
+    for name, values in columns.items():
+        group.create_array(
+            name, data=values, chunks="auto" if chunk_rows is None else (chunk_rows,)
+        )
+    group["ADT_I"].attrs.update(attributes)
+    if missing is not None:
+        group.create_array("__scarf_missing__ADT_I", data=np.asarray(missing))
+        group["ADT_I"].attrs["missing_mask"] = "__scarf_missing__ADT_I"
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1, 2], [3, 4], [5, 6], [7, 8]],
+                _PARTIAL_IDS,
+                ["g0", "g1"],
+                ["G0", "G1"],
+                block_size=2,
+            ),
+            _MergeAssay(
+                "ADT", adt, _PARTIAL_IDS, ["a0", "a1"], ["A0", "A1"], block_size=2
+            ),
+        ],
+        zarr_loc="memory://left",
+    )
+    left.cells = MetaData(group)
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA", [[9, 9], [8, 8]], ["c0", "c1"], ["g0", "g1"], ["G0", "G1"], 2
+            ),
+            _MergeAssay(
+                "ADT", [[3, 3], [4, 4]], ["c0", "c1"], ["a0", "a1"], ["A0", "A1"], 2
+            ),
+        ],
+        zarr_loc="memory://right",
+    )
+    return left, right
+
+
+def test_merge_keeps_each_source_cells_assay_membership():
+    left, right = _partial_adt_sources()
+    output = MemoryStore()
+    merger = DataStoreMerge([left, right], output, ["left", "right"], seed=0)
+
+    plan = merger.plan()
+    assert plan.manifest["sourceMembership"]["RNA"] == ["all", "all"]
+    left_state, right_state = plan.manifest["sourceMembership"]["ADT"]
+    assert len(left_state) == 64 and right_state == "all"
+    merger.dump()
+
+    root = zarr.open_group(store=output, mode="r")
+    assert _rows_by_id(root, "cellData/ADT_I") == {
+        "left__c0": False,
+        "left__c1": True,
+        "left__c2": False,
+        "left__c3": True,
+        "right__c0": True,
+        "right__c1": True,
+    }
+    assert set(_rows_by_id(root, "cellData/RNA_I").values()) == {True}
+    assert root["cellData/ADT_I"].attrs.asdict() == _MEMBERSHIP_ATTRIBUTES
+    # The source membership is not also merged as an ordinary column, which
+    # the default prefix would have named orig_ADT_I.
+    assert not {"orig_ADT_I", "orig_RNA_I"}.intersection(root["cellData"].array_keys())
+
+
+def test_merge_strips_membership_attributes_from_ordinary_columns():
+    # The left source lacks ADT, so its ADT_I is an ordinary column.
+    left, right = _partial_adt_sources()
+    left._assays.pop("ADT")
+    left.assay_names.remove("ADT")
+    output = MemoryStore()
+
+    DataStoreMerge([left, right], output, ["left", "right"], seed=0).dump()
+
+    root = zarr.open_group(store=output, mode="r")
+    assert "role" not in root["cellData/orig_ADT_I"].attrs
+    assert "assay" not in root["cellData/orig_ADT_I"].attrs
+    assert _rows_by_id(root, "cellData/ADT_I") == {
+        "left__c0": False,
+        "left__c1": False,
+        "left__c2": False,
+        "left__c3": False,
+        "right__c0": True,
+        "right__c1": True,
+    }
+
+
+def test_merge_rejects_an_ordinary_column_named_like_a_merged_membership():
+    left, right = _partial_adt_sources()
+    left._assays.pop("ADT")
+    left.assay_names.remove("ADT")
+    destination = MemoryStore()
+    merger = DataStoreMerge(
+        [left, right], destination, ["left", "right"], prepend_text=None, seed=0
+    )
+
+    message = (
+        "Cell column 'ADT_I' of source 'left' would be merged as 'ADT_I', which "
+        "is the merged membership column of assay 'ADT'"
+    )
+    with pytest.raises(ValueError, match=message):
+        merger.plan()
+    with pytest.raises(ValueError, match=message):
+        merger.dump()
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        (
+            {"attributes": {}},
+            r"has attributes \{'role': None, 'assay': None\}.*cells\.drop\('ADT_I'\)",
+        ),
+        (
+            {"missing": [False, False, True, False]},
+            "has a missing-value mask.*Import the data again",
+        ),
+        (
+            {"membership": np.asarray([0, 1, 0, 1], dtype=np.uint8)},
+            "has dtype uint8.*Import the data again",
+        ),
+    ],
+    ids=["plain", "masked", "not_bool"],
+)
+def test_merge_rejects_a_malformed_membership_column_before_writing(options, reason):
+    left, right = _partial_adt_sources(**options)
+    destination = MemoryStore()
+    merger = DataStoreMerge([left, right], destination, ["left", "right"], seed=0)
+
+    message = (
+        f"Cell column 'ADT_I' is reserved for the membership of assay 'ADT'.*{reason}"
+    )
+    with pytest.raises(ValueError, match=message):
+        merger.plan()
+    with pytest.raises(ValueError, match=message):
+        merger.dump()
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")
+
+
+def test_merge_rejects_counts_in_cells_outside_the_assay():
+    # c2 has ADT counts, but the left source marks it as not measured; counts
+    # that cancel to a zero total are counts too. Two-row chunks put c2 in the
+    # second block of the membership column.
+    left, right = _partial_adt_sources(
+        membership=(True, True, False, True),
+        adt=[[0, 0], [5, 1], [1, -1], [2, 7]],
+        chunk_rows=2,
+    )
+    destination = MemoryStore()
+    merger = DataStoreMerge([left, right], destination, ["left", "right"], seed=0)
+
+    message = (
+        "Source 'left' has ADT counts in 1 of the cells that its column 'ADT_I' "
+        "marks as not measured by assay 'ADT'"
+    )
+    with pytest.raises(ValueError, match=message):
+        merger.plan()
+    with pytest.raises(ValueError, match=message):
+        merger.dump()
+    with pytest.raises(GroupNotFoundError):
+        zarr.open_group(destination, mode="r")

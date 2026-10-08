@@ -44,10 +44,14 @@ class CrToZarr:
         lines_in_mem: Matrix Market lines parsed at a time (Matrix Market
                       readers only). The layout fit and the write reserve
                       this parse buffer.
+        overwrite: If True, replace a Scarf store that no ``DataStore`` has opened.
 
     Each assay stores its counts in the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
     canonical values of its own features over the selected cells.
+
+    Raises:
+        FileExistsError: If ``zarr_loc`` is not empty, unless ``overwrite`` replaces it.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
@@ -67,6 +71,8 @@ class CrToZarr:
         io: StorageIoPolicy | None = None,
         assay_types: dict[str, str] | None = None,
         lines_in_mem: int = 100_000,
+        *,
+        overwrite: bool = False,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -74,8 +80,8 @@ class CrToZarr:
             create_zarr_count_assay,
             validate_assay_name,
         )
-        from ..storage.stores import load_zarr
-        from .counts_t import validate_assay_type
+        from ..storage.destinations import check_destination, create_destination
+        from ..assay.classification import validate_assay_type
 
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
@@ -95,11 +101,16 @@ class CrToZarr:
             raise ValueError(
                 f"assay_types names assays that are not imported: {', '.join(unknown)}"
             )
-        for assay_type in self.assayTypes.values():
-            validate_assay_type(assay_type)
+        for name, assay_type in self.assayTypes.items():
+            validate_assay_type(assay_type, assay=name)
         if lines_in_mem <= 0:
             raise ValueError("lines_in_mem must be positive")
         self.linesInMem = lines_in_mem
+        # A destination that would be refused fails before the pass over
+        # the counts; create_destination checks it again.
+        check_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         ranges = assay_feature_ranges(self.cr.assayFeats)
         groups = np.full(self.cr.nFeatures, -1, dtype=np.int64)
         for code, spans in enumerate(ranges.values()):
@@ -116,7 +127,10 @@ class CrToZarr:
         logger.debug(f"Resolved Cell Ranger count storage dtypes={storage_dtypes}")
         # A layout that does not fit fails here, before the destination exists.
         layout = self._fit_count_layout(storage_dtypes, policy)
-        self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
+        # The destination must be empty, or with overwrite an unprepared store.
+        self.z = create_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         cell_group = create_cell_data(
             root=self.z,
             workspace=self.workspace,
@@ -219,6 +233,7 @@ class CrToZarr:
         cell_group: Any,
         assay_names: tuple[str, ...],
     ) -> None:
+        from ..metadata.membership import reserved_membership_columns
         from ..storage.metadata_keys import metadata_column_keys
         from ..storage.types import as_zarr_group
         from ._store import keyed_metadata_columns, write_metadata_column
@@ -228,14 +243,17 @@ class CrToZarr:
         cell_columns = getattr(self.cr, "get_cell_columns", None)
         if callable(cell_columns):
             columns = list(cell_columns())
+            # The membership column name of every imported assay is reserved.
+            reserved = reserved_membership_columns(assay_names)
             keys = metadata_column_keys(
                 (name for name, _values in columns),
-                taken=cell_group.keys(),
+                taken=[*cell_group.keys(), *reserved],
             )
             for key, (name, raw_values) in keyed_metadata_columns(
                 ((name, (name, values)) for name, values in columns),
                 keys,
                 "cell",
+                membership=reserved,
             ):
                 values = np.asarray(raw_values)
                 if values.ndim != 1 or values.size != self.cr.nCells:

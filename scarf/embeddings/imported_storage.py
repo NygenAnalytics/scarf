@@ -21,6 +21,7 @@ from ..storage.artifacts import (
     require_complete_artifact,
 )
 from ..storage.errors import ArtifactResolutionError
+from ..storage.finite_values import FiniteRowWriter
 from ..storage.geometry import array_geometry
 from ..storage.layout import _group_zarr_format, row_sharded_array_spec
 from ..storage.partition import row_band
@@ -145,6 +146,11 @@ class ImportedArtifactStorage:
                 fill_value=0.0,
             ),
         )
+
+    @staticmethod
+    def finite_rows(array: zarr.Array) -> FiniteRowWriter:
+        """Return a checked writer of ``array`` for import_dimreduc."""
+        return FiniteRowWriter(array, operation="import_dimreduc")
 
     @staticmethod
     def create_metadata(

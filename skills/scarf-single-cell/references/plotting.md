@@ -24,14 +24,19 @@ artifact refs. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/plotting.
   writable store `cluster_tree` caches `dendrogram` and `coalesced_tree` artifacts.
 - `show=True` is the default. In a script it draws nothing on Agg and closes a Scarf-owned figure.
   Pass `show=False`, save, then `close()`.
-- Run mode, embedding and embedding_raster only: `run=run`, `layout="umap"` (default), and
-  `color_by` set to one string from `run.cells.columns`. No genes, live columns, lists, `CellField`,
-  `facet_by`, `subset_by`, `normalization` or `Highlight(by=...)`.
+- Run mode, embedding and embedding_raster only: `run=run`, `layout="umap"` (default). Cells are
+  the run's cells, and every cell input names a frozen field from `run.cells.columns`, as a string
+  or `CellField`: `color_by` (one or a list), `facet_by`, `subset_by`, `Highlight(by=...)`,
+  `DensityOverlay(group_by=...)`. `color_by` also takes run outputs (`run["leiden_1.0"]`), and genes
+  or `FeatureRef` with an explicit `normalization=` (live counts of the run's cells). No live
+  columns, other refs, `point_sizes`, `cell_key` or other assays. `embedding_raster` takes one
+  frozen field. `provenance.extras["run"]` holds `runId` and `label`.
 - Ref mode, everything else: `layout=run["umap"]`, `color_by=` an `ArtifactRef`, a live metadata
   column, a gene name, `FeatureRef`, `CellField`, or a list of these (one panel each). Cells come
   from the layout artifact's selection; live columns are aligned to it.
 - Helpers in `scarf.plotting`: `CellField(key, kind="auto"|"categorical"|"continuous", label=)`,
-  `FeatureRef(value, assay=None, by="name"|"id"|"index", label=, reduction=)`,
+  `FeatureRef(value, assay=None, by="name"|"id"|"index", label=, reduction=)` (`value` is a
+  string for `name` and `id` and an integer for `index`),
   `NormalizationSpec(source="assay"|"raw", transform="none"|"log1p")`,
   `ColorScale(cmap, vmin, vmax, vcenter, quantiles, missing_color, scope, scale)`,
   `CategoricalScale(order, palette, labels, missing_color, missing_label, palette_name)`,
@@ -78,6 +83,18 @@ for field in ("clusters", "leiden_1.0", "doublet_score", "cell_cycle_phase"):
     r.close()
 r = ds.plots.embedding_raster(run=run, color_by="doublet_score", show=False)
 r.close()
+# Several panels, faceted by a column frozen with snapshot_columns=("sample_id",), plus a gene.
+r = ds.plots.embedding(
+    run=run,
+    color_by=["clusters", run["leiden_1.0"], "CD3D"],
+    # Genes need normalization= in run mode. log1p suits RNA library-size values; for CLR (ADT),
+    # norm_lib_size_log, or ATAC values, which it rejects, use NormalizationSpec() or source="raw".
+    normalization=splt.NormalizationSpec(transform="log1p"),
+    facet_by="sample_id",
+    show=False,
+)
+r.provenance.extras["run"]  # {"runId": ..., "label": "baseline"}
+r.close()
 ```
 
 ### Color by cluster artifacts, metadata and genes
@@ -90,7 +107,7 @@ umap = run["umap"]
 r = ds.plots.embedding(
     layout=umap,
     color_by=[run["clusters"], "CD3D", "MS4A1", "LYZ"],
-    normalization=splt.NormalizationSpec(transform="log1p"),
+    normalization=splt.NormalizationSpec(transform="log1p"),  # RNA library-size values only
     color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
     sort_values=True,
     show=False,
@@ -153,24 +170,31 @@ ds.plots.distribution("baseline_doublet_score", grouping=run["clusters"], show=F
 ### Dot plots, matrix plots and marker heatmaps
 
 Here `groups=` is the cluster `ArtifactRef`; `group_by=` names a live column instead and groups
-the cells of `cell_key` (default `"I"`, not the run's cells). The aggregate table's group column is
-`groups` for `groups=`, and the column's own name for `group_by=` (one column per name in a tuple).
+the cells of `cell_key` (default `"I"`, not the run's cells). Table columns are named by role,
+whatever the grouping column is called: `group` (the `groups=` labels or the first `group_by`
+key), `subgroup` (a second `group_by` key) and, with `sample_by`, `sample`.
+`provenance.extras["group_by"]` names the source columns.
 
 ```python
 panel = {"T": ["CD3D", "IL7R"], "B": ["MS4A1", "CD79A"], "NK": ["NKG7", "GNLY"]}
 r = ds.plots.dotplot(features=panel, groups=run["clusters"], standardize="feature", show=False)
-r.tables["aggregate"].head()  # groups, feature, feature_group, mean, fraction, n_cells, variance
+r.tables["aggregate"].head()  # group, feature, feature_group, mean, fraction, n_cells, variance,
+# and zscore: standardize keeps mean raw and colors by zscore (extras["color_values"]);
+# tables["per_sample"] (with sample_by) has no zscore
 r.save("figures/dotplot.png", dpi=150)
 r.close()
 r = ds.plots.dotplot(features=panel, group_by="cell_type", show=False)
-agg = r.tables["aggregate"]  # cell_type, feature, feature_group, mean, fraction, n_cells, variance
-fraction = agg.pivot(index="cell_type", columns="feature", values="fraction")  # not "groups"
+agg = r.tables["aggregate"]  # group holds the cell_type values
+fraction = agg.pivot(index="group", columns="feature", values="fraction")
 r.close()
-ds.plots.matrixplot(
+r = ds.plots.matrixplot(
     features=["CD3D", "MS4A1", "LYZ"], groups=run["clusters"], cluster_groups=True, show=False
-).close()
+)
+r.tables["matrix"]  # the drawn values: index "feature" (rows), columns "group"
+r.close()
 r = ds.plots.marker_heatmap(marker=run["markers"], topn=3, show=False)
 r.tables["markers"].head()  # group, rank, feature_index, score, feature
+r.tables["matrix"]  # standardized group means, axes named "feature" and "group" as above
 r.close()
 ```
 
@@ -220,7 +244,7 @@ plt.close(fig)
 | --- | --- | --- |
 | `show` | `True` | Always `False` in scripts; then `save` and `close`. |
 | `layout` / `layout_key` | none; exactly one required (run mode: `"umap"`) | `layout_key` only for coordinates you inserted as metadata columns. |
-| `normalization` | `NormalizationSpec()` (assay normalization, no transform) | `transform="log1p"` for gene panels. |
+| `normalization` | `NormalizationSpec()` (assay normalization, no transform) | `transform="log1p"` for gene panels of RNA library-size values; CLR (ADT), `norm_lib_size_log`, and ATAC values raise, so use `NormalizationSpec()` or `source="raw"` for them. Run mode colors genes only when it is passed. |
 | `color_scale` | auto per feature | `quantiles=(0.0, 0.99)` to stop outliers washing out a gene. |
 | `categorical_scale` | default palette | Fix `order` or `palette` (dict) to keep colors identical; `palette_name` is only `"default"` or `"colorblind"`. |
 | `sort_values` | `False` | `True` draws high values last for expression panels. |
@@ -238,19 +262,26 @@ plt.close(fig)
 
 ## Pitfalls
 
-- Run mode rejects anything but one frozen field: a gene or live column raises `KeyError`, a list
-  or `CellField` raises `TypeError`, `facet_by`/`subset_by`/`normalization` raise `ValueError`.
-  Switch to `layout=run["umap"]`.
+- Run mode reads only the run. A live column, or any name that is neither a frozen field nor a
+  gene, raises `KeyError` listing the run's fields; a ref that is not a run output, and a gene
+  without `normalization=`, raise `ValueError`. Freeze live columns with `snapshot_columns=` when
+  running the pipeline, or switch to `layout=run["umap"]`.
 - `layout="umap"` without `run=` raises `TypeError`. The pipeline writes no `RNA_UMAP*` columns,
   so `layout_key="RNA_UMAP"` fails on pipeline-only stores.
 - `groups` filters categories in `embedding` and `distribution` but is the cluster ref in
-  `dotplot`, `matrixplot` and `cluster_connectivity`. Pivoting a `group_by=` aggregate on
-  `"groups"` raises `KeyError: 'groups'`.
+  `dotplot`, `matrixplot` and `cluster_connectivity`. Their tables call the grouping column
+  `group`, never `groups` or the `group_by` column's name.
 - `CategoricalScale(palette_name="tab20")` raises `ValueError`; pass `palette={label: color}`.
 - The same clusters get different colors in run mode and ref mode; pass a `CategoricalScale`
   when figures must match.
 - A run opened from another `DataStore` object raises `ValueError` in plots.
 - Unclosed `show=False` figures accumulate in long loops.
+- On a merged store, a gene has no value in cells that its assay did not measure (`<assay>_I`
+  False): embeddings draw them in `missing_color`, distributions drop them, and dot and matrix
+  plots compute `mean`, `fraction`, and `n_cells` over measured cells only, so a group without a
+  measured cell has `n_cells` 0 and NaN statistics. `provenance.extras["unmeasured_cells"]`
+  counts them per assay; a gene panel with no measured cell raises `ValueError` naming
+  `subset_by="<assay>_I"`.
 
 ## See also
 

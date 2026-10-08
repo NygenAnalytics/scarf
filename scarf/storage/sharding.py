@@ -30,6 +30,7 @@ from .count_matrix import (
     validate_count_matrix_source,
 )
 from .io_policy import DEFAULT_STORAGE_IO_POLICY, StorageIoPolicy
+from .finite_values import NonFiniteArtifactError, first_nonfinite_row
 from .geometry import ArrayGeometry, array_geometry
 from .layout import (
     ZarrArraySpec,
@@ -843,12 +844,20 @@ def write_dense_from_row_batches(
     producerReserveBytes: int | None = None,
     residentBytes: int = 0,
     countSummary: "CountSummary | None" = None,
+    requireFinite: bool = False,
+    operation: str | None = None,
 ) -> int:
     """Align source batches to destination row bands and write them in parallel.
 
     Bands hold ``dtype``, the destination dtype by default. A value that an
     integer ``dtype`` cannot hold raises OverflowError instead of wrapping.
+    With ``requireFinite``, a NaN or infinite value raises NonFiniteArtifactError.
     """
+    if requireFinite and not operation:
+        raise ValueError("requireFinite needs the operation that produced the values")
+    if requireFinite and np.dtype(dst.dtype).kind not in "fc":
+        raise TypeError("requireFinite needs a floating-point destination")
+    checked_operation = operation if requireFinite else None
     resources = resources or resolve_budget()
     source = iter(batches)
     if int(dst.shape[0]) == 0:
@@ -886,7 +895,7 @@ def write_dense_from_row_batches(
             else producerReserveBytes
         )
         n_bands = (int(dst.shape[0]) + shard_rows - 1) // shard_rows
-        operation = plan_dense_write(
+        write_plan = plan_dense_write(
             dst,
             resources,
             n_bands,
@@ -937,7 +946,23 @@ def write_dense_from_row_batches(
                         # A value the integer dtype cannot hold raises instead
                         # of wrapping.
                         rows = checked_sparse_cast(rows, target_dtype)
-                    buffer[buffered_rows : buffered_rows + copied] = rows
+                    band_rows = buffer[buffered_rows : buffered_rows + copied]
+                    if checked_operation is not None:
+                        # A value that overflows the band dtype, or the
+                        # destination dtype that the write casts it to,
+                        # becomes infinite, so the cast rows are checked.
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            band_rows[...] = rows
+                            stored_rows = band_rows.astype(dst.dtype, copy=False)
+                        bad_row = first_nonfinite_row(stored_rows)
+                        if bad_row is not None:
+                            raise NonFiniteArtifactError(
+                                checked_operation,
+                                dst.basename,
+                                position + buffered_rows + bad_row,
+                            )
+                    else:
+                        band_rows[...] = rows
                     buffered_rows += copied
                     source_start += copied
                     if buffered_rows == shard_rows:
@@ -962,7 +987,7 @@ def write_dense_from_row_batches(
             _close_iterator(source)
 
     target = writable(dst)
-    workers = min(operation.computeWorkers, operation.writeWorkers)
+    workers = min(write_plan.computeWorkers, write_plan.writeWorkers)
     write_seconds: list[float] = []
 
     def write_band(band: _DenseWriteBand) -> int:
@@ -980,7 +1005,7 @@ def write_dense_from_row_batches(
                 write_band,
                 workers=workers,
                 within_block_threads=1,
-                io_concurrency=operation.ioConcurrency,
+                io_concurrency=write_plan.ioConcurrency,
                 msg=msg or "Writing Zarr array",
                 total=n_bands,
             )
@@ -992,7 +1017,7 @@ def write_dense_from_row_batches(
         )
     record_execution_report(
         ExecutionReport(
-            plan=operation,
+            plan=write_plan,
             unitKind="denseRowBand",
             actualReadWorkers=1,
             actualComputeWorkers=workers,
@@ -1002,6 +1027,21 @@ def write_dense_from_row_batches(
         )
     )
     return total_rows
+
+
+def _checked_band(
+    values: np.ndarray,
+    dst: zarr.Array,
+    operation: str,
+    start: int,
+) -> np.ndarray:
+    """Return a band cast to the dtype of ``dst``, refusing NaN and infinity."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        stored = values.astype(dst.dtype, copy=False)
+    bad_row = first_nonfinite_row(stored)
+    if bad_row is not None:
+        raise NonFiniteArtifactError(operation, dst.basename, start + bad_row)
+    return stored
 
 
 def write_dense_in_shard_rows(
@@ -1018,10 +1058,20 @@ def write_dense_in_shard_rows(
     producerBytes: int = 0,
     resultBytes: int = 0,
     countSummary: "CountSummary | None" = None,
+    requireFinite: bool = False,
+    operation: str | None = None,
 ) -> Any | None:
-    """Produce and write complete destination row bands in the same worker."""
+    """Produce and write complete destination row bands in the same worker.
+
+    With ``requireFinite``, a NaN or infinite value raises NonFiniteArtifactError.
+    """
     if (summarize is None) != (merge_summary is None):
         raise ValueError("summarize and merge_summary must be provided together")
+    if requireFinite and not operation:
+        raise ValueError("requireFinite needs the operation that produced the values")
+    if requireFinite and np.dtype(dst.dtype).kind not in "fc":
+        raise TypeError("requireFinite needs a floating-point destination")
+    checked_operation = operation if requireFinite else None
     merger = merge_summary
     resources = resources or resolve_budget()
     n_rows = int(dst.shape[0])
@@ -1034,7 +1084,7 @@ def write_dense_in_shard_rows(
     ):
         raise ValueError("Mirror array must have matching shape and row-band layout")
     slices = list(iter_shard_row_slices(n_rows, rows))
-    operation = plan_dense_write(
+    plan = plan_dense_write(
         dst,
         resources,
         len(slices),
@@ -1044,12 +1094,8 @@ def write_dense_in_shard_rows(
         resultBytes=resultBytes,
         mirror=also_write_to,
     )
-    workers = (
-        1
-        if in_shard_context()
-        else min(operation.computeWorkers, operation.writeWorkers)
-    )
-    inner = operation.ioConcurrency
+    workers = 1 if in_shard_context() else min(plan.computeWorkers, plan.writeWorkers)
+    inner = plan.ioConcurrency
     target = writable(dst)
     mirror = None if also_write_to is None else writable(also_write_to)
 
@@ -1061,6 +1107,10 @@ def write_dense_in_shard_rows(
             raise ValueError(
                 f"Dense producer returned shape {block.shape}, expected {expected}"
             )
+        if checked_operation is not None:
+            # The produced band is released once it is cast, before the
+            # write.
+            block = _checked_band(block, dst, checked_operation, start)
         if countSummary is not None:
             countSummary.update(start, block)
         target[start:end, :] = block
@@ -1074,7 +1124,7 @@ def write_dense_in_shard_rows(
         slices,
         produce_and_write,
         workers=workers,
-        within_block_threads=operation.threadsPerComputeWorker,
+        within_block_threads=plan.threadsPerComputeWorker,
         io_concurrency=inner,
         msg=msg or "Writing Zarr array",
         total=len(slices),
@@ -1085,7 +1135,7 @@ def write_dense_in_shard_rows(
             summary = result if summary is None else merger(summary, result)
     record_execution_report(
         ExecutionReport(
-            plan=operation,
+            plan=plan,
             unitKind="countsRowBand",
             actualReadWorkers=workers,
             actualComputeWorkers=workers,

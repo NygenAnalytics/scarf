@@ -248,6 +248,7 @@ doublets = ds.run_doublet_detection(scaffold["clusters"], scaffold["connectivity
 | `method=` (`min_p`, `max_p`) | `"mad"` | `"gaussian"` only to reproduce the old policy; `min_p`/`max_p` with MAD raise. |
 | `pipeline.run(filtering=False, cell_cycle=False, paris=False)` | filtering on | Scaffold run for the label-free audit. |
 | `run_doublet_detection(random_seed=)` | `4444` | Keep fixed; change only to test score stability. |
+| `run_doublet_detection(heterotypic_fraction=)` | `0.8` | `0` only for a clustering with one cluster, which raises `ValueError` above 0; it then pairs any two sampled cells. |
 
 ## Check before moving on
 

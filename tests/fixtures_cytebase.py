@@ -122,6 +122,7 @@ def cytebase_offline(monkeypatch, tmp_path):
     for name in (
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
+        "CYTEBASE_API_TOKEN",
         "CYTEBASE_BUCKET",
         "CYTEBASE_BUCKET_DEV",
         "CYTEBASE_BUCKET_KEY",

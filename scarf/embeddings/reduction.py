@@ -121,6 +121,12 @@ def _fit_gram_pca(
     )
     column_sum = np.zeros(n_features, dtype=np.float64)
     n_samples_seen = 0
+    # Unscaled values keep their means, and the Gram matrix of values far
+    # from zero minus n * mean * mean^T cancels. Their rank updates
+    # accumulate deviations from the first block's means instead, so the
+    # correction subtracts only the small difference from the final means.
+    # Scaled values are already centered.
+    shift: np.ndarray | None = None
 
     with threadpool_limits(limits=nthreads):
         for block in data._stream_blocks(
@@ -131,7 +137,15 @@ def _fit_gram_pca(
         ):
             if scale is not None:
                 block = scale(block)
-            values = np.asfortranarray(block, dtype=np.float64)
+                values = np.asfortranarray(block, dtype=np.float64)
+            else:
+                # A copy, because a NumPy-backed block can view its source.
+                values = np.array(block, dtype=np.float64, order="F")
+            column_sum += values.sum(axis=0, dtype=np.float64)
+            if scale is None:
+                if shift is None:
+                    shift = values.mean(axis=0)
+                values -= shift
             # The block stream clamps BLAS to one thread per reader for its
             # whole lifetime; the rank update runs here, between blocks.
             with controller.limit(limits=nthreads, user_api="blas"):
@@ -144,14 +158,13 @@ def _fit_gram_pca(
                     lower=0,
                     overwrite_c=1,
                 )
-            column_sum += values.sum(axis=0, dtype=np.float64)
             n_samples_seen += len(values)
             del block, values
 
         mean = column_sum / n_samples_seen
         gram = blas.dsyr(
             -float(n_samples_seen),
-            mean,
+            mean if shift is None else mean - shift,
             lower=0,
             a=gram,
             overwrite_a=1,

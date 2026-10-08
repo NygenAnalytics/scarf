@@ -656,10 +656,16 @@ def test_run_aware_export_aligns_layers_to_the_frozen_features(
 
     exported = datastore.to_anndata(run=run, matrix="normed", layers={"raw": "RNA"})
 
+    # Normalized values are the run's own: the stored float32 values of its
+    # normalized artifact, which cover its highly variable features.
     cells = np.flatnonzero(run.cells.fetch_all("I"))
-    features = np.flatnonzero(run.features.fetch_all("I"))
+    features = np.flatnonzero(run.features.fetch_all("highly_variable_features"))
+    stored = np.asarray(datastore.load_artifact(run["normalized"])["data"][:])
+    feature_ids = datastore.RNA.feats.fetch_all("ids").astype(str)
     expected = _GRAPH_COUNTS[np.ix_(cells, features)]
-    assert exported.var_names.tolist() == run.features.fetch("ids").tolist()
+    assert exported.X.dtype == np.float32
+    np.testing.assert_array_equal(exported.X.toarray(), stored)
+    assert exported.var_names.tolist() == feature_ids[features].tolist()
     np.testing.assert_array_equal(exported.layers["raw"].toarray(), expected)
     assert not np.array_equal(exported.X.toarray(), expected)
 

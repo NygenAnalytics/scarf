@@ -28,6 +28,7 @@ from scarf.storage.count_matrix import (
     CountMatrixPolicy,
     create_product_counts_array,
 )
+from scarf.storage.destinations import refuse_pending_assays
 from scarf.storage.layout import (
     ZarrArraySpec,
     array_info,
@@ -36,7 +37,6 @@ from scarf.storage.layout import (
 )
 from scarf.storage.pipeline_runs import _copy_pipeline_label_claims
 from scarf.storage.profiles import StorageProfile
-from scarf.storage.schema import pending_assay_message, pending_assays
 from scarf.storage.sharding import (
     dense_counts_admission,
     fit_count_layout,
@@ -325,6 +325,7 @@ def repack_store(
         default_feature_sets,
         is_rna_assay_type,
         lookup_persisted_assay_type,
+        recorded_assay_types,
     )
     from ..features.gene_families import DEFAULT_PERCENT_PATTERNS
     from ..metadata import MetaData
@@ -347,12 +348,7 @@ def repack_store(
         # A mount's results can use its source's artifacts, so the copy reads
         # the mounted namespace and holds every artifact they depend on.
         src = mount_artifact_namespace(src, *resolved)
-    pending = pending_assays(src)
-    if pending:
-        raise ValueError(
-            "An interrupted derived assay cannot be repacked. "
-            + pending_assay_message(*pending[0])
-        )
+    refuse_pending_assays(src, operation="repacked")
     assays = _count_assays(src)
     if not assays:
         raise ValueError("No logical assays found in source")
@@ -389,9 +385,12 @@ def repack_store(
         counts_to_copy[path] = counts
         feature_tables[path] = f"{prefix}{name}"
         skip_paths.update({path, f"{matrix_path}/countsT"})
-        raw_types = attr_root.attrs.get("assayTypes", {})
         type_name = lookup_persisted_assay_type(
-            name, raw_types if isinstance(raw_types, dict) else None
+            name,
+            recorded_assay_types(
+                attr_root.attrs.get("assayTypes"),
+                [other for other, place in assays if place == workspace],
+            ),
         )
         assay_types[name, workspace] = type_name
         required = is_rna_assay_type(type_name)
@@ -519,6 +518,7 @@ def repack_store(
                     cell_data=MetaData(cells),
                     nthreads=resources.workers,
                     resources=resources,
+                    assay_type=type_name,
                 )
                 patterns = (
                     {

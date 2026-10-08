@@ -14,9 +14,24 @@ from ..storage.types import ZarrMode, as_zarr_group
 from ..storage.validation_scope import validation_scoped
 from ..storage.budget import ResourceBudget
 from ..features.gene_families import DEFAULT_PERCENT_PATTERNS
+from ..features.values import measured_feature_means
 from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..metadata import MetaData
-from ..metadata.rows import apply_missing_mask, read_metadata_missing_rows
+from ..metadata.membership import (
+    MeasuredCellsRemedy,
+    require_measured_cells,
+    resolve_assay_membership,
+)
+from ..metadata.rows import (
+    apply_missing_mask,
+    read_metadata_missing_rows,
+    read_metadata_rows_chunkwise,
+)
+from ..metadata.selection import (
+    CellValues,
+    cell_value_array,
+    resolve_cell_aligned_artifact,
+)
 from ..storage.schema import validate_assay_name
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.stores import (
@@ -29,15 +44,19 @@ from ..storage.stores import (
 from ..storage.selections import (
     ValidatedStoredSelection,
     resolve_stored_selection,
+    validate_cell_selection,
     validate_stored_selection_integrity,
 )
-from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from ..storage.lineage import ArtifactLineage
     from ..mapping.reference import MappingReference
     from .summary import DataStoreSummary
+
+# Kinds with a row per cell whose cells follow their lineage rather than a
+# recorded cell selection, so load_cell_values points to load_artifact.
+_LINEAGE_ALIGNED_KINDS = frozenset({"batch_correction", "reduction"})
 
 
 def sanitize_hierarchy(
@@ -104,6 +123,13 @@ def _child(group: zarr.Group, key: str, error: str) -> zarr.Group | zarr.Array:
         raise KeyError(error) from None
 
 
+def validate_min_features_per_cell(value: Any) -> int:
+    """Validate a ``min_features_per_cell`` value and return it as a Python integer."""
+    from ..utils.arguments import integer_argument
+
+    return integer_argument(value, "min_features_per_cell", minimum=-1)
+
+
 class BaseDataStore:
     """This is the base datastore class that deals with loading of assays from
     Zarr files and generating basic cell statistics like nCounts and nFeatures.
@@ -111,13 +137,16 @@ class BaseDataStore:
 
     Args:
         zarr_loc: Path to Zarr file created using one of writer functions of Scarf
-        assay_types: A dictionary with keys as assay names present in the Zarr file and values as either one of:
-                     'RNA', 'ADT', 'ATAC' or 'GeneActivity'
+        assay_types: A dictionary with keys as assay names present in the Zarr file and
+                     values as either one of: 'RNA', 'ATAC', 'ADT', 'HTO', 'CRISPR',
+                     'ANTIGEN', 'CUSTOM', 'GeneActivity', 'GeneScores', 'URNA' or
+                     'Assay'. A read-only open cannot change an assay's type.
         default_assay: Name of assay that should be considered as default. It is mandatory to provide this value
                        when DataStore loads a Zarr file for the first time
-        min_features_per_cell: Writable opens remove from ``I`` every cell whose default-assay feature
-                               count is not greater than this value, unless the value exceeds the median
-                               count of the active cells.
+        min_features_per_cell: Writable opens remove from ``I`` every cell whose
+                               default-assay feature count is not greater than
+                               this value, unless that would remove at least half
+                               of the active cells.
         mito_pattern: Feature-name pattern for the ``{assay}_percentMito`` column of each RNA assay.
                       The first writable open replaces any existing column with values computed from
                       this pattern, or ``^MT-`` when None. Later opens keep the stored values when
@@ -155,6 +184,8 @@ class BaseDataStore:
         storage_options: dict[str, Any] | None = None,
         storageIo: Any | None = None,
     ):
+        # Checked before the store is opened, so an invalid value writes nothing.
+        min_features_per_cell = validate_min_features_per_cell(min_features_per_cell)
         self.zarr_mode = zarr_mode
         self.zarr_loc = zarr_loc
         self.z = load_zarr(
@@ -221,7 +252,9 @@ class BaseDataStore:
         self._defaultAssay = self._load_default_assay(default_assay)
         self._load_assays(assay_types)
         # TODO: Reset all attrs, pca, dendrogram etc
-        self._ini_cell_props(min_features_per_cell, mito_pattern, ribo_pattern)
+        self._ini_cell_props(mito_pattern, ribo_pattern)
+        if not self.zw.read_only:
+            self._filter_cells(min_features_per_cell)
         if (
             self.zarr_mode == "r+"
             and self.zw.attrs.get("defaultAssay") != self._defaultAssay
@@ -308,6 +341,67 @@ class BaseDataStore:
             path=store_path,
             mode="r",
             zarr_format=self.zw.metadata.zarr_format,
+        )
+
+    def load_cell_values(
+        self,
+        ref: ArtifactRef,
+        *,
+        value: str | None = None,
+        cell_selection: ArtifactRef | None = None,
+    ) -> CellValues:
+        """Read the per-cell values of a cell-aligned artifact.
+
+        Args:
+            ref: A cell-aligned artifact, such as a clustering or an embedding.
+            value: Name of the per-cell array to read, or None for the canonical one.
+            cell_selection: A subset of the artifact's cell selection, or None for all.
+
+        Returns:
+            The values with their cell ids and missing mask, as ``CellValues``.
+
+        Raises:
+            TypeError: If an argument has the wrong type.
+            ValueError: If ``ref`` is not a complete cell-aligned artifact.
+            MemoryError: If the read does not fit the datastore memory budget.
+        """
+        if not isinstance(ref, ArtifactRef):
+            raise TypeError("ref must be an ArtifactRef")
+        if cell_selection is not None and not isinstance(cell_selection, ArtifactRef):
+            raise TypeError("cell_selection must be an ArtifactRef")
+        try:
+            value_name, categorical = cell_value_array(ref.kind, value)
+        except ValueError as error:
+            if ref.kind not in _LINEAGE_ALIGNED_KINDS:
+                raise
+            raise ValueError(
+                f"{error}. {ref.kind} artifacts take their cells from their "
+                "lineage rather than a cell_selection input; open them with "
+                "load_artifact"
+            ) from None
+        resolved = resolve_cell_aligned_artifact(
+            self.zw,
+            ref,
+            cell_selection=cell_selection,
+            value_name=value_name,
+            ndim=None,
+            max_bytes=self.memoryBytes,
+            # The cell ids are read at the same rows, so the budget charges
+            # them with the values.
+            caller_reads=(self.cells._get_array("ids"),),
+        )
+        cell_ids = np.asarray(
+            read_metadata_rows_chunkwise(self.cells, "ids", resolved.cell_idx)
+        )
+        return CellValues(
+            source=ref,
+            value=value_name,
+            values=resolved.values,
+            cell_ids=cell_ids,
+            cell_idx=resolved.cell_idx,
+            cell_selection=resolved.cell_selection,
+            missing=resolved.missing_mask,
+            categorical=categorical,
         )
 
     def list_artifacts(
@@ -451,90 +545,107 @@ class BaseDataStore:
         assert assay_name is not None
         return assay_name
 
-    def _load_assays(self, custom_assay_types: dict | None = None) -> None:
-        """This function loads all the assay names present in attribute
-        `assayNames` as Assay objects. An attempt is made to automatically
-        determine the most appropriate Assay class for each assay based on
-        following mapping:
+    def _load_assays(self, custom_assay_types: Mapping[str, Any] | None = None) -> None:
+        """Create the assay object of every assay in the store.
 
-        literal_blocks::
-            {'RNA': RNAassay, 'ATAC': ATACassay, 'ADT': ADTassay, 'GeneActivity': RNAassay, 'URNA': RNAassay}
+        Each assay takes its type from ``custom_assay_types``, then from the
+        persisted ``assayTypes`` attribute, then from its own name when that
+        name is a preset (see :func:`~scarf.assay.preset_assay_types`). An
+        assay with none of these opens as the generic ``Assay`` with a warning.
+        A writable store records the resolved types in ``assayTypes``. Each
+        assay carries its resolved type as ``assayType``.
 
-        If an assay name does not match any of the keys above then it is assigned as generic assay class. This can be
-        overridden using `predefined_assays` parameter
+        A read-only open cannot record a type, so an explicit type must equal
+        the type that the store declares. A record that is not a mapping is
+        replaced only by a writable open that declares every assay explicitly.
 
         Args:
-            custom_assay_types: A mapping of assay names to Assay class type to associated with.
+            custom_assay_types: Explicit preset type per assay name.
 
-        Returns:
+        Raises:
+            ValueError: If ``custom_assay_types`` names an assay that is not in
+                the store or a type that is not a preset, if a read-only open
+                declares a type that differs from the store's, if the
+                ``assayTypes`` record is not a mapping, or if a persisted type
+                that an assay would use is not a preset. Nothing is written in
+                that case.
         """
+        from ..assay.classification import (
+            lookup_persisted_assay_type,
+            recorded_assay_types,
+            validate_assay_types,
+        )
 
-        preset_assay_types_map = preset_assay_types()
+        explicit = validate_assay_types(custom_assay_types, self._assayNames)
+        writable = not self.zw.read_only
+        presets = preset_assay_types()
+        raw_types = self.zw.attrs.get("assayTypes")
+        if (
+            writable
+            and raw_types is not None
+            and not isinstance(raw_types, Mapping)
+            and set(self._assayNames) <= set(explicit)
+        ):
+            # Every assay is declared explicitly, so this open replaces the
+            # malformed record below.
+            recorded: dict[str, Any] = {}
+        else:
+            recorded = recorded_assay_types(raw_types, self._assayNames)
         caution_statement = (
             "%s was set as a generic Assay with no normalization. If this is unintended "
             "then please make sure that you provide a correct assay type for this assay using "
             "'assay_types' parameter."
-        )
-        caution_statement = (
-            caution_statement
-            + "\nIf you have more than one assay in the dataset then you can set "
+            "\nIf you have more than one assay in the dataset then you can set "
             "assay_types={'assay1': 'RNA', 'assay2': 'ADT'} "
             "Just replace with actual assay names instead of assay1 and assay2"
         )
-        raw_types = self.zw.attrs.get("assayTypes", {})
-        z_attrs: dict[str, str] = (
-            {str(k): str(v) for k, v in raw_types.items()}
-            if isinstance(raw_types, dict)
-            else {}
-        )
-        if custom_assay_types is None:
-            custom_assay_types = {}
-        assays: dict[str, Assay] = {}
-        for i in self._assayNames:
-            if i in custom_assay_types:
-                if custom_assay_types[i] in preset_assay_types_map:
-                    assay = preset_assay_types_map[custom_assay_types[i]]
-                    assay_name = custom_assay_types[i]
-                else:
-                    logger.warning(
-                        f"{custom_assay_types[i]} is not a recognized assay type. Has to be one of "
-                        f"{', '.join(list(preset_assay_types_map.keys()))}\nPLease note that the names are"
-                        f" case-sensitive."
+
+        def stored_type(name: str) -> str:
+            # The type that the store declares without an explicit one.
+            if name in recorded or name in presets:
+                return lookup_persisted_assay_type(name, recorded)
+            return "Assay"
+
+        # Every type is resolved, and so validated, before any assay is built.
+        resolved: dict[str, str] = {}
+        for name in self._assayNames:
+            if name in explicit:
+                resolved[name] = explicit[name]
+                if not writable and explicit[name] != stored_type(name):
+                    raise ValueError(
+                        f"assay_types declares assay {name!r} as "
+                        f"{explicit[name]!r}, but the store declares it as "
+                        f"{stored_type(name)!r}. A read-only open cannot record "
+                        "a type, so its assay_types must match the store. Open "
+                        "the store once with zarr_mode='r+' and "
+                        f"assay_types={{{name!r}: {explicit[name]!r}}} to record "
+                        "the type, or omit assay_types to use the recorded one."
                     )
-                    logger.warning(caution_statement % i)
-                    assay = Assay
-                    assay_name = "Assay"
-                if i in z_attrs and assay_name == z_attrs[i]:
-                    pass
-                else:
-                    z_attrs[i] = assay_name
-                    logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
-            elif i in z_attrs:
-                assay = preset_assay_types_map[z_attrs[i]]
             else:
-                if i in preset_assay_types_map:
-                    assay = preset_assay_types_map[i]
-                    assay_name = i
-                else:
-                    logger.warning(caution_statement % i)
-                    assay = Assay
-                    assay_name = "Assay"
-                z_attrs[i] = assay_name
-                logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
-            assays[i] = assay(
+                if name not in recorded and name not in presets:
+                    logger.warning(caution_statement % name)
+                resolved[name] = stored_type(name)
+            logger.debug(f"Setting assay {name} to assay type: {resolved[name]}")
+        assays: dict[str, Assay] = {
+            name: presets[type_name](
                 z=self.z,
                 workspace=self.workspace,
-                name=i,
+                name=name,
                 cell_data=self.cells,
                 nthreads=self.nthreads,
-                matrix_root=self._matrix_root_for_assay(i),
+                matrix_root=self._matrix_root_for_assay(name),
                 resources=self.resources,
                 storageIo=self.storageIo,
+                assay_type=type_name,
             )
+            for name, type_name in resolved.items()
+        }
         # Assays are kept apart from the datastore's own attributes, so no
         # assay name can replace one.
         self._assays = assays
-        if not self.zw.read_only and self.zw.attrs.get("assayTypes") != z_attrs:
+        z_attrs = {name: str(value) for name, value in recorded.items()}
+        z_attrs.update(resolved)
+        if writable and self.zw.attrs.get("assayTypes") != z_attrs:
             self.zw.attrs["assayTypes"] = z_attrs
         return None
 
@@ -595,6 +706,55 @@ class BaseDataStore:
             raise PermissionError(
                 f"{operation} requires a DataStore opened with zarr_mode='r+'"
             )
+
+    def _require_measured_cells(
+        self,
+        assay: str | None,
+        cells: ArtifactRef | np.ndarray | str,
+        *,
+        operation: str,
+        remedy: MeasuredCellsRemedy | None = None,
+    ) -> None:
+        """Refuse an operation that reads ``assay`` over cells it did not measure.
+
+        Operations call this after their own argument checks and before they
+        plan, reuse, or write a result, so a read-only store refuses such a
+        request as a writable one does. It checks nothing when ``assay`` has
+        no membership column, which means that it measured every cell, or
+        names no assay of this store, which the operation reports itself;
+        None names the default assay. A ``cells`` value of another type is
+        left to the operation's own argument checks.
+
+        Args:
+            assay: Assay that the operation reads.
+            cells: The cells that it reads: a datastore cell-selection
+                artifact, whose stored mask is read in bounded blocks, the
+                name of a boolean cell column, which the error names as its
+                ``cell_key``, a boolean mask with one entry per cell, or
+                their integer rows.
+            operation: Name of the operation, which the error names.
+            remedy: The input that the error tells the caller to narrow
+                (see :func:`~scarf.metadata.membership.require_measured_cells`).
+
+        Raises:
+            UnmeasuredCellsError: If ``assay`` did not measure one of the cells.
+        """
+        name = assay or self._defaultAssay
+        if name is None or name not in self.assay_names:
+            return
+        rows: Any
+        if isinstance(cells, ArtifactRef):
+            # A selection is validated only when there is membership to check.
+            if resolve_assay_membership(self.cells, name) is None:
+                return
+            rows = validate_cell_selection(self.zw, cells).values
+        elif isinstance(cells, np.ndarray | str):
+            rows = cells
+        else:
+            return
+        require_measured_cells(
+            self.cells, name, rows, operation=operation, remedy=remedy
+        )
 
     def _ensure_dataset_fingerprint(self, from_assay: str) -> str:
         from ..storage.identity import validate_preparation
@@ -748,10 +908,14 @@ class BaseDataStore:
 
     def _ini_cell_props(
         self,
-        min_features: int,
         mito_pattern: str | None,
         ribo_pattern: str | None,
     ) -> None:
+        """Prepare the cell and feature statistics of every assay.
+
+        This never changes ``I``. Only a writable open filters it, once, with
+        its ``min_features_per_cell`` through ``_filter_cells``.
+        """
         for from_assay in self._assayNames:
             # _load_assays opened every assay group, so its attributes are current.
             assay = self._get_assay(from_assay)
@@ -767,23 +931,34 @@ class BaseDataStore:
                     else DEFAULT_PERCENT_PATTERNS["percentRibo"],
                 }
             assay.prepare(patterns)
-        if not self.zw.read_only:
-            self._filter_cells(min_features)
 
     def _filter_cells(self, min_features: int) -> None:
+        """Remove low-feature cells of the default assay from ``I``.
+
+        Active cells whose feature count is not greater than ``min_features``
+        are removed, unless they are at least half of the active cells: then
+        ``I`` is kept and a warning is logged.
+        """
         from_assay = self._defaultAssay
-        n_features = self.cells.fetch_all(from_assay + "_nFeatures")
         active = self.cells.fetch_all("I")
-        if min_features > np.median(n_features[active]):
+        n_active = int(np.count_nonzero(active))
+        if n_active == 0:
+            return
+        n_features = self.cells.fetch_all(from_assay + "_nFeatures")
+        removed = active & (n_features <= min_features)
+        n_removed = int(np.count_nonzero(removed))
+        # Write only when filtering changes the active cells.
+        if n_removed == 0:
+            return
+        if 2 * n_removed >= n_active:
             logger.warning(
-                f"More than half of the cells have fewer than {min_features} features "
-                f"for assay: {from_assay}. Will not remove low quality cells automatically."
+                f"{n_removed} of {n_active} active cells have at most {min_features} "
+                f"features in assay {from_assay!r}. Will not remove low quality cells "
+                "automatically, because that would remove at least half of the active "
+                "cells."
             )
             return
-        keep = (n_features > min_features) & (n_features < np.inf)
-        # Write only when filtering changes the active cells.
-        if not np.array_equal(keep & active, active):
-            self.cells.update_key(keep, key="I")
+        self.cells.update_key(~removed, key="I")
 
     def get_cell_vals(
         self,
@@ -799,25 +974,26 @@ class BaseDataStore:
 
         Rows that a nullable metadata column's linked missing mask flags are
         returned as missing values, as in run-aware plotting views: NaN for
-        numeric columns, which are then returned as float64, None for other
-        non-boolean columns, and False for boolean columns. Columns without
-        masked rows keep their stored dtype.
+        integer and float columns, which are then returned as float64, NaT for
+        datetime and timedelta columns, None for other non-boolean columns, and
+        False for boolean columns. Unclipped columns without masked rows keep
+        their stored dtype.
 
         Args:
             from_assay: Name of assay to be used.
             cell_key: Boolean column in cell metadata selecting cells. Required; pass ``'I'``
                       for the default active-cell key.
             k: Cell metadata column name or feature name whose values are fetched.
-            clip_fraction: Fraction (0-1) for soft percentile clipping of numeric values.
-                           Missing values are ignored when the percentiles are computed.
+            clip_fraction: Fraction in [0, 0.5) for soft percentile clipping of numeric
+                           values. Missing values are ignored when the percentiles are
+                           computed. Clipped integer columns are returned as float64.
 
         Returns:
-            The requested values
+            The requested values; a feature is NaN in cells its assay did not measure.
         """
-        if clip_fraction < 0 or clip_fraction > 1:
-            raise ValueError(
-                "ERROR: Value for `clip_fraction` parameter should be between 0 and 1"
-            )
+        from ..utils.arguments import clip_fraction_argument
+
+        clip_fraction = clip_fraction_argument(clip_fraction)
         cell_idx = self.cells.active_index(cell_key)
         if k not in self.cells.columns:
             assay = self._get_assay(from_assay)
@@ -829,19 +1005,27 @@ class BaseDataStore:
                     logger.warning(
                         f"Plotting mean of {len(feat_idx)} features because {k} is not unique."
                     )
-            vals = controlled_compute(
-                assay.normed(cell_idx, feat_idx).mean(axis=1), self.nthreads
-            ).astype(np.float64)
+            vals = measured_feature_means(
+                assay, feat_idx, cell_idx, nthreads=self.nthreads
+            )
         else:
             vals = apply_missing_mask(
                 self.cells.fetch(k, key=cell_key),
                 read_metadata_missing_rows(self.cells, k, cell_idx),
             )
         if clip_fraction > 0 and vals.dtype.kind in "iuf":
-            low, high = np.nanpercentile(
-                vals, [100 * clip_fraction, 100 - 100 * clip_fraction]
+            values = vals.astype(np.float64, copy=False)
+            present = values[~np.isnan(values)]
+            if present.size:
+                low, high = np.percentile(
+                    present, [100 * clip_fraction, 100 - 100 * clip_fraction]
+                )
+                values = np.clip(values, low, high)
+            vals = (
+                values
+                if vals.dtype.kind in "iu"
+                else values.astype(vals.dtype, copy=False)
             )
-            vals = np.clip(vals, low, high).astype(vals.dtype, copy=False)
         return vals
 
     def __repr__(self) -> str:

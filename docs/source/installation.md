@@ -58,10 +58,11 @@ The current Scarf 1.0 line is published on PyPI as a prerelease.
 Without `--prerelease allow`, uv resolves to the latest stable release (`0.32.3`), which does not match this documentation's Python 3.12 requirement.
 The `extra` optional dependency group adds plotting (`matplotlib`, `seaborn`), AnnData support, widgets, and other helpers used by the tutorials.
 
-Verify the install with the Python interpreter from the same environment:
+Verify the install with the Python interpreter from the same environment.
+`import scarf` defers most modules until their first use, so the check also imports `DataStore`:
 
 ```bash
-python -c "import scarf; print(scarf.__version__)"
+python -c "from scarf import DataStore; import scarf; print(scarf.__version__)"
 ```
 
 ## Alternative: pip environment
@@ -77,7 +78,7 @@ Use the macOS, Linux, or Windows activation command above, then install and veri
 
 ```bash
 python -m pip install --pre "scarf[extra]"
-python -c "import scarf; print(scarf.__version__)"
+python -c "from scarf import DataStore; import scarf; print(scarf.__version__)"
 ```
 
 ## Alternative: conda environment
@@ -88,7 +89,7 @@ This path installs a prebuilt `hnswlib` from conda-forge and is recommended on W
 conda create --name scarf_env --channel conda-forge python=3.12 pip "hnswlib>=0.8"
 conda activate scarf_env
 python -m pip install --pre "scarf[extra]"
-python -c "import scarf; print(scarf.__version__)"
+python -c "from scarf import DataStore; import scarf; print(scarf.__version__)"
 ```
 
 The conda package satisfies Scarf's `hnswlib>=0.8` requirement, so pip does not compile it.
@@ -107,6 +108,23 @@ This adds DuckDB for catalog queries and the SDK's plotting dependencies.
 without requiring credentials. Set `CYTEBASE_BUCKET` or pass `bucket=` to use
 another catalog, then follow
 {doc}`tutorials/cytebase`. See {doc}`reference/api/cytebase` for the full SDK reference.
+
+(installation_tsne)=
+## Optional t-SNE
+
+`run_tsne` and the pipeline's `tsne` stage compute t-SNE with the [sgtsnepi] package, which Scarf does not install by default.
+Add it with the `tsne` extra, in the same environment as Scarf:
+
+```bash
+uv pip install --prerelease allow "scarf[extra,tsne]"
+```
+
+`sgtsnepi` publishes wheels only for Linux x86_64 and for macOS 26 or newer on Apple silicon (arm64).
+On other platforms the installer compiles it from source, which needs a C++ compiler and FFTW, and `sgtsnepi` does not support Windows.
+It runs on one thread, and it is licensed under the GPLv3, while Scarf is BSD-3-Clause and does not depend on it unless you install the extra.
+Without `sgtsnepi`, computing a new t-SNE embedding raises an `ImportError` that names the `tsne` extra.
+Reusing a t-SNE embedding that a store already holds, and plotting or exporting it, does not need `sgtsnepi`.
+A pipeline run that enables t-SNE without `sgtsnepi` therefore still runs, and it logs a warning that names the extra before its first stage.
 
 ## JupyterLab
 
@@ -172,7 +190,7 @@ Clone the repository and let uv create an editable project environment:
 git clone https://github.com/NygenAnalytics/scarf.git
 cd scarf
 uv sync --extra extra
-uv run python -c "import scarf; print(scarf.__version__)"
+uv run python -c "from scarf import DataStore; import scarf; print(scarf.__version__)"
 ```
 
 See {doc}`developers/contributing` before making package or documentation changes.
@@ -182,6 +200,7 @@ See {doc}`developers/contributing` before making package or documentation change
 - **No virtual environment found:** activate `.venv`, or pass it explicitly with `uv pip install --python .venv --prerelease allow "scarf[extra]"`.
 - **`hnswlib` fails to build:** install the compiler and, for a system Python, matching development headers described above.
   On Windows without Build Tools, use the conda path.
+- **`run_tsne` raises `ImportError` naming the `tsne` extra:** install the extra as described in {ref}`Optional t-SNE <installation_tsne>`, or use UMAP.
 - **Scarf imports in a terminal but not a notebook:** compare the terminal path from `python -c "import sys; print(sys.executable)"` with the notebook kernel, then launch Jupyter from the Scarf environment or select its registered kernel.
 
 ## Next steps
@@ -189,4 +208,5 @@ See {doc}`developers/contributing` before making package or documentation change
 After the import check succeeds, continue with the {ref}`Quick start <quickstart>`.
 
 [Visual C++ Build Tools]: https://visualstudio.microsoft.com/visual-cpp-build-tools
+[sgtsnepi]: https://github.com/alex-unofficial/sgtsnepi-python
 [Microsoft long-path documentation]: https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation

@@ -5,6 +5,7 @@ from numba import njit, prange
 from numpy.typing import NDArray
 
 from ...utils.arrays import read_only_copy
+from ...utils.count_values import is_real_count_dtype
 from .net import PreparedNetwork
 
 __all__ = [
@@ -230,11 +231,7 @@ def score_aucell_block(
     matrix = np.asarray(values)
     if matrix.ndim != 2:
         raise ValueError("AUCell values must be two-dimensional")
-    if (
-        not np.issubdtype(matrix.dtype, np.number)
-        or np.issubdtype(matrix.dtype, np.complexfloating)
-        or not np.isfinite(matrix).all()
-    ):
+    if not is_real_count_dtype(matrix.dtype) or not np.isfinite(matrix).all():
         raise ValueError("AUCell values must be finite and numeric")
     permutation_array = np.asarray(permutation)
     if permutation_array.ndim != 1 or len(permutation_array) != matrix.shape[1]:
@@ -253,6 +250,10 @@ def score_aucell_block(
     if matrix.dtype == np.float16:
         # Numba kernels take float32; the widening is exact.
         matrix = matrix.astype(np.float32)
+    elif matrix.dtype == np.bool_:
+        # The ranks of 0 and 1 are those of False and True; a view copies
+        # nothing.
+        matrix = matrix.view(np.uint8)
     scores: NDArray[np.float64] = _score_ranked_block(
         np.ascontiguousarray(matrix),
         np.ascontiguousarray(permutation_array),

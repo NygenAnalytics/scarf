@@ -15,6 +15,7 @@ _METHODS = {
         "lineage",
         "list_artifacts",
         "load_artifact",
+        "load_cell_values",
         "snapshot_cell_selection",
         "snapshot_cluster_labels",
         "summary",
@@ -87,6 +88,7 @@ _METHODS = {
         "run_waggr",
         "select_cells",
         "select_detected_features",
+        "select_measured_cells",
         "set_feature_selection",
         "show_zarr_tree",
         "smart_label",
@@ -95,10 +97,12 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "ed758756696c842110d059b33078b31d7549044b0b5d9537bfe89cfc3563e4b8",
-    GraphDataStore: "0e3510e49b10db97e8e0cda982d629791dcd748f4f5130e4d3ebcfb9d2b9fa7d",
+    # load_cell_values reads one cell-aligned artifact's values aligned to cells.
+    BaseDataStore: "f202cc6ee112f049acc66c1882630b7cb410b86709aba79102c270b2c175c08f",
+    GraphDataStore: "5af1170bf21185ff3e8f4302952a06caf6861b9cbb8f138f95f2b09e826da4cb",
     MappingDatastore: "a4839ac0372df95f021fd8c383c1ac2aff6796c6b093e05510c71ad7e8449a72",
-    DataStore: "e3df7f866e8852021d53ca50bc0b6488923c59d8b8728542f639ba0063333944",
+    # select_measured_cells keeps the cells of a selection that an assay measured.
+    DataStore: "bad4567e78ed0f10d258fa79eae2f80d8a3a81ac0715c0b4e7ee8ad93fcce90d",
 }
 
 

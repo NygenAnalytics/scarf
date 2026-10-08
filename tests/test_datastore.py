@@ -22,7 +22,9 @@ from scarf.trajectory.results import (
     PseudotimeScoreResult,
 )
 from scarf.storage.schema import create_cell_data
+from scarf.utils.logging import logger
 from scarf.writers import create_zarr_count_assay
+from tests.storage_helpers import write_count_store
 from tests.store_probes import RecordingStore
 
 from . import full_path
@@ -110,6 +112,89 @@ def test_fresh_import_requires_preparation_before_read_only_access():
     with pytest.raises(ValueError, match="not prepared"):
         open_qc_store(store, zarr_mode="r")
     assert not any(action == "set" for action, _ in store.ops)
+
+
+def _open_logging_warnings(open_store) -> tuple[DataStore, list[str]]:
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        dataset = open_store()
+    finally:
+        logger.remove(sink)
+    return dataset, [message for message in messages if "Will not remove" in message]
+
+
+def _feature_count_store(path, features_per_cell, n_features: int) -> str:
+    """Write a fresh ADT import whose cells hold the given numbers of features."""
+    counts = np.arange(n_features) < np.asarray(features_per_cell)[:, None]
+    write_count_store(str(path), {"ADT": counts.astype(np.uint32)}, "uint32")
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        (np.nan, TypeError, "min_features_per_cell must be an integer"),
+        ("10", TypeError, "min_features_per_cell must be an integer"),
+        (-2, ValueError, "min_features_per_cell must be at least -1"),
+    ],
+)
+def test_invalid_min_features_per_cell_is_rejected_before_any_write(
+    value, error, message
+):
+    store, _ = fresh_qc_store()
+    with pytest.raises(error, match=message):
+        open_qc_store(store, min_features_per_cell=value)
+
+    assert not any(action in ("set", "delete") for action, _ in store.ops)
+    root = zarr.open_group(store=store, mode="r")
+    assert root["RNA"].attrs["prepared"] is False
+    assert root["cellData/I"][:].all()
+
+
+def test_open_removes_low_feature_cells_when_fewer_than_half_qualify():
+    store, _ = fresh_qc_store()
+    # The cells hold 3, 2, 2, 2, 0, and 4 features.
+    dataset, skipped = _open_logging_warnings(
+        lambda: open_qc_store(store, min_features_per_cell=np.int64(0))
+    )
+
+    np.testing.assert_array_equal(
+        dataset.cells.fetch_all("I"), [True, True, True, True, False, True]
+    )
+    assert skipped == []
+
+
+def test_default_open_never_removes_half_of_the_active_cells(tmp_path):
+    # Two of four cells hold at most the default ten features: half is never
+    # removed.
+    path = _feature_count_store(tmp_path / "adt.zarr", [10, 10, 11, 12], 12)
+
+    dataset, skipped = _open_logging_warnings(
+        lambda: DataStore(path, default_assay="ADT", nthreads=1)
+    )
+
+    assert dataset.cells.fetch_all("I").all()
+    assert len(skipped) == 1
+    assert "2 of 4 active cells have at most 10 features" in skipped[0]
+
+
+def test_open_without_active_cells_leaves_the_cell_key_unchanged():
+    store, _ = fresh_qc_store()
+    dataset = open_qc_store(store, min_features_per_cell=-1)
+    dataset.cells.update_key(np.zeros(dataset.cells.N, dtype=bool), key="I")
+    store.reset()
+
+    dataset, skipped = _open_logging_warnings(
+        lambda: open_qc_store(store, min_features_per_cell=10)
+    )
+
+    assert not dataset.cells.fetch_all("I").any()
+    assert skipped == []
+    assert not any(action in ("set", "delete") for action, _ in store.ops)
 
 
 @pytest.mark.parametrize("assay_type", ["RNA", "ATAC"])
@@ -460,13 +545,18 @@ def test_cell_cycle_transforms_before_binning_and_scores_with_the_same_values():
     assert dataset.inspect_artifact(different_controls).parameters["control_size"] == 2
 
 
+def _unscaled_counts(_assay, counts):
+    """A custom RNA normalizer that keeps the counts, so log1p logs the counts."""
+    return counts * 1.0
+
+
 def test_cell_cycle_logs_the_configured_normalizer_without_replacing_it():
-    from scarf.assay.normalization import norm_dummy, norm_lib_size
+    from scarf.assay.normalization import norm_lib_size
     from scarf.storage.artifacts import callable_identity
 
     store, _ = fresh_qc_store()
     dataset = open_qc_store(store)
-    dataset.RNA.normMethod = norm_dummy
+    dataset.RNA.normMethod = _unscaled_counts
     dataset.RNA.sf = None
     cells = dataset.snapshot_cell_selection()
     rows = dataset.cells.active_index("I")
@@ -474,7 +564,12 @@ def test_cell_cycle_logs_the_configured_normalizer_without_replacing_it():
     expected = logged[:, 2] - logged[:, [0, 1, 4, 5]].mean(axis=1)
     options = dict(s_genes=["GENE_A"], g2m_genes=["RPS3"], n_bins=2, ctrl_size=10000)
 
-    scores = dataset.run_cell_cycle_scoring(cells, **options)
+    # A custom normalizer's values are logged only when asked for.
+    unlogged_custom = dataset.run_cell_cycle_scoring(cells, **options)
+    assert (
+        dataset.inspect_artifact(unlogged_custom).parameters["log_transform"] is False
+    )
+    scores = dataset.run_cell_cycle_scoring(cells, **options, log_transform=True)
 
     np.testing.assert_allclose(dataset.load_artifact(scores)["s_score"][:], expected)
     np.testing.assert_allclose(
@@ -485,11 +580,11 @@ def test_cell_cycle_logs_the_configured_normalizer_without_replacing_it():
         dataset.inspect_artifact(scores).inputs["feature_summary"]
     )
     assert dataset.inspect_artifact(summary).parameters == {
-        "normalization_method": callable_identity(norm_dummy),
+        "normalization_method": callable_identity(_unscaled_counts),
         "size_factor": None,
         "log_transform": True,
     }
-    assert dataset.RNA.normMethod is norm_dummy
+    assert dataset.RNA.normMethod is _unscaled_counts
     dataset.RNA.normMethod = norm_lib_size
     dataset.RNA.sf = 1000
     assert dataset.run_cell_cycle_scoring(cells, **options) != scores
@@ -629,10 +724,17 @@ def test_pca_streams_scaling_statistics_when_normalized_sums_are_absent():
     expected = dataset.load_artifact(
         dataset.run_pca(normalized, dims=2, local_cache=False)
     )
-    other, _, other_normalized = _normalized_qc_dataset()
+    other, other_cells, other_normalized = _normalized_qc_dataset()
     group = artifact_group(other.zw, other_normalized)
-    del group["feature_sum"]
-    del group["feature_squared_sum"]
+    # Artifacts of earlier releases hold feature_squared_sum instead of
+    # feature_m2. They stay reusable, and scaling streams the normalized data
+    # without reading the squared sums, which here hold no valid variance.
+    del group["feature_m2"]
+    group.create_array(
+        "feature_squared_sum", data=np.full(group["data"].shape[1], -1.0)
+    )
+    features = other.select_all_features(from_assay="RNA")
+    assert other.run_normalization(other_cells, features) == other_normalized
 
     observed = other.load_artifact(
         other.run_pca(other_normalized, dims=2, local_cache=False)
@@ -646,8 +748,9 @@ def test_pca_streams_scaling_statistics_when_normalized_sums_are_absent():
 
 def test_ann_index_rejects_non_coordinates_and_missing_reduction_values():
     dataset, _, normalized = _normalized_qc_dataset()
+    # Normalized values are coordinates; a feature selection is not.
     with pytest.raises(ValueError, match="Coordinates must reference"):
-        dataset.build_ann_index(normalized)
+        dataset.build_ann_index(dataset.select_all_features(from_assay="RNA"))
     pca = dataset.run_pca(normalized, dims=2, local_cache=False)
     dataset.build_ann_index(pca)
     del artifact_group(dataset.zw, pca)["data"]
@@ -836,6 +939,33 @@ def test_get_cell_vals_clips_any_numeric_column_ignoring_missing_values(
     np.testing.assert_array_equal(np.isnan(clipped), np.isnan(raw))
     with pytest.raises(ValueError, match="clip_fraction"):
         store.get_cell_vals(from_assay="RNA", cell_key="I", k="score", clip_fraction=2)
+
+
+def test_get_cell_vals_clips_integer_columns_to_fractional_bounds():
+    store, _ = fresh_qc_store()
+    dataset = open_qc_store(store, min_features_per_cell=-1)
+    values = np.array([0, 1, 2, 3, 5, 8], dtype=np.int64)
+    dataset.cells.insert("level", values)
+
+    clipped = dataset.get_cell_vals(
+        from_assay="RNA", cell_key="I", k="level", clip_fraction=0.1
+    )
+
+    # The 10th and 90th percentiles fall between the stored integers.
+    assert clipped.dtype == np.float64
+    np.testing.assert_allclose(clipped, [0.5, 1.0, 2.0, 3.0, 5.0, 6.5])
+    dataset.cells.insert("nobody", np.zeros(len(values), dtype=bool))
+    empty = dataset.get_cell_vals(
+        from_assay="RNA", cell_key="nobody", k="level", clip_fraction=0.1
+    )
+    assert empty.dtype == np.float64 and empty.shape == (0,)
+    # A fraction of one half or more is refused before any value is read.
+    store.reset()
+    with pytest.raises(ValueError, match="at least 0 and less than 0.5"):
+        dataset.get_cell_vals(
+            from_assay="RNA", cell_key="I", k="level", clip_fraction=0.5
+        )
+    assert store.ops == []
 
 
 def test_get_assay_rejects_unknown_and_non_assay_names(toy_store_path) -> None:
@@ -1320,23 +1450,32 @@ class TestDataStore:
             datastore.z[graph_artifacts]["distances"][:],
             dtype=np.float32,
         )
+        n_cells, k = indices.shape
+        # umap-learn fits each row with the cell itself first, at distance
+        # zero, and gives that self edge no weight. The stored index dtype
+        # reuses the compiled kernels instead of compiling new ones.
+        with_self = np.column_stack((np.arange(n_cells, dtype=indices.dtype), indices))
+        with_self_distances = np.zeros((n_cells, k + 1), dtype=np.float32)
+        with_self_distances[:, 1:] = distances
         sigmas, rhos = smooth_knn_dist(
-            distances,
-            k=indices.shape[1],
+            with_self_distances,
+            k=float(k + 1),
             local_connectivity=1.0,
             bandwidth=1.5,
         )
         _, _, expected, _ = compute_membership_strengths(
-            indices,
-            distances,
+            with_self,
+            with_self_distances,
             sigmas,
             rhos,
         )
-        a = np.asarray(expected, dtype=np.float32)
-        a = a[a > 0]
-        graph_path = datastore.inspect_artifact(connectivity_graph).path
-        b = datastore.z[graph_path]["weights"][:]
-        np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
+        expected = np.asarray(expected, dtype=np.float32).reshape(n_cells, k + 1)
+        np.testing.assert_array_equal(expected[:, 0], 0.0)
+        status = datastore.inspect_artifact(connectivity_graph)
+        # These weights are revision 2 of build_connectivity_map.
+        assert status.revision == 2 and status.is_current
+        observed = datastore.z[status.path]["weights"][:]
+        np.testing.assert_allclose(expected[:, 1:].ravel(), observed, rtol=0, atol=1e-5)
 
     def test_atac_graph_indices(self, make_atac_graph, atac_datastore):
         expected = np.load(full_path("atac_knn_indices.npy"))
@@ -1461,7 +1600,13 @@ class TestDataStore:
         assert markers.feature_name.is_unique
         assert {"score", "fold_change", "p_value"}.issubset(markers.columns)
         assert np.isfinite(markers.score).all()
-        assert np.isfinite(markers.fold_change).all()
+        # fold_change is a ratio of means: +inf only where no other cell
+        # expresses the feature, and NaN only where no cell does.
+        fold_change = markers.fold_change.to_numpy()
+        assert not (fold_change < 0).any()
+        assert (markers.mean_rest[np.isposinf(fold_change)] == 0).all()
+        undefined = markers[np.isnan(fold_change)]
+        assert ((undefined["mean"] == 0) & (undefined.mean_rest == 0)).all()
         assert markers.p_value.between(0, 1).all()
 
     def test_get_markers_all_groups(self, marker_search, paris_clustering, datastore):

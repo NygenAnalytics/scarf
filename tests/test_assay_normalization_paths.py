@@ -14,17 +14,25 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.assay.normalization import _normalize_rows, library_size_values
+from scarf.assay.normalization import (
+    _normalize_rows,
+    library_size_divisors,
+    library_size_values,
+)
 from scarf.datastore.datastore import DataStore
 from scarf.storage.artifacts import ArtifactRef, artifact_path
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.storage.io_policy import StorageIoPolicy
 from scarf.storage.layout import normed_array_spec
 from scarf.storage.profiles import resolve_storage_profile
+from scarf.storage.schema import create_cell_data, create_zarr_count_assay
 from scarf.storage.sharding import plan_dense_write
+from scarf.storage.stores import load_zarr
 from scarf.utils import configure_output, logger
 from scarf.writers import write_renorm_subset_to_zarr
-from tests.storage_helpers import write_count_store
+from scarf.writers.counts_t import finalize_writer_counts_t
+from tests.storage_helpers import finalize_test_counts, write_count_store
 
 SIZE_FACTOR = 1000.0
 
@@ -87,6 +95,238 @@ def test_row_normalization_kernel_rounds_float64_library_sizes_once(
     np.testing.assert_array_equal(out, expected.astype(out_dtype))
     np.testing.assert_array_equal(out[block == 0], 0.0)
     np.testing.assert_array_equal(out[2], 0.0)
+
+
+def test_library_size_divisors_map_zero_totals_to_one_and_reject_invalid_ones() -> None:
+    totals = np.array([4, 0, 2], dtype=np.uint32)
+
+    divisors = library_size_divisors(totals, source="RNA_nCounts")
+
+    assert divisors.dtype == np.float64
+    np.testing.assert_array_equal(divisors, [4.0, 1.0, 2.0])
+    # The divisors are a new array; the caller's totals keep their zero.
+    np.testing.assert_array_equal(totals, [4, 0, 2])
+    for invalid in (-1.0, np.nan, np.inf):
+        with pytest.raises(
+            ValueError, match="RNA_nCounts holds negative or non-finite totals"
+        ):
+            library_size_divisors(np.array([1.0, invalid]), source="RNA_nCounts")
+    # Without a copy, float64 totals that the caller owns become the divisors.
+    owned = np.array([4.0, 0.0, 2.0])
+    assert library_size_divisors(owned, source="RNA_nCounts", copy=False) is owned
+    np.testing.assert_array_equal(owned, [4.0, 1.0, 2.0])
+    with pytest.raises(ValueError, match="Unable to avoid copy"):
+        library_size_divisors(totals, source="RNA_nCounts", copy=False)
+
+
+def _library_size_counts(dtype: str) -> np.ndarray:
+    rng = np.random.default_rng(71)
+    counts = rng.poisson(1.5, size=(24, 8)).astype(np.float64)
+    # Two cells without counts, and one without counts in the first features.
+    counts[[3, 17]] = 0
+    counts[5, :3] = 0
+    if dtype == "float32":
+        counts += np.where(counts > 0, rng.random(counts.shape), 0.0)
+    return counts.astype(dtype)
+
+
+@pytest.fixture(scope="module")
+def library_size_store(tmp_path_factory) -> tuple[DataStore, np.ndarray]:
+    counts = _library_size_counts("uint16")
+    zarr_loc = str(tmp_path_factory.mktemp("library_size") / "store.zarr")
+    root = load_zarr(zarr_loc=zarr_loc, mode="w")
+    ids = np.array([f"cell{index}" for index in range(len(counts))])
+    names = np.array([f"RNA{index}" for index in range(counts.shape[1])])
+    create_cell_data(root, None, ids=ids, names=ids)
+    # Small count chunks give countsT several cell bands for streams to merge.
+    stored = create_zarr_count_assay(
+        root,
+        "RNA",
+        None,
+        len(ids),
+        feat_ids=names,
+        feat_names=names,
+        dtype="uint16",
+        policy=CountMatrixPolicy(unitBytes=counts.nbytes, chunkBytes=names.size * 10),
+    )
+    stored[:] = counts
+    finalize_test_counts(stored)
+    finalize_writer_counts_t(root, "RNA", None)
+    # Every cell stays active, including those without counts.
+    dataset = DataStore(
+        zarr_loc, default_assay="RNA", min_features_per_cell=-1, nthreads=1
+    )
+    assert dataset.RNA.rawDataT.chunks[1] < len(counts)
+    return dataset, counts
+
+
+def _library_size_reference(
+    counts: np.ndarray, *, log_transform: bool, subset: np.ndarray | None = None
+) -> np.ndarray:
+    """Return ``size_factor * count / divisor`` in float64, as every path does.
+
+    The divisor of a cell is its total, over ``subset`` when given, or 1 when
+    that total is zero: the rule every path applied before it divided by
+    ``library_size_divisors``.
+    """
+    widened = counts.astype(np.float64)
+    if subset is not None:
+        widened = widened[:, subset]
+    totals = widened.sum(axis=1)
+    values = SIZE_FACTOR * widened / np.where(totals == 0, 1.0, totals)[:, None]
+    return np.log1p(values) if log_transform else values
+
+
+@pytest.mark.parametrize("log_transform", [False, True])
+def test_library_size_paths_keep_their_values_and_zero_total_cells(
+    library_size_store: tuple[DataStore, np.ndarray],
+    log_transform: bool,
+) -> None:
+    dataset, counts = library_size_store
+    rna = dataset.RNA
+    cells = np.arange(len(counts))
+    features = np.arange(counts.shape[1])
+    subset = np.array([0, 1, 2])
+    np.testing.assert_array_equal(
+        dataset.cells.fetch_all("RNA_nCounts"), counts.sum(axis=1, dtype=np.float64)
+    )
+    expected = _library_size_reference(counts, log_transform=log_transform)
+    expected_subset = _library_size_reference(
+        counts, log_transform=log_transform, subset=subset
+    )
+    # Cells without counts, in total or in the subset, normalize to zeros.
+    assert not expected[[3, 17]].any() and not expected_subset[[3, 5, 17]].any()
+
+    normed = rna.normed(cells, features, log_transform=log_transform).compute()
+    np.testing.assert_array_equal(normed, expected)
+    normed_subset = rna.normed(
+        cells, subset, renormalize_subset=True, log_transform=log_transform
+    ).compute()
+    np.testing.assert_array_equal(normed_subset, expected_subset)
+    batches = rna.iter_normed_feature_wise(
+        cells, features, 3, None, as_dataframe=False, log_transform=log_transform
+    )
+    feature_major = np.concatenate([values for values, _labels in batches])
+    np.testing.assert_array_equal(feature_major, expected.T)
+    destination = zarr.open_group(store=MemoryStore(), mode="w")
+    write_renorm_subset_to_zarr(
+        rna, cells, subset, destination, "normalized", 1, log_transform=log_transform
+    )
+    np.testing.assert_array_equal(
+        destination["normalized"][:], expected_subset.astype(np.float32)
+    )
+    means = rna._mean_normed_feature_groups(
+        cells,
+        {"pair": np.array([0, 3]), "one": np.array([5])},
+        log_transform=log_transform,
+    )
+    np.testing.assert_array_equal(means["pair"], expected[:, [0, 3]].mean(axis=1))
+    np.testing.assert_array_equal(means["one"], expected[:, 5])
+    stats = rna._streaming_feature_stats(cells, features, log_transform=log_transform)
+    np.testing.assert_array_equal(stats["normed_n"], (expected > 0).sum(axis=0))
+    np.testing.assert_allclose(stats["normed_tot"], expected.sum(axis=0), rtol=1e-13)
+    np.testing.assert_allclose(
+        stats["sigmas"], expected.var(axis=0), rtol=1e-10, atol=1e-10
+    )
+    if not log_transform:
+        banded = rna._iter_feature_group_means(
+            cells, [np.array([0, 3]), np.array([5])], block_rows=7
+        )
+        np.testing.assert_array_equal(
+            np.concatenate(list(banded)),
+            np.column_stack([expected[:, [0, 3]].mean(axis=1), expected[:, 5]]),
+        )
+
+
+@pytest.fixture(scope="module")
+def negative_total_store(tmp_path_factory) -> DataStore:
+    counts = _library_size_counts("float32").astype(np.float64)
+    # The total of cell 2 is -2, over all features and over the first two.
+    counts[2] = 0
+    counts[2, :2] = [-3.0, 1.0]
+    zarr_loc = str(tmp_path_factory.mktemp("negative_total") / "store.zarr")
+    write_count_store(zarr_loc, {"RNA": counts}, "float64")
+    dataset = DataStore(
+        zarr_loc, default_assay="RNA", min_features_per_cell=-1, nthreads=1
+    )
+    assert dataset.cells.fetch_all("RNA_nCounts")[2] == -2
+    return dataset
+
+
+_ALL_FEATURES = np.arange(8)
+_TOTALS_ERROR = "RNA_nCounts holds negative or non-finite totals of selected cells"
+_SUBSET_ERROR = "The feature subset of RNA holds negative or non-finite totals"
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        (lambda rna, cells: rna.normed(cells, _ALL_FEATURES), _TOTALS_ERROR),
+        (
+            lambda rna, cells: rna.normed(
+                cells, np.array([0, 1]), renormalize_subset=True
+            ),
+            _SUBSET_ERROR,
+        ),
+        (
+            lambda rna, cells: next(
+                rna.iter_normed_feature_wise(cells, _ALL_FEATURES, None, None)
+            ),
+            _TOTALS_ERROR,
+        ),
+        (
+            lambda rna, cells: rna._mean_normed_feature_groups(
+                cells, {"pair": np.array([0, 1])}
+            ),
+            _TOTALS_ERROR,
+        ),
+        (
+            lambda rna, cells: next(
+                rna._iter_feature_group_means(cells, [np.array([0, 1])])
+            ),
+            _TOTALS_ERROR,
+        ),
+        (
+            lambda rna, cells: rna._streaming_feature_stats(cells, _ALL_FEATURES),
+            _TOTALS_ERROR,
+        ),
+        (
+            lambda rna, cells: write_renorm_subset_to_zarr(
+                rna,
+                cells,
+                np.array([0, 1]),
+                zarr.open_group(store=MemoryStore(), mode="w"),
+                "normalized",
+                1,
+            ),
+            _SUBSET_ERROR,
+        ),
+    ],
+    ids=[
+        "normed",
+        "normed-subset",
+        "feature-wise",
+        "group-means",
+        "banded-group-means",
+        "feature-statistics",
+        "subset-write",
+    ],
+)
+def test_library_size_paths_reject_negative_totals(
+    negative_total_store: DataStore, path, message: str
+) -> None:
+    rna = negative_total_store.RNA
+    cells = np.arange(rna.cells.N)
+
+    with pytest.raises(ValueError, match=message):
+        path(rna, cells)
+
+
+def test_library_size_normalization_requires_a_size_factor(store, monkeypatch) -> None:
+    monkeypatch.setattr(store.RNA, "sf", None)
+
+    with pytest.raises(ValueError, match="requires a size factor"):
+        store.RNA.normed(np.arange(4), np.arange(3))
 
 
 def test_renormalized_subset_progress_bar_shows_the_given_message(

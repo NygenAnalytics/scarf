@@ -1,16 +1,14 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
 import types
-from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
-from scipy.io import mmread
 
 import scarf.embeddings.sgtsne as sgtsne_module
 from tests.test_utils_process import _null_descriptors, _standard_descriptors
@@ -33,218 +31,41 @@ def test_run_sgtsne_validates_initial_embedding_shape(initial):
         )
 
 
-_FAKE_SGTSNE = """
-import json
-import os
-import shutil
-import sys
-from pathlib import Path
-
-arguments = sys.argv[1:]
-record = Path(os.environ["SCARF_FAKE_SGTSNE_RECORD"])
-record.mkdir(parents=True, exist_ok=True)
-(record / "argv.json").write_text(json.dumps(arguments), encoding="utf-8")
-shutil.copyfile(arguments[-1], record / "graph.mtx")
-shutil.copyfile(arguments[arguments.index("-i") + 1], record / "initial.txt")
-print("fake sgtsne progress", flush=True)
-mode = os.environ.get("SCARF_FAKE_SGTSNE_MODE", "ok")
-if mode == "fail":
-    sys.stderr.write("\\n".join(f"diagnostic {index}" for index in range(30)))
-    sys.exit(3)
-if mode == "ok":
-    Path(arguments[arguments.index("-o") + 1]).write_text(
-        "1 10\\n2 20\\n3 30\\n",
-        encoding="utf-8",
-    )
-"""
-
-
-def _install_fake_sgtsne(
+def _fake_sgtsnepi(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    mode: str = "ok",
-) -> Path:
-    """Put a real ``sgtsne`` executable that records its argv on PATH."""
-    bin_dir = tmp_path / "fake bin"
-    bin_dir.mkdir()
-    script = bin_dir / "fake_sgtsne.py"
-    script.write_text(_FAKE_SGTSNE, encoding="utf-8")
-    executable = bin_dir / "sgtsne"
-    executable.write_text(
-        f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n',
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    record = tmp_path / "record"
-    monkeypatch.setenv("PATH", str(bin_dir))
-    monkeypatch.setenv("SCARF_FAKE_SGTSNE_RECORD", str(record))
-    monkeypatch.setenv("SCARF_FAKE_SGTSNE_MODE", mode)
-    return record
+    calls: list[dict[str, object]],
+) -> None:
+    """Install an ``sgtsnepi`` module that records its calls."""
+    fake_module = types.ModuleType("sgtsnepi")
+
+    def fake_sgtsnepi(received_graph, **kwargs):
+        calls.append(
+            {
+                "graph": received_graph,
+                "kwargs": kwargs,
+                "descriptors": _standard_descriptors(),
+            }
+        )
+        return np.arange(2 * received_graph.shape[0], dtype=np.float64).reshape(
+            2, received_graph.shape[0]
+        )
+
+    fake_module.sgtsnepi = fake_sgtsnepi
+    monkeypatch.setitem(sys.modules, "sgtsnepi", fake_module)
 
 
 @pytest.mark.parametrize("sparse_format", ["csr", "coo"])
-@pytest.mark.parametrize(
-    ("verbose", "parallel", "expected_threads"),
-    [
-        (True, True, 4),
-        (False, False, 1),
-    ],
-)
-def test_run_sgtsne_cli_backend_passes_argv_and_cleans_temporary_files(
-    monkeypatch,
-    tmp_path,
-    verbose,
-    parallel,
-    expected_threads,
-    sparse_format,
-):
-    graph = _graph().asformat(sparse_format)
-    record = _install_fake_sgtsne(monkeypatch, tmp_path)
-    work_dir = tmp_path / "work dir; $(touch injected)"
-    work_dir.mkdir()
-    monkeypatch.setattr(sgtsne_module, "uuid4", lambda: "fixed")
-    logged: list[str] = []
-    sink = sgtsne_module.logger.add(
-        lambda message: logged.append(message.record["message"]),
-        level="DEBUG",
-    )
-    try:
-        embedding = sgtsne_module.run_sgtsne(
-            graph,
-            np.arange(6).reshape(3, 2),
-            tsne_dims=2,
-            max_iter=11,
-            early_iter=3,
-            alpha=7,
-            lambda_scale=0.5,
-            box_h=0.2,
-            temp_file_loc=str(work_dir),
-            verbose=verbose,
-            parallel=parallel,
-            nthreads=4,
-        )
-    finally:
-        sgtsne_module.logger.remove(sink)
-
-    arguments = json.loads((record / "argv.json").read_text(encoding="utf-8"))
-    assert arguments == [
-        "-m",
-        "11",
-        "-l",
-        "0.5",
-        "-d",
-        "2",
-        "-e",
-        "3",
-        "-p",
-        str(expected_threads),
-        "-a",
-        "7",
-        "-h",
-        "0.2",
-        "-i",
-        str((work_dir / "fixed.txt").resolve()),
-        "-o",
-        str((work_dir / "fixed_output.txt").resolve()),
-        str((work_dir / "fixed.mtx").resolve()),
-    ]
-    exported = mmread(record / "graph.mtx", spmatrix=False)
-    assert exported.nnz == 4
-    assert np.all(exported.data > 0)
-    np.testing.assert_array_equal(exported.toarray(), graph.toarray())
-    assert graph.nnz == 5
-    assert (record / "initial.txt").read_text(encoding="utf-8") == ("0\n1\n2\n3\n4\n5")
-    np.testing.assert_array_equal(
-        embedding,
-        np.array([[1, 2, 3], [10, 20, 30]]),
-    )
-    assert ("fake sgtsne progress" in logged) is verbose
-    assert list(work_dir.iterdir()) == []
-    assert not (tmp_path / "injected").exists()
-
-
-def test_run_sgtsne_cli_backend_raises_on_nonzero_exit(monkeypatch, tmp_path):
-    _install_fake_sgtsne(monkeypatch, tmp_path, mode="fail")
-    work_dir = tmp_path / "work"
-    work_dir.mkdir()
-
-    with pytest.raises(RuntimeError, match="exited with status 3") as caught:
-        sgtsne_module.run_sgtsne(
-            _graph(),
-            np.zeros((3, 2)),
-            temp_file_loc=str(work_dir),
-            verbose=False,
-        )
-
-    message = str(caught.value)
-    assert "diagnostic 29" in message
-    assert "diagnostic 10" in message
-    assert "diagnostic 9\n" not in message
-    assert list(work_dir.iterdir()) == []
-
-
-def test_run_sgtsne_cli_backend_cleans_inputs_when_output_is_missing(
-    monkeypatch,
-    tmp_path,
-):
-    _install_fake_sgtsne(monkeypatch, tmp_path, mode="no-output")
-    work_dir = tmp_path / "work"
-    work_dir.mkdir()
-
-    with pytest.raises(FileNotFoundError):
-        sgtsne_module.run_sgtsne(
-            _graph(),
-            np.zeros((3, 2)),
-            temp_file_loc=str(work_dir),
-        )
-
-    assert list(work_dir.iterdir()) == []
-
-
-@pytest.mark.parametrize("sparse_format", ["csr", "coo"])
-@pytest.mark.parametrize(
-    ("parallel", "expected_warnings"),
-    [
-        (
-            True,
-            [
-                "parallel=True is not supported by the sgtsnepi Python backend; "
-                "running single-threaded"
-            ],
-        ),
-        (False, []),
-    ],
-)
 @pytest.mark.parametrize("verbose", [True, False])
-def test_run_sgtsne_python_backend_forwards_parameters(
+def test_run_sgtsne_forwards_parameters_to_sgtsnepi(
     monkeypatch,
-    parallel,
-    expected_warnings,
     sparse_format,
     verbose,
 ):
     graph = _graph().asformat(sparse_format)
     initial = np.arange(6, dtype=np.float64).reshape(3, 2)
-    captured = {}
-    warnings = []
-    fake_module = types.ModuleType("sgtsnepi")
+    calls: list[dict[str, object]] = []
     before = _standard_descriptors()
-
-    def fake_sgtsnepi(received_graph, **kwargs):
-        captured["graph"] = received_graph
-        captured["kwargs"] = kwargs
-        captured["descriptors"] = _standard_descriptors()
-        return [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
-
-    fake_module.sgtsnepi = fake_sgtsnepi
-    monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(
-        sgtsne_module,
-        "logger",
-        SimpleNamespace(warning=warnings.append),
-    )
-    monkeypatch.setitem(sys.modules, "sgtsnepi", fake_module)
+    _fake_sgtsnepi(monkeypatch, calls)
 
     embedding = sgtsne_module.run_sgtsne(
         graph,
@@ -256,15 +77,15 @@ def test_run_sgtsne_python_backend_forwards_parameters(
         lambda_scale=0.25,
         box_h=0.4,
         verbose=verbose,
-        parallel=parallel,
-        nthreads=12,
     )
 
-    assert captured["graph"].nnz == 4
-    assert np.all(captured["graph"].data > 0)
-    np.testing.assert_array_equal(captured["graph"].toarray(), graph.toarray())
+    (call,) = calls
+    received = call["graph"]
+    assert received.nnz == 4
+    assert np.all(received.data > 0)
+    np.testing.assert_array_equal(received.toarray(), graph.toarray())
     assert graph.nnz == 5
-    assert captured["kwargs"] == {
+    assert call["kwargs"] == {
         "y0": pytest.approx(initial.T),
         "d": 2,
         "max_iter": 17,
@@ -274,13 +95,96 @@ def test_run_sgtsne_python_backend_forwards_parameters(
         "alpha": 8,
         "silent": False,
     }
-    assert captured["descriptors"] == (before if verbose else _null_descriptors())
+    assert call["descriptors"] == (before if verbose else _null_descriptors())
     assert _standard_descriptors() == before
     np.testing.assert_array_equal(
         embedding,
-        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]),
     )
-    assert warnings == expected_warnings
+
+
+def test_run_sgtsne_ignores_an_sgtsne_executable_on_path(monkeypatch, tmp_path):
+    # An earlier release preferred any sgtsne executable on PATH over sgtsnepi
+    # and recorded nothing about which one ran.
+    marker = tmp_path / "executable-ran"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "sgtsne"
+    # A shell redirection marks the run, since PATH holds no touch command.
+    executable.write_text(f'#!/bin/sh\n: > "{marker}"\nexit 3\n', encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert shutil.which("sgtsne") == str(executable)
+    calls: list[dict[str, object]] = []
+    _fake_sgtsnepi(monkeypatch, calls)
+
+    embedding = sgtsne_module.run_sgtsne(_graph(), np.zeros((3, 2)), verbose=False)
+
+    assert len(calls) == 1
+    assert embedding.shape == (2, 3)
+    assert not marker.exists()
+
+
+_SETTINGS = {
+    "tsne_dims": 2,
+    "lambda_scale": 1.0,
+    "max_iter": 500,
+    "early_iter": 200,
+    "alpha": 10,
+    "box_h": 0.7,
+}
+# Each setting's bound. The shared argument validators have their own tests of
+# types and finiteness.
+_INVALID_SETTINGS = [
+    ({"tsne_dims": 0}, ValueError, "tsne_dims must be at least 1"),
+    ({"max_iter": 0}, ValueError, "max_iter must be at least 1"),
+    ({"max_iter": True}, TypeError, "max_iter must be an integer"),
+    ({"early_iter": -1}, ValueError, "early_iter must be at least 0"),
+    ({"alpha": 0}, ValueError, "alpha must be at least 1"),
+    ({"lambda_scale": 0.0}, ValueError, "lambda_scale must be positive"),
+    ({"box_h": 0}, ValueError, "box_h must be positive"),
+]
+
+
+@pytest.mark.parametrize(("change", "error", "message"), _INVALID_SETTINGS)
+def test_sgtsne_settings_reject_invalid_values(change, error, message):
+    with pytest.raises(error, match=message):
+        sgtsne_module.sgtsne_settings(**{**_SETTINGS, **change})
+
+
+def test_sgtsne_settings_are_canonical_python_numbers():
+    settings = sgtsne_module.sgtsne_settings(
+        tsne_dims=np.int64(3),
+        lambda_scale=1,
+        max_iter=np.int32(20),
+        early_iter=0,
+        alpha=np.uint8(1),
+        box_h=np.float32(0.5),
+    )
+
+    assert settings == sgtsne_module.SgtsneSettings(
+        tsne_dims=3,
+        lambda_scale=1.0,
+        max_iter=20,
+        early_iter=0,
+        alpha=1,
+        box_h=0.5,
+    )
+    for name in ("tsne_dims", "max_iter", "early_iter", "alpha"):
+        assert type(getattr(settings, name)) is int
+    for name in ("lambda_scale", "box_h"):
+        assert type(getattr(settings, name)) is float
+
+
+def test_run_sgtsne_validates_settings_before_calling_the_backend(monkeypatch):
+    calls: list[dict[str, object]] = []
+    _fake_sgtsnepi(monkeypatch, calls)
+
+    with pytest.raises(ValueError, match="max_iter must be at least 1"):
+        sgtsne_module.run_sgtsne(
+            _graph(), np.zeros((3, 2)), **{**_SETTINGS, "max_iter": 0}
+        )
+    assert calls == []
 
 
 _QUIET_SGTSNEPI_PROBE = textwrap.dedent(
@@ -346,16 +250,13 @@ def test_quiet_sgtsnepi_backend_keeps_standard_descriptors(tmp_path):
     probe = tmp_path / "probe.py"
     probe.write_text(_QUIET_SGTSNEPI_PROBE, encoding="utf-8")
     result_path = tmp_path / "result.json"
-    empty_path = tmp_path / "empty-path"
-    empty_path.mkdir()
-    environment = {**os.environ, "PATH": str(empty_path)}
 
     completed = subprocess.run(
         [sys.executable, str(probe), str(result_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=environment,
+        env=dict(os.environ),
         timeout=300,
         check=False,
     )
@@ -371,9 +272,8 @@ def test_quiet_sgtsnepi_backend_keeps_standard_descriptors(tmp_path):
     assert "Number of vertices" not in completed.stderr
 
 
-def test_quiet_sgtsnepi_backend_suppresses_notebook_streams(monkeypatch, capsys):
+def test_quiet_sgtsnepi_backend_suppresses_notebook_streams(capsys):
     pytest.importorskip("sgtsnepi")
-    monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
     n_cells = 40
     rows = np.repeat(np.arange(n_cells), 2)
     columns = np.column_stack(
@@ -395,32 +295,18 @@ def test_quiet_sgtsnepi_backend_suppresses_notebook_streams(monkeypatch, capsys)
     assert np.isfinite(embedding).all()
 
 
-def test_run_sgtsne_requires_an_available_backend(monkeypatch):
-    monkeypatch.setattr(sgtsne_module.shutil, "which", lambda _name: None)
+def test_run_sgtsne_names_the_tsne_extra_when_sgtsnepi_is_missing(monkeypatch):
     monkeypatch.setitem(sys.modules, "sgtsnepi", None)
 
-    with pytest.raises(ImportError, match="executable on PATH or the sgtsnepi package"):
+    with pytest.raises(ImportError) as caught:
         sgtsne_module.run_sgtsne(
             csr_matrix((1, 1), dtype=np.float64),
             np.zeros((1, 2)),
         )
 
-
-def test_export_knn_to_mtx_writes_every_row_block(tmp_path):
-    rng = np.random.default_rng(3)
-    dense = (rng.random((7, 7)) < 0.4) * rng.random((7, 7))
-    path = tmp_path / "graph.mtx"
-
-    # Blocks of three rows leave a final block of one.
-    sgtsne_module.export_knn_to_mtx(str(path), csr_matrix(dense), batch_size=3)
-
-    np.testing.assert_array_equal(mmread(path, spmatrix=False).toarray(), dense)
-
-
-def test_export_knn_to_mtx_refuses_a_batch_size_that_skips_rows(tmp_path):
-    # A negative batch size iterates no row blocks; the row count check stops
-    # the header-only file from passing as the whole graph.
-    with pytest.raises(ValueError, match="Internal loop count error"):
-        sgtsne_module.export_knn_to_mtx(
-            str(tmp_path / "graph.mtx"), _graph(), batch_size=-1
-        )
+    message = str(caught.value)
+    assert message == sgtsne_module.SGTSNEPI_GUIDANCE
+    assert 'pip install "scarf[tsne]"' in message
+    assert "Linux x86_64" in message
+    assert "macOS 26 or newer on arm64" in message
+    assert isinstance(caught.value.__cause__, ImportError)

@@ -5,7 +5,6 @@ exclude .gitignore
 exclude .gitattributes
 exclude .readthedocs.yml
 exclude Dockerfile
-prune scarf_toolkit.egg-info
 prune docs
 prune tests
 prune profiling
@@ -13,4 +12,3 @@ prune scripts
 prune .circleci
 prune .github
 include README.md
-graft bin

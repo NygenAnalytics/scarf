@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -34,6 +34,7 @@ from ...metadata.arguments import (
     HtoIdentityArguments,
     PrevalentPeakArguments,
 )
+from ...metadata.membership import measured_selection
 from ...metadata.rows import (
     metadata_missing_mask,
     read_metadata_missing_rows,
@@ -41,12 +42,11 @@ from ...metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ...metadata.selection import (
-    GROUPING_VALUE_NAMES,
     NamedCellArtifact,
+    grouping_value_name,
     require_complete_cluster_labels,
     resolve_cell_aligned_artifact,
 )
-from ...storage.arrays import linked_missing_mask
 from ...storage.artifacts import (
     artifact_group,
     artifact_path,
@@ -62,7 +62,6 @@ from ...storage.feature_selection import (
 )
 from ...storage.refs import ArtifactRef
 from ...storage.selections import (
-    iter_stored_selection_blocks,
     ValidatedStoredSelection,
     read_stored_selection_indices,
     resolve_generated_selection_artifact,
@@ -79,6 +78,12 @@ if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _QualityControlOperationsBase
 else:
     _QualityControlOperationsBase = object
+
+
+_ONE_CLUSTER_DOUBLET_REMEDY = (
+    "Pass a clustering with two or more clusters, or heterotypic_fraction=0 to "
+    "simulate doublets from any two sampled cells."
+)
 
 
 def _validated_real(
@@ -114,13 +119,19 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
         ctrl_size: int | None = None,
-        log_transform: bool = True,
+        log_transform: bool | None = None,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Create or reuse cell-cycle scores without creating metadata columns."""
-        self._require_writable("run_cell_cycle_scoring")
+        """Create or reuse cell-cycle scores without creating metadata columns.
+
+        The arguments are checked first, then the cells against the assay's
+        membership, then that the store is writable, before anything is
+        saved.
+        """
+        from ...assay.normalization import resolve_normalization_params
+
         if s_genes is None:
             from ...quality_control.cell_cycle_genes import s_phase_genes
 
@@ -139,8 +150,15 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             "ctrl_size",
             minimum=1,
         )
-        if not isinstance(log_transform, bool):
+        if log_transform is not None and not isinstance(log_transform, bool):
             raise TypeError("log_transform must be a bool")
+        # Scores are logged by default when the normalizer's defaults log.
+        log_transform = resolve_normalization_params(
+            assay,
+            {"log_transform": log_transform},
+            caller="run_cell_cycle_scoring",
+            default=True,
+        )["log_transform"]
         n_bins = integer_argument(n_bins, "n_bins", minimum=2)
         rand_seed = integer_argument(rand_seed, "rand_seed", minimum=0)
         names = np.asarray(
@@ -168,6 +186,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         s_gene_indices = indices_for(s_genes, "s_genes")
         g2m_gene_indices = indices_for(g2m_genes, "g2m_genes")
+        self._require_measured_cells(
+            assay.name, cell_selection, operation="run_cell_cycle_scoring"
+        )
+        self._require_writable("run_cell_cycle_scoring")
         summary_ref = ensure_feature_summary(
             self.zw,
             assay,
@@ -292,6 +314,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             TypeError: If a bound or ``keep_bounds`` has an invalid type.
             ValueError: If a bound is invalid, the input selection is empty,
                 or no cell passes the filter.
+            UnmeasuredCellsError: If a column's assay did not measure a selected cell.
         """
         attrs = list(attrs)
         lows = list(lows)
@@ -305,6 +328,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if missing:
             joined = ", ".join(repr(attr) for attr in missing)
             raise KeyError(f"Cell metadata columns not found: {joined}")
+        self._require_measured_metric_cells(
+            attrs, [], cell_selection, operation="filter_cells"
+        )
         prior, active_idx = self._filter_input_cells(cell_selection)
         # Provenance fingerprints cover whole columns, so each is read in full.
         input_fingerprints: dict[str, str] = {}
@@ -378,9 +404,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         """Select cells from one numeric or categorical artifact vector.
 
         Numeric values use optional bounds. Categorical values use ``include``.
-        Categorical label artifacts are read from their canonical label array,
-        for example ``phase`` of a ``cell_cycle`` artifact or ``labels`` of a
-        ``cluster_cut``; other artifacts are read from ``values``.
+        The artifact is read from its kind's canonical array, for example
+        ``phase`` of a ``cell_cycle`` artifact or ``labels`` of a ``cluster_cut``.
         The artifact must identify its source cell selection in provenance. By
         default the new selection is composed with that source selection. An
         explicit ``cell_selection`` may narrow it further, but cannot add cells
@@ -448,47 +473,22 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         ):
             raise ValueError("low cannot exceed high")
 
-        status = self.inspect_artifact(values)
-        if not status.exists or not status.complete:
-            raise ValueError("values must identify a complete artifact")
-        raw_source_selection = (status.inputs or {}).get("cell_selection")
-        if not isinstance(raw_source_selection, Mapping):
-            raise ValueError("values artifact has no cell-selection input")
-        try:
-            source_selection = ArtifactRef.from_dict(raw_source_selection)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("values artifact cell selection is malformed") from exc
-        source = validate_stored_selection_integrity(
+        if cell_selection is not None and not isinstance(cell_selection, ArtifactRef):
+            raise TypeError("cell_selection must be an ArtifactRef")
+        # The one reader of cell-aligned artifacts checks the kind, the cell
+        # selection that the artifact records, and that cell_selection lies
+        # within it, and reads the canonical array for exactly those cells,
+        # once what it holds fits the memory budget, as load_cell_values does.
+        aligned = resolve_cell_aligned_artifact(
             self.zw,
-            source_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
+            values,
+            cell_selection=cell_selection,
+            max_bytes=self.memoryBytes,
         )
-
-        group = as_zarr_group(
-            self.zw[artifact_path(values)],
-            name=values.artifact_id,
-        )
-        value_name = GROUPING_VALUE_NAMES.get(values.kind, "values")
-        if value_name not in group:
-            raise ValueError(f"values artifact has no canonical {value_name!r} array")
-        source_values = as_zarr_array(group[value_name], name=value_name)
-        if (
-            source_values.ndim != 1
-            or int(source_values.shape[0]) != source.selected_count
-        ):
-            raise ValueError(
-                "values artifact must contain one value per source-selected cell"
-            )
-        source_missing = linked_missing_mask(
-            group,
-            value_name,
-            label="values artifact",
-            values=source_values,
-        )
-        value_kind = np.dtype(source_values.dtype).kind
+        source_selection = aligned.source_cell_selection
+        prior_selection = aligned.cell_selection
+        raw_values = np.asarray(aligned.values)
+        value_kind = raw_values.dtype.kind
         if raw_include is None and value_kind not in {"i", "u", "f"}:
             raise TypeError(
                 "values artifact must be numeric unless include is provided"
@@ -525,7 +525,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     raise TypeError(
                         "include values must be integers for an integer artifact"
                     )
-                limits = np.iinfo(source_values.dtype)
+                limits = np.iinfo(raw_values.dtype)
                 if any(
                     int(value) < limits.min or int(value) > limits.max
                     for value in raw_include
@@ -550,11 +550,19 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     ) from exc
                 resolved_include = tuple(sorted(normalized))
 
-        prior_selection = source_selection
-        if cell_selection is not None:
-            if not isinstance(cell_selection, ArtifactRef):
-                raise TypeError("cell_selection must be an ArtifactRef")
-            prior_selection = cell_selection
+        if resolved_include is not None:
+            keep = np.isin(raw_values, resolved_include)
+        else:
+            numeric = np.asarray(raw_values, dtype=np.float64)
+            keep = np.isfinite(numeric) & within_bounds(
+                numeric, resolved_low, resolved_high, keep_bounds=keep_bounds
+            )
+        if aligned.missing_mask is not None:
+            keep &= ~aligned.missing_mask
+        selected = np.zeros(self.cells.N, dtype=bool)
+        selected[aligned.cell_idx[keep]] = True
+        if not selected.any():
+            raise ValueError("select_cells retained no cells")
         prior = validate_stored_selection_integrity(
             self.zw,
             prior_selection,
@@ -563,43 +571,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay=None,
             table_path="cellData",
         )
-        prior_mask = selection_mask(prior)
-
-        selected = np.zeros(self.cells.N, dtype=bool)
-        for block in iter_stored_selection_blocks(
-            self.zw,
-            source_selection,
-            kind="cell_selection",
-            scope="datastore",
-            assay=None,
-            table_path="cellData",
-        ):
-            prior_block = prior_mask[block.start : block.stop]
-            if np.any(prior_block & ~block.mask):
-                raise ValueError(
-                    "cell_selection must be a subset of the values artifact's "
-                    "cell selection"
-                )
-            raw_compact = np.asarray(
-                source_values[block.compact_start : block.compact_stop]
-            )
-            if resolved_include is not None:
-                keep = np.isin(raw_compact, resolved_include)
-            else:
-                compact = np.asarray(raw_compact, dtype=np.float64)
-                keep = np.isfinite(compact) & within_bounds(
-                    compact, resolved_low, resolved_high, keep_bounds=keep_bounds
-                )
-            if source_missing is not None:
-                keep &= ~np.asarray(
-                    source_missing[block.compact_start : block.compact_stop],
-                    dtype=bool,
-                )
-            block_selected = np.zeros(block.stop - block.start, dtype=bool)
-            block_selected[block.mask] = keep
-            selected[block.start : block.stop] = block_selected & prior_block
-        if not selected.any():
-            raise ValueError("select_cells retained no cells")
 
         inputs: dict[str, Any] = {
             "values": values,
@@ -625,6 +596,65 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         logger.info(f"Cell selection retained {int(stored.sum())}/{self.cells.N} cells")
+        return ref
+
+    def select_measured_cells(
+        self,
+        assay: str,
+        *,
+        cell_selection: ArtifactRef | None = None,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Keep the cells of a selection that an assay measured.
+
+        Args:
+            assay: Name of the assay whose measured cells are kept.
+            cell_selection: Optional prior cell-selection artifact.
+            invalidate_cache: Create a fresh result instead of reusing a match.
+
+        Returns:
+            A complete datastore-scoped ``cell_selection`` artifact.
+
+        Raises:
+            ValueError: If ``assay`` is unknown or measured no selected cell.
+        """
+        if not isinstance(assay, str) or not assay:
+            raise TypeError("assay must be the name of an assay")
+        assay_name = self._get_assay(assay).name
+        prior, active_idx = self._filter_input_cells(cell_selection)
+        selected = np.zeros(self.cells.N, dtype=bool)
+        selected[active_idx] = True
+        measured = measured_selection(self.cells, assay_name, selected)
+        if measured is None:
+            return prior.ref
+        column, values, membership_fingerprint = measured
+        remaining = int(np.count_nonzero(values))
+        if remaining == len(active_idx):
+            return prior.ref
+        if remaining == 0:
+            raise ValueError(
+                f"Assay {assay_name!r} measured none of the {len(active_idx)} "
+                f"selected cells: cell column {column!r} is False for all of them."
+            )
+        ref, _stored = resolve_generated_selection_artifact(
+            self.zw,
+            scope="datastore",
+            kind="cell_selection",
+            values=values,
+            row_ids=prior.row_ids,
+            row_ids_fingerprint=prior.row_ids_fingerprint,
+            operation="select_measured_cells",
+            parameters={"assay": assay_name},
+            inputs={
+                "prior_cell_selection": prior.ref,
+                "membership_fingerprint": membership_fingerprint,
+            },
+            source_column=column,
+            invalidate_cache=invalidate_cache,
+        )
+        logger.info(
+            f"Assay {assay_name} measured {remaining}/{len(active_idx)} selected cells"
+        )
         return ref
 
     def _read_filter_metrics(
@@ -697,6 +727,61 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError("Cell selection contains no active cells")
         return prior, active_idx
 
+    def _metric_assays(
+        self,
+        attrs: Sequence[str],
+        artifact_metrics: Sequence[NamedCellArtifact],
+    ) -> list[str]:
+        """Return the assays whose values the QC metrics describe.
+
+        A cell metadata column is a metric of the assay whose preparation
+        wrote it (:func:`~scarf.storage.identity.generated_cell_columns`):
+        ``<assay>_nCounts``, ``<assay>_nFeatures``, and the percentage columns
+        that the assay records in its ``percentFeatures`` attribute. The
+        column is found among each assay's own columns, never by parsing its
+        name, so a user column named like a metric is no metric. A
+        ``quality_metric`` artifact scoped to an assay is a metric of it.
+        """
+        from ...storage.identity import generated_cell_columns
+
+        owners = {
+            column: name
+            for name in self.assay_names
+            for column in generated_cell_columns(
+                name, self._get_assay(name)._percent_features()
+            )
+        }
+        assays = [owners[attr] for attr in attrs if attr in owners]
+        assays.extend(
+            source.artifact.assay
+            for source in artifact_metrics
+            if source.artifact.kind == "quality_metric"
+            and source.artifact.scope == "assay"
+            and source.artifact.assay is not None
+        )
+        return list(dict.fromkeys(assays))
+
+    def _require_measured_metric_cells(
+        self,
+        attrs: Sequence[str],
+        artifact_metrics: Sequence[NamedCellArtifact],
+        cell_selection: ArtifactRef | None,
+        *,
+        operation: str,
+    ) -> None:
+        """Refuse QC metrics of an assay over cells that it did not measure.
+
+        Such a cell holds zero counts, so its metrics are zero and would set
+        the bounds of the measured cells. Without ``cell_selection``, the
+        live ``I`` column, which the filter would snapshot, is checked
+        before anything is written.
+        """
+        cells: ArtifactRef | str = "I" if cell_selection is None else cell_selection
+        for assay in self._metric_assays(attrs, artifact_metrics):
+            self._require_measured_cells(
+                assay, cells, operation=operation, remedy="cell_selection"
+            )
+
     def auto_filter_cells(
         self,
         attrs: Iterable[str] | None = None,
@@ -749,6 +834,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns:
             A complete datastore-scoped ``cell_selection`` artifact.
+
+        Raises:
+            UnmeasuredCellsError: If a metric's assay did not measure a selected cell.
         """
         if method not in ("mad", "gaussian"):
             raise ValueError("method must be 'mad' or 'gaussian'")
@@ -793,6 +881,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 min_cells_per_sample=min_cells_per_sample,
             )
 
+        self._require_measured_metric_cells(
+            attrs_list, metric_artifacts, cell_selection, operation="auto_filter_cells"
+        )
         prior, active_idx = self._filter_input_cells(cell_selection)
         values_by_name, missing_by_name, missing_fingerprints = (
             self._read_filter_metrics(attrs_list, metric_artifacts, prior, active_idx)
@@ -886,6 +977,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"sample_column '{sample_column}' not found in cell metadata"
             )
+        self._require_measured_metric_cells(
+            attrs, artifact_metrics, cell_selection, operation="auto_filter_cells"
+        )
         prior, active_idx = self._filter_input_cells(cell_selection)
         sample_options: dict[str, Any] = {}
         if sample_column is not None:
@@ -1020,6 +1114,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns:
             A complete assay-scoped ``quality_metric`` artifact.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a selected cell.
         """
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
@@ -1038,6 +1135,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         ).astype(np.int64, copy=False)
         if len(cell_index) == 0:
             raise ValueError("cell_selection must select at least one cell")
+        # The stored mask of the selection is read in bounded blocks.
+        self._require_measured_cells(
+            assay.name, cell_selection, operation="run_feature_percentage"
+        )
         feature_selection = resolve_feature_selection(
             self.zw,
             assay.name,
@@ -1093,14 +1194,22 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns:
             A complete ``hto_identity`` artifact.
+
+        Raises:
+            UnmeasuredCellsError: If the HTO assay did not measure a selected cell.
         """
+        from ...assay.classification import declared_assay_type
+
         if from_assay is None:
             from_assay = "HTO"
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
-        assay_types = self.zw.attrs.get("assayTypes", {})
+        # The type this datastore resolved for the assay, which its store
+        # records; an assay that the store lacks declares none.
         declared_type = (
-            assay_types.get(from_assay) if isinstance(assay_types, Mapping) else None
+            declared_assay_type(self._get_assay(from_assay))
+            if from_assay in self.assay_names
+            else None
         )
         if declared_type != "HTO":
             raise TypeError(
@@ -1124,6 +1233,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"HTO demultiplexing requires at least {required_cells} selected cells"
             )
+        # The stored mask of the selection is read in bounded blocks.
+        self._require_measured_cells(
+            assay.name, cell_selection, operation="run_hto_demultiplexing"
+        )
         arguments = HtoIdentityArguments(
             cell_selection=cell_selection,
             feature_ids_fingerprint=fingerprint_strings(
@@ -1191,8 +1304,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         normalize_scores: bool = True,
         random_seed: int = 4444,
         invalidate_cache: bool = False,
+        one_cluster_remedy: str = _ONE_CLUSTER_DOUBLET_REMEDY,
     ) -> ArtifactRef:
-        """Create doublet scores without creating metadata columns."""
+        """Create doublet scores without creating metadata columns.
+
+        ``one_cluster_remedy`` ends the error raised when
+        ``heterotypic_fraction`` is above 0 and every cell has the same
+        cluster label, so a caller can name the settings that it exposes.
+        """
         from ...quality_control.doublets import (
             score_synthetic_doublets,
             smooth_doublet_scores,
@@ -1218,6 +1337,18 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         integer_argument(random_seed, "random_seed", minimum=0)
         if not isinstance(normalize_scores, bool):
             raise TypeError("normalize_scores must be a boolean")
+        labels = np.asarray(cluster_values)
+        if labels.ndim != 1:
+            raise ValueError("Cluster values must contain one label per selected cell")
+        # Forced heterotypic doublets need a partner outside the first
+        # parent's cluster, so one cluster fails before any planning.
+        if heterotypic_fraction > 0 and len(np.unique(labels)) < 2:
+            raise ValueError(
+                "Doublet detection with heterotypic_fraction="
+                f"{float(heterotypic_fraction):g} pairs cells from two different "
+                "clusters, but every selected cell has the same cluster label. "
+                f"{one_cluster_remedy}"
+            )
         assay_name = source_assay.name
         connectivity_status = self._require_complete_artifact(
             connectivity,
@@ -1247,8 +1378,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             assay=None,
             table_path="cellData",
         ).astype(np.int64, copy=False)
-        labels = np.asarray(cluster_values)
-        if labels.ndim != 1 or len(labels) != len(active_idx):
+        if len(labels) != len(active_idx):
             raise ValueError("Cluster values must contain one label per selected cell")
         n_active = len(active_idx)
         arguments = DoubletScoreArguments(
@@ -1378,7 +1508,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Compute doublet scores from explicit cluster and graph artifacts."""
+        """Compute doublet scores from explicit cluster and graph artifacts.
+
+        Raises:
+            ValueError: If ``heterotypic_fraction`` is above 0 with one cluster.
+            UnmeasuredCellsError: If the assay did not measure a cell of the graph.
+        """
         if not isinstance(graph, ArtifactRef):
             raise TypeError("graph must be an ArtifactRef")
         if not isinstance(clusters, ArtifactRef):
@@ -1402,6 +1537,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 "Doublet detection is only supported for RNA assays; "
                 f"received {type(assay).__name__}"
             )
+        self._require_measured_cells(
+            assay.name,
+            graph_selection,
+            operation="run_doublet_detection",
+            remedy="graph",
+        )
         cluster_status = self.inspect_artifact(clusters)
         if (
             clusters.kind not in {"cluster_labels", "cluster_cut"}
@@ -1430,7 +1571,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.zw[artifact_path(clusters)],
             name=clusters.artifact_id,
         )
-        value_name = "values" if clusters.kind == "cluster_labels" else "labels"
+        value_name = grouping_value_name(clusters.kind)
         require_complete_cluster_labels(cluster_group, value_name, name="clusters")
         cluster_values = artifact_values(cluster_group, value_name)
         ref = self._run_doublet_detection_artifact(
@@ -1465,14 +1606,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         and then marks `top_n` peaks with the highest prevalence as prevalent peaks.
 
         Args:
-            from_assay: Assay to use for graph creation. If no value is provided then `defaultAssay` will be used
+            from_assay: Assay to use for peak selection. If no value is provided
+                then `defaultAssay` will be used
             cell_selection: Explicit cells used to calculate peak prevalence.
             top_n: Number of top prevalent peaks to be selected, from 1 to one
                 fewer than the number of peaks. (Default: 10000)
         Returns:
             The persisted prevalent-peak feature-selection artifact.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a selected cell.
         """
-        self._require_writable("select_prevalent_peaks")
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
         assay = self._get_assay(from_assay)
@@ -1486,6 +1630,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             raise ValueError(
                 f"top_n must be less than the number of peaks ({assay.feats.N})"
             )
+        self._require_measured_cells(
+            assay.name, cell_selection, operation="select_prevalent_peaks"
+        )
+        self._require_writable("select_prevalent_peaks")
         summary_ref = ensure_feature_summary(
             self.zw,
             assay,
@@ -1534,7 +1682,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         s_genes: list[str] | None = None,
         g2m_genes: list[str] | None = None,
         ctrl_size: int | None = None,
-        log_transform: bool = True,
+        log_transform: bool | None = None,
         n_bins: int = 50,
         rand_seed: int = 4466,
         invalidate_cache: bool = False,
@@ -1560,13 +1708,16 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             g2m_genes: A list of G2M phase genes. If not provided then Scarf loads pre-saved genes accessible at
                      `scarf.quality_control.g2m_phase_genes`
             ctrl_size: Controls sampled per bin. None uses the shorter input gene list.
-            log_transform: Apply log1p before binning and scoring. Defaults to True.
+            log_transform: Apply log1p before binning and scoring. None applies it
+                           only for ``norm_lib_size``.
             n_bins: Number of bins into which average expression of genes is divided.
-            rand_seed: A random values to set seed while sampling cells from a cluster randomly. (Default value: 4466)
+            rand_seed: A random seed for sampling control genes. (Default value: 4466)
         Returns:
             A complete ``cell_cycle`` artifact containing S, G2M, and phase values.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a selected cell.
         """
-        self._require_writable("run_cell_cycle_scoring")
         if from_assay is None:
             from_assay = self._defaultAssay
         assay = self._get_assay(from_assay)

@@ -238,17 +238,37 @@ Wilcoxon keeps donors seen at both levels (`n_pairs`). Reload: `ds.get_statistic
 `scarf.DataStoreMerge(datasets=[ds_a, ds_b], zarr_path=..., names=[...], assays=["RNA"],
 prepend_text="orig", source_column="dataset", overwrite=True).dump()` gives an uncorrected joint
 store; drop `is_primary_data == False` cells first and score iLISI before Harmony (not executed:
-`MemoryError` under a 3 GB budget). Mapping keeps a reference fixed; the query is another store.
+`MemoryError` under a 3 GB budget). Sources must declare the same type for each assay
+(`assayTypes`), and `<assay>_I` marks the cells each merged assay measured. Operations that read
+an assay refuse its unmeasured cells with `UnmeasuredCellsError`: narrow with
+`merged.select_measured_cells(assay, cell_selection=...)` first; WNN or SNN needs one selection
+that every integrated assay measured (chain the call per assay). `overwrite=True`
+restarts only an earlier merge; a destination that holds another store or other files raises
+`ValueError`.
+`out_workspace=` adds a workspace to an existing Scarf store and keeps its other members. Mapping
+keeps a reference fixed; the query is another store.
 
 ```python
 reference = ds.get_mapping_reference(ds.build_mapping_reference(native["neighbors"]))
 query = scarf.DataStore("query.zarr", default_assay="RNA")
 mapping_ref = query.run_mapping(reference, query.snapshot_cell_selection("I"), save_k=5)
-print(query.get_mapping_result(mapping_ref, reference=reference).diagnostics)
-labels = query.get_target_classes(mapping_ref, "cell_type", reference=reference,
-                                  threshold_fraction=0.6)
-query.cells.insert("transferred_cell_type", labels.to_numpy(), overwrite=True)  # "NA" = abstained
+print(query.get_mapping_result(mapping_ref, reference=reference).diagnostics)  # featureCoverage
+transfer_ref = query.run_label_transfer(          # reference column or cell-label artifact
+    mapping_ref, reference=reference, reference_labels="cell_type", threshold_fraction=0.6,
+)
+transfer = query.get_label_transfer(transfer_ref)  # reads only the query store
+calls = transfer.evidence.set_axis(pd.Index(transfer.cell_idx, name="query_row"))
+print(calls["abstentionReason"].value_counts(dropna=False))  # None = labelled
+print(calls.loc[~calls["abstained"], "label"].value_counts())
 ```
+
+`run_label_transfer` freezes the reference labels into the query store and saves a
+`label_transfer` artifact; the same projection, labels and rule are reused. An abstained cell has
+a missing `label` and an `abstentionReason`; `candidateLabel` and `voteFraction` let you compare
+other thresholds without a new transfer, and `max_distance=` adds a distance rule as a second
+transfer. Pass `transfer_ref` wherever a cell-label artifact is accepted (`color_by` of
+`query.plots.embedding`, `mapping_evidence`, `mapping_confusion`) instead of inserting a column;
+an inserted copy records abstentions only as missing values and loses their reasons.
 
 `ds.run_topacedo_sampler(graph, paris, max_sampling_rate=0.1)` keeps graph coverage, not
 proportions (`sampled` is in graph-row order); to balance donors, snapshot a seeded mask instead.
@@ -275,10 +295,22 @@ proportions (`sampled` is in graph-row order); to balance donors, snapshot a see
 
 ## Pitfalls
 
-- `insert` stores `None` as `""` (Harmony silently treats it as a level; metrics raise) and `pd.NA`
-  as the literal `"<NA>"` (a real group everywhere). `to_pandas_dataframe` shows missingness.
+- `insert` records `None`, `NaN` and `pd.NA`, and the rows outside `key` of values given only for
+  active cells, as missing: Harmony and the metrics raise on them, and `sift` and `select_cells`
+  skip them. Replace missing values before inserting to make them a level; `fill_value` (it must
+  fit the dtype, such as `"unknown"` for text) sets only the rows outside `key`.
+  `to_pandas_dataframe` shows missingness.
 - Correcting on `donor_id` or `sample_id` with a donor-level condition aligns donors and can absorb
   the condition. Prefer library or batch; otherwise recheck condition-specific clusters.
+- Harmony, WNN and SNN check their memory against `mem_budget` before reading and raise
+  `MemoryError` naming the bytes, cells, dimensions, clusters or neighbours, and the limit. Harmony
+  holds about 5 KB per cell at 30 dims and 100 clusters (`nclust` defaults to cells / 30, at most
+  100), plus its batch labels (about 60 bytes per cell per column): lower
+  `harmony_params={"nclust": ...}` or the PCA dims, or raise the budget. WNN holds every assay's
+  neighbours and coordinates, SNN every graph plus a float64 matrix per graph. The estimates are
+  near-exact counts of what each step allocates, not a cap on process memory; leave headroom.
+- `run_harmony` and WNN reject coordinates that are normalized values (`pca_dims=0` runs); build
+  PCA first, or integrate such graphs with `method="snn"`.
 - iLISI depends on `k`: a random synthetic batch scored 0.34, 0.67 and 0.76 at `k` 11, 21 and 31
   (10x 5K PBMC docs dataset). CELLxGENE `cell_type` may come from the authors' own integration,
   biasing cLISI toward it.

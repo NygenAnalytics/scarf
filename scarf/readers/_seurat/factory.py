@@ -259,7 +259,13 @@ def _operation_arguments(
 
 def _dimnames(
     slots: Mapping[str, Any],
+    object_path: str,
 ) -> tuple[Any, Any]:
+    """Return a node's row and column names, each a vector, ``None``, or a marker.
+
+    A rename node marks an inherited axis with -1, which ``_renamed_axis``
+    resolves. A mapping is rejected here, where the names enter.
+    """
     values = _optional_value(slots, "Dimnames", "dimnames")
     if values is None:
         return None, None
@@ -269,6 +275,12 @@ def _dimnames(
         or len(values) != 2
     ):
         raise MatrixSourceError("dimnames must contain row and column names")
+    for axis, names in zip(("row", "column"), values, strict=True):
+        if isinstance(names, Mapping):
+            raise MatrixSourceError(
+                f"{axis} names in dimnames at {object_path} must be a vector, "
+                "not a mapping"
+            )
     return values[0], values[1]
 
 
@@ -514,7 +526,7 @@ def _inferred_operation_spec(
             ),
             f"{object_path}@seed",
         )
-        rows, columns = _dimnames(slots)
+        rows, columns = _dimnames(slots, object_path)
         return {
             **base,
             "operation": "rename",
@@ -866,7 +878,7 @@ def matrix_source_from_slots(
             primary_class,
             "a fragment source cannot be used as a matrix",
         )
-    row_names, column_names = _dimnames(slots)
+    row_names, column_names = _dimnames(slots, object_path)
     if primary_class in _WRAPPER_CLASSES:
         return _finalize_slot_source(
             resolve_source(_first_value(slots, "seed"), f"{object_path}@seed"),

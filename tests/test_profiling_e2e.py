@@ -656,10 +656,8 @@ def test_shared_session_counts_store_operations_per_stage(tmp_path: Path) -> Non
     from profiling.datasets import write_fixture_h5ad
 
     h5ad = write_fixture_h5ad(tmp_path / "cells.h5ad", nRows=200, nColumns=60)
-    workflow = WorkflowParameters(
-        filterAttrs=("RNA_nCounts", "RNA_nFeatures"),
-        minFeaturesPerCell=1,
-    )
+    # The default filter attributes include both fixture percentage columns.
+    workflow = WorkflowParameters(minFeaturesPerCell=1)
     # Leave headroom above memory retained by earlier tests in this worker.
     resources = StageResources(
         modalMemoryRequestMb=4096,
@@ -696,6 +694,7 @@ def test_shared_session_counts_store_operations_per_stage(tmp_path: Path) -> Non
         operations[stage] = result.details["storeOperations"]
         if stage == "initializeStore":
             initialized_store = session["store"]
+            assert set(workflow.filterAttrs) <= set(initialized_store.cells.columns)
 
     # filterCells reuses the store that initializeStore opened and still counts.
     assert session["store"] is initialized_store

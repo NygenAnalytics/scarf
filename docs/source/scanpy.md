@@ -82,7 +82,12 @@ scarf.to_h5ad(ds.RNA, "pipeline-analysis.h5ad", run=run)
 ```
 
 Run export writes frozen UMAP coordinates to `obsm["X_umap"]` and frozen cluster labels to
-`obs["clusters"]`. A run with `umap=False` does not invent an embedding.
+`obs["clusters"]`. A run with `umap=False` does not invent an embedding. Both calls export the same
+object: `ds.to_anndata` holds it in memory, while `scarf.to_h5ad` streams it to disk and needs
+neither the `anndata` package nor memory for the complete matrix. `X` holds raw counts over the
+run's feature universe. Pass `matrix="normed"` to either call for the values that the run's PCA
+read: its stored normalized values, float32, over its highly variable genes only, which then
+become `var`.
 
 `ds.to_anndata()` defaults to active cells and all features. Pass `feature_indexes` or
 `feature_names` to subset features. Without `run`, `scarf.to_h5ad` writes the full assay to disk,

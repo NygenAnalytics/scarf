@@ -11,16 +11,21 @@ from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..storage.artifacts import provenance_hash
 from ..storage.budget import ResourceBudget, resolve_budget
-from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.types import as_zarr_array, as_zarr_group, read_fresh_group
 from ..utils.arguments import integer_argument
 from ..utils.arrays import array_digest, regex_match_mask
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from .normalization import (
     NormMethod,
+    check_normalization_flags,
     iter_feature_group_means,
+    norm_clr,
     norm_dummy,
     norm_lib_size,
+    norm_lib_size_log,
+    norm_tf_idf,
+    uses_library_size_normalization,
 )
 
 type PercentFeatures = dict[str, str]
@@ -70,6 +75,7 @@ class Assay:
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         nthreads: number of threads to use for parallel computations
+        assay_type: Preset type that the store declares for the assay, such as ``HTO``.
 
     Attributes:
         name: A label for the assay instance
@@ -93,7 +99,10 @@ class Assay:
         matrix_root: zarr.Group | None = None,
         resources: ResourceBudget | None = None,
         storageIo: Any | None = None,
+        *,
+        assay_type: str | None = None,
     ) -> None:
+        self._assayType = self._checked_assay_type(name, assay_type)
         self.name = name
         self.cells = cell_data
         self.resources = resources or resolve_budget(workers=nthreads)
@@ -145,25 +154,53 @@ class Assay:
         # ``normMethod``.
         self._normalization_lock = threading.Lock()
 
+    def _checked_assay_type(self, name: str, assay_type: str | None) -> str | None:
+        """Return ``assay_type`` after checking that it opens as this class."""
+        if assay_type is None:
+            return None
+        from .classification import preset_assay_types, validate_assay_type
+
+        validate_assay_type(assay_type, assay=name)
+        presets = preset_assay_types()
+        preset_classes = set(presets.values())
+        # A subclass of a preset class opens as that preset class.
+        own = next(cls for cls in type(self).__mro__ if cls in preset_classes)
+        if own is not presets[assay_type]:
+            raise ValueError(
+                f"Assay {name!r} is declared as {assay_type!r}, which opens as "
+                f"{presets[assay_type].__name__}, not {own.__name__}"
+            )
+        return assay_type
+
+    @property
+    def assayType(self) -> str | None:
+        """Preset type declared for this assay, such as ``HTO``, or None."""
+        return self._assayType
+
     def _percent_features(self) -> PercentFeatures:
         raw = self.attrs.get("percentFeatures", {})
         if not isinstance(raw, dict):
             return {}
         return {str(k): str(v) for k, v in raw.items()}
 
+    @property
+    def _totals_name(self) -> str:
+        """Name of the cell-metadata column of the prepared cell totals."""
+        return f"{self.name}_nCounts"
+
     def _cell_count_totals(self, cell_idx: np.ndarray) -> np.ndarray:
-        """Read the prepared cell totals."""
+        """Read the prepared cell totals as a new float64 array."""
         if len(cell_idx) == 0:
             return np.empty(0, dtype=np.float64)
-        column = self.name + "_nCounts"
-        totals = self.cells.fetch_all(column)[cell_idx]
+        totals = self.cells.fetch_all(self._totals_name)[cell_idx]
         return np.asarray(totals, dtype=np.float64)
 
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs: Any,
+        renormalize_subset: bool = False,
+        log_transform: bool = False,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data.
@@ -174,32 +211,62 @@ class Assay:
                       attribute table)
             feat_idx: Indices of features to be included in the normalized matrix.
                       Defaults to the complete physical feature axis.
-            **kwargs:
+            renormalize_subset: Must be False.
+            log_transform: Return ``log1p`` of the normalized values.
 
         Returns: A chunked array (delayed matrix) containing normalized data.
+
+        Raises:
+            ValueError: If the configured normalizer cannot apply a requested flag.
         """
         from ..storage.identity import read_dataset_fingerprint
 
+        log_transform, _ = check_normalization_flags(
+            self,
+            log_transform=log_transform,
+            renormalize_subset=renormalize_subset,
+        )
         read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
-        return self.normMethod(self, counts)
+        values = self.normMethod(self, counts)
+        if log_transform:
+            # NumPy logs uint8 in float16 and uint16 in float32, so the
+            # logarithms are taken in float64 for every value dtype.
+            values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
+        return values
+
+    def _normalization_flags(self) -> frozenset[str]:
+        """Return the normalization flags that ``normed`` applies.
+
+        ``normed`` hands the configured normalizer the selected counts and no
+        totals, so ``renormalize_subset`` never applies. It can take ``log1p``
+        of the values of ``norm_dummy`` and of custom normalizers. CLR values
+        are already log ratios, and the library-size and TF-IDF normalizers
+        need totals or fitted state that this class does not hand them.
+        """
+        method = self.normMethod
+        if any(
+            method is builtin
+            for builtin in (norm_clr, norm_lib_size, norm_lib_size_log, norm_tf_idf)
+        ):
+            return frozenset()
+        return frozenset({"log_transform"})
 
     requiresCountsT = False
 
     def prepare(self, percent_patterns: dict[str, str | None]) -> None:
         from ..storage.identity import (
             clear_column,
-            fresh_group,
             load_count_summaries,
             publish_preparation,
             validate_preparation,
         )
 
-        self.z = fresh_group(self.z)
+        self.z = read_fresh_group(self.z)
         self.attrs = self.z.attrs
         state = self.attrs.get("prepared")
         cells = self.cells.locations["primary"]
@@ -270,7 +337,7 @@ class Assay:
             self.matrixGroup,
             require_transpose=self.requiresCountsT,
         )
-        self.z = fresh_group(self.z)
+        self.z = read_fresh_group(self.z)
         self.attrs = self.z.attrs
 
     def _feature_totals(self, indices: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -471,7 +538,14 @@ class Assay:
         renormalize_subset: bool,
         mirror: zarr.Array | None = None,
     ) -> None:
-        """Write one normalization payload into its started artifact group."""
+        """Write one normalization payload into its started artifact group.
+
+        Normalized values can be graph coordinates, so the payload is written
+        with a checked writer: a value that is NaN or infinite once rounded to
+        float32, such as one from a custom normalizer, raises
+        :class:`~scarf.storage.finite_values.NonFiniteArtifactError` naming
+        ``run_normalization`` before the artifact is complete.
+        """
 
         from ..storage.materialize import chunked_to_zarr
 
@@ -490,6 +564,8 @@ class Assay:
             mirror=mirror,
             resources=self.resources,
             stats_group=as_zarr_group(self.z[location], name=location),
+            requireFinite=True,
+            operation="run_normalization",
         )
 
     def iter_normed_feature_wise(
@@ -752,19 +828,26 @@ class Assay:
             ctrl_size: Number of reference features to be sampled from each bin.
             n_bins: Number of bins for sampling.
             rand_seed: The seed to use for the random number generation.
+            log_transform: Score ``log1p`` of the normalized values.
 
         Returns: Numpy array of the calculated scores
+
+        Raises:
+            ValueError: If ``log_transform`` is True and the normalizer cannot apply it.
         """
 
         from .rna import RNAassay
 
+        log_transform, _ = check_normalization_flags(
+            self, log_transform=log_transform, renormalize_subset=False
+        )
         feature_idx = self.feats.get_index_by(feature_names, "names", None)
         if len(feature_idx) == 0:
             raise ValueError(
                 f"ERROR: No feature ids found for any of the provided {len(feature_names)} features"
             )
         cell_idx = self._get_cell_idx(cell_key)
-        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
+        if isinstance(self, RNAassay) and uses_library_size_normalization(self):
             summary = self._compute_feature_summary(
                 cell_idx,
                 np.arange(self.feats.N, dtype=np.int64),
@@ -780,11 +863,8 @@ class Assay:
             values = self.normed(
                 cell_idx=cell_idx,
                 feat_idx=np.arange(self.feats.N, dtype=np.int64),
+                log_transform=log_transform,
             )
-            if log_transform:
-                # NumPy logs uint8 in float16 and uint16 in float32, so the
-                # logarithms are computed in float64 for every count dtype.
-                values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
             obs_avg = np.asarray(values.mean(axis=0).compute(), dtype=np.float64)
         else:
             obs_avg = np.zeros(self.feats.N, dtype=np.float64)
@@ -809,10 +889,17 @@ class Assay:
         rand_seed: int,
         log_transform: bool = False,
     ) -> np.ndarray:
-        """Score feature indexes against controls using supplied feature means."""
+        """Score feature indexes against controls using supplied feature means.
+
+        ``log_transform`` scores ``log1p`` of the normalized values, as
+        ``normed(log_transform=True)`` returns them.
+        """
         from ..features.scoring import binned_sampling
         from .rna import RNAassay
 
+        log_transform, _ = check_normalization_flags(
+            self, log_transform=log_transform, renormalize_subset=False
+        )
         feature_idx = np.asarray(feature_idx, dtype=np.int64)
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feature_avg = np.asarray(feature_avg, dtype=np.float64)
@@ -836,7 +923,7 @@ class Assay:
             raise ValueError(
                 "No control features were sampled. Reduce n_bins or increase ctrl_size."
             )
-        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
+        if isinstance(self, RNAassay) and uses_library_size_normalization(self):
             means = self._mean_normed_feature_groups(
                 cell_idx,
                 {
@@ -852,9 +939,11 @@ class Assay:
             return np.zeros(0, dtype=np.float64)
 
         def calc_mean(index: np.ndarray) -> np.ndarray:
-            values = self.normed(cell_idx=cell_idx, feat_idx=np.sort(index))
-            if log_transform:
-                values = cast(ChunkedArray, np.log1p(values, dtype=np.float64))
+            values = self.normed(
+                cell_idx=cell_idx,
+                feat_idx=np.sort(index),
+                log_transform=log_transform,
+            )
             return np.asarray(values.mean(axis=1).compute())
 
         return np.asarray(calc_mean(feature_idx) - calc_mean(control_idx))

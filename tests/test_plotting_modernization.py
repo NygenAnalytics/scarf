@@ -360,6 +360,13 @@ def test_embedding_validates_limits_and_point_sizes(options, message):
         )
 
 
+@pytest.mark.parametrize("layout_key", ["layout", ["layout", "other"]])
+def test_embedding_validates_clip_fraction_before_reading_the_store(layout_key):
+    # Reading anything from this store raises AttributeError instead.
+    with pytest.raises(ValueError, match="clip_fraction"):
+        splt.embedding(object(), layout_key=layout_key, clip_fraction=0.5, show=False)
+
+
 def test_embedding_categorical_colors_and_scatter_sizes_are_preserved():
     categories = np.asarray(["b", "a", None, "b"], dtype=object)
     sizes = np.asarray([4.0, 9.0, 16.0, 25.0])
@@ -493,7 +500,7 @@ def test_embedding_feature_matrix_prefetch_batches_feature_slots(monkeypatch):
         label = item.label if isinstance(item, splt.FeatureRef) else str(item)
         return SimpleNamespace(label=label)
 
-    def fetch_matrix(_store, resolved, cell_idx, *, normalization):
+    def fetch_matrix(_store, resolved, cell_idx, *, normalization, unmeasured=None):
         fetches.append((resolved, cell_idx.copy(), normalization))
         return matrix
 
@@ -1005,6 +1012,167 @@ def test_dotplot_left_group_labels_clear_feature_tick_labels():
 
     assert feature_label_left - group_label_right >= figure.dpi * 6.0 / 72.0
     result.close()
+
+
+_LEGEND_FRACTIONS = [0.25, 0.5, 0.75, 1.0]
+
+
+def _legend_marker_areas(legend) -> np.ndarray:
+    """Marker areas in points squared, as scatter sizes measure dots."""
+    return np.asarray(
+        [
+            handle.get_markersize() ** 2
+            if hasattr(handle, "get_markersize")
+            else handle.get_sizes()[0]
+            for handle in legend.legend_handles
+        ]
+    )
+
+
+def _legend_handle_areas(artist):
+    """The drawing areas that hold a legend's handles, in handle order."""
+    from matplotlib.offsetbox import DrawingArea
+
+    for child in artist.get_children():
+        if isinstance(child, DrawingArea):
+            yield child
+        else:
+            yield from _legend_handle_areas(child)
+
+
+def _assert_legend_rows_hold_their_markers(legend) -> None:
+    """Markers fit their handle boxes and stack centered beside their labels."""
+    from matplotlib.transforms import Bbox
+
+    figure = legend.figure
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    fontsize = legend.prop.get_size_in_points() / 72.0 * figure.dpi
+    boxes = []
+    for handle, area in zip(
+        legend.legend_handles, _legend_handle_areas(legend), strict=True
+    ):
+        # A single legend marker sits at the middle of its handle line.
+        points = handle.get_transform().transform(np.column_stack(handle.get_data()))
+        x, y = points.mean(axis=0)
+        radius = handle.get_markersize() / 72.0 * figure.dpi / 2
+        box = Bbox.from_extents(x - radius, y - radius, x + radius, y + radius)
+        held = area.get_window_extent(renderer).padded(0.1)
+        assert held.x0 <= box.x0 and box.x1 <= held.x1
+        assert held.y0 <= box.y0 and box.y1 <= held.y1
+        boxes.append(box)
+    for upper, lower in zip(boxes, boxes[1:]):
+        assert upper.y0 >= lower.y1
+    for box, text in zip(boxes, legend.get_texts(), strict=True):
+        label = text.get_window_extent(renderer)
+        assert label.x0 >= box.x1
+        assert abs(0.5 * (label.y0 + label.y1) - 0.5 * (box.y0 + box.y1)) <= (
+            0.25 * fontsize
+        )
+    frame = legend.get_window_extent(renderer)
+    for box in boxes:
+        assert frame.x0 <= box.x0 and box.x1 <= frame.x1
+        assert frame.y0 <= box.y0 and box.y1 <= frame.y1
+
+
+@pytest.mark.parametrize(
+    ("owned", "size_scale"),
+    [(True, None), (False, splt.SizeScale(size_min=0.0, size_max=600.0))],
+    ids=["default-owned", "explicit-target"],
+)
+def test_dotplot_size_legend_draws_the_data_areas(owned, size_scale, monkeypatch):
+    import scarf.plotting.summary as summary
+
+    fit_default_scale = summary._default_dot_size_scale
+    fitted = []
+
+    def record_default_scale(ax, **kwargs):
+        fitted.append(fit_default_scale(ax, **kwargs))
+        return fitted[-1]
+
+    monkeypatch.setattr(summary, "_default_dot_size_scale", record_default_scale)
+    figure = target = None
+    if not owned:
+        figure, target = plt.subplots(figsize=(3.2, 2.4), layout="constrained")
+    result = splt.dotplot(
+        _dotplot_store(),
+        features=["GeneA", "GeneB", "GeneC", "GeneD"],
+        group_by="cluster",
+        size_scale=size_scale,
+        target=target,
+        figsize=(3.2, 2.4) if owned else None,
+        show=False,
+    )
+    try:
+        legend = (
+            result.figure.legends[0] if owned else result.axes["dotplot"].get_legend()
+        )
+        assert legend.get_title().get_text() == "Detected cells"
+        assert [text.get_text() for text in legend.get_texts()] == [
+            "25%",
+            "50%",
+            "75%",
+            "100%",
+        ]
+        final_scale = result.scales[1]
+        if size_scale is None:
+            # The default scale is refit to the laid-out panel, and the
+            # legend follows the refit scale.
+            assert len(fitted) == 2
+            assert fitted[1].size_max < fitted[0].size_max
+            assert final_scale == fitted[1]
+        else:
+            assert fitted == []
+            assert final_scale == size_scale
+        legend_areas = _legend_marker_areas(legend)
+        np.testing.assert_allclose(legend_areas, final_scale.areas(_LEGEND_FRACTIONS))
+        if size_scale is not None:
+            np.testing.assert_allclose(legend_areas, [150.0, 300.0, 450.0, 600.0])
+        # Dots detected in half and in all cells have the legend's areas.
+        fractions = result.tables["aggregate"]["fraction"].to_numpy()
+        data_areas = result.axes["dotplot"].collections[0].get_sizes()
+        for fraction, legend_area in ((0.5, legend_areas[1]), (1.0, legend_areas[3])):
+            observed = data_areas[np.isclose(fractions, fraction)]
+            assert observed.size
+            np.testing.assert_allclose(observed, legend_area)
+        assert result.legends[1].extras == {
+            "domain": [0.0, 1.0],
+            "values": _LEGEND_FRACTIONS,
+        }
+        _assert_legend_rows_hold_their_markers(legend)
+    finally:
+        result.close()
+        if figure is not None:
+            plt.close(figure)
+
+
+def test_composed_dotplot_size_legend_matches_the_child_legend():
+    figure, axis = plt.subplots(figsize=(6, 4), layout="constrained")
+    child = splt.dotplot(
+        _dotplot_store(),
+        features=["GeneA", "GeneB", "GeneC", "GeneD"],
+        group_by="cluster",
+        target=axis,
+        show=False,
+    )
+    child_legend = axis.get_legend()
+    child_labels = [text.get_text() for text in child_legend.get_texts()]
+    child_areas = _legend_marker_areas(child_legend)
+
+    # A user's legend.markerscale does not rescale the legend's exact areas.
+    with plt.rc_context({"legend.markerscale": 2.0}):
+        composite = splt.compose_results(figure, [child], panel_labels=False)
+
+    (shared,) = [
+        legend
+        for legend in figure.legends
+        if legend.get_title().get_text() == "Detected cells"
+    ]
+    assert [text.get_text() for text in shared.get_texts()] == child_labels
+    np.testing.assert_allclose(_legend_marker_areas(shared), child_areas)
+    _assert_legend_rows_hold_their_markers(shared)
+    composite.close()
+    plt.close(figure)
 
 
 def _violin_store():
@@ -2433,6 +2601,8 @@ def test_distribution_stats_warn_when_no_table_can_be_annotated(table):
             "stats_results contains no supported pairwise or omnibus annotation "
             "table for method 'welch'; skipping statistical annotations"
         ]
+        # The warning points at the caller's line, not at Scarf's decorator.
+        assert {warning.filename for warning in warned} == {__file__}
         assert result.provenance.extras["stats_annotated"] is False
         assert len(result.axes["metric"].texts) == 0
     finally:
@@ -3084,7 +3254,7 @@ def test_grouping_plots_exclude_masked_labels_and_samples(tmp_path):
         plotted = plot(store, features=[gene], groups=clusters, show=False)
         try:
             aggregate = plotted.tables["aggregate"]
-            assert dict(zip(aggregate["groups"], aggregate["n_cells"])) == members
+            assert dict(zip(aggregate["group"], aggregate["n_cells"])) == members
             assert plotted.provenance.extras["dropped_group_cells"] == missing.sum()
         finally:
             plotted.close()
@@ -3092,7 +3262,7 @@ def test_grouping_plots_exclude_masked_labels_and_samples(tmp_path):
     plotted = splt.dotplot(store, features=[gene], group_by="donor", show=False)
     try:
         aggregate = plotted.tables["aggregate"]
-        assert dict(zip(aggregate["donor"], aggregate["n_cells"])) == {
+        assert dict(zip(aggregate["group"], aggregate["n_cells"])) == {
             label: int(((donor == label) & ~donor_missing).sum()) for label in (1, 2)
         }
     finally:

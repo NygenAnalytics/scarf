@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -8,6 +9,7 @@ from ..graph.feature_projection import (
     resolve_coordinate_inputs,
     resolve_native_graph_inputs,
 )
+from ..matrix import ChunkedArray
 from ..metrics.cluster_selection import (
     DEFAULT_MIN_CLUSTER_QUOTA,
     SHARED_CLUSTER_QUOTA_STRATEGY,
@@ -32,10 +34,18 @@ from ..storage.types import as_zarr_array
 from ..utils.arguments import integer_argument
 from ..utils.shutdown import shutdown_checkpoint
 
+# The coordinates that cluster selection scores, by kind: the operation that
+# must have produced them and its name in errors. A pipeline run with
+# ``pca_dims=0`` builds its graph on the normalized values.
 _COORDINATE_OPERATIONS = {
-    "reduction": "run_pca",
-    "batch_correction": "run_harmony",
+    "reduction": ("run_pca", "PCA"),
+    "batch_correction": ("run_harmony", "Harmony"),
+    "normalized": ("run_normalization", "run_normalization"),
 }
+# The silhouette's distance chunks fill its working memory, and the sums per
+# cluster of each chunk and its Python objects add up to about a quarter
+# more, as measured from the oldest supported NumPy and scikit-learn on.
+_SILHOUETTE_WORKING_MEMORY_FACTOR = 1.3
 
 
 def cluster_label_array(root: zarr.Group, ref: ArtifactRef) -> zarr.Array:
@@ -69,22 +79,16 @@ def _validate_inputs(
 ) -> tuple[zarr.Array, tuple[tuple[str, ArtifactRef, zarr.Array], ...]]:
     if not isinstance(coordinates, ArtifactRef):
         raise TypeError("coordinates must be an ArtifactRef")
-    expected_operation = _COORDINATE_OPERATIONS.get(coordinates.kind)
-    if (
-        expected_operation is None
-        or coordinates.scope != "assay"
-        or coordinates.assay is None
-    ):
+    expected = _COORDINATE_OPERATIONS.get(coordinates.kind)
+    if expected is None or coordinates.scope != "assay" or coordinates.assay is None:
         raise ValueError(
-            "coordinates must be an assay-scoped PCA reduction or Harmony "
-            "batch-correction artifact"
+            "coordinates must be an assay-scoped PCA reduction, Harmony "
+            "batch-correction, or normalized artifact"
         )
+    expected_operation, operation_name = expected
     coordinate_status = require_complete_artifact(store.zw, coordinates)
     if coordinate_status.operation != expected_operation:
-        raise ValueError(
-            "coordinates must reference a "
-            f"{'PCA' if coordinates.kind == 'reduction' else 'Harmony'} artifact"
-        )
+        raise ValueError(f"coordinates must reference a {operation_name} artifact")
     if not isinstance(connectivity_map, ArtifactRef):
         raise TypeError("connectivity_map must be an ArtifactRef")
     if not isinstance(cell_selection, ArtifactRef):
@@ -153,6 +157,60 @@ def _validate_inputs(
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError("Cluster selection candidate keys must be unique")
     return scored, tuple(validated)
+
+
+def _admitted_coordinates(
+    store: Any,
+    scored: zarr.Array,
+    sample_indices: np.ndarray,
+    *,
+    working_memory_mib: int,
+) -> ChunkedArray:
+    """Return the scored coordinates, read in blocks under the memory budget.
+
+    The silhouette reads the rows of ``sample_indices`` in their stored dtype,
+    one block of rows at a time, which decodes every stored chunk that holds
+    one of them; copies them to float64; and scores the copy in distance
+    chunks of ``working_memory_mib``. Raises MemoryError, before any
+    coordinate is read, when the most of these it holds at once exceeds the
+    operation limit.
+    """
+    coordinates = ChunkedArray(
+        scored,
+        nthreads=store.nthreads,
+        resources=store.resources,
+    )
+    # The rows the silhouette reads, in the blocks it reads them in.
+    sampled = ChunkedArray(
+        scored,
+        rows=np.asarray(sample_indices, dtype=np.int64),
+        nthreads=store.nthreads,
+        resources=store.resources,
+    )
+    n_rows, dims = sampled.shape
+    stored_bytes = n_rows * dims * np.dtype(sampled.dtype).itemsize
+    float64_bytes = n_rows * dims * np.dtype(np.float64).itemsize
+    copy_bytes = 0 if np.dtype(sampled.dtype) == np.dtype(np.float64) else float64_bytes
+    working_bytes = math.ceil(
+        _SILHOUETTE_WORKING_MEMORY_FACTOR * working_memory_mib * 1024**2
+    )
+    required = max(
+        # The sampled rows and one block of them in flight.
+        stored_bytes + sampled._resident_bytes() + sampled._block_task_bytes(),
+        # Their float64 copy beside them.
+        stored_bytes + copy_bytes,
+        # The float64 rows beside the silhouette's distance chunks.
+        float64_bytes + working_bytes,
+    )
+    limit = int(store.resources.memoryBytes)
+    if required > limit:
+        raise MemoryError(
+            f"Cluster selection needs about {required} bytes to score "
+            f"{n_rows} sampled cells with {dims} dimensions, but the operation "
+            f"limit is {limit} bytes. Raise mem_budget, or score fewer "
+            "dimensions, such as a PCA reduction instead of normalized values."
+        )
+    return coordinates
 
 
 def _cluster_selection_reuse_validator(
@@ -344,7 +402,12 @@ def run_cluster_selection(
         return planned.ref, selected_key, refs_by_key[selected_key]
 
     result = select_clusters_by_silhouette(
-        scored,
+        _admitted_coordinates(
+            store,
+            scored,
+            sample_indices,
+            working_memory_mib=working_memory_mib,
+        ),
         tuple((key, labels) for key, _ref, labels in validated),
         seed=seed,
         max_sample_size=max_sample_size,

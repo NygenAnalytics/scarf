@@ -1,7 +1,7 @@
 import zarr
 
 from .count_matrix import require_count_matrix_layout
-from .types import as_zarr_array
+from .types import as_zarr_array, read_fresh_group
 from .validation_scope import store_key, validated_once
 
 
@@ -18,9 +18,9 @@ def validate_count_matrix(
 def _validate_count_matrix(
     matrix: zarr.Group, *, require_transpose: bool
 ) -> tuple[zarr.Array, zarr.Array | None]:
-    from .identity import REBUILD_REQUIRED, fresh_group, opened_count_fingerprint
+    from .identity import REBUILD_REQUIRED, opened_count_fingerprint
 
-    matrix = fresh_group(matrix)
+    matrix = read_fresh_group(matrix)
     # Each lookup reads the child's metadata, so the arrays carry fresh attributes.
     try:
         counts = as_zarr_array(matrix["counts"], name="counts")

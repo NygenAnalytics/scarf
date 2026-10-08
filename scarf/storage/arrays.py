@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -166,6 +166,32 @@ def stored_metadata_dtype(
     return resolved
 
 
+def encode_metadata_values(
+    data: Any,
+    dtype: Any = None,
+    *,
+    name: str,
+) -> np.ndarray:
+    """Return metadata values in the form that a metadata column stores."""
+    raw = np.asarray(data)
+    try:
+        values = _decode_metadata_values(raw)
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"Column {name!r} holds text that is not valid UTF-8; pass str values "
+            "or UTF-8 encoded bytes"
+        ) from exc
+    # Text is stored at its decoded width, whatever the source S or O dtype.
+    if (
+        dtype is None
+        or np.dtype(dtype).kind == "O"
+        or raw.dtype.kind in {"S", "O"}
+        and values.dtype.kind == "U"
+    ):
+        return values.astype(_measured_text_dtype((values,)))
+    return np.asarray(values, dtype=dtype)
+
+
 def create_metadata_column(
     group: zarr.Group,
     name: str,
@@ -175,6 +201,8 @@ def create_metadata_column(
     chunkSize: int | bool | None = None,
     shape: int | None = None,
     profile: StorageProfile | None = None,
+    *,
+    attributes: Mapping[str, Any] | None = None,
 ) -> zarr.Array:
     """Create a metadata column, optionally from provided data."""
     if chunkSize is None or chunkSize is False:
@@ -187,20 +215,10 @@ def create_metadata_column(
         resolved_profile,
         zarrFormat=_group_zarr_format(group),
     )
+    attrs = None if attributes is None else dict(attributes)
 
     if data is not None:
-        raw = np.asarray(data)
-        values = _decode_metadata_values(raw)
-        # Text is stored at its decoded width, whatever the source S or O dtype.
-        if (
-            dtype is None
-            or np.dtype(dtype).kind == "O"
-            or raw.dtype.kind in {"S", "O"}
-            and values.dtype.kind == "U"
-        ):
-            values = values.astype(_measured_text_dtype((values,)))
-        else:
-            values = np.asarray(values, dtype=dtype)
+        values = encode_metadata_values(data, dtype, name=name)
         if chunks is False:
             chunks = (max(1, len(values)),)
         return group.create_array(
@@ -209,6 +227,7 @@ def create_metadata_column(
             chunks=chunks,
             overwrite=overwrite,
             compressors=compressors,
+            attributes=attrs,
         )
 
     if shape is None:
@@ -222,6 +241,7 @@ def create_metadata_column(
         dtype=dtype,
         overwrite=overwrite,
         compressors=compressors,
+        attributes=attrs,
     )
 
 
@@ -236,6 +256,7 @@ def create_streamed_metadata_column(
     chunkSize: int = 100_000,
     hasMissing: bool = False,
     profile: StorageProfile | None = None,
+    attributes: Mapping[str, Any] | None = None,
 ) -> zarr.Array:
     """Create and fill a metadata column from bounded contiguous blocks."""
     if shape < 0:
@@ -250,6 +271,7 @@ def create_streamed_metadata_column(
         chunkSize=chunkSize,
         shape=shape,
         profile=profile,
+        attributes=attributes,
     )
     missing_output: zarr.Array | None = None
     if hasMissing:

@@ -1,6 +1,7 @@
-from typing import Literal
+from typing import Literal, overload
 
 import zarr
+from zarr.errors import GroupNotFoundError
 
 
 type ZarrMode = Literal["r", "r+", "a", "w", "w-"]
@@ -40,3 +41,44 @@ def as_zarr_group(
 
 def array_metadata_shards(array: zarr.Array) -> tuple[int, ...] | None:
     return getattr(array.metadata, "shards", None)
+
+
+@overload
+def read_fresh_group(
+    parent: zarr.Group,
+    path: str = "",
+    *,
+    mode: Literal["r", "r+"] | None = None,
+    missing_ok: Literal[False] = False,
+) -> zarr.Group: ...
+
+
+@overload
+def read_fresh_group(
+    parent: zarr.Group,
+    path: str = "",
+    *,
+    mode: Literal["r", "r+"] | None = None,
+    missing_ok: bool,
+) -> zarr.Group | None: ...
+
+
+def read_fresh_group(
+    parent: zarr.Group,
+    path: str = "",
+    *,
+    mode: Literal["r", "r+"] | None = None,
+    missing_ok: bool = False,
+) -> zarr.Group | None:
+    """Open the group at ``path`` below ``parent`` from its stored record."""
+    try:
+        return zarr.open_group(
+            store=parent.store,
+            path=(parent.store_path / path).path,
+            mode=("r" if parent.read_only else "r+") if mode is None else mode,
+            zarr_format=parent.metadata.zarr_format,
+        )
+    except GroupNotFoundError:
+        if missing_ok:
+            return None
+        raise

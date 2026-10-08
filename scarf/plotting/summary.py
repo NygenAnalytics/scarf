@@ -21,10 +21,12 @@ from ._contracts import (
 from ._data import (
     _check_feature_count,
     _fetch_cell_column,
+    _group_roles,
     _resolve_grouping,
     _summarize_resolved_features,
     coerce_feature_list,
     resolve_feature,
+    unmeasured_extras,
 )
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
@@ -40,6 +42,7 @@ from ._heatmap_utils import (
     draw_annotation_strips,
     normalize_annotations,
     order_heatmap,
+    validate_linkage,
 )
 from ..utils.arrays import sort_categories
 from ._style import (
@@ -48,6 +51,7 @@ from ._style import (
     continuous_norm,
     resolve_color_limits,
     scatter_edgecolor,
+    size_legend_layout,
     theme_context,
 )
 
@@ -61,6 +65,12 @@ def _wrap_tick_labels(values: Sequence[Any], width: int | None) -> list[str]:
     return [textwrap.fill(label, width=width) for label in labels]
 
 
+# Bounds in points on the largest dot of a default size scale, which fills 72%
+# of a grid cell. No default dot is wider than 26 pt, however roomy the cell.
+_DEFAULT_DOT_DIAMETER_RANGE = (2.5, 26.0)
+_SIZE_LEGEND_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
+
+
 def _default_dot_size_scale(ax: Any, *, n_x: int, n_y: int) -> SizeScale:
     """Fit default marker areas to the physical dot-grid cells."""
     bounds = ax.get_position()
@@ -70,7 +80,7 @@ def _default_dot_size_scale(ax: Any, *, n_x: int, n_y: int) -> SizeScale:
         width_points / max(n_x, 1),
         height_points / max(n_y, 1),
     )
-    maximum_diameter = float(np.clip(0.72 * slot_points, 2.5, 26.0))
+    maximum_diameter = float(np.clip(0.72 * slot_points, *_DEFAULT_DOT_DIAMETER_RANGE))
     minimum_diameter = float(np.clip(0.18 * maximum_diameter, 1.0, 3.0))
     return SizeScale(
         size_min=minimum_diameter**2,
@@ -195,13 +205,16 @@ def _draw_feature_group_brackets(
     return len(grouped_ranges)
 
 
-def _standardize_feature(df: pd.DataFrame, value_col: str = "mean") -> pd.DataFrame:
-    """Z-score each feature row across groups, keeping bracket groups apart."""
+def _standardize_feature(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``zscore``: each feature row's means z-scored across groups.
+
+    Bracket groups are standardized apart, and ``mean`` keeps its raw values.
+    """
     out = df.copy()
     rows = out.groupby(["feature", "feature_group"], observed=False, dropna=False)
-    means = rows[value_col].transform("mean")
-    stds = rows[value_col].transform("std").replace(0, np.nan)
-    out[value_col] = (out[value_col] - means) / stds
+    means = rows["mean"].transform("mean")
+    stds = rows["mean"].transform("std").replace(0, np.nan)
+    out["zscore"] = (out["mean"] - means) / stds
     return out
 
 
@@ -251,10 +264,11 @@ def _group_order(
     return _label_order(observed, requested, name="group order", noun="groups")
 
 
-def _group_axis_labels(df: pd.DataFrame, group_keys: tuple[str, ...]) -> pd.Series:
-    if len(group_keys) == 1:
-        return df[group_keys[0]].astype(str)
-    return df[list(group_keys)].astype(str).agg(" | ".join, axis=1)
+def _group_axis_labels(df: pd.DataFrame, roles: tuple[str, ...]) -> pd.Series:
+    """Label each row's group from its role-named grouping columns."""
+    if len(roles) == 1:
+        return df[roles[0]].astype(str)
+    return df[list(roles)].astype(str).agg(" | ".join, axis=1)
 
 
 def _sample_counts(
@@ -328,9 +342,9 @@ def dotplot(
 ) -> PlotResult:
     """Dotplot of expression by group.
 
-    Color is the mean value in the group. Dot size is the fraction of cells
-    above ``expression_cutoff``. Pass ``features`` as a list of genes, or as a
-    mapping of group name to gene list when you want gene-set brackets.
+    Color is the mean value in the group. Dot size is the fraction of measured
+    cells above ``expression_cutoff``. Pass ``features`` as a list of genes, or
+    as a mapping of group name to gene list when you want gene-set brackets.
     Different features of one assay that carry the same explicit
     ``FeatureRef.label`` are pooled into one row. Any other label shared by
     different features raises, including a label shared across assays.
@@ -366,7 +380,7 @@ def dotplot(
         resolve_feature(store, feature, from_assay=from_assay)
         for _, feature in feature_pairs
     ]
-    aggregate, per_sample = _summarize_resolved_features(
+    aggregate, per_sample, unmeasured = _summarize_resolved_features(
         store,
         resolved_features,
         [group for group, _ in feature_pairs],
@@ -377,12 +391,13 @@ def dotplot(
         expression_cutoff=expression_cutoff,
     )
     if standardize == "feature":
-        aggregate = _standardize_feature(aggregate, "mean")
+        aggregate = _standardize_feature(aggregate)
     elif standardize not in ("none", "feature"):
         raise ValueError("standardize must be 'none' or 'feature'")
+    color_values = "zscore" if standardize == "feature" else "mean"
 
     plot_df = aggregate.copy()
-    plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
+    plot_df["group_label"] = _group_axis_labels(plot_df, _group_roles(group_keys))
     # One row per requested feature and bracket group, in input order, so a
     # feature listed under two groups keeps a row in each.
     plot_df["row"] = list(
@@ -465,7 +480,7 @@ def dotplot(
                 ),
             )
 
-        vals = plot_df["mean"].to_numpy(dtype=np.float64)
+        vals = plot_df[color_values].to_numpy(dtype=np.float64)
         vmin, vmax = resolve_color_limits(vals, color_scale)
         norm = continuous_norm(
             mpl,
@@ -544,38 +559,47 @@ def dotplot(
                 fraction=0.05,
             )
             cb.set_label(colorbar_label)
-        legend_values = np.array([0.25, 0.5, 0.75, 1.0])
-        legend_areas = size_scale.areas(legend_values)
-        legend_area_factor = min(
-            1.0,
-            180.0 / max(float(legend_areas.max()), 1.0),
-        )
-        handles = [
-            ax.scatter(
-                [],
-                [],
-                s=area * legend_area_factor,
-                facecolor="#bdbdbd",
-                edgecolor=edgecolor,
-                linewidth=marker_linewidth,
-            )
-            for area in legend_areas
-        ]
+        legend_values = np.asarray(_SIZE_LEGEND_FRACTIONS)
+        size_legend = None
         # Keep fraction sizes beside the colorbar, away from x tick labels.
         if show_legend:
+            # The legend draws the data's own areas. Its rows are spaced for
+            # the largest dot the scale can draw, so the legend keeps its
+            # geometry when the default scale is refit to the final panel.
+            legend_areas, legend_boxes = size_legend_layout(
+                size_scale,
+                legend_values,
+                max_area=(
+                    size_scale.size_max
+                    if size_scale_is_explicit
+                    else _DEFAULT_DOT_DIAMETER_RANGE[1] ** 2
+                ),
+            )
             legend_kwargs = {
-                "handles": handles,
+                "handles": [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        linestyle="",
+                        markersize=float(np.sqrt(area)),
+                        markerfacecolor="#bdbdbd",
+                        markeredgecolor=edgecolor,
+                        markeredgewidth=marker_linewidth,
+                    )
+                    for area in legend_areas
+                ],
                 "labels": [f"{value:.0%}" for value in legend_values],
                 "title": "Detected cells",
                 "frameon": False,
                 "borderaxespad": 0.4,
                 "handletextpad": 0.4,
-                "labelspacing": 1.1,
+                **legend_boxes.legend_kwargs(),
             }
             if owns:
-                fig.legend(loc="outside right center", **legend_kwargs)
+                size_legend = fig.legend(loc="outside right center", **legend_kwargs)
             else:
-                ax.legend(
+                size_legend = ax.legend(
                     loc="upper left",
                     bbox_to_anchor=(1.02, 1),
                     **legend_kwargs,
@@ -598,13 +622,14 @@ def dotplot(
             )
             areas = size_scale.areas(plot_df["fraction"].to_numpy(dtype=np.float64))
             sc.set_sizes(areas)
-            legend_areas = size_scale.areas(legend_values)
-            legend_area_factor = min(
-                1.0,
-                180.0 / max(float(legend_areas.max()), 1.0),
-            )
-            for handle, area in zip(handles, legend_areas, strict=True):
-                handle.set_sizes([area * legend_area_factor])
+            if size_legend is not None:
+                # A legend draws copies of its handles, so resize the copies.
+                for handle, area in zip(
+                    size_legend.legend_handles,
+                    size_scale.areas(legend_values),
+                    strict=True,
+                ):
+                    handle.set_markersize(float(np.sqrt(area)))
 
     tables = {"aggregate": aggregate}
     if per_sample is not None:
@@ -631,7 +656,7 @@ def dotplot(
             LegendSpec(
                 kind="size",
                 label="Detected cells",
-                extras={"domain": [0.0, 1.0]},
+                extras={"domain": [0.0, 1.0], "values": legend_values.tolist()},
             ),
         ),
         scales=(
@@ -686,6 +711,7 @@ def dotplot(
                     "source": normalization.source,
                     "transform": normalization.transform,
                 },
+                "color_values": color_values,
                 "assays": sorted(assays),
                 "feature_group_brackets": bracket_count,
                 "swap_axes": swap_axes,
@@ -695,6 +721,7 @@ def dotplot(
                     "explicit" if size_scale_is_explicit else "panel"
                 ),
                 "size_range": [size_scale.size_min, size_scale.size_max],
+                **unmeasured_extras(unmeasured),
             },
         ),
         owns_figure=owns,
@@ -751,10 +778,10 @@ def matrixplot(
     explicit orders, compared as text, or enable hierarchical clustering
     independently for either axis.
     ``value="mean"`` colors by average expression; ``value="fraction"`` colors
-    by the share of cells above ``expression_cutoff``. ``standardize="feature"``
-    applies only to means. ``sample_by`` has the same equal-sample weighting
-    behavior as :func:`dotplot`, and shared feature labels follow the same
-    pooling rule.
+    by the share of measured cells above ``expression_cutoff``.
+    ``standardize="feature"`` applies only to means. ``sample_by`` has the same
+    equal-sample weighting behavior as :func:`dotplot`, and shared feature
+    labels follow the same pooling rule.
     """
     _, mpl = require_matplotlib()
     if value not in ("mean", "fraction"):
@@ -763,6 +790,7 @@ def matrixplot(
         raise ValueError("standardize must be 'none' or 'feature'")
     if standardize == "feature" and value != "mean":
         raise ValueError("standardize='feature' applies only to value='mean'")
+    validate_linkage(cluster_method, cluster_metric)
     color_scale = color_scale or ColorScale(cmap="viridis")
     if color_scale.scale != "linear":
         raise NotImplementedError(
@@ -783,7 +811,7 @@ def matrixplot(
         resolve_feature(store, feature, from_assay=from_assay)
         for _, feature in feature_pairs
     ]
-    aggregate, per_sample = _summarize_resolved_features(
+    aggregate, per_sample, unmeasured = _summarize_resolved_features(
         store,
         resolved_features,
         [group for group, _ in feature_pairs],
@@ -793,10 +821,11 @@ def matrixplot(
         normalization=normalization,
         expression_cutoff=expression_cutoff,
     )
-    plot_df = aggregate.copy()
     if standardize == "feature":
-        plot_df = _standardize_feature(plot_df, "mean")
-    plot_df["group_label"] = _group_axis_labels(plot_df, group_keys)
+        aggregate = _standardize_feature(aggregate)
+    color_values = "zscore" if standardize == "feature" else value
+    plot_df = aggregate.copy()
+    plot_df["group_label"] = _group_axis_labels(plot_df, _group_roles(group_keys))
     summarized_features = set(plot_df["feature"].tolist())
     observed_feature_order = [
         feature
@@ -822,7 +851,7 @@ def matrixplot(
     mat = plot_df.pivot_table(
         index="feature",
         columns="group_label",
-        values=value,
+        values=color_values,
         observed=False,
     ).reindex(index=observed_feature_order, columns=observed_group_order)
     row_annotation_values = normalize_annotations(
@@ -844,10 +873,16 @@ def matrixplot(
         method=cluster_method,
         metric=cluster_metric,
     )
+    # Name the axes by role, as the aggregate table names its columns.
+    mat = mat.rename_axis(index="feature", columns="group")
     resolved_feature_order = list(mat.index)
     resolved_group_order = list(mat.columns)
-    row_annotation_values = row_annotation_values.reindex(resolved_feature_order)
-    column_annotation_values = column_annotation_values.reindex(resolved_group_order)
+    row_annotation_values = row_annotation_values.reindex(
+        resolved_feature_order
+    ).rename_axis("feature")
+    column_annotation_values = column_annotation_values.reindex(
+        resolved_group_order
+    ).rename_axis("group")
     row_colors, row_annotation_scales = annotation_colors(
         row_annotation_values,
         annotation_scales,
@@ -943,13 +978,13 @@ def matrixplot(
                     )
         apply_figure_chrome(fig, theme)
 
-    tables = {"aggregate": aggregate, "matrix": mat.reset_index()}
+    tables = {"aggregate": aggregate, "matrix": mat}
     if per_sample is not None:
         tables["per_sample"] = per_sample
     if not row_annotation_values.empty:
-        tables["row_annotations"] = row_annotation_values.reset_index()
+        tables["row_annotations"] = row_annotation_values
     if not column_annotation_values.empty:
-        tables["column_annotations"] = column_annotation_values.reset_index()
+        tables["column_annotations"] = column_annotation_values
     n_samples, dropped_sample_cells = _sample_counts(
         store,
         cell_key=cell_key,
@@ -998,6 +1033,7 @@ def matrixplot(
                     "source": normalization.source,
                     "transform": normalization.transform,
                 },
+                "color_values": color_values,
                 "assays": sorted(assays),
                 "feature_order": resolved_feature_order,
                 "group_order": resolved_group_order,
@@ -1007,6 +1043,7 @@ def matrixplot(
                 "cluster_metric": cluster_metric,
                 "row_annotations": list(row_annotation_values.columns),
                 "column_annotations": list(column_annotation_values.columns),
+                **unmeasured_extras(unmeasured),
             },
         ),
         owns_figure=owns,

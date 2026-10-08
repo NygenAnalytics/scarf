@@ -79,8 +79,8 @@ run = ds.pipeline.run(leiden={"partitions": [0.4, 0.8]})
 
 Doublets and markers require at least one Leiden candidate. Paris can still run as a diagnostic
 output when those stages are disabled; a Paris-only run has `run["paris"]` and no
-`run["clusters"]`. Setting `umap=False` skips both embedding initialization and UMAP, so neither
-artifact appears in the completed run.
+`run["clusters"]`. Setting `umap=False` skips UMAP, and the embedding initialization unless t-SNE,
+which uses it, is enabled; a skipped stage's artifact does not appear in the completed run.
 
 `filtering=True` uses MAD filtering over available assay QC columns. The default and
 `method="auto"` both resolve to `method="mad"`. Set filtering to `False` to retain the captured
@@ -110,7 +110,16 @@ run = ds.pipeline.run(
 
 `params` configures the run with one mapping. Each key names a stage, and its value holds the
 keyword arguments the pipeline forwards to that stage's function. The pipeline still supplies the
-artifacts each stage consumes.
+artifacts each stage consumes. A setting has exactly the meaning of the same keyword on the method
+in the table below, and omitting it uses that method's default.
+
+Settings are JSON values, so a run configuration can be saved and passed again; infinity and NaN are
+never settings. Some settings spell a derived default as `None`: `hvg` `max_cells`, which excludes
+genes detected in at least the number of selected cells minus 20; `batch_size` of every stage that
+takes it; `cell_cycle` `ctrl_size` and `log_transform`; `paris` `min_cluster_size`; and
+`normalization` `log_transform` and `renormalize_subset`, whose defaults follow the assay's
+normalizer ({doc}`assays`). The run records `params` as given, and each artifact records the values
+its method resolved.
 
 ```python
 run = ds.pipeline.run(
@@ -141,11 +150,11 @@ run = ds.pipeline.run(
 | `connectivity` | {py:meth}`~scarf.DataStore.build_connectivity_map` | `local_connectivity`, `bandwidth` |
 | `embedding_initialization` | {py:meth}`~scarf.DataStore.build_embedding_initialization` | `n_centroids`, `rand_state`, `batch_size`, `kmeans_sampling`, `kmeans_batch_size` |
 | `umap` | {py:meth}`~scarf.datastore.datastore.DataStore.run_umap` | `umap_dims`, `spread`, `min_dist`, `n_epochs`, `repulsion_strength`, `initial_alpha`, `negative_sample_rate`, `use_density_map`, `dens_lambda`, `dens_frac`, `dens_var_shift`, `random_seed`, `parallel`, `symmetric_graph`, `graph_upper_only` |
-| `tsne` | {py:meth}`~scarf.datastore.datastore.DataStore.run_tsne` | `tsne_dims`, `lambda_scale`, `max_iter`, `early_iter`, `alpha`, `box_h`, `parallel`, `symmetric_graph`, `graph_upper_only` |
+| `tsne` | {py:meth}`~scarf.datastore.datastore.DataStore.run_tsne` | `tsne_dims`, `lambda_scale`, `max_iter`, `early_iter`, `alpha`, `box_h`, `symmetric_graph`, `graph_upper_only` |
 | `leiden` | {py:meth}`~scarf.datastore.datastore.DataStore.run_leiden_clustering` | `partitions`, `selected`, `backend`, `random_seed`, `symmetric_graph`, `graph_upper_only` |
 | `membership_strength` | {py:meth}`~scarf.datastore.datastore.DataStore.calc_membership_strength` | none; a bool |
 | `paris` | Paris clustering | `n_clusters`, `min_cluster_size` |
-| `doublets` | doublet detection | `cluster_sample_fraction`, `max_cells_per_cluster`, `simulation_ratio`, `heterotypic_fraction`, `save_k`, `smoothing_t`, `normalize_scores`, `random_seed` |
+| `doublets` | {py:meth}`~scarf.datastore.datastore.DataStore.run_doublet_detection` | `cluster_sample_fraction`, `max_cells_per_cluster`, `simulation_ratio`, `heterotypic_fraction`, `save_k`, `smoothing_t`, `normalize_scores`, `random_seed` |
 | `markers` | marker search | none; a bool |
 | `species` | recorded with the run | a species key such as `homo_sapiens` or `mus_musculus` |
 
@@ -153,19 +162,77 @@ Optional stages also accept `True` or `False`: `filtering`, `cell_cycle`, `harmo
 only), `umap`, `tsne`, `leiden`, `membership_strength`, `paris`, `doublets`, and `markers`. `tsne`
 and `membership_strength` are off unless requested. t-SNE uses the UMAP graph and embedding
 initialization and runs after UMAP; its coordinates appear as `tsne_1`, `tsne_2`, and so on.
-Membership strength is computed on the saved clustering and appears as `membership_strength`.
+A new t-SNE embedding needs the optional `sgtsnepi` package of the `tsne` extra; without it the
+`tsne` stage fails, after the earlier stages have completed, and the run raises a
+`PipelineExecutionError` whose `__cause__` is the `ImportError` that names the extra. A run whose
+t-SNE embedding the store already holds reuses it without the package, so a run that enables t-SNE
+without `sgtsnepi` is not refused: it logs a warning that names the extra before it creates a run
+record, and then runs.
+Before this release the `tsne` settings also accepted `parallel`, which `sgtsnepi` ignored, and
+t-SNE identities recorded thread settings. A saved configuration that sets `parallel` is now
+rejected as an unknown setting when it runs again, while a run that recorded it still reopens and
+reports, because reopening never checks a run's configuration against the current recipe. t-SNE
+embeddings from earlier releases are recomputed instead of reused.
+Membership strength is computed on the saved clustering and appears as `membership_strength`: the
+fraction of each cell's graph neighbors that carry the cell's own cluster label. Before this
+release it was the share of the most common neighbor label, whatever the cell's own label, so a
+cell whose neighbors all belonged to one other cluster scored 1; such results are recomputed
+instead of reused.
 
-`pca` `dims=0` skips PCA. The graph then uses the normalized values of the selected features,
-recorded as the `reduction` output. `leiden` `selected` names one of the partitions as the saved
-clustering, `run["clusters"]`, in place of the silhouette choice, and the cluster-selection stage
-is skipped; the other partitions still run beside it.
+`pca` `dims=0` skips the `pca` stage. The graph is then built on the normalized values of the
+selected features, one coordinate per feature: the ANN index, the neighbors, the embedding
+initialization, and cluster selection use `run["normalized"]` as their coordinates, and the run
+records no `pca` output. Harmony corrects reduced coordinates and doublet scoring needs a PCA graph,
+so `dims=0` with `harmony_batch_columns`, or with doublet scoring on, which it is by default,
+raises `ValueError` before a run record is created; pass `doublets=False`. Before this release
+`dims=0` registered an identity matrix over the selected features as a custom reduction, recorded
+as the `reduction` output, and its runs failed at cluster selection unless `leiden` `selected` was
+given or Leiden was off, and at the doublets stage.
+`leiden` `selected` names one of the partitions as the saved clustering, `run["clusters"]`, in place
+of the silhouette choice, and the cluster-selection stage is skipped; the other partitions still
+run beside it.
 
-Unknown sections or settings, non-finite numbers, and `True` for a stage that always runs are
-rejected before a run record is created. A setting cannot also be given through its shortcut
-argument: `hvg_count` with `hvg.top_n`, `pca_dims` with `pca.dims`, `neighbors_k` with
-`neighbors.k`, `harmony_batch_columns` with `harmony`, or a changed stage switch such as
-`umap=False` with `params["umap"]`. Each stage checks its own values when it runs. The run's
-configuration records the resolved settings under `params`.
+With `dims=0` the graph has one coordinate per highly variable gene, so the memory and time of the
+ANN index, the neighbour queries, the embedding initialization, and cluster selection scale with
+the HVG count instead of the PCA dimensions. The hnswlib index holds about
+`4 * hvg_count + 8 * ann_m + 130` bytes per cell on x86-64 Linux, about 4.5 GB for 1,000,000 cells
+with 1,000 HVGs and 8.5 GB with 2,000, and the `ann_index` and `neighbors` stages fail before they
+create or load it when it does not fit the memory budget: the run raises a
+`PipelineExecutionError` whose `__cause__` is the `MemoryError`. By default the embedding
+initialization reads the coordinates in their stored row bands, and fits k-means in memory over
+every cell's coordinates, 4 bytes per HVG per cell, when one band holds every cell; set
+`params={"embedding_initialization": {"batch_size": ...}}` below the cell count to select the
+streamed fit, which holds a sample of the cells and one block of coordinates at a time.
+
+The `doublets` stage forces each simulated doublet, with probability `heterotypic_fraction` (0.8
+by default), to pair parents from two different clusters, so it needs a saved clustering with two
+or more clusters. The silhouette choice never saves a partition with one cluster, but `leiden`
+`selected` can. The stage then fails with a `PipelineExecutionError` that names the settings to
+change: select a partition with two or more clusters, set
+`params["doublets"]["heterotypic_fraction"]` to 0 to simulate doublets from any two sampled cells,
+or pass `doublets=False`. Before this release a few redraws approximated the forced pairs and
+could fall well short of the fraction when one cluster dominated the sampled cells, and a single
+cluster was scored with homotypic doublets only; doublet scores that earlier releases computed
+with a `heterotypic_fraction` above 0 are recomputed instead of reused.
+
+Unknown sections or settings, settings without a JSON value such as infinity, and `True` for a stage
+that always runs are rejected before a run record is created; `hvg` settings also get the checks of
+`select_hvgs` then. `min_cells` must be an integer of at least 0, `top_n` and `n_bins` integers of
+at least 1, `lowess_frac` a finite number from 0 to 1 for either `bin_strategy`, `keep_bounds` a
+boolean, and `bin_strategy` `"adaptive"` or `"fixed"`; an omitted setting is checked as its
+`select_hvgs` default.
+`tsne` settings get the checks of `run_tsne` then too, because the stage runs after most
+others: `tsne_dims`, `max_iter`, and `alpha` must be integers of at least 1, `early_iter` an integer
+of at least 0, `lambda_scale` and `box_h` finite positive numbers, and `symmetric_graph` and
+`graph_upper_only` booleans; an omitted setting is checked as its `run_tsne` default. The `umap`
+`symmetric_graph` and `graph_upper_only` settings must be booleans too, checked at the same time;
+`run_umap` no longer accepts `None` for them. A setting
+cannot also be given through its shortcut argument: `hvg_count` with
+`hvg.top_n`, `pca_dims` with `pca.dims`, `neighbors_k` with `neighbors.k`, `harmony_batch_columns`
+with `harmony`, or a changed stage switch such as `umap=False` with `params["umap"]`. Each shortcut
+defaults to the default of the keyword it sets, so `hvg_count`, `pca_dims`, and `neighbors_k` follow
+`select_hvgs` `top_n`, `run_pca` `dims`, and `query_neighbors` `k`. Every other stage checks its own
+values when it runs. The run's configuration records the settings under `params` as JSON values.
 
 The invocation is validated before a run record is created. Unknown options, missing columns,
 invalid stage combinations, reserved snapshot fields, and an already completed label fail without
@@ -185,12 +252,18 @@ except PipelineExecutionError as error:
 
 ## Automatic cluster selection
 
-The `cluster_selection` stage scores enabled Leiden resolutions in the same PCA or Harmony
-coordinates used to build the graph. Paris remains `run["paris"]` for diagnosis and comparison; it
-is never the automatic `run["clusters"]` winner. Selection uses one deterministic shared sample of
-at most 10,000 selected cells with seed `4466`. The sample reserves up to two seeded cells per
-cluster across every Leiden candidate, then fills remaining capacity without replacement. Pairwise
-work stays within the datastore memory budget.
+The `cluster_selection` stage scores enabled Leiden resolutions in the coordinates used to build
+the graph: PCA or Harmony coordinates, or with `pca_dims=0` the normalized values. Paris remains
+`run["paris"]` for diagnosis and comparison; it is never the automatic `run["clusters"]` winner.
+Selection uses one deterministic shared sample of at most 10,000 selected cells with seed `4466`.
+The sample reserves up to two seeded cells per cluster across every Leiden candidate, then fills
+remaining capacity without replacement. The sampled cells' coordinates are read in blocks under the
+datastore memory budget, and pairwise distances are computed in chunks of a quarter of the budget,
+at most 1 GiB. Before it reads a coordinate, the stage fails when the sampled coordinates, in their
+stored dtype and as float64, with one block of the read or with the distance chunks, exceed the
+budget: the run raises a `PipelineExecutionError` whose `__cause__` is the `MemoryError`. Reading
+a sample spread over a large normalized matrix, as with `pca_dims=0`, decodes most of its stored
+chunks.
 
 This silhouette comparison is a reproducible provisional baseline. It is not biological validation
 or ground truth. Keep alternative Leiden refs and Paris when the study question needs other
@@ -254,6 +327,12 @@ adata = ds.to_anndata(run=run)
 # adata.obsm["X_umap"] holds frozen UMAP; cluster labels stay in adata.obs
 ```
 
+The marker table of a run saved before Scarf 1.0.0 cannot be read, because its `fold_change`
+column held sentinels: `get_markers` raises and names
+`ds.run_marker_search(run["clusters"], features=run["feature_universe"])`, which recomputes the
+table for the run's clusters. A saved agent result keeps the table that it read, so its analysis
+must be run again.
+
 ## Open, list, and report runs
 
 A successful optional label is an immutable name for one run:
@@ -294,13 +373,30 @@ Every status exposes identity, status, and `run.report(format="dict" | "markdown
 completed run exposes mapping outputs and frozen views. Reports include stage timing, sampled
 process-tree RSS, artifact plans with `created` or `reused` dispositions, failures, interruption
 details, and signal-guard availability. RSS peaks are sampled lower bounds. An unavailable
-measurement is reported as null with a reason.
+measurement is reported as null with a reason. RSS comes from the Linux `/proc` filesystem; on
+platforms without it, such as macOS and Windows, nothing is sampled, so `sampleCount` is 0.
 
-Run and stage records are strict and unversioned. Unknown or malformed fields fail closed. A hard
-process death can leave `complete=False`; this is reported as an unclean incomplete run. There is
-no resume, repair, or same-ID retry. A new invocation may reuse only complete artifacts.
-Catalog scans and open-by-label skip malformed or torn children so healthy runs remain accessible;
-opening the malformed child by its exact run ID remains strict.
+A hard process death can leave `complete=False`; this is reported as an unclean incomplete run.
+There is no resume, repair, or same-ID retry. A new invocation may reuse only complete artifacts.
+
+### Runs saved by other releases
+
+A run completed under any 1.x release reopens under every later 1.x release. `open` by label or
+run ID, `list_runs`, `run[key]`, `run.report()`, and the frozen `run.cells` and `run.features`
+views work as long as the artifacts the run references exist and satisfy their payload contracts.
+Running a saved configuration again recomputes a stage whose operation gained a revision that
+applies to it, or whose recorded provenance a later release changed; it never modifies the earlier
+run. Lineage reports of the earlier run's outputs mark those that a revision supersedes `stale`.
+
+A run that a newer Scarf saved with record fields this release does not know fails closed: opening
+it by run ID raises a `ValueError` that names those fields. Upgrade Scarf to open it. Within 1.x,
+releases only add record fields, so runs from earlier releases never meet this error. A 2.0 release
+may change run records and lists each change in its compatibility inventory.
+
+Run and stage records are otherwise strict: a missing or unknown field, or a malformed value,
+fails closed. `list_runs` and open-by-label skip records they cannot read so healthy runs remain
+accessible, and log a warning that names each skipped run ID and why it could not be read. Opening
+that run by its exact ID raises its error.
 
 ## Graceful interruption and callbacks
 
@@ -313,6 +409,9 @@ record that signal protection was unavailable.
 
 `KeyboardInterrupt` and an escaped `asyncio.CancelledError` use the same durable interruption
 boundary. Ordinary stage exceptions produce a failed run instead.
+Run and stage records hold at most 512 characters of an error or interruption message. A longer
+message keeps its first 509 characters followed by `...`; the raised exception keeps its full
+message.
 If a termination signal races with an ordinary failure or the final successful handoff, the
 pipeline preserves that durable outcome and still propagates the pending signal after cleanup.
 

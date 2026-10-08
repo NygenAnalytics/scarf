@@ -14,10 +14,7 @@ if TYPE_CHECKING:
         write_imported_coordinates as write_imported_coordinates,
         write_imported_embedding as write_imported_embedding,
     )
-    from .sgtsne import (
-        export_knn_to_mtx as export_knn_to_mtx,
-        run_sgtsne as run_sgtsne,
-    )
+    from .sgtsne import run_sgtsne as run_sgtsne
     from .umap import (
         calc_dens_map_params as calc_dens_map_params,
         fit_transform as fit_transform,
@@ -29,7 +26,6 @@ __all__ = [
     "Harmony",
     "HarmonyResult",
     "calc_dens_map_params",
-    "export_knn_to_mtx",
     "fit_harmony",
     "fit_transform",
     "fuzzy_simplicial_set",
@@ -47,7 +43,6 @@ __getattr__, __dir__ = _lazy_facade(
         "Harmony": ".harmony",
         "HarmonyResult": ".harmony",
         "calc_dens_map_params": ".umap",
-        "export_knn_to_mtx": ".sgtsne",
         "fit_harmony": ".harmony",
         "fit_transform": ".umap",
         "fuzzy_simplicial_set": ".umap",

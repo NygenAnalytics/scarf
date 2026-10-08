@@ -20,6 +20,12 @@ labels. Docs: <https://scarf.readthedocs.io/en/latest/tutorials/annotation.html>
   1/n_groups means ubiquitous), `mean`/`mean_rest`, `frac_exp`/`frac_exp_rest`, `fold_change`,
   `auc`, two-sided Mann-Whitney `p_value` and `p_value_adjusted` (BH within each group). They are
   one-versus-rest statistics over cells, not replicate-aware differential expression.
+- `fold_change` is `mean / mean_rest` of the normalized values that the search ranks, with no
+  pseudocount: `inf` when no other cell expresses the gene, `NaN` when no cell does (or a mean is
+  negative, from signed counts). Every other column is finite. With `log_transform=True` or CLR
+  (ADT) it compares log-scale means, so compare it only within one assay and normalization.
+  Tables from earlier releases (100.1 and 0 sentinels) raise `ValueError` on load; rerun
+  `run_marker_search`.
 - `get_markers` returns a DataFrame with a string `group_id`, rows sorted by `score` within each
   group and groups in natural order (`"2"` before `"10"`). Defaults `min_score=0.25`,
   `min_frac_exp=0.2` hide most genes; pass `-1` for both to get every gene for every group.
@@ -244,6 +250,7 @@ case (`Cd3e`, `Ptprc`, `Mki67`), and panel lookups are exact, so convert the pan
 | `min_score` (`get_markers`) | `0.25` | `-1` to see negatives and weak genes; raise for a short list |
 | `min_frac_exp` (`get_markers`) | `0.2` | `-1` with `min_score=-1` for complete panel tables |
 | `features` (`run_marker_search`) | required | `run["feature_universe"]` tests every gene; an HVG ref limits the search |
+| `log_transform` (`run_marker_search`) | `False` | `True` ranks `log1p` of the assay normalizer's values; ADT CLR, ATAC TF-IDF and `norm_lib_size_log` raise |
 | `tmin` (AUCell, WAGGR) | `5` | Lower for short sets; sources with fewer matched targets are dropped |
 | `n_up` (AUCell) | `None` (5% of universe) | Fix it when comparing runs; changes the score scale |
 | `s_genes` / `g2m_genes` | built-in human and mouse lists | Other species or naming schemes |
@@ -267,6 +274,9 @@ case (`Cd3e`, `Ptprc`, `Mki67`), and panel lookups are exact, so convert the pan
 - Ambient genes (HBB, LYZ, S100A8, JCHAIN, immunoglobulins) show nonzero `frac_exp` in most
   clusters. Use `score` and `auc`, not detection alone, and leave them out of co-detection checks.
 - Small groups inflate `fold_change` and can pass `min_score` with odd genes; check group size.
+  A descending sort by `fold_change` puts genes exclusive to a group first (`inf`) however faint
+  they are, and `NaN` last; read `frac_exp` before trusting an `inf`. Use `np.isfinite` before
+  averaging fold changes or taking their logarithm.
 - `ds.cells.insert(..., overwrite=True)` silently replaces a column; use versioned names.
 - `select_cells(include=...)` needs integers for integer cluster artifacts (`TypeError` otherwise).
 - Scores from different feature universes, `n_up` or WAGGR `mode`/`log_transform` are not comparable.

@@ -325,10 +325,11 @@ def lisi_batch_mixing_score(
 
     Raises:
         ValueError: If the inputs are misaligned, contain non-finite scores or
-            missing labels, or describe fewer than two batches.
+            missing labels, or assign the cells to fewer than two batches.
     """
     scores = np.asarray(lisi_scores, dtype=np.float64)
-    labels = pd.Categorical(batch_labels)
+    # A declared category without cells is not a batch.
+    labels = pd.Categorical(batch_labels).remove_unused_categories()
     if scores.ndim != 1 or len(scores) != len(labels):
         raise ValueError("LISI scores and batch labels must be aligned vectors")
     if not np.all(np.isfinite(scores)):

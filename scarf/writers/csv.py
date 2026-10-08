@@ -41,15 +41,18 @@ class CSVtoZarr:
             stay under automatic planning.
         assay_type: Preset assay type, such as ``RNA``, for an assay whose name
                     is not a preset. When None, the assay name decides the type.
+        overwrite: If True, replace a Scarf store that no ``DataStore`` has opened.
 
     The counts are stored in the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from the
     range the reader found in its first pass over every row. A count that
     the stored dtype cannot hold raises instead of wrapping.
 
+    Raises:
+        FileExistsError: If ``zarr_loc`` is not empty and may not be replaced.
+
     Attributes:
         csvr: A CSVReader object
-        fn: The file name for the Zarr hierarchy.
         z: The Zarr hierarchy (array or group).
     """
 
@@ -66,6 +69,8 @@ class CSVtoZarr:
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
         assay_type: str | None = None,
+        *,
+        overwrite: bool = False,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -73,14 +78,15 @@ class CSVtoZarr:
             create_zarr_count_assay,
             validate_assay_name,
         )
-        from ..storage.stores import load_zarr
-        from .counts_t import validate_assay_type
+        from ..storage.destinations import create_destination
+        from ..assay.classification import validate_assay_type
 
         self.csvr = cr
         self.assayName = assay_name
         validate_assay_name(self.assayName)
-        validate_assay_type(assay_type)
+        validate_assay_type(assay_type, assay=self.assayName)
         self.assayType = assay_type
+        self._cellDataColumns = _cell_data_columns(cr)
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.io = io
@@ -90,7 +96,10 @@ class CSVtoZarr:
         storage_dtype = count_storage_dtype(self.csvr.countDtype, self.csvr.countRange)
         # A layout that does not fit fails here, before the destination exists.
         layout = self._fit_count_layout(storage_dtype, policy)
-        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
+        # The destination must be empty, or with overwrite an unprepared store.
+        self.z = create_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
         _ = create_cell_data(
             root=self.z,
             workspace=workspace,
@@ -155,6 +164,7 @@ class CSVtoZarr:
         Returns:
             None
         """
+        from ..metadata.membership import reserved_membership_columns
         from ..storage.identity import CountSummary, finalize_counts
         from ..storage.schema import load_count_array
         from ..storage.metadata_keys import metadata_column_keys
@@ -170,19 +180,19 @@ class CSVtoZarr:
             self.z[cell_data_path],
             name=cell_data_path,
         )
+        # The membership column name of the imported assay is reserved.
+        reserved = reserved_membership_columns([self.assayName])
         # Each entry pairs a column's position in the reader payload with its
         # dtype across every row, so skipped columns keep the mapping.
         metadata = list(
             keyed_metadata_columns(
-                zip(
-                    self.csvr.cellDataCols,
-                    enumerate(self.csvr.cellDataDtypes or []),
-                ),
+                self._cellDataColumns,
                 metadata_column_keys(
-                    self.csvr.cellDataCols,
-                    taken=cell_data_grp.keys(),
+                    [name for name, _payload in self._cellDataColumns],
+                    taken=[*cell_data_grp.keys(), *reserved],
                 ),
                 "cell",
+                membership=reserved,
             )
         )
         parts: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {
@@ -236,6 +246,25 @@ class CSVtoZarr:
             profile=self.profile,
             io=self.io,
         )
+
+
+def _cell_data_columns(
+    reader: CSVReader,
+) -> list[tuple[str, tuple[int, np.dtype[Any]]]]:
+    """Pair each cell metadata column with its payload position and dtype.
+
+    The reader records the dtype of every ``cell_data_cols`` column across all
+    rows, and no dtypes without such columns, so a count mismatch means that
+    the reader no longer describes its payload.
+    """
+    columns = list(reader.cellDataCols)
+    dtypes = list(reader.cellDataDtypes or [])
+    if len(dtypes) != len(columns):
+        raise ValueError(
+            f"CSVReader.cellDataDtypes holds {len(dtypes)} dtypes for "
+            f"{len(columns)} cell_data_cols columns; it needs one dtype per column"
+        )
+    return list(zip(columns, enumerate(dtypes), strict=True))
 
 
 def _metadata_part(

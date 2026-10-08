@@ -120,7 +120,7 @@ def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
 
 
-def test_write_counts_t_accounts_for_process_resident_memory(tmp_path):
+def test_write_counts_t_accounts_for_process_resident_memory(tmp_path, monkeypatch):
     root_path = tmp_path / "store.zarr"
     _seed_counts(root_path, np.arange(24, dtype=np.uint32).reshape(6, 4))
     resources = _resources().model_copy(update={"scarfMemoryBudget": 1024**2})
@@ -142,6 +142,23 @@ def test_write_counts_t_accounts_for_process_resident_memory(tmp_path):
         r"MemoryError: countsT write needs at least \d+ bytes, "
         r"but the operation limit is 1048576 bytes",
         result.error,
+    )
+    assert "countsT" not in zarr.open_group(str(root_path), mode="r")["RNA"]
+
+    # Without /proc the resident memory is unknown, so the write is refused.
+    monkeypatch.setattr(profiling_stages, "process_rss_mb", lambda: None)
+    result = run_stage(
+        "writeCountsT",
+        nRows=6,
+        storeUri=str(root_path),
+        workflow=WorkflowParameters(),
+        resources=resources,
+        sampleIntervalSeconds=0.01,
+        submissionId="testsubmission",
+    )
+    assert result.error is not None
+    assert result.error.startswith(
+        "RuntimeError: Profiling stages measure resident memory through Linux /proc"
     )
     assert "countsT" not in zarr.open_group(str(root_path), mode="r")["RNA"]
 

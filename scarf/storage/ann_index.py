@@ -192,6 +192,8 @@ def load_ann_index(
                 )
                 digest.update(values)
                 destination.write(memoryview(values))
+                # Release the window before the next read allocates its own.
+                del values
         if digest.hexdigest() != validated.stored_digest:
             raise ValueError("ANN index payload digest does not match its metadata")
         index = hnswlib.Index(space=space, dim=dim)

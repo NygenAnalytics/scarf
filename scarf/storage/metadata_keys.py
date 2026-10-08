@@ -5,6 +5,8 @@ named with either one would nest into groups instead of forming one array.
 Imports store such source columns under a key with ``_`` in place of each
 separator. Scarf's own ``I``, ``ids``, and ``names`` columns and the
 missing-value masks linked through ``__scarf_missing__<name>`` are reserved.
+The cell column named by :func:`assay_membership_column` records which cells
+an assay measures.
 """
 
 from collections.abc import Iterable
@@ -13,6 +15,23 @@ from .arrays import MISSING_MASK_PREFIX
 
 RESERVED_METADATA_COLUMNS = frozenset({"I", "ids", "names"})
 """Columns that Scarf writes into every cell and feature table."""
+
+ASSAY_MEMBERSHIP_ROLE = "assay_membership"
+"""``role`` attribute of the cell column that records which cells an assay measures."""
+
+
+def assay_membership_column(assay: str) -> str:
+    """Return the name of the cell column that records which cells ``assay`` measures.
+
+    An assay without this column measures every cell.
+    """
+    return f"{assay}_I"
+
+
+def assay_membership_attributes(assay: str) -> dict[str, str]:
+    """Return the attributes that mark ``<assay>_I`` as the membership of ``assay``."""
+    return {"role": ASSAY_MEMBERSHIP_ROLE, "assay": assay}
+
 
 _UNSTORABLE_NAMES = frozenset({"", ".", ".."})
 

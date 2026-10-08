@@ -263,6 +263,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         the query measured is recorded as uninformative. It keeps a projection
         row but is excluded from label transfer, mapping scores, Symphony
         query-batch statistics, and ``queryScaledDispersion``.
+
+        Raises:
+            UnmeasuredCellsError: If the query assay did not measure a selected cell.
         """
         if not isinstance(reference, MappingReference):
             raise TypeError("reference must be a MappingReference")
@@ -288,8 +291,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise TypeError("query_batches must be a pandas DataFrame or None")
         if not isinstance(invalidate_cache, bool):
             raise TypeError("invalidate_cache must be a boolean")
-        if self.zarr_mode != "r+":
-            raise ValueError("Mapping requires a read-write query datastore")
         if _same_physical_store(self, reference):
             raise ValueError(
                 "Query and reference cannot use the same physical Zarr store. "
@@ -305,6 +306,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping currently supports RNA query assays only")
+        # After the argument and assay checks, and before the write check, so
+        # a read-only store refuses unmeasured cells as a writable one does.
+        self._require_measured_cells(
+            assay_name, cell_selection, operation="run_mapping"
+        )
+        if self.zarr_mode != "r+":
+            raise ValueError("Mapping requires a read-write query datastore")
         validated_cells = validate_stored_selection_integrity(
             self.zw,
             cell_selection,

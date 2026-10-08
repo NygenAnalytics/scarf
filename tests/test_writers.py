@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pytest
 import zarr
@@ -43,6 +45,25 @@ class _FakeAssay:
         self.cells = _FakeCells(n_cells, columns)
         self.z = zarr.group()
         self.matrixGroup = self.z
+
+
+@pytest.fixture(scope="module")
+def memory_source():
+    """An in-memory DataStore with one RNA assay of two cells, which tests only read."""
+    from scipy.sparse import csr_matrix
+
+    from scarf import DataStore
+    from scarf.writers import SparseToZarr
+
+    store = MemoryStore()
+    SparseToZarr(
+        csr_matrix(np.arange(1, 7, dtype=np.uint8).reshape(2, 3)),
+        store,
+        ["c0", "c1"],
+        ["f1", "f2", "f3"],
+        nthreads=1,
+    ).dump()
+    return DataStore(store, min_features_per_cell=0, nthreads=1)
 
 
 def _assert_counts_equal(array, expected) -> None:
@@ -717,11 +738,13 @@ def test_h5ad_direct_writers_fit_their_window_summaries(tmp_path, monkeypatch):
 
         reader = H5adReader(str(path), feature_name_key="feature_name")
         try:
-            # Each probe only plans, so one writer serves every budget.
+            # Each probe only plans, so one writer serves every budget. A
+            # second search replaces the unprepared planning store of the first.
             writer = H5adToZarr(
                 reader,
                 zarr_loc=str(tmp_path / "planning.zarr"),
                 io=StorageIoPolicy(readWorkers=2),
+                overwrite=True,
                 **_SHARD_BAND_BUDGET,
             )
             with monkeypatch.context() as patch:
@@ -1394,6 +1417,31 @@ def test_csv_to_zarr_preserves_supplied_cell_ids(tmp_path):
     np.testing.assert_array_equal(result.RNA.rawData.compute(), [[1, 2], [3, 4]])
 
 
+@pytest.mark.parametrize(
+    ("dtypes", "message"),
+    [
+        ([], "holds 0 dtypes for 1 cell_data_cols columns"),
+        (
+            [np.dtype(np.int64), np.dtype(object)],
+            "holds 2 dtypes for 1 cell_data_cols columns",
+        ),
+    ],
+)
+def test_csv_cell_data_dtypes_must_match_the_columns_before_writing(
+    tmp_path, dtypes, message
+) -> None:
+    path = tmp_path / "counts.csv"
+    path.write_text("g1,g2,quality\n1,0,7\n0,3,8\n")
+    reader = CSVReader(str(path), cell_data_cols=["quality"])
+    reader.cellDataDtypes = dtypes
+    destination = MemoryStore()
+    zarr.open_group(store=destination, mode="w").create_group("sentinel")
+    with pytest.raises(ValueError, match=message):
+        CSVtoZarr(reader, destination, assay_name="RNA", nthreads=1)
+    root = zarr.open_group(store=destination, mode="r")
+    assert set(root.group_keys()) == {"sentinel"}
+
+
 def _write_reserved_h5ad(tmp_path):
     import h5py
 
@@ -1570,6 +1618,20 @@ def test_subset_assay_zarr_counts_carry_the_count_matrix_layout():
     np.testing.assert_array_equal(
         counts[:], np.arange(20, dtype=np.uint16).reshape(5, 4)[[4, 1, 3]][:, [3, 0]]
     )
+    # Zarr ignores extra separators, so the layout goes on the group "other".
+    root.create_group("other")
+    subset_assay_zarr(
+        store,
+        in_grp="source",
+        out_grp="/other//counts/",
+        cells_idx=np.array([0]),
+        feat_idx=np.array([1]),
+    )
+    counts, _ = validate_count_matrix(
+        zarr.open_group(store=store, path="other", mode="r"),
+        require_transpose=False,
+    )
+    np.testing.assert_array_equal(counts[:], [[1]])
 
 
 @pytest.mark.parametrize(
@@ -1648,6 +1710,64 @@ def test_subset_assay_zarr_rejects_unusable_indices_before_writing(
     assert "selected" not in root
 
 
+def test_subset_assay_zarr_writes_only_new_nodes_of_its_store(monkeypatch):
+    from zarr.errors import ContainsArrayError
+
+    import scarf.writers.subset as subset_module
+
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_group("RNA").create_array(
+        "counts", data=np.arange(12, dtype=np.uint16).reshape(4, 3)
+    )
+    root.create_group("selected")
+
+    def subset(in_grp: str, out_grp: str) -> None:
+        subset_assay_zarr(
+            store,
+            in_grp,
+            out_grp,
+            cells_idx=np.array([0, 1]),
+            feat_idx=np.array([0, 1]),
+            nthreads=1,
+        )
+
+    def stored() -> dict[str, bytes]:
+        return {
+            key: bytes(value.to_bytes()) for key, value in store._store_dict.items()
+        }
+
+    subset("RNA/counts", "selected/counts")
+    before = stored()
+    overlap = "must not be, contain, or lie inside"
+    # Before, an out_grp equal to in_grp zeroed its counts, and out_grp="RNA"
+    # deleted the assay.
+    for in_grp, out_grp, error, message in (
+        ("RNA/counts", "RNA/counts", ValueError, overlap),
+        ("RNA/counts", "/RNA//counts/", ValueError, overlap),
+        ("RNA/counts", "RNA", ValueError, overlap),
+        ("RNA/counts", "", ValueError, overlap),
+        ("RNA/counts", "RNA/counts/subset", ValueError, overlap),
+        ("/RNA/counts", "RNA\\counts", ValueError, overlap),
+        ("RNA/counts", "selected/../RNA", ValueError, "must not contain '.' or '..'"),
+        ("RNA/counts", "selected/counts", FileExistsError, "already exists"),
+        # The layout record of a matrix group describes the counts it holds.
+        ("RNA/counts", "selected/again", FileExistsError, "records the layout"),
+    ):
+        with pytest.raises(error, match=message):
+            subset(in_grp, out_grp)
+    assert stored() == before
+
+    # A node that another writer creates after the check is never replaced.
+    def racing_check(z, out_grp: str, _parts) -> None:
+        z.create_array(out_grp, data=np.array([7]))
+
+    monkeypatch.setattr(subset_module, "_check_new_output", racing_check)
+    with pytest.raises(ContainsArrayError):
+        subset("RNA/counts", "raced")
+    np.testing.assert_array_equal(root["raced"][:], [7])
+
+
 def test_v2_fixture_read_only(datastore):
     from tests import full_path
 
@@ -1706,12 +1826,24 @@ def export_assay_store(toy_crdir_writer, tmp_path):
     )
 
 
-def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tmp_path):
+def test_to_h5ad_preserves_counts_metadata_and_embeddings(
+    export_assay_store, tmp_path, monkeypatch
+):
     import h5py
     from scipy.sparse import csr_matrix
 
+    from scarf.matrix import ChunkedArray
     from scarf.writers import to_h5ad
+    from scarf.writers.export import h5ad_conversion_bytes, largest_block_rows
 
+    charged = []
+    stream = ChunkedArray._stream_blocks
+
+    def charging(self, **options):
+        charged.append(options["resident_bytes"])
+        return stream(self, **options)
+
+    monkeypatch.setattr(ChunkedArray, "_stream_blocks", charging)
     assay = export_assay_store.RNA
     n_cells = assay.cells.N
     umap = np.column_stack(
@@ -1728,6 +1860,10 @@ def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tm
 
     path = tmp_path / "toy_export.h5ad"
     to_h5ad(assay, str(path), embeddings_cols=["UMAP"])
+    # The stream charges the conversion of its largest block to CSR.
+    counts = assay.rawData
+    rows = largest_block_rows(counts)
+    assert charged == [h5ad_conversion_bytes(counts.dtype, counts.shape[1], rows)]
 
     with h5py.File(path, "r") as h5:
         shape = tuple(int(x) for x in h5["X"].attrs["shape"])
@@ -1754,6 +1890,13 @@ def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tm
         np.testing.assert_allclose(h5["obsm/X_umap"][:], umap)
         assert "RNA_UMAP1" not in h5["obs"]
         assert "RNA_UMAP2" not in h5["obs"]
+
+    # Two prefixes that would both export as obsm["X_umap"] are refused.
+    assay.cells.insert("RNA_umap1", umap[:, 0], overwrite=True)
+    clash = tmp_path / "clash.h5ad"
+    with pytest.raises(ValueError, match=r"both export as obsm\['X_umap'\]"):
+        to_h5ad(assay, str(clash), embeddings_cols=["UMAP", "umap"])
+    assert not clash.exists()
 
 
 @pytest.mark.parametrize("skip_recalc", [True, False])
@@ -1815,55 +1958,377 @@ def test_to_h5ad_rejects_count_metadata_shape_mismatches_and_closes_output(
     assay.rawData = ChunkedArray(group.create_array("counts", data=values), nthreads=1)
     path = tmp_path / "invalid.h5ad"
     handles = h5py.h5f.get_obj_count()
-    with pytest.raises(
-        ValueError, match="Count matrix .* does not match assay metadata"
-    ):
+    with pytest.raises(ValueError, match="The X matrix has .* the export declares"):
         to_h5ad(assay, str(path), nthreads=1)
     assert h5py.h5f.get_obj_count() == handles
-    with h5py.File(path, "r") as handle:
-        assert "encoding-type" not in handle["X"].attrs
+    # The file is written under another name and moved into place only once
+    # it is complete, so a failed export leaves nothing behind.
+    assert list(tmp_path.glob("invalid.h5ad*")) == []
 
 
-def _completed_export_run():
+def _plan(blocks, *, shape=(3, 2), dtype=np.int32, obs=(), obsm=None):
+    """A one-matrix H5AD plan whose X yields ``blocks``."""
+    from scarf.writers.export import H5adColumn, H5adExportPlan, H5adMatrix
+
+    def ids(prefix: str, count: int) -> H5adColumn:
+        names = np.asarray([f"{prefix}{index}" for index in range(count)])
+        return H5adColumn("_index", lambda: (names, None))
+
+    return H5adExportPlan(
+        x=H5adMatrix(
+            shape=shape,
+            dtype=np.dtype(dtype),
+            blocks=lambda: iter(blocks),
+        ),
+        obs_index=ids("c", shape[0]),
+        obs=tuple(obs),
+        var_index=ids("g", shape[1]),
+        var=(),
+        obsm={} if obsm is None else obsm,
+    )
+
+
+# Blocks of other shapes are refused through to_h5ad in
+# test_to_h5ad_rejects_count_metadata_shape_mismatches_and_closes_output.
+@pytest.mark.parametrize(
+    ("blocks", "message"),
+    [
+        (
+            [np.ones((3, 2), dtype=np.float64)],
+            "The X matrix has a row block of dtype float64; the export declares int32",
+        ),
+        (
+            [np.ones(2, dtype=np.int32)],
+            "The X matrix has a row block with 1 dimension; blocks are two-dimensional",
+        ),
+    ],
+)
+def test_h5ad_plan_writer_rejects_blocks_that_do_not_fit_the_plan(
+    tmp_path, blocks, message
+):
+    from scarf.writers.export import materialize_h5ad_matrix, write_h5ad_plan
+
+    path = tmp_path / "export.h5ad"
+    path.write_bytes(b"an earlier export")
+
+    with pytest.raises(ValueError, match=message):
+        write_h5ad_plan(_plan(blocks), path)
+    with pytest.raises(ValueError, match=message):
+        materialize_h5ad_matrix(_plan(blocks).x)
+
+    # The earlier file is kept, and no partial or temporary file is left.
+    assert path.read_bytes() == b"an earlier export"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_h5ad_plan_writer_keeps_the_permissions_of_a_replaced_file(
+    tmp_path, monkeypatch
+):
+    import stat
+
+    import scarf.writers.export as export
+    from scarf.writers.export import write_h5ad_plan
+
+    path = tmp_path / "export.h5ad"
+    path.write_bytes(b"an earlier export")
+    path.chmod(0o640)
+    new = tmp_path / "new.h5ad"
+    write_plan = export._write_plan
+    modes = []
+
+    def recorded(h5, plan):
+        modes.append(stat.S_IMODE(os.stat(h5.filename).st_mode))
+        write_plan(h5, plan)
+
+    monkeypatch.setattr(export, "_write_plan", recorded)
+    previous = os.umask(0o022)
+    try:
+        write_h5ad_plan(_plan([np.ones((3, 2), dtype=np.int32)]), path)
+        write_h5ad_plan(_plan([np.ones((3, 2), dtype=np.int32)]), new)
+    finally:
+        os.umask(previous)
+
+    # The data of a replaced file is private until the file takes its mode.
+    assert modes[0] == 0o600
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    # A new file takes the mode that the umask gives any new file.
+    assert stat.S_IMODE(new.stat().st_mode) == 0o644
+    assert sorted(tmp_path.iterdir()) == [path, new]
+
+
+def test_h5ad_plan_writer_leaves_nothing_behind_when_interrupted(tmp_path):
+    import dataclasses
+
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers.export import H5adColumn, write_h5ad_plan
+
+    def interrupted_blocks():
+        yield csr_matrix(np.ones((1, 2), dtype=np.int32))
+        raise KeyboardInterrupt
+
+    def unreadable():
+        raise OSError("metadata is unreadable")
+
+    path = tmp_path / "export.h5ad"
+    plan = _plan([])
+    interrupted = dataclasses.replace(
+        plan, x=dataclasses.replace(plan.x, blocks=interrupted_blocks)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        write_h5ad_plan(interrupted, path)
+    assert list(tmp_path.iterdir()) == []
+
+    rows = [np.ones((3, 2), dtype=np.int32)]
+    failing = _plan(rows, obs=[H5adColumn("batch", lambda: unreadable())])
+    with pytest.raises(OSError, match="metadata is unreadable"):
+        write_h5ad_plan(failing, path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_h5ad_plan_writer_checks_columns_and_replaces_a_file_once_written(tmp_path):
+    import dataclasses
+
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers.export import (
+        H5adColumn,
+        h5ad_frame,
+        materialize_h5ad_matrix,
+        write_h5ad_plan,
+    )
+
+    rows = [csr_matrix(np.asarray([[1, 0], [0, 2]], dtype=np.int32))]
+    rows.append(np.asarray([[0, 3]], dtype=np.int32))
+    path = tmp_path / "export.h5ad"
+    path.write_bytes(b"an earlier export")
+    short = H5adColumn("batch", lambda: (np.asarray(["a", "b"]), None))
+    misaligned = H5adColumn(
+        "batch", lambda: (np.asarray(["a", "b", "c"]), np.zeros(2, dtype=bool))
+    )
+    table = H5adColumn("batch", lambda: (np.zeros((3, 1)), None))
+    duplicated = H5adColumn("_index", lambda: (np.asarray(["a", "b", "c"]), None))
+    incomplete = H5adColumn(
+        "_index", lambda: (np.asarray(["a", "", "c"]), np.asarray([False, True, False]))
+    )
+    wide = {"X_umap": lambda: np.zeros((2, 2))}
+    flat = {"X_umap": lambda: np.zeros(3)}
+    small = _plan([], shape=(2, 2)).x
+    for plan, message in (
+        (_plan(rows, obs=[short]), "Column 'batch' has 2 rows; the export declares 3"),
+        (
+            _plan(rows, obs=[misaligned]),
+            "Column 'batch' has a missing mask of shape \\(2,\\); its values have 3 rows",
+        ),
+        (_plan(rows, obs=[table]), "Column 'batch' has 2 dimensions"),
+        (_plan(rows, obs=[duplicated]), "Column '_index' is written twice"),
+        (
+            dataclasses.replace(_plan(rows), obs_index=incomplete),
+            "Index '_index' holds missing values",
+        ),
+        (_plan(rows, obsm=wide), "obsm 'X_umap' has 2 rows; the export declares 3"),
+        (_plan(rows, obsm=flat), "obsm 'X_umap' has 1 dimensions"),
+        (
+            dataclasses.replace(_plan(rows), layers={"raw": small}),
+            "Layer 'raw' has shape \\(2, 2\\); X has shape \\(3, 2\\)",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            write_h5ad_plan(plan, path)
+        assert path.read_bytes() == b"an earlier export"
+        assert list(tmp_path.iterdir()) == [path]
+    with pytest.raises(ValueError, match="Index '_index' holds missing values"):
+        h5ad_frame(incomplete, (), 3)
+    empty = materialize_h5ad_matrix(_plan([], shape=(0, 2)).x)
+    assert empty.shape == (0, 2) and empty.dtype == np.int32
+
+    plan = _plan(rows)
+    write_h5ad_plan(dataclasses.replace(plan, layers={"raw": plan.x}), path)
+
+    anndata = pytest.importorskip("anndata")
+    exported = anndata.read_h5ad(path)
+    assert list(tmp_path.iterdir()) == [path]
+    np.testing.assert_array_equal(
+        exported.X.toarray(), np.asarray([[1, 0], [0, 2], [0, 3]])
+    )
+    np.testing.assert_array_equal(
+        exported.layers["raw"].toarray(), exported.X.toarray()
+    )
+    assert exported.obs_names.tolist() == ["c0", "c1", "c2"]
+    assert exported.var_names.tolist() == ["g0", "g1"]
+
+
+def test_h5ad_export_of_a_tiny_matrix_fits_a_small_budget(monkeypatch) -> None:
+    import zarr
+
+    from scarf.datastore._operations.presentation import _stored_row_blocks
+    from scarf.matrix import ChunkedArray
+    from scarf.storage.budget import ResourceBudget
+    from scarf.writers.export import h5ad_conversion_bytes
+
+    charged: list[int] = []
+    stream = ChunkedArray._stream_blocks
+
+    def record(self, *args, **kwargs):
+        charged.append(kwargs["resident_bytes"])
+        return stream(self, *args, **kwargs)
+
+    monkeypatch.setattr(ChunkedArray, "_stream_blocks", record)
+
+    # The reservation follows the rows of the largest block that the stream
+    # yields; before, it held a full step of 2**20 values, about 20 MiB, for
+    # any matrix, and then for every row of the matrix.
+    assert h5ad_conversion_bytes(np.float32, 2, 2) < 1024
+    assert h5ad_conversion_bytes(np.float32, 2, 0) == 0
+    for shape, chunks, budget in (
+        ((2, 2), None, 8 * 1024**2),
+        ((2_000, 2), (10, 2), 1024**2),
+        # Converting every row of this matrix at once would hold about 12 MB.
+        ((200_000, 2), (1_000, 2), 1024**2),
+    ):
+        data = zarr.create_array(
+            store=zarr.storage.MemoryStore(),
+            shape=shape,
+            chunks=chunks or shape,
+            dtype="float32",
+        )
+        data[:] = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) % 3
+        blocks = _stored_row_blocks(data, 1, ResourceBudget(budget, 1), "export")
+        np.testing.assert_array_equal(np.vstack(list(blocks)), data[:])
+        # The stream charges the conversion of its blocks to CSR as resident.
+        assert len(charged) == 1 and charged.pop() > 0
+
+
+def test_h5ad_writer_converts_dense_blocks_within_the_charged_bytes(
+    tmp_path, monkeypatch
+):
+    import tracemalloc
+
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    import scarf.writers.export as export
+    from scarf.writers.export import (
+        h5ad_conversion_bytes,
+        iter_h5ad_blocks,
+        write_h5ad_plan,
+    )
+
+    monkeypatch.setattr(export, "_CSR_STEP_VALUES", 1 << 15)
+    # Every value is nonzero, the worst case for a conversion to CSR.
+    rng = np.random.default_rng(5)
+    dense = rng.integers(1, 100, size=(1024, 512)).astype(np.float32)
+    plan = _plan([dense], shape=dense.shape, dtype=np.float32)
+    charged = h5ad_conversion_bytes(np.float32, 512, 1024)
+
+    tracemalloc.start()
+    try:
+        for piece in iter_h5ad_blocks(plan.x):
+            del piece
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # Converting the 2 MiB block through COO held about 14 MiB.
+    assert peak <= charged < dense.nbytes
+    path = tmp_path / "dense.h5ad"
+    write_h5ad_plan(plan, path)
+    with h5py.File(path, "r") as h5:
+        stored = csr_matrix(
+            (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
+            shape=dense.shape,
+        )
+    np.testing.assert_array_equal(stored.toarray(), dense)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "order"),
+    [
+        ((37, 23), np.float32, "C"),
+        ((37, 23), np.float32, "F"),
+        ((5, 3000), np.int64, "C"),
+        ((0, 4), np.float64, "C"),
+        ((6, 0), np.float32, "C"),
+    ],
+)
+def test_dense_blocks_become_the_csr_pieces_that_scipy_builds(
+    monkeypatch, shape, dtype, order
+):
+    from scipy.sparse import csr_matrix, vstack
+
+    import scarf.writers.export as export
+
+    monkeypatch.setattr(export, "_CSR_STEP_VALUES", 64)
+    rng = np.random.default_rng(9)
+    values = rng.integers(0, 3, size=shape).astype(dtype)
+    if np.issubdtype(dtype, np.floating) and values.size:
+        values.flat[::7] = np.nan
+        values.flat[1::11] = -0.0
+    block = np.asarray(values, order=order)
+
+    pieces = list(export._dense_csr_pieces(block))
+    expected = csr_matrix(values)
+
+    assert sum(piece.shape[0] for piece in pieces) == shape[0]
+    if pieces:
+        assert len(pieces) == -(-shape[0] // export._csr_step_rows(shape[1]))
+        joined = vstack(pieces, format="csr")
+        assert joined.dtype == expected.dtype
+        np.testing.assert_array_equal(joined.indptr, expected.indptr)
+        np.testing.assert_array_equal(joined.indices, expected.indices)
+        np.testing.assert_array_equal(joined.data, expected.data)
+    else:
+        assert shape[0] == 0
+
+
+def _completed_export_run(umap=True):
+    """A completed run whose datastore owner hands the writer a fixed plan."""
     from types import SimpleNamespace
 
-    from anndata import AnnData
-    import pandas as pd
     from scipy.sparse import csr_matrix
 
     from scarf.datastore.pipeline_run import PipelineRun
     from scarf.storage.pipeline_runs import PipelineRunRecord
+    from scarf.writers.export import H5adColumn, H5adExportPlan, H5adMatrix
 
     assay = SimpleNamespace(name="RNA")
+
+    def frozen(name, values, missing=None):
+        array = np.asarray(values)
+        return H5adColumn(name, lambda: (array, missing), "categorical")
 
     class Owner:
         def __init__(self):
             self.zw = zarr.open_group(store=MemoryStore(), mode="w")
             self.cells = SimpleNamespace()
-            self.received_run = None
+            self.requests = []
 
         def _get_assay(self, name):
             assert name == "RNA"
             return assay
 
-        def to_anndata(self, *, run):
-            self.received_run = run
-            return AnnData(
-                csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32)),
-                obs=pd.DataFrame(
-                    {
-                        "I": [True, True],
-                        "names": ["frozen-a", "frozen-c"],
-                        "batch": ["x", "x"],
-                        "clusters": [0, 2],
-                    },
-                    index=pd.Index(["c1", "c3"], name="ids"),
+        def _h5ad_run_plan(self, run, *, matrix):
+            self.requests.append((run, matrix))
+            counts = csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32))
+            coordinates = np.asarray([[1.5, 10.5], [3.5, 30.5]], dtype=np.float32)
+            return H5adExportPlan(
+                x=H5adMatrix(
+                    shape=(2, 2),
+                    dtype=np.dtype(np.int32),
+                    blocks=lambda: iter([counts]),
                 ),
-                var=pd.DataFrame(
-                    {"names": ["frozen-g1", "frozen-g3"]},
-                    index=pd.Index(["g1", "g3"], name="gene_ids"),
+                obs_index=frozen("ids", ["c1", "c3"]),
+                obs=(
+                    frozen("I", [True, True]),
+                    frozen("names", ["frozen-a", "frozen-c"]),
+                    frozen("batch", ["x", "x"]),
+                    frozen("clusters", [0, 2]),
+                    frozen("site", ["s1", "s1"], np.asarray([False, True])),
                 ),
-                obsm={"X_umap": np.asarray([[1.5, 10.5], [3.5, 30.5]])},
+                var_index=frozen("gene_ids", ["g1", "g3"]),
+                var=(frozen("names", ["frozen-g1", "frozen-g3"]),),
+                obsm={"X_umap": lambda: coordinates} if umap else {},
             )
 
     owner = Owner()
@@ -1889,6 +2354,7 @@ def _completed_export_run():
 
 
 def test_to_h5ad_exports_completed_run_frozen_fields_and_artifact_layout(tmp_path):
+    import h5py
     from anndata import read_h5ad
 
     from scarf.writers import to_h5ad
@@ -1898,13 +2364,16 @@ def test_to_h5ad_exports_completed_run_frozen_fields_and_artifact_layout(tmp_pat
 
     to_h5ad(assay, str(path), run=run)
 
-    assert owner.received_run is run
+    assert owner.requests == [(run, "raw")]
     exported = read_h5ad(path)
     assert list(exported.obs_names) == ["c1", "c3"]
     assert list(exported.var_names) == ["g1", "g3"]
+    assert exported.obs.index.name == "ids"
+    assert exported.var.index.name == "gene_ids"
     assert exported.obs["names"].tolist() == ["frozen-a", "frozen-c"]
     assert exported.obs["batch"].tolist() == ["x", "x"]
     assert exported.obs["clusters"].tolist() == [0, 2]
+    assert exported.obs["site"].isna().tolist() == [False, True]
     assert "umap_1" not in exported.obs
     assert "umap_2" not in exported.obs
     np.testing.assert_allclose(
@@ -1915,36 +2384,24 @@ def test_to_h5ad_exports_completed_run_frozen_fields_and_artifact_layout(tmp_pat
         exported.X.toarray(),
         np.asarray([[2, 0], [5, 7]]),
     )
+    # A run export keeps AnnData's encoding: text that repeats or is missing
+    # is categorical, distinct text a string array, and the indexes keep
+    # their names.
+    with h5py.File(path, "r") as h5:
+        assert h5["obs"].attrs["_index"] == "ids"
+        assert h5["var"].attrs["_index"] == "gene_ids"
+        assert h5["obs/batch"].attrs["encoding-type"] == "categorical"
+        assert h5["obs/site"].attrs["encoding-type"] == "categorical"
+        assert h5["obs/site/codes"].dtype == np.int8
+        assert h5["obs/names"].attrs["encoding-type"] == "string-array"
 
 
-def test_to_h5ad_run_export_does_not_invent_umap_when_anndata_has_none(tmp_path):
-    from anndata import AnnData, read_h5ad
-    import pandas as pd
-    from scipy.sparse import csr_matrix
+def test_to_h5ad_run_export_does_not_invent_umap_without_frozen_umap(tmp_path):
+    from anndata import read_h5ad
 
     from scarf.writers import to_h5ad
 
-    assay, owner, run = _completed_export_run()
-
-    def to_anndata_without_umap(*, run):
-        owner.received_run = run
-        return AnnData(
-            csr_matrix(np.asarray([[2, 0], [5, 7]], dtype=np.int32)),
-            obs=pd.DataFrame(
-                {
-                    "I": [True, True],
-                    "names": ["frozen-a", "frozen-c"],
-                    "clusters": [0, 2],
-                },
-                index=pd.Index(["c1", "c3"], name="ids"),
-            ),
-            var=pd.DataFrame(
-                {"names": ["frozen-g1", "frozen-g3"]},
-                index=pd.Index(["g1", "g3"], name="gene_ids"),
-            ),
-        )
-
-    owner.to_anndata = to_anndata_without_umap
+    assay, _owner, run = _completed_export_run(umap=False)
     path = tmp_path / "run_export_no_umap.h5ad"
     to_h5ad(assay, str(path), run=run)
     exported = read_h5ad(path)
@@ -1957,7 +2414,7 @@ def test_to_h5ad_run_export_rejects_foreign_assay_and_live_options(tmp_path):
 
     from scarf.writers import to_h5ad
 
-    assay, _owner, run = _completed_export_run()
+    assay, owner, run = _completed_export_run()
     path = tmp_path / "rejected_run_export.h5ad"
 
     with pytest.raises(ValueError, match="exact run assay"):
@@ -1970,24 +2427,39 @@ def test_to_h5ad_run_export_rejects_foreign_assay_and_live_options(tmp_path):
         to_h5ad(assay, str(path), nthreads=2, run=run)
     with pytest.raises(TypeError, match="PipelineRun"):
         to_h5ad(assay, str(path), run=object())
+    with pytest.raises(ValueError, match="matrix must be either 'raw' or 'normed'"):
+        to_h5ad(assay, str(path), run=run, matrix="scaled")
+    with pytest.raises(ValueError, match="matrix='normed' requires run"):
+        to_h5ad(assay, str(path), matrix="normed")
+    assert owner.requests == []
     assert not path.exists()
 
 
-def test_to_h5ad_run_export_requires_a_datastore_owner_and_an_anndata(tmp_path):
+def test_to_h5ad_run_export_writes_without_anndata_from_a_datastore_owner(
+    tmp_path, monkeypatch
+):
+    import sys
+
+    import h5py
+
     from scarf.writers import to_h5ad
 
     assay, owner, run = _completed_export_run()
     path = tmp_path / "run_export.h5ad"
-    # Without AnnData, the owner logs the missing dependency and returns None;
-    # the export then writes no file.
-    owner.to_anndata = lambda *, run: None
-    assert to_h5ad(assay, str(path), run=run) is None
-    assert not path.exists()
+    with monkeypatch.context() as patched:
+        patched.setitem(sys.modules, "anndata", None)
+        to_h5ad(assay, str(path), run=run, matrix="normed")
+    assert owner.requests == [(run, "normed")]
+    with h5py.File(path, "r") as h5:
+        assert h5.attrs["encoding-type"] == "anndata"
+        assert h5["obs/ids"].asstr()[:].tolist() == ["c1", "c3"]
+        np.testing.assert_array_equal(h5["X/indptr"][:], [0, 1, 3])
 
-    owner.to_anndata = None
+    owner._h5ad_run_plan = None
+    other = tmp_path / "unowned.h5ad"
     with pytest.raises(TypeError, match="run must be opened from a DataStore"):
-        to_h5ad(assay, str(path), run=run)
-    assert not path.exists()
+        to_h5ad(assay, str(other), run=run)
+    assert not other.exists()
 
 
 def test_to_h5ad_skips_a_metadata_column_of_unsupported_dtype(
@@ -2250,6 +2722,8 @@ def test_zarr_subset_does_not_copy_source_pipeline_runs(
 def test_subset_zarr_rejects_invalid_assay_inputs():
     with pytest.raises(TypeError, match="should be a list"):
         SubsetZarr._check_assays("RNA")
+    with pytest.raises(ValueError, match="at least one assay"):
+        SubsetZarr._check_assays([])
     with pytest.raises(ValueError, match="actual assay objects"):
         SubsetZarr._check_assays([object()])
     with pytest.raises(ValueError, match="same numer of cells"):
@@ -2259,6 +2733,15 @@ def test_subset_zarr_rejects_invalid_assay_inputs():
                 _FakeAssay("ATAC", 4),
             ]
         )
+    # Assays of two datastores with as many cells hold two cell tables.
+    with pytest.raises(ValueError, match="not from the same DataStore"):
+        SubsetZarr._check_assays([_FakeAssay("RNA", 3), _FakeAssay("ATAC", 3)])
+    rna = _FakeAssay("RNA", 3)
+    with pytest.raises(ValueError, match="must not repeat"):
+        SubsetZarr._check_assays([rna, rna])
+    adt = _FakeAssay("ADT", 3)
+    adt.cells = rna.cells
+    assert SubsetZarr._check_assays([rna, adt]) == [rna, adt]
 
 
 def test_subset_zarr_requires_cell_key_or_indices():
@@ -2326,63 +2809,53 @@ def test_subset_zarr_rejects_different_cell_masks():
         subset._check_idx("selected", None)
 
 
-def test_subset_zarr_local_path_guard(tmp_path):
-    existing = tmp_path / "out.zarr"
-    existing.mkdir()
-    subset = object.__new__(SubsetZarr)
-    subset.assays = []
-    subset.overFn = False
-    subset.storage_options = None
-    with pytest.raises(ValueError, match="already exists"):
-        SubsetZarr._check_files(subset, str(existing))
-
-
-def test_subset_zarr_allows_empty_store():
-    subset = object.__new__(SubsetZarr)
-    subset.assays = []
-    subset.overFn = False
-    subset.storage_options = None
-    destination = MemoryStore()
-    # The check raises for a destination that holds content, so an empty one
-    # passes and stays empty.
-    assert SubsetZarr._check_files(subset, destination) is None
-    with pytest.raises(FileNotFoundError):
-        zarr.open_group(store=destination, mode="r")
-    zarr.open_group(store=destination, mode="w").create_group("content")
-    with pytest.raises(ValueError, match="already exists"):
-        SubsetZarr._check_files(subset, destination)
-
-
 @pytest.mark.parametrize("on_disk", [False, True])
-def test_subset_zarr_refuses_existing_store_without_overwrite(tmp_path, on_disk):
+def test_subset_zarr_never_replaces_foreign_content(tmp_path, memory_source, on_disk):
     store = LocalStore(tmp_path / "existing.zarr") if on_disk else MemoryStore()
     root = zarr.open_group(store=store, mode="w")
     root.create_array("existing", data=np.array([123]))
 
-    with pytest.raises(ValueError, match="already exists"):
-        SubsetZarr(store, assays=[_FakeAssay("RNA", 2)], cell_idx=np.array([0]))
+    for overwrite, reason in (
+        (False, "is not empty"),
+        (True, "holds 'existing', which is not part of a Scarf store"),
+    ):
+        with pytest.raises(FileExistsError, match=reason):
+            SubsetZarr(
+                store,
+                [memory_source.RNA],
+                cell_idx=np.array([0]),
+                overwrite_existing_file=overwrite,
+            )
 
     np.testing.assert_array_equal(root["existing"][:], [123])
 
 
-@pytest.mark.parametrize("invalid_assays", [False, True])
-def test_subset_zarr_validates_inputs_before_overwriting(invalid_assays):
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        ("assays", "actual assay objects"),
+        ("cell_idx", "max value"),
+        ("out_workspace", "must not contain path separators"),
+    ],
+)
+def test_subset_zarr_validates_inputs_before_overwriting(invalid, message):
     store = MemoryStore()
     root = zarr.open_group(store=store, mode="w")
     root.create_array("existing", data=np.array([123]))
 
-    with pytest.raises(ValueError, match="actual assay objects|max value"):
+    with pytest.raises(ValueError, match=message):
         SubsetZarr(
             store,
-            assays=[object()] if invalid_assays else [_FakeAssay("RNA", 2)],
-            cell_idx=np.array([2]),
+            assays=[object()] if invalid == "assays" else [_FakeAssay("RNA", 2)],
+            cell_idx=np.array([2 if invalid == "cell_idx" else 0]),
+            out_workspace="a/b" if invalid == "out_workspace" else None,
             overwrite_existing_file=True,
         )
 
     np.testing.assert_array_equal(root["existing"][:], [123])
 
 
-def test_subset_zarr_remote_uri_checks_contents(monkeypatch):
+def test_subset_zarr_remote_uri_checks_contents(memory_source, monkeypatch):
     calls = []
     store = MemoryStore()
     root = zarr.open_group(store=store, mode="w")
@@ -2393,17 +2866,21 @@ def test_subset_zarr_remote_uri_checks_contents(monkeypatch):
         return store
 
     monkeypatch.setattr("scarf.storage.stores.make_store", make_store)
-    subset = object.__new__(SubsetZarr)
-    subset.assays = []
-    subset.overFn = False
-    subset.storage_options = {"access_key_id": "key"}
-    with pytest.raises(ValueError, match="already exists"):
-        SubsetZarr._check_files(subset, "s3://bucket/out.zarr")
-    assert calls == [("s3://bucket/out.zarr", {"access_key_id": "key"}, True)]
+    options = {"access_key_id": "key"}
+    with pytest.raises(FileExistsError, match="is not empty"):
+        SubsetZarr(
+            "s3://bucket/out.zarr",
+            [memory_source.RNA],
+            cell_idx=np.array([0]),
+            storage_options=options,
+        )
+    assert calls == [("s3://bucket/out.zarr", options, True)]
     np.testing.assert_array_equal(root["existing"][:], [123])
 
 
-def test_subset_zarr_refuses_to_overwrite_after_probe_failure(monkeypatch):
+def test_subset_zarr_refuses_to_overwrite_after_probe_failure(
+    memory_source, monkeypatch
+):
     store = MemoryStore()
     root = zarr.open_group(store=store, mode="w")
     root.create_array("existing", data=np.array([123]))
@@ -2413,13 +2890,19 @@ def test_subset_zarr_refuses_to_overwrite_after_probe_failure(monkeypatch):
 
     monkeypatch.setattr(store, "is_empty", fail_probe)
     with pytest.raises(OSError, match="Cannot inspect destination"):
-        SubsetZarr(store, assays=[_FakeAssay("RNA", 2)], cell_idx=np.array([0]))
+        SubsetZarr(
+            store,
+            [memory_source.RNA],
+            cell_idx=np.array([0]),
+            overwrite_existing_file=True,
+        )
 
     np.testing.assert_array_equal(root["existing"][:], [123])
 
 
 def test_crtozarr_forwards_storage_options(monkeypatch):
     captured = {}
+    probed = []
 
     def fake_load_zarr(zarr_loc, mode, storage_options=None):
         captured["zarr_loc"] = zarr_loc
@@ -2427,7 +2910,13 @@ def test_crtozarr_forwards_storage_options(monkeypatch):
         captured["storage_options"] = storage_options
         return zarr.open_group(store=MemoryStore(), mode="w")
 
+    def fake_make_store(location, storage_options=None, read_only=False):
+        # The destination check reads the store before it is created.
+        probed.append(storage_options)
+        return MemoryStore()
+
     monkeypatch.setattr("scarf.storage.stores.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.storage.stores.make_store", fake_make_store)
     monkeypatch.setattr("scarf.storage.schema.create_cell_data", lambda **kwargs: None)
     monkeypatch.setattr(
         "scarf.storage.schema.create_zarr_count_assay",
@@ -2468,6 +2957,7 @@ def test_crtozarr_forwards_storage_options(monkeypatch):
         storage_options={"access_key_id": "id"},
     )
     assert captured["storage_options"] == {"access_key_id": "id"}
+    assert probed and all(options == {"access_key_id": "id"} for options in probed)
 
 
 def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
@@ -2734,19 +3224,6 @@ def test_h5ad_process_windows_run_in_the_parent_process(tmp_path) -> None:
         reader.close()
 
 
-def test_source_assay_types_reads_artifact_root() -> None:
-    from types import SimpleNamespace
-
-    from scarf.writers.subset import _source_assay_types
-
-    root = SimpleNamespace(attrs={})
-    assert _source_assay_types(SimpleNamespace(_artifact_root=root)) == {}
-    untyped = SimpleNamespace(attrs={"assayTypes": ["RNA"]})
-    assert _source_assay_types(SimpleNamespace(_artifact_root=untyped)) == {}
-    typed = SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
-    assert _source_assay_types(SimpleNamespace(_artifact_root=typed)) == {"RNA": "RNA"}
-
-
 def test_h5ad_import_links_missing_masks_and_keeps_nullable_booleans(tmp_path):
     import h5py
 
@@ -2890,7 +3367,8 @@ def test_import_writers_accept_an_explicit_assay_type(tmp_path):
 
     untouched = MemoryStore()
     zarr.open_group(store=untouched, mode="w").create_group("sentinel")
-    with pytest.raises(ValueError, match="assay_type 'rna' is not a preset"):
+    # The error names the assay, which defaults to RNA.
+    with pytest.raises(ValueError, match="assay_type 'rna' of assay 'RNA' is not a"):
         SparseToZarr(
             matrix,
             untouched,

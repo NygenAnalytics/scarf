@@ -1,5 +1,6 @@
 """Themes and categorical palettes for scarf.plotting."""
 
+import functools
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,7 +11,13 @@ import numpy as np
 import pandas as pd
 
 from ..utils.arrays import sort_categories
-from ._contracts import CategoricalScale, ColorScale, FrameStyle, LegendLoc
+from ._contracts import (
+    CategoricalScale,
+    ColorScale,
+    FrameStyle,
+    LegendLoc,
+    SizeScale,
+)
 
 # Shared Scarf figure defaults used by embedding-like plots.
 DEFAULT_RASTERIZE_THRESHOLD = 50_000
@@ -439,6 +446,80 @@ def legend_side_columns(n_entries: int) -> int:
     """Columns for a side legend, bounded so wide category sets stay readable."""
     columns = int(np.ceil(max(int(n_entries), 1) / LEGEND_SIDE_ENTRIES_PER_COLUMN))
     return max(1, min(columns, LEGEND_SIDE_MAX_COLUMNS))
+
+
+# Matplotlib lowers a legend handle box by _HANDLE_DESCENT * (handleheight -
+# _HANDLE_BASE) legend font sizes below its label's baseline and shortens it
+# by as much. In a box of the base height, the default, a marker sits half the
+# base height above the baseline, about the middle of the label.
+_HANDLE_DESCENT = 0.35
+_HANDLE_BASE = 0.7
+_LABEL_MIDDLE = _HANDLE_BASE / 2
+
+
+def _center_legend_marker(
+    legend_handle: Any, orig_handle: Any, *, center: float
+) -> None:
+    """Style a legend line like its handle and center its marker on the label.
+
+    ``center`` is the label's middle in points above its baseline.
+    """
+    legend_handle.update_from(orig_handle)
+    legend_handle.set_ydata(np.full(len(legend_handle.get_xdata()), center))
+
+
+@dataclass(frozen=True, slots=True)
+class LegendMarkerBoxes:
+    """Legend handle boxes that hold line markers up to ``diameter`` points."""
+
+    diameter: float
+
+    def merged(self, other: "LegendMarkerBoxes") -> "LegendMarkerBoxes":
+        """Boxes that hold the markers of both legends."""
+        return LegendMarkerBoxes(max(self.diameter, other.diameter))
+
+    def legend_kwargs(self) -> dict[str, Any]:
+        """Legend keywords that hold the markers in the current theme."""
+        from ._deps import require_matplotlib
+
+        _, mpl = require_matplotlib()
+        from matplotlib.font_manager import FontProperties
+        from matplotlib.legend_handler import HandlerLine2D
+
+        rc = mpl.rcParams
+        fontsize = FontProperties(size=rc["legend.fontsize"]).get_size_in_points()
+        radius = 0.5 * self.diameter / fontsize
+        # The lowered box spans -d to h - 2 * d about the baseline, with
+        # d = _HANDLE_DESCENT * (h - _HANDLE_BASE). Solve for the least h
+        # whose box holds the marker's top, then its bottom.
+        handleheight = max(
+            float(rc["legend.handleheight"]),
+            (_LABEL_MIDDLE + radius - 2 * _HANDLE_DESCENT * _HANDLE_BASE)
+            / (1 - 2 * _HANDLE_DESCENT),
+            _HANDLE_BASE + (radius - _LABEL_MIDDLE) / _HANDLE_DESCENT,
+        )
+        center = functools.partial(
+            _center_legend_marker,
+            center=_LABEL_MIDDLE * fontsize,
+        )
+        return {
+            "handlelength": max(float(rc["legend.handlelength"]), 2 * radius),
+            "handleheight": handleheight,
+            "markerscale": 1.0,
+            "handler_map": {mpl.lines.Line2D: HandlerLine2D(update_func=center)},
+        }
+
+
+def size_legend_layout(
+    scale: SizeScale,
+    values: Sequence[float] | np.ndarray,
+    *,
+    max_area: float | None = None,
+) -> tuple[np.ndarray, LegendMarkerBoxes]:
+    """Return the marker areas of a size legend and the boxes that hold them."""
+    areas = scale.areas(np.asarray(values, dtype=np.float64))
+    largest = max(float(np.max(areas, initial=0.0)), float(max_area or 0.0))
+    return areas, LegendMarkerBoxes(float(np.sqrt(largest)))
 
 
 def capped_figsize(

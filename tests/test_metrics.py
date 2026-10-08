@@ -18,6 +18,7 @@ from scarf.metrics import (
     lisi_batch_mixing_score,
     silhouette_scoring,
 )
+from scarf.metrics.graph import neighbor_label_agreement
 from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
 from scarf.metadata.artifacts import plan_cell_data_artifact, write_cell_data_artifact
 from scarf.storage.artifacts import ArtifactRef, ArtifactScope
@@ -550,6 +551,76 @@ def test_streamed_knn_similarity_validates_blocks(
         )
 
 
+def _cell_major_edges(neighbors: np.ndarray, dtype=np.uint32) -> np.ndarray:
+    n_cells, k = neighbors.shape
+    return np.stack(
+        (np.repeat(np.arange(n_cells), k), np.asarray(neighbors).ravel()), axis=1
+    ).astype(dtype)
+
+
+def test_neighbor_label_agreement_counts_only_the_cell_label():
+    # Cell 0 is labelled 0 and all its neighbors are labelled 1, so its
+    # neighborhood is pure but gives its own label no support.
+    neighbors = np.array([[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]])
+    labels = np.array([0, 1, 1, 1])
+
+    agreement = neighbor_label_agreement(_cell_major_edges(neighbors), labels, k=3)
+
+    np.testing.assert_array_equal(agreement, [0.0, 2 / 3, 2 / 3, 2 / 3])
+    assert agreement.dtype == np.float64
+
+
+@pytest.mark.parametrize("block_edges", [1, 7, 10_000])
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64, np.int64])
+def test_neighbor_label_agreement_does_not_depend_on_block_boundaries(
+    block_edges, dtype
+):
+    rng = np.random.default_rng(5)
+    n_cells, k = 23, 3
+    neighbors = rng.integers(0, n_cells, size=(n_cells, k))
+    labels = rng.integers(0, 4, size=n_cells)
+    edges = zarr.create_array(
+        MemoryStore(), shape=(n_cells * k, 2), chunks=(5, 2), dtype=dtype
+    )
+    edges[:] = _cell_major_edges(neighbors, dtype)
+
+    agreement = neighbor_label_agreement(edges, labels, k=k, block_edges=block_edges)
+
+    shared = labels[neighbors] == labels[:, None]
+    np.testing.assert_array_equal(agreement, np.count_nonzero(shared, axis=1) / k)
+
+
+def test_neighbor_label_agreement_rejects_edges_out_of_cell_major_order():
+    edges = _cell_major_edges(np.array([[1, 2], [0, 2], [0, 1], [1, 2]]))
+    edges[[0, 3]] = edges[[3, 0]]
+
+    # One cell per block, so every block checks its own sources.
+    with pytest.raises(ValueError, match="cell-major order"):
+        neighbor_label_agreement(edges, np.array([0, 0, 1, 1]), k=2, block_edges=2)
+
+
+@pytest.mark.parametrize(
+    ("edges", "labels", "k", "error", "message"),
+    [
+        (np.zeros((3, 2), np.int64), [0, 1], 2, ValueError, "k rows for each"),
+        (
+            _cell_major_edges(np.array([[1], [2]])),
+            [0, 1],
+            1,
+            IndexError,
+            "outside the label",
+        ),
+        (np.array([[0, 1], [1, -1]]), [0, 1], 1, IndexError, "outside the label"),
+        (np.array([[0, 1], [1, 0]]), [[0, 1]], 1, ValueError, "one-dimensional"),
+        (np.array([[0, 1], [1, 0]]), [0.0, 1.0], 1, TypeError, "Label codes"),
+        (np.array([[0.0, 1.0], [1.0, 0.0]]), [0, 1], 1, TypeError, "Graph edges"),
+    ],
+)
+def test_neighbor_label_agreement_validates_inputs(edges, labels, k, error, message):
+    with pytest.raises(error, match=message):
+        neighbor_label_agreement(edges, np.array(labels), k=k)
+
+
 def test_top_k_distances_accept_all_candidates():
     distances = calculate_top_k_neighbor_distances(
         np.array([[0.0]]),
@@ -767,6 +838,14 @@ def test_lisi_batch_mixing_score():
 
     assert lisi_batch_mixing_score(np.ones(4), labels) == pytest.approx(0)
     assert lisi_batch_mixing_score(np.full(4, 2.0), labels) == pytest.approx(1)
+    # A declared category without cells is not a batch.
+    declared = pd.Categorical(["a", "a", "b", "b"], categories=["a", "b", "c"])
+    assert lisi_batch_mixing_score(np.ones(4), declared) == pytest.approx(0)
+    assert lisi_batch_mixing_score(np.full(4, 2.0), declared) == pytest.approx(1)
+    one_batch = pd.Series(pd.Categorical(["a"] * 4, categories=["a", "b"]))
+    for scores in (np.ones(4), np.full(4, 2.0)):
+        with pytest.raises(ValueError, match="at least two batches"):
+            lisi_batch_mixing_score(scores, one_batch)
 
 
 def test_metric_label_concordance_uses_frozen_clustering_refs_after_alias_drift(

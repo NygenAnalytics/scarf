@@ -2,7 +2,7 @@
 name: scarf-single-cell
 description: Analyze single-cell data with core Scarf, the out-of-core Zarr DataStore library with immutable artifacts and pipeline runs. Covers opening, converting and mounting stores (including Cytebase datasets), QC with removal audits, HVG/PCA/neighbour graphs, Leiden/Paris clustering, UMAP, markers and cautious annotation, batch correction and donor-level comparisons, headless plotting, provenance and export. Use when a task involves a Scarf .zarr store, a Cytebase dataset, scarf.DataStore, ds.pipeline, or converting H5AD/10x/MTX/Seurat data for Scarf. Does not cover scarf.agent (the automated agent package).
 license: BSD-3-Clause
-compatibility: Requires Python 3.12+ and scarf 1.0.0rc17 or newer (pip install "scarf[extra]>=1.0.0rc17"; add the cytebase extra and network access for Cytebase datasets).
+compatibility: Requires Python 3.12+ and scarf 1.0.0rc20 or newer (pip install "scarf[extra]>=1.0.0rc20"; add the cytebase extra and network access for Cytebase datasets, and the tsne extra for t-SNE).
 metadata:
   version: "0.4"
 ---
@@ -22,9 +22,9 @@ Every recipe in the modules was run against a real store. Numbers quoted there c
 
 ## Setup
 
-- Install into the environment you run Python from: `pip install "scarf[extra]>=1.0.0rc17"`, plus
-  `scarf[cytebase]` for Cytebase. The explicit pre-release floor matters: a bare `scarf[extra]` resolves
-  to the old 0.32 series, whose API this skill does not describe.
+- Install into the environment you run Python from: `pip install "scarf[extra]>=1.0.0rc20"`, plus
+  `scarf[cytebase]` for Cytebase and `scarf[tsne]` for t-SNE. The explicit pre-release floor matters: a
+  bare `scarf[extra]` resolves to the old 0.32 series, whose API this skill does not describe.
 - Set resources per process before importing Scarf. Defaults claim all detected RAM and every CPU:
   `SCARF_MEM_BUDGET=8G SCARF_WORKERS=8` (memory specs need a unit; a bare `8` is rejected).
 - Headless: `MPLBACKEND=Agg`, call plots with `show=False`, then `result.save(path)` and
@@ -64,9 +64,10 @@ Every recipe in the modules was run against a real store. Numbers quoted there c
 ## Golden rules
 
 1. **Inspect read-only first.** `scarf.DataStore(path, zarr_mode="r")` writes nothing. A writable
-   open (the default) prepares new stores and applies `min_features_per_cell` (default 10) to `I`
-   permanently. Reopen existing stores and mounts with
-   `scarf.DataStore(path, min_features_per_cell=-1)`.
+   open (the default) prepares new stores and permanently removes from `I` the cells with at most
+   `min_features_per_cell` (default 10) default-assay features, unless that would remove at least
+   half of the active cells. Reopen existing stores and mounts with
+   `scarf.DataStore(path, min_features_per_cell=-1)`, which keeps every cell.
 2. **Never filter by editing `I`.** Keep the `cell_selection` ref a filter returns and pass it on, or
    insert a boolean column and use `cell_key=`. `ds.cells.reset_key("I")` undoes an accidental
    open-time filter.
@@ -108,8 +109,10 @@ Every recipe in the modules was run against a real store. Numbers quoted there c
     repeated measures. A donor with samples in two arms must not count in both:
     `run_statistical_testing(sample_by="sample_id")` silently does that, while `sample_by="donor_id"`
     refuses such a design. `run_harmony` runs silently on a column confounded with the biology you
-    want to compare, so audit donors x batch x condition first. When inserting design columns, replace
-    missing values explicitly: `ds.cells.insert` stores `None` as `""` and `pd.NA` as `"<NA>"`.
+    want to compare, so audit donors x batch x condition first. When inserting design columns, decide
+    on missing values: `ds.cells.insert` records `None`, `NaN` and `pd.NA` as missing, and so the
+    rows outside `key` when `values` covers only the active cells, unless `fill_value` gives them a
+    value. Harmony raises on a missing batch value.
 14. **Hold out annotation columns when they will judge the result.** Do not use author labels
     (`cell_type`, `author_cell_type`, `cell.type.*`, `singler`, `predicted.*`, ...) to choose QC,
     parameters or labels. Use them only in a final, clearly separated comparison.
@@ -228,18 +231,29 @@ any changes you make after seeing the comparison as such.
 | `Assay 'RNA' is not prepared` on a read-only open | store just written by a converter or `SubsetZarr` | open once writable, then read-only |
 | Fewer active cells than expected after opening | writable open applied `min_features_per_cell` | `ds.cells.reset_key("I")`; reopen with `-1` |
 | `ValueError` on `ds.pipeline.run(label=...)` | label already completed | new label; reuse makes it cheap |
-| `PermissionError` from a producer | store opened with `zarr_mode="r"` and no matching artifact | reopen writable |
+| `PermissionError` from a producer | store opened with `zarr_mode="r"` and no matching artifact; feature selections, WAGGR, AUCell, `select_prevalent_peaks`, and cell-cycle scoring refuse even with one | reopen writable |
 | `KeyError: 'values'` on a Paris ref | Paris stores `labels` | `ds.load_artifact(ref)["labels"]` |
 | Array length differs from `ds.cells.N` | payload follows the cell selection | align with `run.cells.fetch_all` or the selection mask |
-| Plot raises with `run=` and a gene or live column | run mode accepts one frozen field only | `layout=run["umap"], color_by=[...]` |
+| Plot raises with `run=` and a gene or live column | run mode reads only frozen run fields and run outputs, and genes need an explicit normalization | gene: add `normalization=scarf.plotting.NormalizationSpec()`; live column: freeze it with `snapshot_columns=` or use `layout=run["umap"]` |
 | `TypeError` from `distribution(grouping="col")` | grouping needs a ref or `CellField` | `grouping=scarf.plotting.CellField("col")` |
 | Very slow steps on a mount | each count pass is a network read | fewer passes; repack locally (rule 8) |
 | `MemoryError` (`CountLayoutMemoryError` after 1.0.0rc19) from a converter | default count layout does not fit `mem_budget` | larger `mem_budget`; else the `policy=` the message names (`references/data-access.md`) |
 | `ValueError` plotting after reopening the store | a `PipelineRun` is bound to the store object that opened it | reopen the run from the new `ds` |
 | `list_artifacts(kind="cell_selection")` is empty | cell selections are datastore-scoped | add `scope="datastore"` |
-| `KeyError: 'groups'` in a dot plot table | with `group_by=` the column is named after the grouping column | read `res.tables["aggregate"].columns` first |
+| `KeyError` for a grouping column of a dot or matrix plot table | summary tables name grouping columns by role: `group`, `subgroup`, `sample` | `res.tables["aggregate"]["group"]`; `res.provenance.extras["group_by"]` names the source columns |
 | A wait for a long step never ends | unbounded polling, or the process died | bounded wait that checks the process and the log tail (Setup) |
 | QC bounds look odd or nothing is filtered | counts are corrected or already filtered | check the matrix first; prefer flag-only or gentle filters |
+| Pipeline fails in stage `'doublets'`: `every selected cell has the same cluster label` | `params["leiden"]["selected"]` saved a one-cluster partition, and heterotypic doublets need two clusters | select a finer resolution or drop `selected`; or `params={"doublets": {"heterotypic_fraction": 0}}`; or `doublets=False` |
+| Writer raises `FileExistsError: Destination ... is not empty` | the path holds data, such as an earlier import | `overwrite=True` (`SubsetZarr`: `overwrite_existing_file=True`) to replace an output that no `DataStore` has opened, or a new path |
+| Writer with `overwrite=True` raises `FileExistsError: Destination ... holds the prepared assays ...` or `... not part of a Scarf store` | the path holds a store that a `DataStore` has opened, or other files | write to a new path, or delete the old store yourself first |
+| Writer raises `ValueError: Destination ... lies inside the Zarr store at ...` | the path is inside another store, such as `s.zarr/RNA` | write each store to its own directory outside other stores |
+| `assay_types names assays that are not in the store` or `... is not a preset` | a key is not in `ds.assay_names`, or a value is not a preset (case-sensitive) | keys from `ds.assay_names`; values such as `RNA`, `ADT`, `HTO`, `GeneActivity`, `Assay` |
+| `assay_types declares assay ... but the store declares it as ...` on `zarr_mode="r"` | a read-only open cannot record a different type | open once writable with that `assay_types`, or omit `assay_types` |
+| `The assayTypes attribute of the store is ..., which is not a mapping` | another tool wrote a malformed `assayTypes` | open writable with `assay_types` naming a preset for every assay |
+| Merge raises `Sources declare different types for assay ...` | sources record different `assayTypes` for one assay | reopen the wrong source writable with the right `assay_types`, then merge |
+| Merge raises `Cell column '<assay>_I' is reserved for the membership of assay ...` | a plain `<assay>_I` column, from an earlier import of an exported file or inserted by hand | import the H5AD again with this release, or drop the plain column in the source with `cells.drop("<assay>_I")` |
+| `cells.insert`/`update_key`/`reset_key`/`drop` raises `Cell column '<assay>_I' is reserved ...` or `... records which cells assay ... measured` | only imports, merges, and derived assays write membership | store values under another name; select measured cells with `select_measured_cells("<assay>")` |
+| `UnmeasuredCellsError: ... reads assay '<assay>' over N of M selected cells that it did not measure` | a merged store whose assay measured only some cells; their zero counts are no measurement | narrow first: `ds.select_measured_cells("<assay>", cell_selection=...)`, which `make_bulk`, `run_statistical_testing`, and QC filters take as `cell_selection=`; labels: `snapshot_cluster_labels(labels, cell_selection=...)` of that; graphs: rebuild over it; pipeline: a `cell_key` column of the cells of `I` that the assay measured, `ds.cells.insert("RNA_measured", ds.cells.fetch_all("I") & ds.cells.fetch_all("RNA_I"))` |
 | `ValueError: None of the s_genes match the assay feature names` from `ds.pipeline.run` | feature names are not gene symbols (Ensembl IDs, synthetic names); matching ignores case, so mouse symbols work | `cell_cycle=False`, or pass lists in the store's naming via `params={"cell_cycle": {"s_genes": [...], "g2m_genes": [...]}}` |
 
 ## Documentation map

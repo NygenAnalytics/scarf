@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 import scarf.plotting as splt
+from scarf.assay.normalization import applicable_normalization_flags
 from scarf.storage import ArtifactRef
 
 
@@ -60,18 +61,23 @@ class _ArrayFeatures:
 
 
 class _ArrayAssay:
+    # A synthetic assay measured every cell: the cell table that feature
+    # reads take its membership from holds no membership column.
+    cells = SimpleNamespace(columns=())
+
     def __init__(self, values, names):
         self._values = np.asarray(values, dtype=np.float64)
         self.rawData = self._values
         self.feats = _ArrayFeatures(names)
 
-    def normed(self, *, cell_idx, feat_idx):
-        return self._values[
+    def normed(self, *, cell_idx, feat_idx, log_transform=False):
+        values = self._values[
             np.ix_(
                 np.asarray(cell_idx, dtype=np.int64),
                 np.asarray(feat_idx, dtype=np.int64),
             )
         ]
+        return np.log1p(values) if log_transform else values
 
 
 class _ArrayStore:
@@ -179,7 +185,7 @@ def _summarize(
 
     pairs = coerce_feature_list(features)
     _check_feature_count(pairs)
-    return _summarize_resolved_features(
+    aggregate, per_sample, _unmeasured = _summarize_resolved_features(
         store,
         [
             resolve_feature(store, feature, from_assay=from_assay)
@@ -189,6 +195,7 @@ def _summarize(
         _resolve_grouping(store, group_by=group_by, groups=groups, cell_key="I"),
         **options,
     )
+    return aggregate, per_sample
 
 
 @pytest.fixture
@@ -399,28 +406,32 @@ def test_feature_summary_matches_cell_table_across_blocks(
     frames = []
     for feature_group, items in features.items():
         for feature in items:
+            # Summary tables name the grouping columns by role.
+            column = normalized[:, int(feature.value)]
             frame = pd.DataFrame(
                 {
-                    "category": store.cells.fetch_all("category"),
-                    "split": store.cells.fetch_all("split"),
+                    "group": store.cells.fetch_all("category"),
+                    "subgroup": store.cells.fetch_all("split"),
                     "feature": feature.label,
                     "feature_group": feature_group,
-                    "value": normalized[:, int(feature.value)],
-                    "detected": normalized[:, int(feature.value)] > 0.5,
+                    "value": column,
+                    # Every statistic covers the cells with a value, which
+                    # n_cells counts: the NaN cell joins no denominator.
+                    "detected": np.where(np.isnan(column), np.nan, column > 0.5),
                 }
             )
             if sample_by is not None:
                 frame["sample"] = store.cells.fetch_all(sample_by)
                 frame = frame.loc[frame["sample"].notna()]
             frames.append(frame)
-    keys = ["category", "split", "feature", "feature_group"]
+    keys = ["group", "subgroup", "feature", "feature_group"]
     expected = (
         pd.concat(frames)
         .groupby((["sample"] if sample_by else []) + keys, dropna=False)
         .agg(
             mean=("value", "mean"),
             fraction=("detected", "mean"),
-            n_cells=("value", "size"),
+            n_cells=("value", "count"),
             variance=("value", "var"),
         )
         .reset_index()
@@ -443,7 +454,8 @@ def test_feature_summary_matches_cell_table_across_blocks(
                 mean=("mean", "mean"),
                 fraction=("fraction", "mean"),
                 n_cells=("n_cells", "sum"),
-                n_samples=("sample", "nunique"),
+                # Samples without a value of the feature are skipped.
+                n_samples=("n_cells", lambda counts: int((counts > 0).sum())),
                 variance=("variance", "mean"),
             )
             .reset_index()
@@ -543,11 +555,17 @@ def test_feature_summary_preserves_assay_normalization(
 ):
     store = request.getfixturevalue(fixture_name)
     cell_idx = store.cells.active_index("I")
-    expected = np.log1p(
+    expected = np.asarray(
         store._get_assay(assay_name)
         .normed(cell_idx=cell_idx, feat_idx=np.array([0, 1]))
-        .compute()
+        .compute(),
+        dtype=np.float64,
     )
+    # Only values that are not logarithms are logged: RNA library sizes are,
+    # while CLR log ratios and ATAC TF-IDF values are not.
+    logged = assay_name == "RNA"
+    if logged:
+        expected = np.log1p(expected)
     aggregate, per_sample = _summarize(
         store,
         features=[
@@ -556,7 +574,7 @@ def test_feature_summary_preserves_assay_normalization(
         ],
         from_assay=assay_name,
         group_by="I",
-        normalization=splt.NormalizationSpec(transform="log1p"),
+        normalization=splt.NormalizationSpec(transform="log1p" if logged else "none"),
     )
 
     assert per_sample is None
@@ -694,7 +712,7 @@ def test_embedding_dotplot_matrixplot_on_artifacts(plot_artifacts):
         show=False,
     )
     aggregate = dp.tables["aggregate"]
-    assert aggregate["groups"].tolist() == groups
+    assert aggregate["group"].tolist() == groups
     np.testing.assert_allclose(aggregate["mean"], means, rtol=1e-5)
     np.testing.assert_allclose(aggregate["fraction"], fractions)
     assert aggregate["n_cells"].tolist() == [4, 4, 4]
@@ -1071,7 +1089,8 @@ def test_feature_plotting_uses_assay_normalization_adapter(plot_artifacts, monke
     )
     result.close()
     assert len(calls) == 1
-    assert set(calls[0]) == {"cell_idx", "feat_idx"}
+    assert calls[0]["log_transform"] is True
+    assert set(calls[0]) == {"cell_idx", "feat_idx", "log_transform"}
 
 
 def _assert_plotting_fetch_matches_assay_normed(
@@ -1106,14 +1125,19 @@ def _assert_plotting_fetch_matches_assay_normed(
         cell_idx,
         normalization=splt.NormalizationSpec(source="assay"),
     )
-    logged = fetch_normalized_feature_matrix(
-        datastore,
-        resolved,
-        cell_idx,
-        normalization=splt.NormalizationSpec(source="assay", transform="log1p"),
-    )
     np.testing.assert_allclose(fetched, expected)
-    np.testing.assert_allclose(logged, np.log1p(expected))
+    log_spec = splt.NormalizationSpec(source="assay", transform="log1p")
+    if "log_transform" in applicable_normalization_flags(assay):
+        logged = fetch_normalized_feature_matrix(
+            datastore, resolved, cell_idx, normalization=log_spec
+        )
+        np.testing.assert_allclose(logged, np.log1p(expected))
+    else:
+        # CLR log ratios and ATAC values are never logged again.
+        with pytest.raises(ValueError, match="does not support log_transform"):
+            fetch_normalized_feature_matrix(
+                datastore, resolved, cell_idx, normalization=log_spec
+            )
 
 
 def test_plotting_fetch_matches_rna_normed(datastore):
@@ -2916,8 +2940,8 @@ def test_summary_panels_use_explicit_feature_group_orders(
     assert dots.get_cmap().name == "magma"
 
     matrix_table = matrix.tables["matrix"]
-    assert matrix_table["feature"].tolist() == ["GeneB", "GeneA"]
-    assert matrix_table.columns[1:].tolist() == group_order
+    assert matrix_table.index.tolist() == ["GeneB", "GeneA"]
+    assert matrix_table.columns.tolist() == group_order
     expected_fractions = fractions.loc[group_order, ["GeneB", "GeneA"]].T.to_numpy()
     np.testing.assert_allclose(
         matrix_table[group_order].to_numpy(dtype=float), expected_fractions
@@ -2940,8 +2964,8 @@ def test_summary_helpers_validate_labels_and_standardization():
     with pytest.raises(ValueError, match="label_wrap"):
         _wrap_tick_labels(["value"], 0)
 
-    grouped = pd.DataFrame({"first": ["a"], "second": ["b"]})
-    assert _group_axis_labels(grouped, ("first", "second")).tolist() == ["a | b"]
+    grouped = pd.DataFrame({"group": ["a"], "subgroup": ["b"]})
+    assert _group_axis_labels(grouped, ("group", "subgroup")).tolist() == ["a | b"]
 
     values = pd.DataFrame(
         {
@@ -2951,22 +2975,24 @@ def test_summary_helpers_validate_labels_and_standardization():
         }
     )
     standardized = _standardize_feature(values)
+    # The means stay raw; the z-scores are a column of their own.
+    pd.testing.assert_frame_equal(standardized[values.columns], values)
     first = standardized.loc[standardized["feature_group"] == "T"]
     # Means 1 and 3 have sample standard deviation sqrt(2).
     np.testing.assert_allclose(
-        first.loc[first["feature"] == "a", "mean"], [-(0.5**0.5), 0.5**0.5]
+        first.loc[first["feature"] == "a", "zscore"], [-(0.5**0.5), 0.5**0.5]
     )
-    assert first.loc[first["feature"] == "b", "mean"].isna().all()
+    assert first.loc[first["feature"] == "b", "zscore"].isna().all()
     # A feature listed under two bracket groups is standardized once per group,
     # so both rows carry the same values.
     np.testing.assert_allclose(
         standardized.loc[
             (standardized["feature"] == "a") & (standardized["feature_group"] == "T"),
-            "mean",
+            "zscore",
         ],
         standardized.loc[
             (standardized["feature"] == "a") & (standardized["feature_group"] == "B"),
-            "mean",
+            "zscore",
         ],
     )
 
@@ -3088,7 +3114,7 @@ def test_matrixplot_on_a_caller_axis_keeps_annotations_and_sample_table(
     # Group means average the per-sample means, as in the dotplot.
     per_sample = result.tables["per_sample"]
     assert sorted(per_sample["sample"].unique()) == ["s1", "s2", "s3", "s4"]
-    matrix = result.tables["matrix"].set_index("feature")
+    matrix = result.tables["matrix"]
     np.testing.assert_allclose(
         matrix.loc["GeneA", ["group1", "group2", "group10"]].to_numpy(dtype=float),
         [4.5, 2.75, 1.125],

@@ -331,16 +331,18 @@ def test_graph_construction_methods_chain_explicit_refs_and_persist_artifacts(
     )
     normalized_group = datastore.zw[artifact_path(normalized)]
     assert normalized_group["feature_sum"].dtype == np.dtype(np.float64)
-    assert normalized_group["feature_squared_sum"].dtype == np.dtype(np.float64)
+    assert normalized_group["feature_m2"].dtype == np.dtype(np.float64)
+    assert "feature_squared_sum" not in normalized_group
     normalized_values = normalized_group["data"][:]
     np.testing.assert_allclose(
         normalized_group["feature_sum"][:],
         normalized_values.sum(axis=0, dtype=np.float64),
         rtol=1e-6,
     )
+    widened = normalized_values.astype(np.float64)
     np.testing.assert_allclose(
-        normalized_group["feature_squared_sum"][:],
-        np.square(normalized_values, dtype=np.float64).sum(axis=0),
+        normalized_group["feature_m2"][:],
+        np.square(widened - widened.mean(axis=0)).sum(axis=0),
         rtol=1e-6,
     )
     reduction_group = datastore.zw[artifact_path(pca)]

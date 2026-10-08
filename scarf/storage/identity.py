@@ -6,12 +6,25 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .arrays import _decode_metadata_values, linked_missing_mask
+from .arrays import (
+    MISSING_MASK_PREFIX,
+    _decode_metadata_values,
+    create_metadata_column,
+    encode_metadata_values,
+    linked_missing_mask,
+)
 from .artifacts import ValueFingerprintBuilder, canonical_bytes
 from .geometry import array_geometry
+from .layout import PROFILE_METADATA_CHUNK
+from .metadata_keys import (
+    ASSAY_MEMBERSHIP_ROLE,
+    assay_membership_column,
+    validate_metadata_column_name,
+)
 from .partition import scan_band
+from .schema import PENDING_ASSAY_ATTR
 from .stores import metadata_workers, run_concurrently
-from .types import as_zarr_array, as_zarr_group
+from .types import as_zarr_array, as_zarr_group, read_fresh_group
 from .validation_scope import store_key, validated_once
 
 REBUILD_REQUIRED = (
@@ -25,16 +38,6 @@ def generated_cell_columns(name: str, percentages: object) -> frozenset[str]:
     return frozenset(
         {f"{name}_nCounts", f"{name}_nFeatures"}
         | set(percentages if isinstance(percentages, dict) else ())
-    )
-
-
-def fresh_group(group: zarr.Group) -> zarr.Group:
-    # A known format reads one metadata document instead of probing every format.
-    return zarr.open_group(
-        store=group.store,
-        path=group.path,
-        mode="r" if group.read_only else "r+",
-        zarr_format=group.metadata.zarr_format,
     )
 
 
@@ -70,7 +73,7 @@ def read_dataset_fingerprint(assay: zarr.Group) -> str:
 
 
 def _read_dataset_fingerprint(assay: zarr.Group) -> str:
-    attrs = fresh_group(assay).attrs
+    attrs = read_fresh_group(assay).attrs
     value = attrs.get("dataset_fingerprint")
     if attrs.get("prepared") is not True or not isinstance(value, str) or not value:
         raise ValueError(f"Assay {assay.name!r} is not prepared. {REBUILD_REQUIRED}")
@@ -371,7 +374,7 @@ def _validate_preparation(
 ) -> str | None:
     from .counts_t_contract import validate_count_matrix
 
-    assay = fresh_group(assay)
+    assay = read_fresh_group(assay)
     state = assay.attrs.get("prepared")
     if state is not True and (require_prepared or state is not False):
         raise ValueError(f"Assay {assay.name!r} is not prepared. {REBUILD_REQUIRED}")
@@ -466,7 +469,7 @@ def publish_preparation(
         raise ValueError(
             "Copied dataset identity differs from the source; saved results cannot be used"
         )
-    group = fresh_group(assay)
+    group = read_fresh_group(assay)
     # One metadata write publishes the identity together with the prepared flag.
     group.attrs.put(
         {
@@ -479,23 +482,37 @@ def publish_preparation(
     return fingerprint
 
 
-def protect_metadata_column(group: zarr.Group, column: str) -> None:
-    root = zarr.open_group(
-        store=group.store, mode="r", zarr_format=group.metadata.zarr_format
-    )
+def protect_metadata_column(
+    group: zarr.Group,
+    column: str,
+    *,
+    removing: zarr.Array | None = None,
+) -> None:
+    """Refuse a change to a metadata column that Scarf owns.
+
+    Pass the existing column as ``removing`` only when the change deletes it.
+    """
     path = group.path.strip("/")
     if path.endswith("/featureData"):
         if column != "ids" and column not in GENERATED_FEATURE_COLUMNS:
             return
+        root = _stored_root(group)
         assay = as_zarr_group(root[path.rsplit("/", 1)[0]], name="assay")
         protected = assay.attrs.get("prepared") is True
     elif path == "cellData" or path.endswith("/cellData"):
+        root = _stored_root(group)
         parent_path = path.rpartition("/")[0]
         parent = (
             root
             if not parent_path
             else as_zarr_group(root[parent_path], name=parent_path)
         )
+        groups = dict(parent.groups())
+        for name, assay in groups.items():
+            if assay_membership_column(name) == column and (
+                assay.attrs.get("is_assay") is True or PENDING_ASSAY_ATTR in assay.attrs
+            ):
+                _protect_membership_column(column, name, removing)
         protected = any(
             assay.attrs.get("prepared") is True
             and (
@@ -503,7 +520,7 @@ def protect_metadata_column(group: zarr.Group, column: str) -> None:
                 or column
                 in generated_cell_columns(name, assay.attrs.get("percentFeatures"))
             )
-            for name, assay in parent.groups()
+            for name, assay in groups.items()
             if assay.attrs.get("is_assay") is True
         )
     else:
@@ -514,15 +531,133 @@ def protect_metadata_column(group: zarr.Group, column: str) -> None:
         )
 
 
+def _stored_root(group: zarr.Group) -> zarr.Group:
+    """Open the root of ``group``'s store, reading its stored records."""
+    return zarr.open_group(
+        store=group.store, mode="r", zarr_format=group.metadata.zarr_format
+    )
+
+
+def _protect_membership_column(
+    column: str, assay: str, removing: zarr.Array | None
+) -> None:
+    """Refuse a change to the membership column ``column`` of ``assay``."""
+    if removing is None:
+        raise ValueError(
+            f"Cell column {column!r} is reserved for the membership of assay "
+            f"{assay!r}, the record of which cells the assay measured. Only an "
+            "import, DataStoreMerge, or a derived assay writes it, so it cannot "
+            "be inserted, overwritten, restricted, or reset. Store other values "
+            "under another name."
+        )
+    if removing.attrs.get("role") == ASSAY_MEMBERSHIP_ROLE:
+        raise ValueError(
+            f"Cell column {column!r} records which cells assay {assay!r} "
+            "measured and cannot be dropped: without it, every cell would count "
+            "as measured. To analyze only the measured cells, snapshot the "
+            f"column with snapshot_cell_selection({column!r}); to leave the "
+            "assay out, write the other assays to a new store with "
+            "SubsetZarr(..., assays=[...]). A pending derived assay and its "
+            "column are removed together by discard_interrupted_assay."
+        )
+
+
 def clear_column(group: zarr.Group, column: str) -> None:
+    """Delete a metadata column and its linked missing mask."""
     # A missing column has nothing to protect or clear; one lookup answers both.
     try:
         array = as_zarr_array(group[column], name=column)
     except KeyError:
         return
-    protect_metadata_column(group, column)
+    protect_metadata_column(group, column, removing=array)
     # Resolve the mask before deleting anything, so a malformed link fails closed.
     mask = linked_missing_mask(group, column, label=f"Column {column!r}", values=array)
     del group[column]
     if mask is not None:
         del group[mask.basename]
+
+
+type _HeldArray = tuple[np.ndarray, dict[str, Any], int]
+"""The values, attributes, and chunk length of an array, held in memory."""
+
+
+def _held(array: zarr.Array) -> _HeldArray:
+    """Read an array into memory."""
+    return np.asarray(array[:]), array.attrs.asdict(), int(array.chunks[0])
+
+
+def _write_column(
+    group: zarr.Group,
+    name: str,
+    column: _HeldArray | None,
+    mask: _HeldArray | None,
+) -> None:
+    """Delete column ``name`` and its mask, then write ``mask`` and ``column``.
+
+    The values are deleted first and written last, so they never link a missing mask.
+    """
+    mask_name = f"{MISSING_MASK_PREFIX}{name}"
+    del group[name]
+    del group[mask_name]
+    for key, held in ((mask_name, mask), (name, column)):
+        if held is not None:
+            values, attributes, chunk = held
+            create_metadata_column(
+                group,
+                key,
+                data=values,
+                dtype=values.dtype,
+                chunkSize=chunk,
+                attributes=attributes,
+            )
+
+
+def replace_metadata_column(
+    group: zarr.Group,
+    name: str,
+    values: np.ndarray,
+    missing: np.ndarray | None = None,
+) -> None:
+    """Replace or create column ``name``; the caller checks protection first.
+
+    A failed write puts the previous column back before the error propagates.
+    """
+    validate_metadata_column_name(name)
+    raw = np.asarray(values)
+    # A value that cannot be stored is refused before anything changes.
+    stored = encode_metadata_values(raw, raw.dtype, name=name)
+    flagged = None if missing is None else np.asarray(missing, dtype=bool)
+    if flagged is not None and flagged.shape != stored.shape:
+        raise ValueError(f"Column {name!r} has a misaligned missing mask")
+    if flagged is not None and not flagged.any():
+        flagged = None
+    if group.read_only:
+        raise ValueError(
+            f"Cannot write metadata column {name!r}: the store is open read-only"
+        )
+    previous: tuple[_HeldArray | None, _HeldArray | None] = (None, None)
+    try:
+        array = as_zarr_array(group[name], name=name)
+    except KeyError:
+        pass
+    else:
+        # Resolve the mask before anything changes, so a malformed link fails closed.
+        mask = linked_missing_mask(group, name, label=f"Column {name!r}", values=array)
+        previous = (_held(array), None if mask is None else _held(mask))
+    link = {} if flagged is None else {"missing_mask": f"{MISSING_MASK_PREFIX}{name}"}
+    try:
+        _write_column(
+            group,
+            name,
+            (stored, link, PROFILE_METADATA_CHUNK),
+            None if flagged is None else (flagged, {}, PROFILE_METADATA_CHUNK),
+        )
+    except BaseException as error:
+        try:
+            _write_column(group, name, *previous)
+        except BaseException as failure:
+            error.add_note(
+                f"Metadata column {name!r} could not be restored ({failure!r}); "
+                "it may be missing or hold partial values."
+            )
+        raise

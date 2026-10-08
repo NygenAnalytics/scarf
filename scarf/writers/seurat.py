@@ -7,6 +7,7 @@ import numpy as np
 import zarr
 from scipy.sparse import coo_matrix, issparse
 
+from ..metadata.membership import membership_attributes
 from ..readers import SeuratReader
 from ..readers.seurat import (
     SeuratAssay,
@@ -29,6 +30,7 @@ from ..storage.artifact_writer import (
 from ..storage.io_policy import StorageIoPolicy
 from ..storage.metadata_keys import (
     RESERVED_METADATA_COLUMNS,
+    assay_membership_column,
     is_reserved_metadata_name,
     metadata_column_key,
     metadata_column_keys,
@@ -127,12 +129,16 @@ class SeuratToZarr:
                 that fits.
         io: Optional explicit read, compute, and write widths. Unset values
             stay under automatic planning.
+        overwrite: Replace an existing Scarf store that no ``DataStore`` has opened.
 
     Construction prepares every selected assay's counts and reads them once.
     Each assay stores its counts in the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves from their
     canonical values, and a count that the stored dtype cannot hold raises
     instead of wrapping.
+
+    Raises:
+        FileExistsError: If ``zarr_loc`` is not empty and may not be replaced.
     """
 
     def __init__(
@@ -146,6 +152,8 @@ class SeuratToZarr:
         profile: StorageProfile | None = None,
         policy: CountMatrixPolicy | None = None,
         io: StorageIoPolicy | None = None,
+        *,
+        overwrite: bool = False,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -153,7 +161,7 @@ class SeuratToZarr:
             create_empty_zarr_count_assay,
             validate_assay_name,
         )
-        from ..storage.stores import load_zarr
+        from ..storage.destinations import check_destination, create_destination
 
         resources = resolve_budget(mem_budget, nthreads)
         inspection = reader.inspection
@@ -192,17 +200,18 @@ class SeuratToZarr:
             )
         active_identity = reader.activeIdentity
         self._validate_metadata_names(reader.cellMetadata, "cell")
-        membership_names = {
-            f"{assay.name}_I"
-            for assay in assays
-            if not assay.cellMembership.allIncluded
-        }
+        # The membership column name of every imported assay is reserved,
+        # whether or not the import writes the column.
+        membership_names = {assay_membership_column(assay.name) for assay in assays}
         cell_names = set(reader.cellMetadata.columnNames)
         conflicts = sorted(cell_names.intersection(membership_names))
         if conflicts:
             raise ValueError(
                 "Assay membership columns conflict with cell metadata: "
                 + ", ".join(conflicts)
+                + ". Scarf reserves the cell column '<assay>_I' of every imported "
+                "assay for the membership of that assay; rename the metadata "
+                "column in the Seurat object or leave the assay out of the import."
             )
         for assay in assays:
             self._validate_metadata_names(
@@ -229,6 +238,11 @@ class SeuratToZarr:
             )
             for assay in assays
         }
+        # A destination that would be refused fails before the passes over
+        # the source below; create_destination checks it again.
+        check_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
+        )
 
         source_digest = bytes.fromhex(reader.document.source.source_sha256)
         string_block_rows = max(
@@ -272,10 +286,9 @@ class SeuratToZarr:
             for assay in assays
         }
 
-        self.z = load_zarr(
-            zarr_loc=zarr_loc,
-            mode="w",
-            storage_options=storage_options,
+        # The destination must be empty, or with overwrite an unprepared store.
+        self.z = create_destination(
+            zarr_loc, overwrite=overwrite, storage_options=storage_options
         )
         self.root = (
             self.z
@@ -384,12 +397,12 @@ class SeuratToZarr:
                 self._write_counts(assay, requested_rows)
             from .counts_t import finalize_writer_counts_t
 
+            # Each assay takes the preset of its name, or the generic type.
             for assay in self._assays:
                 finalize_writer_counts_t(
                     self.z,
                     assay.name,
                     self.workspace,
-                    assay_type=assay.name,
                     resources=self.resources,
                     profile=self.profile,
                     io=self.io,
@@ -446,15 +459,14 @@ class SeuratToZarr:
         for assay in self._assays:
             if assay.cellMembership.allIncluded:
                 continue
-            column_name = f"{assay.name}_I"
-            output = self._create_boolean_column(
+            # The attributes are part of the column's first metadata write.
+            self._create_boolean_column(
                 self.cellData,
-                column_name,
+                assay_membership_column(assay.name),
                 assay.cellMembership,
                 block_rows,
+                attributes=membership_attributes(assay.name),
             )
-            output.attrs["assay"] = assay.name
-            output.attrs["role"] = "assay_membership"
 
     def _write_feature_data(self, assay: SeuratAssay, block_rows: int) -> None:
         group = self.featureData[assay.name]
@@ -625,6 +637,8 @@ class SeuratToZarr:
         name: str,
         values: SeuratMembership,
         block_rows: int,
+        *,
+        attributes: dict[str, Any] | None = None,
     ) -> zarr.Array:
         from ..storage.arrays import MetadataBlock, create_streamed_metadata_column
 
@@ -644,6 +658,7 @@ class SeuratToZarr:
             overwrite=True,
             chunkSize=min(DEFAULT_IMPORT_BLOCK_ROWS, max(1, len(values))),
             profile=self.profile,
+            attributes=attributes,
         )
 
     def _source_staging_peak(
@@ -783,7 +798,7 @@ class SeuratToZarr:
             nCells=n_cells,
             profile=self.profile,
             memoryBytes=self.resources.memoryBytes,
-            transposed=counts_t_assays((assay.name,), {assay.name: assay.name}),
+            transposed=counts_t_assays((assay.name,)),
             admitCounts=(
                 sparse_counts_admission(
                     nRows=n_cells,

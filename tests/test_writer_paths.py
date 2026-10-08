@@ -3,7 +3,9 @@
 import re
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -11,7 +13,7 @@ import pandas as pd
 import pytest
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
-from zarr.storage import MemoryStore
+from zarr.storage import LocalStore, MemoryStore
 
 from scarf import DataStore
 from scarf.readers import CSVReader, H5adReader
@@ -42,6 +44,10 @@ def _sentinel_store() -> MemoryStore:
 
 def _untouched(store: MemoryStore) -> bool:
     return set(zarr.open_group(store=store, mode="r").group_keys()) == {"sentinel"}
+
+
+def _store_bytes(store: MemoryStore) -> dict[str, bytes]:
+    return {key: bytes(value.to_bytes()) for key, value in store._store_dict.items()}
 
 
 def test_h5ad_analysis_assay_must_own_a_selected_output(tmp_path) -> None:
@@ -490,7 +496,8 @@ def test_cellranger_assay_types_must_name_imported_assays_and_presets() -> None:
     destination = _sentinel_store()
     with pytest.raises(ValueError, match="names assays that are not imported: GEX"):
         CrToZarr(reader, zarr_loc=destination, assay_types={"GEX": "RNA"})
-    with pytest.raises(ValueError, match="assay_type 'rna' is not a preset"):
+    # The error names the assay, as every writer's does.
+    with pytest.raises(ValueError, match="assay_type 'rna' of assay 'RNA' is not a"):
         CrToZarr(reader, zarr_loc=destination, assay_types={"RNA": "rna"})
     assert _untouched(destination)
 
@@ -532,6 +539,97 @@ def test_cellranger_reader_metadata_must_align_with_its_axis(columns, message) -
         CrToZarr(reader, zarr_loc=MemoryStore(), nthreads=1)
 
 
+_IMPORTED = np.array([[1, 0, 2], [0, 3, 0], [4, 0, 5]], dtype=np.uint8)
+
+type _Importer = Callable[[Any, ExitStack, Path, bool], Any]
+
+
+def _sparse(destination: Any, _stack: ExitStack, _tmp: Path, overwrite: bool) -> Any:
+    return SparseToZarr(
+        csr_matrix(_IMPORTED),
+        destination,
+        _CELLS,
+        ["f1", "f2", "f3"],
+        nthreads=1,
+        overwrite=overwrite,
+    )
+
+
+def _csv(destination: Any, _stack: ExitStack, tmp: Path, overwrite: bool) -> Any:
+    path = tmp / "counts.csv"
+    path.write_text("g1,g2,g3\n1,0,2\n0,3,0\n4,0,5\n")
+    return CSVtoZarr(
+        CSVReader(str(path)),
+        destination,
+        assay_name="RNA",
+        nthreads=1,
+        overwrite=overwrite,
+    )
+
+
+def _cellranger(
+    destination: Any, _stack: ExitStack, _tmp: Path, overwrite: bool
+) -> Any:
+    return CrToZarr(
+        _CountsReader(_IMPORTED), zarr_loc=destination, nthreads=1, overwrite=overwrite
+    )
+
+
+def _h5ad(destination: Any, stack: ExitStack, tmp: Path, overwrite: bool) -> Any:
+    reader = H5adReader(
+        str(_write_h5ad(tmp / "counts.h5ad", _IMPORTED)),
+        feature_name_key="feature_name",
+    )
+    stack.callback(reader.close)
+    return H5adToZarr(reader, zarr_loc=destination, nthreads=1, overwrite=overwrite)
+
+
+def _seurat(destination: Any, stack: ExitStack, tmp: Path, overwrite: bool) -> Any:
+    path = _write_seurat(tmp / "counts.rds", _Wire())
+    reader = stack.enter_context(SeuratReader(path, reductions=[]))
+    return SeuratToZarr(reader, destination, nthreads=1, overwrite=overwrite)
+
+
+_IMPORTERS: dict[str, _Importer] = {
+    "sparse": _sparse,
+    "csv": _csv,
+    "cellranger": _cellranger,
+    "h5ad": _h5ad,
+    "seurat": _seurat,
+}
+
+
+def _unread(*_args: Any) -> Any:
+    raise AssertionError("the source counts were read before the destination check")
+
+
+@pytest.mark.parametrize("importer", sorted(_IMPORTERS))
+def test_importers_replace_a_store_only_with_overwrite(
+    tmp_path, monkeypatch, importer
+) -> None:
+    # Before, an import opened its destination with mode "w", which deleted
+    # whatever it held.
+    destination = MemoryStore()
+    with ExitStack() as stack:
+        _sparse(destination, stack, tmp_path, False).dump()
+    before = _store_bytes(destination)
+    with (
+        ExitStack() as stack,
+        monkeypatch.context() as patch,
+        pytest.raises(FileExistsError, match="is not empty"),
+    ):
+        # Importers that pass over their source refuse the destination first.
+        for writer in ("cellranger", "h5ad", "seurat"):
+            patch.setattr(f"scarf.writers.{writer}.count_storage_dtype", _unread)
+        _IMPORTERS[importer](destination, stack, tmp_path, False)
+    assert _store_bytes(destination) == before
+
+    with ExitStack() as stack:
+        _IMPORTERS[importer](destination, stack, tmp_path, True).dump()
+    root = zarr.open_group(store=destination, mode="r")
+    assert root["RNA/counts"].attrs["complete"] is True
+
+
 _SUBSET_COUNTS = np.array(
     [[1, 4, 9], [2, 20, 3], [12, 2, 2], [5, 0, 1]], dtype=np.uint16
 )
@@ -546,6 +644,27 @@ def _subset_source(location: str | MemoryStore) -> DataStore:
         nthreads=1,
     ).dump()
     return DataStore(location, default_assay="RNA", min_features_per_cell=0, nthreads=1)
+
+
+def test_subset_refuses_its_source_even_when_it_is_not_prepared(tmp_path) -> None:
+    """The overlap check protects a source that no DataStore prepared.
+
+    An assay built directly over imported counts is not prepared, so the
+    refusal to replace a prepared store does not protect it.
+    """
+    on_disk = str(tmp_path / "source.zarr")
+    dataset = _subset_source(on_disk)
+    dataset.z["RNA"].attrs["prepared"] = False
+    for destination in (on_disk, LocalStore(on_disk)):
+        with pytest.raises(ValueError, match="overlaps a source store"):
+            SubsetZarr(
+                destination,
+                assays=[dataset.RNA],
+                cell_idx=np.array([0]),
+                overwrite_existing_file=True,
+                nthreads=1,
+            )
+    np.testing.assert_array_equal(dataset.RNA.rawData.compute(), _SUBSET_COUNTS)
 
 
 def test_subset_refuses_a_destination_that_overlaps_its_source(tmp_path) -> None:
@@ -564,6 +683,16 @@ def test_subset_refuses_a_destination_that_overlaps_its_source(tmp_path) -> None
     with pytest.raises(ValueError, match="overlaps a source store"):
         SubsetZarr(
             in_memory,
+            assays=[dataset.RNA],
+            cell_idx=np.array([0]),
+            overwrite_existing_file=True,
+            nthreads=1,
+        )
+    # Before, a second store object over the source's keys was replaced, which
+    # emptied the source. The source is prepared, so overwrite refuses it.
+    with pytest.raises(FileExistsError, match=r"holds the prepared assays \['RNA'\]"):
+        SubsetZarr(
+            MemoryStore(in_memory._store_dict),
             assays=[dataset.RNA],
             cell_idx=np.array([0]),
             overwrite_existing_file=True,

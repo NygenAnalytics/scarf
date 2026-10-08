@@ -759,6 +759,39 @@ def test_agent_facade_defers_numerical_and_provider_imports(fresh_import_errors)
     _assert_fresh_import_check(fresh_import_errors, "agent_facade")
 
 
+_UNIX_ONLY_MODULES = frozenset(
+    {"fcntl", "grp", "pty", "pwd", "resource", "termios", "tty"}
+)
+
+
+def _load_time_imports(tree: ast.Module) -> list[tuple[int, str]]:
+    """Return the modules a source imports while it loads, outside any function."""
+    imports: list[tuple[int, str]] = []
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            continue
+        if isinstance(node, ast.Import):
+            imports.extend((node.lineno, alias.name) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imports.append((node.lineno, node.module))
+        pending.extend(ast.iter_child_nodes(node))
+    return imports
+
+
+def test_unix_only_modules_are_imported_only_at_call_time():
+    # Windows lacks these modules. A call-time import behind a platform check,
+    # as in scarf.agent.records, keeps every module importable there.
+    violations = sorted(
+        (path.relative_to(_SCARF_ROOT).as_posix(), lineno, module)
+        for path in _SCARF_ROOT.rglob("*.py")
+        for lineno, module in _load_time_imports(_tree(path))
+        if module.split(".")[0] in _UNIX_ONLY_MODULES
+    )
+    assert violations == []
+
+
 def test_agent_support_modules_keep_narrow_dependencies():
     # Decisions stay independent of execution, the provider cannot reach Scarf
     # computation, and reports can be regenerated without opening a store.
@@ -1283,6 +1316,7 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     allowed_operation_helpers = {
         "datastore._operations.enrichment_store",
         "datastore._operations.paris_persistence",
+        "datastore._operations.statistical_store",
     }
     for path in operations_root.glob("*.py"):
         runtime_imports = _runtime_import_modules(path)

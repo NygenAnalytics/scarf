@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -23,6 +23,8 @@ from ..storage.execution import admitted_worker_split
 from ..storage.identity import GENERATED_FEATURE_COLUMNS, clear_column
 from ..storage.layout import PROFILE_METADATA_CHUNK, _encoded_chunk_bound
 from ..storage.metadata_keys import (
+    ASSAY_MEMBERSHIP_ROLE,
+    assay_membership_column,
     is_reserved_metadata_name,
     metadata_column_key,
     validate_metadata_column_name,
@@ -47,6 +49,23 @@ _PROTECTED = frozenset({"ids", "I", "names"})
 _MERGED_ATTRIBUTES = tuple(
     key for key in COLUMN_METADATA_ATTRIBUTES if key != "feature_selection_fingerprint"
 )
+# Only the merge marks a merged cell column as an assay's membership, so an
+# ordinary column never carries the membership attributes of a source.
+_CELL_ATTRIBUTES = tuple(
+    key for key in _MERGED_ATTRIBUTES if key not in {"role", "assay"}
+)
+
+SOURCE_LACKS_ASSAY = "missing"
+"""Membership state of a source that does not hold the assay."""
+SOURCE_MEASURES_ALL = "all"
+"""Membership state of a source that measures every cell with the assay."""
+
+type SourceMembership = Mapping[str, Sequence[str]]
+"""Per merged assay, each source's membership state in source order.
+
+A state is :data:`SOURCE_LACKS_ASSAY`, :data:`SOURCE_MEASURES_ALL`, or the
+name of the source's membership column of the assay.
+"""
 
 
 def _cell_data_path(workspace: str | None) -> str:
@@ -415,12 +434,13 @@ def _reconciled_cell_attributes(
 
     Equal values are kept. Differing ``levels`` of an unordered column become
     their union in first-seen order. Any other disagreement drops the
-    attribute, and the dropped names are returned.
+    attribute, and the dropped names are returned. Membership attributes are
+    never carried.
     """
     found: dict[str, list[Any]] = {}
     for array in arrays:
         attrs = getattr(array, "attrs", {})
-        for key in _MERGED_ATTRIBUTES:
+        for key in _CELL_ATTRIBUTES:
             if key in attrs:
                 found.setdefault(key, []).append(attrs[key])
     ordered = any(value is True for value in found.get("ordered", ()))
@@ -449,7 +469,7 @@ def plan_cell_metadata(
     prepend_text: str | None,
     reset_cell_filter: bool,
     source_column: str | None,
-    membership_assays: list[str] | None = None,
+    membership: SourceMembership | None = None,
     block_rows: int = 100_000,
     scan_rows: int | None = None,
     excluded_columns: list[frozenset[str]] | None = None,
@@ -485,12 +505,23 @@ def plan_cell_metadata(
             mapping[public] = column
         per_source.append(mapping)
 
+    membership = dict(membership or {})
+    membership_columns = {
+        assay_membership_column(assay_name): assay_name for assay_name in membership
+    }
+    for name, mapping in zip(source_names, per_source, strict=True):
+        for public, column in mapping.items():
+            if public in membership_columns:
+                raise ValueError(
+                    f"Cell column {column!r} of source {name!r} would be merged "
+                    f"as {public!r}, which is the merged membership column of "
+                    f"assay {membership_columns[public]!r}. Rename the column in "
+                    "the source or choose a prepend_text that keeps the names apart."
+                )
     all_public: set[str] = set()
     for mapping in per_source:
         all_public.update(mapping)
     all_public.update(_PROTECTED)
-    membership = membership_assays or []
-    membership_columns = {f"{assay_name}_I" for assay_name in membership}
     all_public.update(membership_columns)
     if source_column is not None:
         if source_column in all_public:
@@ -516,8 +547,7 @@ def plan_cell_metadata(
     ordered = ["ids", "names", "I"]
     if source_column is not None:
         ordered.append(source_column)
-    for assay_name in membership:
-        ordered.append(f"{assay_name}_I")
+    ordered.extend(membership_columns)
     remaining = sorted(name for name in all_public if name not in ordered)
     ordered.extend(remaining)
 
@@ -591,15 +621,22 @@ def plan_cell_metadata(
                 _metadata_column_spec(public, np.dtype(f"U{max_len}"), False)
             )
             continue
-        if public.endswith("_I") and public[:-2] in membership:
+        if public in membership_columns:
+            assay_name = membership_columns[public]
             columns.append(
                 _metadata_column_spec(
                     public,
                     np.dtype(bool),
                     False,
-                    role="assay_membership",
-                    assay=public[:-2],
-                    attributes=attributes_for(public),
+                    value_arrays=(
+                        table._get_array(state)
+                        for table, state in zip(
+                            source_cell_tables, membership[assay_name], strict=True
+                        )
+                        if state not in {SOURCE_LACKS_ASSAY, SOURCE_MEASURES_ALL}
+                    ),
+                    role=ASSAY_MEMBERSHIP_ROLE,
+                    assay=assay_name,
                 )
             )
             continue
@@ -936,11 +973,10 @@ def _iter_column_blocks(
     source_columns: Sequence[dict[str, str]],
     reset_cell_filter: bool,
     source_column: str | None,
-    membership_by_source: dict[str, set[str]] | None,
+    membership: SourceMembership,
     segment_rows: int,
     chunk_rows: int,
 ) -> Iterator[MetadataBlock]:
-    membership_by_source = membership_by_source or {}
     # Segments fill one destination chunk band at a time, so each band is
     # written with a single whole-chunk write instead of partial updates.
     band_start = 0
@@ -979,9 +1015,18 @@ def _iter_column_blocks(
                 )
         elif spec.name == source_column:
             values = np.full(n, name, dtype=spec.dtype)
-        elif spec.role == "assay_membership":
-            present = spec.assay in membership_by_source.get(name, set())
-            values = np.full(n, present, dtype=bool)
+        elif spec.role == ASSAY_MEMBERSHIP_ROLE:
+            assert spec.assay is not None
+            state = membership[spec.assay][source_idx]
+            if state == SOURCE_LACKS_ASSAY:
+                values = np.zeros(n, dtype=bool)
+            elif state == SOURCE_MEASURES_ALL:
+                values = np.ones(n, dtype=bool)
+            else:
+                values = np.asarray(
+                    read_metadata_rows_chunkwise(table, state, local_rows),
+                    dtype=bool,
+                )
         else:
             source_col = source_columns[source_idx].get(spec.name)
             if source_col is None:
@@ -1029,7 +1074,7 @@ def write_cell_metadata(
     profile: StorageProfile,
     reset_cell_filter: bool,
     source_column: str | None,
-    membership_by_source: dict[str, set[str]] | None = None,
+    membership: SourceMembership,
 ) -> zarr.Group:
     """Stream cell metadata columns in merged row order, replacing any partial slot."""
     cell_slot = _cell_data_path(workspace)
@@ -1046,11 +1091,17 @@ def write_cell_metadata(
             source_columns=metadata_plan.sourceColumns,
             reset_cell_filter=reset_cell_filter,
             source_column=source_column,
-            membership_by_source=membership_by_source,
+            membership=membership,
             segment_rows=segment_rows,
             chunk_rows=chunk_size,
         )
-        array = create_streamed_metadata_column(
+        # The merge's own membership contract wins over source attributes.
+        attributes = dict(spec.attributes)
+        if spec.role is not None:
+            attributes["role"] = spec.role
+        if spec.assay is not None:
+            attributes["assay"] = spec.assay
+        create_streamed_metadata_column(
             group,
             spec.name,
             shape=row_plan.nCells,
@@ -1060,15 +1111,8 @@ def write_cell_metadata(
             chunkSize=chunk_size,
             hasMissing=spec.hasMissing,
             profile=profile,
+            attributes=attributes or None,
         )
-        # The merge's own membership contract wins over source attributes.
-        attributes = dict(spec.attributes)
-        if spec.role is not None:
-            attributes["role"] = spec.role
-        if spec.assay is not None:
-            attributes["assay"] = spec.assay
-        if attributes:
-            array.attrs.update(attributes)
     group.attrs["complete"] = True
     return group
 

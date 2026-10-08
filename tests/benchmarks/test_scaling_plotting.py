@@ -272,8 +272,12 @@ def _summary_store(values: np.ndarray) -> SimpleNamespace:
     from scarf.matrix.chunked import ChunkedArray
 
     class Assay:
+        # A cell table without membership columns: every cell is measured.
+        cells = SimpleNamespace(columns=())
+
         @staticmethod
-        def normed(*, cell_idx, feat_idx):
+        def normed(*, cell_idx, feat_idx, log_transform=False):
+            assert not log_transform
             return ChunkedArray(
                 values,
                 rows=cell_idx,
@@ -319,7 +323,8 @@ def test_dotplot_group_summary(bench) -> None:
         )
 
     def check(n_cells: int, value) -> None:
-        aggregate, per_sample = value
+        aggregate, per_sample, unmeasured = value
+        assert unmeasured == {}
         assert per_sample is None
         values, labels = _expression(n_cells)
         counts = np.bincount(labels, minlength=N_CLUSTERS)
@@ -331,9 +336,10 @@ def test_dotplot_group_summary(bench) -> None:
             expressing = np.bincount(labels, weights=column > 0, minlength=N_CLUSTERS)
             means = sums / counts
             for cluster in range(N_CLUSTERS):
+                # Summary tables name the grouping column by its role.
                 rows.append(
                     {
-                        "cluster": cluster,
+                        "group": cluster,
                         "feature": name,
                         "mean": means[cluster],
                         "fraction": expressing[cluster] / counts[cluster],
@@ -344,8 +350,8 @@ def test_dotplot_group_summary(bench) -> None:
                         / (counts[cluster] - 1),
                     }
                 )
-        expected = pd.DataFrame(rows).set_index(["cluster", "feature"]).sort_index()
-        observed = aggregate.set_index(["cluster", "feature"]).sort_index()
+        expected = pd.DataFrame(rows).set_index(["group", "feature"]).sort_index()
+        observed = aggregate.set_index(["group", "feature"]).sort_index()
         assert observed.index.equals(expected.index)
         np.testing.assert_array_equal(observed["n_cells"], expected["n_cells"])
         np.testing.assert_allclose(

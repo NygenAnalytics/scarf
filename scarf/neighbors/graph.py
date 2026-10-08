@@ -4,6 +4,7 @@ import numpy as np
 from numba import jit, njit
 from scipy.sparse import coo_matrix, csr_matrix
 
+from ..utils.arguments import integer_argument
 from ..utils.progress import iter_progress
 
 
@@ -21,12 +22,18 @@ def smooth_knn_chunk(
     distance_array = np.asarray(distances, dtype=np.float32)
     if not distance_array.flags.c_contiguous:
         distance_array = np.ascontiguousarray(distance_array)
+    n_rows, n_neighbors = distance_array.shape
+    with_self = np.zeros((n_rows, n_neighbors + 1), dtype=np.float32)
+    with_self[:, 1:] = distance_array
     sigmas, rhos = smooth_knn_dist(
-        distance_array,
-        k=indices_array.shape[1],
+        with_self,
+        k=float(n_neighbors + 1),
         local_connectivity=local_connectivity,
         bandwidth=bandwidth,
     )
+    # Free the padded copy before the edge arrays are allocated, so it does
+    # not raise the peak memory of the conversion.
+    del with_self
     rows, columns, values, _ = compute_membership_strengths(
         indices_array,
         distance_array,
@@ -132,15 +139,66 @@ def take_nearest_per_row(
 
 
 @jit(nopython=True)
+def _count_shared_neighbors(indices: np.ndarray, out: np.ndarray) -> None:
+    """Write the neighbors each cell shares with each of its neighbors to ``out``."""
+    ncells, nk = indices.shape
+    for i in range(ncells):
+        for j in range(nk):
+            k = indices[i][j]
+            out[i][j] = len(set(indices[i]).intersection(set(indices[k])))
+
+
+@jit(nopython=True)
 def calc_snn(indices: np.ndarray) -> np.ndarray:
     """Calculate shared-neighbor fractions for a KNN index matrix."""
     ncells, nk = indices.shape
     snn = np.zeros((ncells, nk))
-    for i in range(ncells):
-        for j in range(nk):
-            k = indices[i][j]
-            snn[i][j] = len(set(indices[i]).intersection(set(indices[k])))
+    _count_shared_neighbors(indices, snn)
     return np.asarray(snn / (nk - 1))
+
+
+def _shared_neighbor_fractions(indices: np.ndarray) -> np.ndarray:
+    """Return :func:`calc_snn` of ``indices`` in one NumPy-allocated array.
+
+    The fractions are computed in place, so merging holds one float64 matrix
+    per graph, and it holds it as NumPy memory, which a memory trace sees.
+    """
+    shared = np.empty(indices.shape, dtype=np.float64)
+    _count_shared_neighbors(indices, shared)
+    shared /= indices.shape[1] - 1
+    return shared
+
+
+# Python objects a merge holds whatever the data size, such as the per-row
+# candidates and the progress bars, measured below 64 KiB.
+_SNN_OBJECT_BYTES = 256 * 1024
+
+
+def snn_merge_peak_bytes(
+    n_cells: int,
+    n_neighbors: int,
+    n_graphs: int,
+    *,
+    index_itemsize: int = 4,
+    weight_itemsize: int = 4,
+) -> int:
+    """Estimate the peak bytes of ``merge_graphs``, including its input graphs."""
+    cells = integer_argument(n_cells, "n_cells", minimum=1)
+    k = integer_argument(n_neighbors, "n_neighbors", minimum=1)
+    graphs = integer_argument(n_graphs, "n_graphs", minimum=1)
+    index_bytes = integer_argument(index_itemsize, "index_itemsize", minimum=1)
+    weight_bytes = integer_argument(weight_itemsize, "weight_itemsize", minimum=1)
+    edges = cells * k
+    # Each graph's indices, weights, and shared-neighbor fractions; the merged
+    # columns and weights; and the int64 rows of the COO graph with their
+    # copy in its index dtype.
+    per_edge = graphs * (index_bytes + weight_bytes + 8) + (
+        index_bytes + weight_bytes + 8 + index_bytes
+    )
+    # Each graph's row pointers and row counts, and the int64 row numbers
+    # that the COO rows repeat.
+    per_cell = graphs * 2 * index_bytes + 8
+    return edges * per_edge + cells * per_cell + _SNN_OBJECT_BYTES
 
 
 def weight_sort_indices(
@@ -180,7 +238,7 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     neighbor_rows = [matrix.indices.reshape((n_cells, nk)) for matrix in csr_mats]
     weight_rows = [matrix.data.reshape((n_cells, nk)) for matrix in csr_mats]
     snns = [
-        calc_snn(neighbors)
+        _shared_neighbor_fractions(neighbors)
         for neighbors in iter_progress(
             neighbor_rows,
             desc="Identifying SNNs in graphs",

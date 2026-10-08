@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
+from scipy.stats import chisquare
 
 from scarf.quality_control.cell_cycle import assign_cell_cycle_phase
 from scarf.quality_control.doublets import (
@@ -12,7 +13,10 @@ from scarf.quality_control.doublets import (
     sum_doublet_pairs,
 )
 from scarf.quality_control.filtering import gaussian_quantile_bounds
-from scarf.graph.feature_projection import resolve_native_graph_inputs
+from scarf.graph.feature_projection import (
+    graph_cell_selection,
+    resolve_native_graph_inputs,
+)
 from scarf.metadata.artifacts import (
     artifact_values,
     plan_cell_data_artifact,
@@ -24,6 +28,7 @@ from scarf.storage.artifacts import (
     fingerprint_array,
     fingerprint_strings,
 )
+from scarf.storage.operation_revisions import effective_revision
 from scarf.storage.selections import (
     read_stored_selection_mask,
     resolve_generated_selection_artifact,
@@ -85,12 +90,66 @@ def test_simulate_doublet_pairs_is_seeded_and_heterotypic():
         n_sim=12,
         heterotypic_fraction=1.0,
         rng=np.random.default_rng(11),
-        max_tries=100,
     )
 
+    # The pairs are pinned: changing them changes every doublet score, which
+    # needs a revision of run_doublet_detection.
     np.testing.assert_array_equal(left, [0, 0, 3, 1, 2, 2, 2, 0, 1, 0, 1, 3])
-    np.testing.assert_array_equal(right, [2, 3, 1, 3, 1, 1, 0, 2, 3, 2, 3, 0])
+    np.testing.assert_array_equal(right, [3, 3, 1, 3, 1, 1, 0, 2, 2, 3, 3, 0])
     assert np.all(clusters[left] != clusters[right])
+    repeated = simulate_doublet_pairs(clusters, 12, 1.0, np.random.default_rng(11))
+    np.testing.assert_array_equal(repeated[0], left)
+    np.testing.assert_array_equal(repeated[1], right)
+
+
+@pytest.mark.parametrize(("sizes", "fraction"), [((100, 1), 1.0), ((990, 5, 5), 0.8)])
+def test_simulate_doublet_pairs_make_every_forced_doublet_heterotypic(sizes, fraction):
+    # A dominant cluster made bounded redraws fall far short of the fraction:
+    # 0.20 heterotypic pairs for sizes (100, 1) at 1.0.
+    clusters = np.repeat(np.arange(len(sizes)), sizes)
+    n_sim = 5_000
+    left, right = simulate_doublet_pairs(
+        clusters, n_sim, fraction, np.random.default_rng(29)
+    )
+
+    # The documented draws: first parents, then the forced doublets.
+    draws = np.random.default_rng(29)
+    np.testing.assert_array_equal(left, draws.integers(0, len(clusters), size=n_sim))
+    forced = draws.random(n_sim) < fraction
+    heterotypic = clusters[left] != clusters[right]
+    assert np.all(heterotypic[forced])
+    # Unconstrained doublets may pair two clusters too.
+    assert heterotypic.mean() >= forced.mean()
+    if fraction == 1.0:
+        assert heterotypic.all()
+
+
+def test_simulate_doublet_pairs_draw_partners_uniformly_from_eligible_cells():
+    # Pool positions interleave the clusters, which hold 5, 3, and 2 cells.
+    clusters = np.array(["b", "a", "c", "a", "b", "a", "c", "a", "b", "a"])
+    left, right = simulate_doublet_pairs(
+        clusters, 60_000, 1.0, np.random.default_rng(7)
+    )
+
+    assert chisquare(np.bincount(left, minlength=len(clusters))).pvalue > 1e-3
+    for cluster in np.unique(clusters):
+        partners = np.bincount(
+            right[clusters[left] == cluster], minlength=len(clusters)
+        )
+        assert not partners[clusters == cluster].any()
+        # Every cell outside the cluster is an equally likely partner, so
+        # partner clusters are drawn in proportion to their sizes.
+        assert chisquare(partners[clusters != cluster]).pvalue > 1e-3
+
+    # The partner of a doublet that is not forced is any pool cell.
+    left, right = simulate_doublet_pairs(
+        clusters, 60_000, 0.5, np.random.default_rng(13)
+    )
+    draws = np.random.default_rng(13)
+    draws.integers(0, len(clusters), size=60_000)
+    free = draws.random(60_000) >= 0.5
+    partners = np.bincount(right[free], minlength=len(clusters))
+    assert chisquare(partners).pvalue > 1e-3
 
 
 def test_simulate_doublet_pairs_allows_homotypic_when_fraction_is_zero():
@@ -107,12 +166,41 @@ def test_simulate_doublet_pairs_allows_homotypic_when_fraction_is_zero():
     np.testing.assert_array_equal(left, expected.integers(0, 4, size=40))
     np.testing.assert_array_equal(right, expected.integers(0, 4, size=40))
     assert np.any(clusters[left] == clusters[right])
-    # One cluster cannot form heterotypic pairs, so none are redrawn.
+    # One cluster can form only homotypic pairs, which a zero quota allows.
     single = simulate_doublet_pairs(
-        np.zeros(4, dtype=int), 40, 1.0, np.random.default_rng(3)
+        np.zeros(4, dtype=int), 40, 0.0, np.random.default_rng(3)
     )
     np.testing.assert_array_equal(single[0], left)
     np.testing.assert_array_equal(single[1], right)
+    empty = simulate_doublet_pairs(clusters, 0, 0.8, np.random.default_rng(3))
+    assert [part.shape for part in empty] == [(0,), (0,)]
+
+
+def test_simulate_doublet_pairs_refuse_heterotypic_doublets_of_one_cluster():
+    with pytest.raises(ValueError, match="the pool holds one cluster"):
+        simulate_doublet_pairs(np.full(4, "T"), 40, 1e-9, np.random.default_rng(3))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error", "message"),
+    [
+        ({"n_sim": -1}, ValueError, "n_sim must be at least 0"),
+        ({"heterotypic_fraction": 1.5}, ValueError, "from 0 to 1"),
+        ({"pool_clusters": np.zeros((2, 2))}, ValueError, "one-dimensional"),
+        ({"pool_clusters": np.array([])}, ValueError, "non-empty"),
+        ({"n_sim": 2.5}, TypeError, "n_sim must be an integer"),
+        ({"heterotypic_fraction": True}, TypeError, "must be a real number"),
+    ],
+)
+def test_simulate_doublet_pairs_validate_arguments(arguments, error, message):
+    options = {
+        "pool_clusters": np.array([0, 1]),
+        "n_sim": 4,
+        "heterotypic_fraction": 0.5,
+        "rng": np.random.default_rng(0),
+    }
+    with pytest.raises(error, match=message):
+        simulate_doublet_pairs(**(options | arguments))
 
 
 def test_sample_cluster_pool_respects_fraction_and_cap():
@@ -566,8 +654,10 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
     )
 
     # The record holds the scoring parameters only; it carries no
-    # arithmetic salt.
-    assert set(datastore.inspect_artifact(score_ref).parameters) == {
+    # arithmetic salt. Revision 2, direct heterotypic sampling, changed the
+    # scores without changing the parameters.
+    score_status = datastore.inspect_artifact(score_ref)
+    assert set(score_status.parameters) == {
         "cluster_sample_fraction",
         "max_cells_per_cluster",
         "simulation_ratio",
@@ -577,6 +667,7 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
         "normalize_scores",
         "random_seed",
     }
+    assert score_status.revision == 2 and score_status.is_current
     assert (
         set(
             datastore.list_artifacts(
@@ -617,7 +708,6 @@ def test_doublet_scores_preserve_artifacts_without_materializing_queries(
         _snapshot_store(str(Path(datastore.zarr_loc) / "cellData")) == metadata_before
     )
 
-    score_status = datastore.inspect_artifact(score_ref)
     neighbors = ArtifactRef.from_dict(score_status.inputs["neighbors"])
     reference_refs = datastore.list_artifacts(
         kind="mapping_reference",
@@ -792,4 +882,71 @@ def test_doublet_detection_rejects_symphony_connectivity_chain(
             )
         )
         == references_before
+    )
+
+
+def test_doublet_detection_needs_two_clusters_for_heterotypic_doublets(
+    analyzed_datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    graph = _fixture_graph(datastore)
+    datastore.cells.insert(
+        "one_cluster", np.full(datastore.cells.N, "all"), overwrite=True
+    )
+    clusters = datastore.snapshot_cluster_labels(
+        "one_cluster", cell_selection=graph_cell_selection(datastore.zw, graph)
+    )
+    from scarf.datastore._operations import quality_control as operations
+
+    def refuse_planning(*_args, **_kwargs):
+        raise AssertionError("a one-cluster request must fail before planning")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(operations, "plan_cell_data_artifact", refuse_planning)
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"^Doublet detection with heterotypic_fraction=0\.8 pairs cells "
+                r"from two different clusters, but every selected cell has the "
+                r"same cluster label\. Pass a clustering with two or more "
+                r"clusters, or heterotypic_fraction=0 to simulate doublets from "
+                r"any two sampled cells\.$"
+            ),
+        ):
+            datastore.run_doublet_detection(clusters, graph)
+
+    # Without forced heterotypic doublets one cluster is enough.
+    ref = datastore.run_doublet_detection(
+        clusters,
+        graph,
+        cluster_sample_fraction=0.01,
+        max_cells_per_cluster=2,
+        simulation_ratio=0.01,
+        heterotypic_fraction=0.0,
+        save_k=3,
+        smoothing_t=1,
+    )
+    status = datastore.inspect_artifact(ref)
+    # Zero-fraction pairs are the draws of earlier releases, so the scores
+    # keep revision 1 and their identity.
+    assert status.complete and status.revision == 1
+
+
+@pytest.mark.parametrize(
+    ("parameters", "revision"),
+    [
+        ({"heterotypic_fraction": 0.0}, 1),
+        ({"heterotypic_fraction": 0}, 1),
+        ({"heterotypic_fraction": 0.8}, 2),
+        ({"heterotypic_fraction": False}, 2),
+        ({}, 2),
+    ],
+)
+def test_doublet_revision_spares_scores_without_forced_heterotypic_pairs(
+    parameters, revision
+):
+    assert (
+        effective_revision("run_doublet_detection", "doublet_score", parameters, {})
+        == revision
     )

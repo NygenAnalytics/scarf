@@ -1,6 +1,7 @@
 """Plotting functions bound to a datastore instance."""
 
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import cache
 from inspect import Parameter, signature
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
+from ..features.values import resolve_feature, resolve_feature_batch
 from ..mapping.reference import MappingReference
 from ..plotting._contracts import (
     CategoricalScale,
@@ -71,17 +73,49 @@ class _FrozenRunPlotCells:
 
 
 class _FrozenRunPlotStore:
-    """Expose only the frozen run cells needed by artifact embedding plots."""
+    """Expose a run's frozen cells, and the live features of its assay.
 
-    __slots__ = ("_defaultAssay", "cells", "zw")
+    Cell fields come only from the run. Gene values, which a run never
+    freezes, come from the live counts and normalizer of the run's assay; no
+    other assay is reachable.
+    """
+
+    __slots__ = ("_defaultAssay", "_owner", "cells", "zw")
 
     def __init__(self, store: "DataStore", *, assay: str, cells: Any) -> None:
+        self._owner = store
         self._defaultAssay = assay
         self.cells = _FrozenRunPlotCells(cells)
         self.zw = store.zw
 
+    @property
+    def nthreads(self) -> int:
+        return self._owner.nthreads
+
+    def _get_assay(self, name: str | None) -> Any:
+        """Return the run's assay, the only assay whose features run plots read."""
+        if name != self._defaultAssay:
+            raise ValueError(
+                f"Run plots read features only from the run's assay "
+                f"{self._defaultAssay!r}, not {name!r}"
+            )
+        return self._owner._get_assay(name)
+
     def _stored_display_metadata(self, column: str) -> dict[str, Any] | None:
+        # Only frozen fields carry a display; a gene name has none.
+        if column not in self.cells.columns:
+            return None
         return self.cells._field_display(column)
+
+
+_RUN_GENE_COLOR_MESSAGE = (
+    "Run embedding colors genes only with an explicit "
+    "normalization=NormalizationSpec(...); the run freezes no gene values"
+)
+_RUN_ARTIFACT_COLOR_MESSAGE = (
+    "Run embedding colors only by outputs of this run; pass layout=run[...] "
+    "to color by other artifacts"
+)
 
 
 def _require_run(
@@ -89,9 +123,8 @@ def _require_run(
     run: object,
     layout_key: object,
     layout: object,
-    color_by: object,
 ) -> tuple[PipelineRun, str]:
-    """Validate the arguments shared by run-backed embedding plots.
+    """Validate the run and layout shared by run-backed embedding plots.
 
     Returns the run and the name of its layout output.
     """
@@ -109,18 +142,132 @@ def _require_run(
         layout_name = layout
     else:
         raise TypeError("layout must name a pipeline output")
-    if not isinstance(color_by, str | type(None)):
-        raise TypeError("color_by must name a frozen cell field or be None")
     return run, layout_name
 
 
-def _run_cells(run: PipelineRun, *fields: str | None) -> Any:
-    """Return a run's frozen cells after checking the requested fields exist."""
-    cells = run.cells
+def _missing_run_field(cells: Any, field: str) -> KeyError:
+    return KeyError(
+        f"Pipeline run has no frozen cell field {field!r}; run cell fields: "
+        + ", ".join(repr(column) for column in cells.columns)
+    )
+
+
+def _require_run_fields(cells: Any, *fields: str | None) -> None:
+    """Check that every named field is a frozen cell field of the run."""
     for field in fields:
         if field is not None and field not in cells.columns:
-            raise KeyError(f"Pipeline run has no frozen cell field {field!r}")
-    return cells
+            raise _missing_run_field(cells, field)
+
+
+def _run_feature_names(store: _FrozenRunPlotStore, names: list[str]) -> set[str]:
+    """Return the names that resolve to features of the run's assay.
+
+    The assay's feature index is read once when every name resolves, and
+    name by name only to find the names that do not. A name that matches
+    several features still names features; the plot reports that ambiguity
+    with its remedy.
+    """
+    if not names:
+        return set()
+    assay = store._defaultAssay
+    try:
+        resolve_feature_batch(store, names, from_assay=assay)
+    except (KeyError, ValueError):
+        pass
+    else:
+        return set(names)
+    found: set[str] = set()
+    for name in names:
+        try:
+            resolve_feature(store, name, from_assay=assay)
+        except KeyError:
+            continue
+        except ValueError:
+            pass
+        found.add(name)
+    return found
+
+
+def _check_run_embedding_colors(
+    run: PipelineRun,
+    store: _FrozenRunPlotStore,
+    color_by: object,
+    normalization: NormalizationSpec | None,
+) -> None:
+    """Validate run embedding colors against the run, in color order.
+
+    A string names a frozen cell field, or else a gene of the run's assay.
+    Gene names and ``FeatureRef`` colors need an explicit normalization,
+    because a run freezes no gene values. An ``ArtifactRef`` must be an
+    output of the run.
+    """
+    if color_by is None:
+        return
+    if isinstance(color_by, str | ArtifactRef | FeatureRef | CellField):
+        items: list[object] = [color_by]
+    elif isinstance(color_by, Iterable):
+        items = list(color_by)
+    else:
+        raise TypeError(
+            "color_by must be a frozen cell field, CellField, FeatureRef, "
+            "ArtifactRef, or a sequence of them"
+        )
+    cells = store.cells
+    genes = _run_feature_names(
+        store,
+        [item for item in items if isinstance(item, str) and item not in cells.columns],
+    )
+    outputs: set[ArtifactRef] | None = None
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, CellField):
+            _require_run_fields(cells, item.key)
+        elif isinstance(item, ArtifactRef):
+            if outputs is None:
+                outputs = set(run.values())
+            if item not in outputs:
+                raise ValueError(_RUN_ARTIFACT_COLOR_MESSAGE)
+        elif isinstance(item, FeatureRef):
+            if item.assay is not None and item.assay != run.assay:
+                raise ValueError(
+                    f"Run embedding reads features only from its assay "
+                    f"{run.assay!r}, not {item.assay!r}"
+                )
+            if normalization is None:
+                raise ValueError(_RUN_GENE_COLOR_MESSAGE)
+        elif isinstance(item, str):
+            if item in cells.columns:
+                continue
+            if item not in genes:
+                raise _missing_run_field(cells, item)
+            if normalization is None:
+                raise ValueError(_RUN_GENE_COLOR_MESSAGE)
+        else:
+            raise TypeError(
+                "color_by items must be frozen cell fields, CellField, "
+                f"FeatureRef, or ArtifactRef; got {type(item).__name__}"
+            )
+
+
+def _with_run_provenance(
+    result: PlotResult,
+    run: PipelineRun,
+    *,
+    show: bool,
+) -> PlotResult:
+    """Record the run that a run plot drew, then show the plot if requested."""
+    provenance = result.provenance
+    result.provenance = replace(
+        provenance,
+        extras={
+            **provenance.extras,
+            "run": {"runId": run.run_id, "label": run.label},
+        },
+    )
+    if show:
+        result.show()
+    return result
 
 
 @cache
@@ -244,37 +391,39 @@ class DataStorePlotAccessor:
     ) -> "PlotResult":
         """Plot cells in a stored two-dimensional embedding."""
         if run is not None:
-            run, layout_name = _require_run(
-                self._store, run, layout_key, layout, color_by
+            run, layout_name = _require_run(self._store, run, layout_key, layout)
+            if cell_key != "I":
+                raise ValueError(
+                    "Run embedding uses the frozen pipeline cell selection"
+                )
+            if from_assay is not None and from_assay != run.assay:
+                raise ValueError(
+                    f"Run embedding reads features only from its assay "
+                    f"{run.assay!r}, not {from_assay!r}"
+                )
+            if point_sizes is not None:
+                raise ValueError(
+                    "Run embedding takes no point_sizes; pass layout=run[...] "
+                    "and point_sizes in that layout's cell order"
+                )
+            frozen = _FrozenRunPlotStore(self._store, assay=run.assay, cells=run.cells)
+            _check_run_embedding_colors(run, frozen, color_by, normalization)
+            _require_run_fields(
+                frozen.cells,
+                facet_by,
+                subset_by,
+                None if highlight is None else highlight.by,
+                None if density_overlay is None else density_overlay.group_by,
             )
-            if (
-                cell_key != "I"
-                or from_assay is not None
-                or normalization is not None
-                or point_sizes is not None
-                or facet_by is not None
-                or facet_order is not None
-                or subset_by is not None
-            ):
-                raise ValueError(
-                    "Run embedding uses frozen layout and color outputs; live "
-                    "selection, feature, facet, and subset inputs are unavailable"
-                )
-            if density_overlay is not None and density_overlay.group_by is not None:
-                raise ValueError(
-                    "Run embedding density filters cannot use live metadata"
-                )
-            if highlight is not None and highlight.by is not None:
-                raise ValueError("Run embedding highlights cannot use live metadata")
-            cells = _run_cells(run, cast(str | None, color_by))
-            # The live-only inputs validated above equal their canonical defaults.
-            return self._forward(
+            result = self._forward(
                 PlotResult,
                 "embedding",
                 locals(),
-                store=_FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
+                store=frozen,
                 layout=run[layout_name],
+                show=False,
             )
+            return _with_run_provenance(result, run, show=show)
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")
         return self._forward(PlotResult, "embedding", locals())
@@ -300,20 +449,29 @@ class DataStorePlotAccessor:
     ) -> "PlotResult":
         """Rasterize continuous cell metadata over a stored embedding."""
         if run is not None:
-            run, layout_name = _require_run(
-                self._store, run, layout_key, layout, color_by
-            )
+            run, layout_name = _require_run(self._store, run, layout_key, layout)
             if cell_key != "I":
                 raise ValueError("Run raster uses the frozen pipeline cell selection")
-            cells = _run_cells(run, cast(str | None, color_by), subset_by)
-            # layout_key and cell_key were validated to their canonical defaults.
-            return self._forward(
+            if isinstance(color_by, CellField):
+                color_key: str | None = color_by.key
+            elif isinstance(color_by, str | None):
+                color_key = color_by
+            else:
+                raise TypeError(
+                    "color_by must name a frozen cell field, as a string or "
+                    "CellField, or be None"
+                )
+            frozen = _FrozenRunPlotStore(self._store, assay=run.assay, cells=run.cells)
+            _require_run_fields(frozen.cells, color_key, subset_by)
+            result = self._forward(
                 PlotResult,
                 "embedding_raster",
                 locals(),
-                store=_FrozenRunPlotStore(self._store, assay=run.assay, cells=cells),
+                store=frozen,
                 layout=run[layout_name],
+                show=False,
             )
+            return _with_run_provenance(result, run, show=show)
         if isinstance(layout, str):
             raise TypeError("String layout names require a pipeline run")
         return self._forward(PlotResult, "embedding_raster", locals())

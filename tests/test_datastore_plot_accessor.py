@@ -317,31 +317,48 @@ class _RunHarness:
         import scarf.datastore._plot_accessor as plot_accessor_module
 
         self.layout = _EMBEDDING_REF
-        clusters = ArtifactRef(
+        self.clusters = ArtifactRef(
             scope="assay",
             assay="RNA",
             kind="cluster_cut",
             artifact_id="1" * 64,
         )
-        self.owner = type("Owner", (), {"zw": object()})()
-        self.frozen_cells = type(
-            "FrozenCells", (), {"columns": ("sample_id", "clusters")}
-        )()
+        # The run's assay holds CD3E, MS4A1 and two features named HLA-A;
+        # plots read no other assay.
+        self.assay = _HarnessAssay(["CD3E", "MS4A1", "HLA-A", "hla-a"])
         harness = self
+
+        class Owner:
+            zw = object()
+            nthreads = 3
+
+            def _get_assay(self, name: str) -> object:
+                assert name == "RNA"
+                return harness.assay
+
+        self.owner = Owner()
+        self.frozen_cells = type(
+            "FrozenCells", (), {"columns": ("sample_id", "clusters", "kept")}
+        )()
 
         class FakeRun:
             assay = "RNA"
+            run_id = "9" * 64
+            label = "baseline"
             cells = harness.frozen_cells
 
             def __init__(self) -> None:
                 self._owner = harness.owner
-                self._outputs = {"umap": harness.layout, "clusters": clusters}
+                self._outputs = {"umap": harness.layout, "clusters": harness.clusters}
 
             def __contains__(self, key: object) -> bool:
                 return key in self._outputs
 
             def __getitem__(self, key: str) -> ArtifactRef:
                 return self._outputs[key]
+
+            def values(self) -> Any:
+                return self._outputs.values()
 
         self.run_type = FakeRun
         self.calls: list[tuple[str, object, dict[str, Any]]] = []
@@ -360,9 +377,36 @@ class _RunHarness:
     def _recorder(self, name: str) -> Callable[..., object]:
         def canonical(store: object, **kwargs: Any) -> object:
             self.calls.append((name, store, kwargs))
-            return object()
+            return splt.PlotResult(
+                figure=None,
+                axes={},
+                tables={},
+                legends=(),
+                scales=(),
+                provenance=splt.PlotProvenance(extras={"layout": name}),
+                owns_figure=False,
+            )
 
         return canonical
+
+
+class _HarnessFeatures:
+    def __init__(self, names: list[str]) -> None:
+        self.N = len(names)
+        self._names = np.asarray(names, dtype=object)
+
+    def fetch_all(self, column: str) -> np.ndarray:
+        if column == "names":
+            return self._names
+        return np.asarray([f"id-{name}" for name in self._names], dtype=object)
+
+
+class _HarnessAssay:
+    def __init__(self, names: list[str]) -> None:
+        self.feats = _HarnessFeatures(names)
+
+
+_RUN_PROVENANCE = {"runId": "9" * 64, "label": "baseline"}
 
 
 @pytest.mark.parametrize("name", ["embedding", "embedding_raster"])
@@ -373,8 +417,8 @@ def test_run_plots_forward_frozen_cells_and_the_named_output(
     harness = _RunHarness(monkeypatch)
     method = getattr(harness.accessor, name)
 
-    for color_by in ("sample_id", "clusters", None):
-        method(run=harness.run, layout="umap", color_by=color_by, show=False)
+    for color_by in ("sample_id", "clusters", splt.CellField("kept"), None):
+        result = method(run=harness.run, layout="umap", color_by=color_by, show=False)
         called, proxy, kwargs = harness.calls.pop()
         expected = dict(harness.defaults[name])
         expected.update(layout=harness.layout, color_by=color_by, show=False)
@@ -384,11 +428,66 @@ def test_run_plots_forward_frozen_cells_and_the_named_output(
         assert proxy._defaultAssay == "RNA"
         assert proxy.zw is harness.owner.zw
         assert proxy.cells._cells is harness.frozen_cells
+        # The plot's own provenance gains the run that it drew.
+        assert result.provenance.extras == {"layout": name, "run": _RUN_PROVENANCE}
 
-    method(run=harness.run, color_by="sample_id", show=False)
+    shown: list[object] = []
+    monkeypatch.setattr(
+        splt.PlotResult,
+        "show",
+        lambda result: shown.append(result.provenance.extras.get("run")),
+    )
+    method(run=harness.run, color_by="sample_id", show=True)
     _, _, kwargs = harness.calls.pop()
     assert kwargs["layout"] == harness.layout
+    # The plot is shown once, after its provenance names the run.
+    assert kwargs["show"] is False
+    assert shown == [_RUN_PROVENANCE]
     assert harness.calls == []
+
+
+def test_run_embedding_forwards_frozen_field_options_and_run_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    harness = _RunHarness(monkeypatch)
+    normalization = splt.NormalizationSpec(transform="log1p")
+    options: dict[str, Any] = {
+        "color_by": [
+            "clusters",
+            None,
+            splt.CellField("sample_id", kind="categorical"),
+            harness.clusters,
+            "CD3E",
+            splt.FeatureRef("MS4A1", assay="RNA"),
+        ],
+        "normalization": normalization,
+        "from_assay": "RNA",
+        "facet_by": "sample_id",
+        "facet_order": ["s2", "s1"],
+        "subset_by": "kept",
+        "groups": ["s1"],
+        "highlight": splt.Highlight(by="clusters", groups=(1,)),
+        "density_overlay": splt.DensityOverlay(group_by="sample_id"),
+    }
+
+    harness.accessor.embedding(run=harness.run, show=False, **options)
+
+    (_, proxy, kwargs) = harness.calls.pop()
+    for key, value in options.items():
+        assert kwargs[key] is value
+    # Gene colors resolve against the run's assay, through the live owner.
+    assert proxy.nthreads == 3
+    assert proxy._get_assay("RNA") is harness.assay
+    with pytest.raises(ValueError, match="only from the run's assay 'RNA', not 'ADT'"):
+        proxy._get_assay("ADT")
+    assert proxy._stored_display_metadata("CD3E") is None
+
+
+_GENE_COLOR_MESSAGE = (
+    "Run embedding colors genes only with an explicit "
+    "normalization=NormalizationSpec(...); the run freezes no gene values"
+)
+_RUN_FIELDS = "run cell fields: 'sample_id', 'clusters', 'kept'"
 
 
 @pytest.mark.parametrize("name", ["embedding", "embedding_raster"])
@@ -408,22 +507,22 @@ def test_run_plots_forward_frozen_cells_and_the_named_output(
         (
             {"layout": "umap", "color_by": "live_only"},
             KeyError,
-            "Pipeline run has no frozen cell field 'live_only'",
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
         ),
         (
             {"layout": "umap", "color_by": "umap"},
             KeyError,
-            "Pipeline run has no frozen cell field 'umap'",
+            f"Pipeline run has no frozen cell field 'umap'; {_RUN_FIELDS}",
         ),
         (
-            {"layout": "umap", "color_by": _EMBEDDING_REF},
-            TypeError,
-            "color_by must name a frozen cell field or be None",
+            {"layout": "umap", "color_by": splt.CellField("live_only")},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
         ),
         (
-            {"layout": "umap", "color_by": splt.CellField("sample_id")},
-            TypeError,
-            "color_by must name a frozen cell field or be None",
+            {"layout": "umap", "subset_by": "live_only"},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
         ),
         ({"layout": 3}, TypeError, "layout must name a pipeline output"),
     ],
@@ -463,52 +562,142 @@ def test_run_plots_require_a_run_opened_from_this_datastore(
     assert harness.calls == []
 
 
-_LIVE_ONLY_MESSAGE = (
-    "Run embedding uses frozen layout and color outputs; live selection, "
-    "feature, facet, and subset inputs are unavailable"
+_FOREIGN_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="cluster_labels",
+    artifact_id="8" * 64,
 )
 
 
 @pytest.mark.parametrize(
-    ("name", "kwargs", "message"),
+    ("name", "kwargs", "error", "message"),
     [
-        ("embedding", {"cell_key": "filtered"}, _LIVE_ONLY_MESSAGE),
-        ("embedding", {"from_assay": "ADT"}, _LIVE_ONLY_MESSAGE),
         (
             "embedding",
-            {"normalization": splt.NormalizationSpec()},
-            _LIVE_ONLY_MESSAGE,
-        ),
-        ("embedding", {"point_sizes": [1.0, 2.0]}, _LIVE_ONLY_MESSAGE),
-        ("embedding", {"facet_by": "sample_id"}, _LIVE_ONLY_MESSAGE),
-        ("embedding", {"facet_order": ["s1"]}, _LIVE_ONLY_MESSAGE),
-        ("embedding", {"subset_by": "sample_id"}, _LIVE_ONLY_MESSAGE),
-        (
-            "embedding",
-            {"density_overlay": splt.DensityOverlay(group_by="sample_id")},
-            "Run embedding density filters cannot use live metadata",
+            {"cell_key": "filtered"},
+            ValueError,
+            "Run embedding uses the frozen pipeline cell selection",
         ),
         (
             "embedding",
-            {"highlight": splt.Highlight(by="sample_id", groups=("s1",))},
-            "Run embedding highlights cannot use live metadata",
+            {"from_assay": "ADT"},
+            ValueError,
+            "Run embedding reads features only from its assay 'RNA', not 'ADT'",
+        ),
+        (
+            "embedding",
+            {"point_sizes": [1.0, 2.0]},
+            ValueError,
+            "Run embedding takes no point_sizes; pass layout=run[...] and "
+            "point_sizes in that layout's cell order",
+        ),
+        (
+            "embedding",
+            {"color_by": ["clusters", _FOREIGN_REF]},
+            ValueError,
+            "Run embedding colors only by outputs of this run; pass "
+            "layout=run[...] to color by other artifacts",
+        ),
+        ("embedding", {"color_by": "CD3E"}, ValueError, _GENE_COLOR_MESSAGE),
+        (
+            "embedding",
+            {"color_by": ["clusters", "ms4a1"]},
+            ValueError,
+            _GENE_COLOR_MESSAGE,
+        ),
+        (
+            "embedding",
+            {"color_by": splt.FeatureRef("CD3E")},
+            ValueError,
+            _GENE_COLOR_MESSAGE,
+        ),
+        (
+            "embedding",
+            {
+                "color_by": splt.FeatureRef("CD3E", assay="ADT"),
+                "normalization": splt.NormalizationSpec(),
+            },
+            ValueError,
+            "Run embedding reads features only from its assay 'RNA', not 'ADT'",
+        ),
+        (
+            "embedding",
+            {"color_by": "GeneX", "normalization": splt.NormalizationSpec()},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'GeneX'; {_RUN_FIELDS}",
+        ),
+        # An ambiguous name is still a gene; the plot reports the ambiguity.
+        (
+            "embedding",
+            {"color_by": ["clusters", "HLA-A"]},
+            ValueError,
+            _GENE_COLOR_MESSAGE,
+        ),
+        # A missing name leaves the other names genes.
+        (
+            "embedding",
+            {"color_by": ["CD3E", "GeneX"], "normalization": splt.NormalizationSpec()},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'GeneX'; {_RUN_FIELDS}",
+        ),
+        (
+            "embedding",
+            {"color_by": 3},
+            TypeError,
+            "color_by must be a frozen cell field, CellField, FeatureRef, "
+            "ArtifactRef, or a sequence of them",
+        ),
+        (
+            "embedding",
+            {"color_by": ["clusters", 3]},
+            TypeError,
+            "color_by items must be frozen cell fields, CellField, FeatureRef, "
+            "or ArtifactRef; got int",
+        ),
+        (
+            "embedding",
+            {"facet_by": "live_only"},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
+        ),
+        (
+            "embedding",
+            {"density_overlay": splt.DensityOverlay(group_by="live_only")},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
+        ),
+        (
+            "embedding",
+            {"highlight": splt.Highlight(by="live_only", groups=("s1",))},
+            KeyError,
+            f"Pipeline run has no frozen cell field 'live_only'; {_RUN_FIELDS}",
         ),
         (
             "embedding_raster",
             {"cell_key": "filtered"},
+            ValueError,
             "Run raster uses the frozen pipeline cell selection",
+        ),
+        (
+            "embedding_raster",
+            {"color_by": _EMBEDDING_REF},
+            TypeError,
+            "color_by must name a frozen cell field, as a string or CellField, "
+            "or be None",
         ),
     ],
 )
-def test_run_plots_reject_live_only_inputs(
+def test_run_plots_reject_inputs_that_the_run_cannot_answer(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     kwargs: dict[str, Any],
+    error: type[Exception],
     message: str,
 ):
     harness = _RunHarness(monkeypatch)
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(error) as raised:
         getattr(harness.accessor, name)(
             run=harness.run,
             layout="umap",

@@ -556,8 +556,12 @@ def test_wnn_integration_assembles_coordinates_streamed_in_several_blocks(
             for block in self.source.iter_coordinate_blocks(message):
                 yield from np.array_split(np.asarray(block), 3)
 
-    def split_coordinate_source(coordinates: ArtifactRef, *, batch_size: int | None):
-        source, n_cells, dims = stream_coordinates(coordinates, batch_size=batch_size)
+    def split_coordinate_source(
+        coordinates: ArtifactRef, *, batch_size: int | None, **options: Any
+    ):
+        source, n_cells, dims = stream_coordinates(
+            coordinates, batch_size=batch_size, **options
+        )
         return SplitBlocks(source), n_cells, dims
 
     monkeypatch.setattr(store, "_coordinate_source", split_coordinate_source)

@@ -56,6 +56,7 @@ from scarf.storage.selections import (
     snapshot_run_metadata,
 )
 from scarf.storage.types import as_zarr_array
+from scarf.utils.logging import logger
 
 
 class _Table:
@@ -570,10 +571,26 @@ def test_run_catalog_skips_torn_and_corrupt_children() -> None:
     runs.create_group(corrupt_id).create_group("stages")
     runs.create_group("not-a-run")
 
-    assert list_pipeline_run_records(root) == (
-        load_pipeline_run_record(root, completed.run_id),
-    )
-    assert open_pipeline_run_record(root, label="baseline").run_id == completed.run_id
+    messages: list[str] = []
+    sink = logger.add(messages.append, level="WARNING", format="{message}")
+    try:
+        assert list_pipeline_run_records(root) == (
+            load_pipeline_run_record(root, completed.run_id),
+        )
+        assert (
+            open_pipeline_run_record(root, label="baseline").run_id == completed.run_id
+        )
+    finally:
+        logger.remove(sink)
+    # Each scan warns once and names every skipped child and its error.
+    assert len(messages) == 2
+    assert messages[0].startswith("Skipped 3 unreadable pipeline run record(s)")
+    for expected in (
+        f"{torn_id} (Pipeline run {torn_id} has no stages group)",
+        f"{corrupt_id} (pipeline run fields do not match the contract: missing",
+        "not-a-run (run_id must be a 64-character lowercase hex token)",
+    ):
+        assert expected in messages[0]
     assert list_pipeline_runs(_Owner(root))[0].run_id == completed.run_id
     with pytest.raises(ValueError, match="has no stages group"):
         open_pipeline_run_record(root, run_id=torn_id)
@@ -959,7 +976,9 @@ def test_running_label_claim_requires_explicit_exact_owner_abandonment(
 
     run_group = root[f"pipeline/runs/{first.run_id}"]
     run_group.attrs["runId"] = "invalid"
-    with pytest.raises(ValueError, match="invalid claim-owner record"):
+    with pytest.raises(
+        ValueError, match=f"invalid claim-owner record {first.run_id}: run_id"
+    ):
         pipeline_run_storage.ensure_pipeline_label_claimable(root, label)
     run_group.attrs["runId"] = first.run_id
     run_group.attrs["requestedLabel"] = "different-label"

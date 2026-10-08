@@ -1,6 +1,13 @@
 name: Docs
 
 on:
+  # The release workflow verifies the exact commit it publishes.
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check out and build
+        type: string
+        required: true
   push:
     branches:
       - master
@@ -38,11 +45,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
       - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+          sudo apt-get install -y build-essential
       - name: Install uv
         uses: astral-sh/setup-uv@v9.0.0
         with:

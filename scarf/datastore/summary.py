@@ -5,6 +5,11 @@ from typing import Any, Protocol
 import zarr
 
 from ..assay import Assay
+from ..assay.classification import (
+    declared_assay_type,
+    lookup_persisted_assay_type,
+    recorded_assay_types,
+)
 from ..metadata import MetaData
 from ..storage.artifacts import (
     inspect_artifact,
@@ -16,7 +21,7 @@ from ..storage.pipeline_runs import list_pipeline_run_records
 from ..storage.refs import ArtifactRef
 from ..storage.schema import validate_assay_name
 from ..storage.stores import load_zarr
-from ..storage.types import ZarrMode, as_zarr_group
+from ..storage.types import ZarrMode, as_zarr_group, read_fresh_group
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +113,7 @@ class DataStoreSummary:
 class _AssaySummaryView(Protocol):
     feats: MetaData
     attrs: Mapping[str, Any]
+    assayType: str
 
 
 class _SummaryStore(Protocol):
@@ -132,6 +138,7 @@ class _ReadOnlyAssayView:
     name: str
     feats: MetaData
     attrs: Mapping[str, Any]
+    assayType: str
 
 
 class _ReadOnlySummaryStore:
@@ -210,7 +217,23 @@ class _ReadOnlySummaryStore:
             name=assay,
             feats=MetaData(as_zarr_group(self.zw[feature_path], name=display_path)),
             attrs=assay_group.attrs,
+            assayType=self._assay_type(assay),
         )
+
+    def _assay_type(self, assay: str) -> str:
+        """Return the type that a read-only DataStore open resolves for ``assay``.
+
+        That is the store's recorded type, else the assay name when it is a
+        preset, else ``Assay``.
+
+        Raises:
+            ValueError: If the ``assayTypes`` record is not a mapping, or the
+                type it records for ``assay`` is not a preset.
+        """
+        recorded = recorded_assay_types(
+            self.zw.attrs.get("assayTypes"), self.assay_names
+        )
+        return lookup_persisted_assay_type(assay, recorded)
 
 
 def _count_active(metadata: MetaData) -> int:
@@ -242,31 +265,23 @@ def _summarize_artifacts(
     return tuple(summaries)
 
 
-def _assay_type_mapping(root: zarr.Group) -> dict[str, str]:
-    value = root.attrs.get("assayTypes", {})
-    if not isinstance(value, Mapping):
-        return {}
-    return {str(name): str(assay_type) for name, assay_type in value.items()}
-
-
 def build_datastore_summary(
     store: _SummaryStore,
     *,
     scarf_version: str,
 ) -> DataStoreSummary:
-    assay_types = _assay_type_mapping(store.zw)
     assays = []
     for assay_name in sorted(store.assay_names):
         assay = store._get_assay(assay_name)
-        from ..storage.identity import fresh_group
-
-        fingerprint = fresh_group(
-            as_zarr_group(store.zw[assay_name], name=assay_name)
-        ).attrs.get("dataset_fingerprint")
+        fingerprint = read_fresh_group(store.zw, assay_name).attrs.get(
+            "dataset_fingerprint"
+        )
         assays.append(
             AssaySummary(
                 name=assay_name,
-                assay_type=assay_types.get(assay_name, "Assay"),
+                # The type that the open resolved, which a read-only open
+                # cannot record, so the attribute can lack it.
+                assay_type=declared_assay_type(assay),
                 total_features=int(assay.feats.N),
                 active_features=_count_active(assay.feats),
                 feature_columns=tuple(sorted(assay.feats.columns)),

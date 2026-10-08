@@ -42,6 +42,17 @@ class CoordinateInputs:
     feature_selection: ArtifactRef | None
 
 
+# The artifact kinds whose ``data`` array a graph can be built on: reduced,
+# batch-corrected, and imported coordinates, and the normalized values of the
+# selected features themselves.
+NATIVE_COORDINATE_KINDS = frozenset(
+    {"reduction", "batch_correction", "imported_coordinates", "normalized"}
+)
+_NATIVE_COORDINATE_KIND_NAMES = (
+    "reduction,batch_correction,imported_coordinates,normalized"
+)
+
+
 def _resolution_error(
     message: str,
     *,
@@ -212,12 +223,39 @@ def resolve_coordinate_inputs(
             cell_selection=cell_selection,
             feature_selection=None,
         )
+    if coordinates.kind == "normalized":
+        _require_complete(
+            root,
+            coordinates,
+            expected_kind="normalized",
+            expected_scope="assay",
+            expected_assay=assay,
+            statuses=statuses,
+        )
+        # This checks the dataset fingerprint, both selections, and that the
+        # float32 data holds one row per selected cell and one column per
+        # selected feature.
+        _, normalized_selections = load_normalized_inputs(root, coordinates)
+        if not normalized_selections.featureMask.any():
+            raise _resolution_error(
+                "Coordinates must be a non-empty two-dimensional array",
+                code="invalid_shape",
+                ref=coordinates,
+            )
+        return CoordinateInputs(
+            coordinates=coordinates,
+            reduction=None,
+            normalized=coordinates,
+            cell_selection=normalized_selections.cells.ref,
+            feature_selection=normalized_selections.features,
+        )
     if coordinates.kind not in {"reduction", "batch_correction"}:
         raise _resolution_error(
-            "Coordinates must be reduction, batch_correction, or imported_coordinates",
+            "Coordinates must be reduction, batch_correction, "
+            "imported_coordinates, or normalized",
             code="unsupported_graph_kind",
             ref=coordinates,
-            expected_kind="reduction,batch_correction,imported_coordinates",
+            expected_kind=_NATIVE_COORDINATE_KIND_NAMES,
         )
     _require_complete(
         root,
@@ -379,16 +417,12 @@ def _resolve_native_graph_inputs(
         statuses=statuses,
     )
     coordinates = neighbor_status.input_ref("coordinates")
-    if coordinates.kind not in {
-        "reduction",
-        "batch_correction",
-        "imported_coordinates",
-    }:
+    if coordinates.kind not in NATIVE_COORDINATE_KINDS:
         raise _resolution_error(
             "Neighbor coordinates have an unsupported artifact kind",
             code="unsupported_graph_kind",
             ref=coordinates,
-            expected_kind="reduction,batch_correction,imported_coordinates",
+            expected_kind=_NATIVE_COORDINATE_KIND_NAMES,
         )
     _require_complete(
         root,

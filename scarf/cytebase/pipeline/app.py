@@ -1,6 +1,51 @@
-"""One worker per dataset, a queued orchestrator, and the development HTTP API."""
+"""One worker per dataset, a queued orchestrator, and the development HTTP API.
+
+The HTTP API can register collections, start dataset processing, and rebuild
+the catalog with the deployment's Hugging Face credentials, so every request
+passes two checks.
+
+1. Modal proxy authentication. Create a proxy auth token in the Modal
+   workspace that owns the app, for example with
+   ``modal workspace proxy-tokens create``, and send its ID and secret in the
+   ``Modal-Key`` and ``Modal-Secret`` headers. Modal rejects a request without
+   them before it reaches the app. A proxy token is valid for every
+   proxy-authenticated endpoint of the workspace, so on its own it does not
+   identify a Cytebase operator.
+2. The API token. Only the web function receives the ``cytebase-api`` Modal
+   secret, whose ``CYTEBASE_API_TOKEN`` holds at least 32 visible ASCII
+   characters without whitespace. Send that value in the ``Cytebase-Token``
+   header; the app answers 401 to any request without it, before routing or
+   reading the body. The ``Authorization`` header is not used because Modal's
+   proxy reads it for its own bearer tokens. Create the secret in each Modal
+   environment you deploy to from a private dotenv file kept outside the
+   repository, for example::
+
+       python -c "import secrets; print('CYTEBASE_API_TOKEN=' + secrets.token_urlsafe(32))" > <file>
+       modal secret create cytebase-api --from-dotenv <file> --env <environment>
+
+   A deployment fails while the secret or its key is missing, and the web
+   function does not start without a valid token. Every environment needs the
+   secret, even one where nobody calls the HTTP API and work starts only with
+   ``python -m scarf.cytebase.pipeline reset-run`` or the Modal SDK, because
+   the app always deploys its web function. To rotate the token, recreate the
+   secret with ``--force`` and redeploy.
+
+Keep both tokens out of source control, notebooks, and shell history.
+
+``GET /jobs/{call_id}`` reports only calls that this deployment's API started.
+The API records each call it starts under the key ``api:<call ID>`` of the
+``cytebase-runs`` Modal Dict of its environment and answers 404 for any other
+ID, including calls that ``reset-run`` or the Modal SDK started, without a
+Modal lookup; poll those through the Modal SDK. Scarf never deletes these
+records. Modal expires a Dict entry 7 days after its last read or write, so a
+record lives 7 days after the call started or after its last poll, whichever
+is later, and the API then answers 404 for the call. Modal also keeps a call's
+result only for a limited time, after which the API answers 404 with "Job
+result is missing or expired".
+"""
 
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -18,6 +63,8 @@ from typing import Any
 import modal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.websockets import WebSocketClose
 
 from .._storage import Bucket, dataset_prefix, error_message
 from .catalog import load_record, select_dataset_ids
@@ -63,12 +110,19 @@ def _bucket_key() -> str:
 
 
 BUCKET_KEY = _bucket_key()
+API_TOKEN_KEY = "CYTEBASE_API_TOKEN"
+API_TOKEN_HEADER = "Cytebase-Token"
 app = modal.App("cytebase")
 secret = modal.Secret.from_name("scarf-env", required_keys=["HF_TOKEN", BUCKET_KEY])
+# Attached to the web function only, so no worker can read the API token.
+api_secret = modal.Secret.from_name("cytebase-api", required_keys=[API_TOKEN_KEY])
 progress_store = modal.Dict.from_name("cytebase-progress", create_if_missing=True)
 # Live run and child state for ownership checks. Keeping it in a modal.Dict
 # means claiming, checking and finishing work spends no Hugging Face quota;
-# the bucket keeps only the run's start and final record at RUN_PATH.
+# the bucket keeps only the run's start and final record at RUN_PATH. The web
+# API also records each call it starts under an ``api:`` key, so it reports
+# only those calls. Nothing here deletes entries: Modal expires each one 7 days
+# after its last read or write.
 run_store = modal.Dict.from_name("cytebase-runs", create_if_missing=True)
 CURRENT_RUN = "current"
 RUN_PATH = "_internal/pipeline.json"
@@ -210,6 +264,15 @@ def _run_progress(
 
 def _child_key(run_id: str, key: str) -> str:
     return f"{run_id}:{key}"
+
+
+def _api_job_key(call_id: str) -> str:
+    """Return the run-store key of a call that the web API started.
+
+    Run IDs are Modal call IDs, so these keys never share a prefix with the
+    ``<run ID>:`` child keys that ``_reset`` scans.
+    """
+    return f"api:{call_id}"
 
 
 def _owner(run_id: str, key: str, call_id: str | None) -> None:
@@ -974,8 +1037,58 @@ async def run_pipeline(action: str, request: dict) -> dict:
     return result
 
 
-def create_web_app() -> FastAPI:
-    web = FastAPI(title="Cytebase pipeline (development)")
+# At least 32 visible ASCII characters, which no client or proxy rewrites.
+_API_TOKEN_FORMAT = re.compile(r"[!-~]{32,}")
+
+
+class _RequireApiToken:
+    """Reject each request without the API token before FastAPI handles it.
+
+    The check runs ahead of routing and body parsing, so a request without the
+    token cannot start work, read the bucket, or tell routes, methods, and
+    request validation apart: every such HTTP request receives the same 401.
+    """
+
+    def __init__(self, app: ASGIApp, token: bytes) -> None:
+        self.app = app
+        self.token = token
+        self.field = API_TOKEN_HEADER.lower().encode("ascii")
+
+    def _authorized(self, scope: Scope) -> bool:
+        values = [
+            value for name, value in scope["headers"] if name.lower() == self.field
+        ]
+        # A repeated header is ambiguous, so only one exact value passes.
+        return len(values) == 1 and hmac.compare_digest(values[0], self.token)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan" or self._authorized(scope):
+            await self.app(scope, receive, send)
+        elif scope["type"] == "http":
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": f"Missing or invalid {API_TOKEN_HEADER} header"},
+                headers={"WWW-Authenticate": API_TOKEN_HEADER},
+            )
+            await response(scope, receive, send)
+        else:
+            await WebSocketClose(code=1008)(scope, receive, send)
+
+
+def create_web_app(api_token: str) -> FastAPI:
+    """Return the development control API, which requires ``api_token``."""
+    if not _API_TOKEN_FORMAT.fullmatch(api_token):
+        raise ValueError(
+            "The API token must have at least 32 visible ASCII characters "
+            "without whitespace"
+        )
+    web = FastAPI(
+        title="Cytebase pipeline (development)",
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
+    web.add_middleware(_RequireApiToken, token=api_token.encode("ascii"))
 
     @web.exception_handler(405)
     async def missing_endpoint(_request: Request, _error: Exception) -> JSONResponse:
@@ -984,6 +1097,22 @@ def create_web_app() -> FastAPI:
 
     def submit(action: str, payload: dict) -> dict:
         call = run_pipeline.spawn(action, payload)
+        try:
+            run_store.put(
+                _api_job_key(call.object_id), {"action": action, "submittedAt": _now()}
+            )
+        except Exception as error:
+            # The call is already running, so name it rather than invite a
+            # retry that would queue a second run.
+            message = error_message(error)
+            logger.error(
+                "Job %s started but was not recorded: %s", call.object_id, message
+            )
+            raise HTTPException(
+                500,
+                detail=f"Job {call.object_id} started, but this API could not "
+                f"record it, so /jobs will not report it: {message}",
+            ) from error
         return {"callId": call.object_id}
 
     @web.post("/collections/register", status_code=202)
@@ -1014,6 +1143,15 @@ def create_web_app() -> FastAPI:
 
     @web.get("/jobs/{call_id}", response_model=None)
     def job(call_id: str) -> Any:
+        # Any call of the workspace can be looked up by ID, so only the calls
+        # that submit() recorded, and whose record Modal has not expired, are
+        # polled.
+        if run_store.get(_api_job_key(call_id)) is None:
+            raise HTTPException(
+                404,
+                detail="No job with this ID was started by this API, or its "
+                "record expired after 7 days without a poll",
+            )
         try:
             return modal.FunctionCall.from_id(call_id).get(timeout=0)
         except (
@@ -1076,7 +1214,11 @@ def create_web_app() -> FastAPI:
     return web
 
 
-@app.function(image=image, secrets=[secret], max_containers=1)
-@modal.asgi_app()
+@app.function(image=image, secrets=[secret, api_secret], max_containers=1)
+@modal.asgi_app(requires_proxy_auth=True)
 def web_app() -> FastAPI:
-    return create_web_app()
+    """Serve the control API behind Modal proxy auth and the API token."""
+    token = os.environ.get(API_TOKEN_KEY)
+    if not token:
+        raise RuntimeError(f"Missing required environment variable: {API_TOKEN_KEY}")
+    return create_web_app(token)

@@ -25,8 +25,26 @@ __all__ = [
 
 _ENSEMBL_GFF3 = "https://ftp.ensembl.org/pub/current_gff3/{species}/"
 _GENE_TYPES = frozenset({"gene", "ncRNA_gene", "pseudogene"})
+# Ensembl names a GFF3 file <Species>.<assembly>.<release>[.<part>].gff3.gz.
+# Assemblies can contain dots, such as BDGP6.54 for the fly and mRatBN7.2 for
+# the rat, so the release is the number just before the extension.
 _GFF_NAME = re.compile(
-    r"^(?P<label>[^.]+)\.(?P<assembly>[^.]+)\.(?P<release>\d+)\.gff3\.gz$"
+    r"^(?P<label>[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+)"
+    r"\.(?P<assembly>[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*?)"
+    r"\.(?P<release>\d+)\.gff3\.gz$"
+)
+# A file that covers part of the genome or another gene set names that part
+# after the release. A numeric part, such as chromosome.1, would otherwise
+# parse as the release of a file with a longer dotted assembly.
+_GFF_PARTS = frozenset(
+    {
+        "abinitio",
+        "chr",
+        "chr_patch_hapl_scaff",
+        "chromosome",
+        "primary_assembly",
+        "scaffold",
+    }
 )
 
 
@@ -214,25 +232,29 @@ def _directory_listing(url: str, *, timeout: float) -> str:
     return bytes(payload).decode("utf-8", errors="replace")
 
 
+def _top_level_release(name: str) -> str | None:
+    """Return the release of a whole-genome Ensembl GFF3 file name, else None."""
+    parsed = _GFF_NAME.match(name)
+    if parsed is None:
+        return None
+    if _GFF_PARTS.intersection(parsed.group("assembly").lower().split(".")):
+        return None
+    return parsed.group("release")
+
+
 def _pick_gff3_name(listing: str) -> tuple[str, str]:
     candidates: list[tuple[str, str]] = []
     for match in re.finditer(r'href="([^"]+\.gff3\.gz)"', listing, flags=re.IGNORECASE):
         name = match.group(1).rsplit("/", 1)[-1]
-        if "chromosome" in name.lower() or "abinitio" in name.lower():
-            continue
-        parsed = _GFF_NAME.match(name)
-        if parsed is None:
-            continue
-        candidates.append((name, parsed.group("release")))
+        release = _top_level_release(name)
+        if release is not None:
+            candidates.append((name, release))
     if not candidates:
         for match in re.finditer(r"([A-Za-z0-9._-]+\.gff3\.gz)", listing):
             name = match.group(1)
-            if "chromosome" in name.lower() or "abinitio" in name.lower():
-                continue
-            parsed = _GFF_NAME.match(name)
-            if parsed is None:
-                continue
-            candidates.append((name, parsed.group("release")))
+            release = _top_level_release(name)
+            if release is not None:
+                candidates.append((name, release))
     if not candidates:
         raise FileNotFoundError("no top-level Ensembl GFF3 file found in listing")
     candidates.sort(key=lambda item: int(item[1]), reverse=True)

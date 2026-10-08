@@ -9,7 +9,12 @@ from ..metadata import MetaData
 from ..utils.compute import compute_with_progress
 from .base import Assay
 from .normalization import (
+    check_normalization_flags,
     inverse_document_frequency,
+    norm_clr,
+    norm_dummy,
+    norm_lib_size,
+    norm_lib_size_log,
     norm_tf_idf,
     stream_document_frequency,
 )
@@ -65,7 +70,8 @@ class ATACassay(Assay):
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs: Any,
+        renormalize_subset: bool = False,
+        log_transform: bool = False,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
@@ -81,12 +87,18 @@ class ATACassay(Assay):
                       attribute table)
             feat_idx: Indices of features to be included in the normalized matrix.
                       Defaults to the complete physical feature axis.
-            **kwargs: `log_transform` must be false. `renormalize_subset` uses
-                      counts among `feat_idx` as the term-frequency denominator.
+            renormalize_subset: If True, use counts among ``feat_idx`` as the
+                                term-frequency denominator.
+            log_transform: Must be False.
 
         Returns: A chunked array (delayed matrix) containing normalized data.
         """
-        counts, state = self._fit_tf_idf(cell_idx, feat_idx, **kwargs)
+        counts, state = self._fit_tf_idf(
+            cell_idx,
+            feat_idx,
+            renormalize_subset=renormalize_subset,
+            log_transform=log_transform,
+        )
         # The method reads the fitted state from these attributes while it
         # builds the lazy result, so concurrent calls must not interleave here.
         with self._normalization_lock:
@@ -97,11 +109,30 @@ class ATACassay(Assay):
             finally:
                 self.n_term_per_doc, self.n_docs, self.n_docs_per_term = previous
 
+    def _normalization_flags(self) -> frozenset[str]:
+        """Return the normalization flags that ``normed`` applies.
+
+        ``normed`` hands every normalizer each cell's term-frequency
+        denominator in ``n_term_per_doc``, so TF-IDF and custom normalizers
+        take ``renormalize_subset``. ATAC values are never log transformed,
+        and the CLR, ``norm_dummy``, and library-size normalizers read no
+        term frequencies.
+        """
+        method = self.normMethod
+        if any(
+            method is builtin
+            for builtin in (norm_clr, norm_dummy, norm_lib_size, norm_lib_size_log)
+        ):
+            return frozenset()
+        return frozenset({"renormalize_subset"})
+
     def _fit_tf_idf(
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs: Any,
+        *,
+        renormalize_subset: bool = False,
+        log_transform: bool = False,
     ) -> tuple[ChunkedArray, tuple[np.ndarray, int, np.ndarray]]:
         """Return the selected counts and the TF-IDF state fitted on them.
 
@@ -112,19 +143,16 @@ class ATACassay(Assay):
         """
         from ..storage.identity import read_dataset_fingerprint
 
+        _, renormalize_subset = check_normalization_flags(
+            self,
+            log_transform=log_transform,
+            renormalize_subset=renormalize_subset,
+        )
         read_dataset_fingerprint(self.z)
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
             feat_idx = np.arange(self.feats.N, dtype=np.int64)
-        log_transform = kwargs.get("log_transform", False)
-        renormalize_subset = kwargs.get("renormalize_subset", False)
-        if not isinstance(log_transform, (bool, np.bool_)):
-            raise TypeError("log_transform must be a boolean")
-        if not isinstance(renormalize_subset, (bool, np.bool_)):
-            raise TypeError("renormalize_subset must be a boolean")
-        if log_transform:
-            raise ValueError("ATAC TF-IDF does not support log_transform; use False")
         cell_idx = np.asarray(cell_idx, dtype=np.int64)
         feat_idx = np.asarray(feat_idx, dtype=np.int64)
         counts: ChunkedArray = self.rawData[:, feat_idx][cell_idx, :]

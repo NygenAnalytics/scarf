@@ -1,5 +1,6 @@
 """Lazy blockwise matrix operations over NumPy and Zarr arrays."""
 
+import operator
 import warnings
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -9,7 +10,7 @@ import numpy as np
 import zarr
 from numpy.typing import DTypeLike, NDArray
 
-from ..utils.arrays import sum_and_squared_sum
+from ..utils.moments import ColumnMoments, column_moments
 from ..storage.budget import (
     DEFAULT_READ_AHEAD_BLOCKS,
     ResourceBudget,
@@ -29,11 +30,22 @@ from ._reductions import ReductionOp, _Reduction
 __all__ = ["ChunkedArray"]
 
 type Backing = np.ndarray | zarr.Array
-type BlockFn = Callable[[int, int, int], NDArray[Any]]
+type BlockFn[T] = Callable[[int, int, int], T]
 type Axis = Literal[0, 1] | None
 
 # Ufunc keywords a lazy operation can honour; others would be silently dropped.
 _UFUNC_KEYWORDS = frozenset({"dtype", "out"})
+
+
+def _mean_accumulator(dtype: np.dtype[Any]) -> np.dtype[Any]:
+    """Return the dtype that means and variances accumulate and return in.
+
+    Float64 for bool, integer, and floating-point values up to float64, so
+    integer sums cannot overflow and float32 sums keep float64 precision.
+    Promotion with float64 keeps a wider floating-point dtype and widens
+    complex values to at least complex128.
+    """
+    return np.promote_types(dtype, np.float64)
 
 
 def _reduction_axis(axis: int | None) -> Axis:
@@ -259,13 +271,13 @@ class ChunkedArray:
         """Bytes one row block holds while it is read and transformed."""
         return self._block_owned_bytes() + self._max_decode_bytes()
 
-    def _block_results(
+    def _block_results[T](
         self,
-        fn: BlockFn,
+        fn: BlockFn[T],
         nthreads: int | None,
         msg: str | None,
         result_bytes: int,
-    ) -> Iterator[NDArray[Any]]:
+    ) -> Iterator[T]:
         """Yield ``fn(index, start, end)`` for every row block in row order.
 
         ``result_bytes`` bounds what the caller retains from the results.
@@ -305,9 +317,9 @@ class ChunkedArray:
             workers = 1
         workers = min(workers, len(ranges))
 
-        def produce(item: tuple[int, tuple[int, int]]) -> NDArray[Any]:
+        def produce(item: tuple[int, tuple[int, int]]) -> T:
             index, (start, end) = item
-            return np.asarray(fn(index, start, end))
+            return fn(index, start, end)
 
         completed = 0
         for result in stream_shards(
@@ -333,17 +345,22 @@ class ChunkedArray:
                 )
             )
 
-    def _accumulate(
+    def _accumulate[T](
         self,
-        fn: BlockFn,
+        fn: BlockFn[T],
         nthreads: int | None,
         msg: str | None,
         result_bytes: int,
-    ) -> NDArray[Any]:
-        """Add block results in row order, holding one running total."""
-        total: NDArray[Any] | None = None
+        merge: Callable[[T, T], T] = operator.add,
+    ) -> T:
+        """Merge block results in row order, holding one running result.
+
+        Each block's result is merged into the running result as the next
+        rows, ``merge(running, block)``; the default adds them.
+        """
+        total: T | None = None
         for part in self._block_results(fn, nthreads, msg, result_bytes):
-            total = part if total is None else total + part
+            total = part if total is None else merge(total, part)
         assert total is not None
         return total
 
@@ -685,9 +702,11 @@ class ChunkedArray:
         )
 
     def mean(self, axis: int | None = None) -> _Reduction:
+        """Return the deferred mean, accumulated and returned in float64."""
         return _Reduction(self, "mean", _reduction_axis(axis))
 
     def var(self, axis: int | None = None) -> _Reduction:
+        """Return the deferred population variance in float64."""
         return _Reduction(self, "var", _reduction_axis(axis))
 
     def mean_and_std(
@@ -695,26 +714,41 @@ class ChunkedArray:
         axis: int = 0,
         nthreads: int | None = None,
         msg: str | None = None,
-    ) -> tuple[NDArray[Any], NDArray[Any]]:
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Compute column mean and standard deviation in one pass."""
         if _reduction_axis(axis) != 0:
             raise NotImplementedError("mean_and_std only supports axis=0")
         if self._n_rows == 0:
             missing = np.full(self._n_cols, np.nan)
             return missing, missing.copy()
+        moments = self._column_moments(nthreads, msg, collapse=False)
+        return moments.mean, np.sqrt(moments.variance())
 
-        def summarize(_: int, start: int, end: int) -> NDArray[Any]:
-            return np.asarray(sum_and_squared_sum(self._materialize_range(start, end)))
+    def _column_moments(
+        self,
+        nthreads: int | None,
+        msg: str | None,
+        *,
+        collapse: bool,
+    ) -> ColumnMoments:
+        """Merge the column moments of the row blocks in row order.
 
-        total, squared_total = self._accumulate(
+        With ``collapse``, each block's values pool into one column, giving the
+        moments of every value of the matrix without per-column arrays.
+        """
+
+        def summarize(_: int, start: int, end: int) -> ColumnMoments:
+            block = self._materialize_range(start, end)
+            return column_moments(np.reshape(block, (-1, 1)) if collapse else block)
+
+        width = 1 if collapse else self._n_cols
+        return self._accumulate(
             summarize,
             nthreads,
             msg,
-            result_bytes=2 * 2 * self._n_cols * 8,
+            result_bytes=2 * 2 * width * 8,
+            merge=ColumnMoments.merge,
         )
-        mean = total / self._n_rows
-        variance = squared_total / self._n_rows - np.square(mean)
-        return np.asarray(mean), np.asarray(np.sqrt(np.clip(variance, 0, None)))
 
     def count_nonzero(self, axis: int | None = None) -> _Reduction:
         return _Reduction(self, "count_nonzero", _reduction_axis(axis))
@@ -749,7 +783,10 @@ class ChunkedArray:
         axis: int | None,
         dtype: np.dtype[Any] | None,
     ) -> np.ndarray:
-        """Reduce a matrix without rows exactly as NumPy reduces one."""
+        """Reduce a matrix without rows exactly as NumPy reduces one.
+
+        Means and variances take the dtype they accumulate in on rows.
+        """
         empty = np.empty((0, self._n_cols), dtype=self.dtype)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -757,6 +794,9 @@ class ChunkedArray:
                 return np.asarray(np.count_nonzero(empty, axis=axis))
             if op == "sum":
                 return np.asarray(empty.sum(axis=axis, dtype=dtype))
+            if op in ("mean", "var"):
+                accumulator = _mean_accumulator(empty.dtype)
+                return np.asarray(getattr(empty, op)(axis=axis, dtype=accumulator))
             return np.asarray(getattr(empty, op)(axis=axis))
 
     def _reduce_rows(
@@ -772,6 +812,9 @@ class ChunkedArray:
                 return np.asarray(np.count_nonzero(array, axis=1))
             if op == "sum":
                 return np.asarray(array.sum(axis=1, dtype=dtype))
+            if op in ("mean", "var"):
+                accumulator = _mean_accumulator(array.dtype)
+                return np.asarray(getattr(array, op)(axis=1, dtype=accumulator))
             return np.asarray(getattr(array, op)(axis=1))
 
         result: np.ndarray | None = None
@@ -796,21 +839,21 @@ class ChunkedArray:
         msg: str | None,
         dtype: np.dtype[Any] | None,
     ) -> np.ndarray:
+        if op == "var":
+            moments = self._column_moments(nthreads, msg, collapse=True)
+            return np.asarray(moments.variance()[0])
+        if op == "mean":
+            dtype = _mean_accumulator(self.dtype)
+
         def reduce_block(_: int, start: int, end: int) -> NDArray[Any]:
             array = self._materialize_range(start, end)
             if op == "count_nonzero":
                 return np.asarray(np.count_nonzero(array))
-            if op == "var":
-                return np.asarray(sum_and_squared_sum(array, axis=None))
             return np.asarray(array.sum(dtype=dtype))
 
         total = self._accumulate(reduce_block, nthreads, msg, result_bytes=2 * 16)
-        count = self._n_rows * self._n_cols
         if op == "mean":
-            return np.asarray(total / count)
-        if op == "var":
-            mean = total[0] / count
-            return np.asarray(total[1] / count - np.square(mean))
+            return np.asarray(total / (self._n_rows * self._n_cols))
         return np.asarray(total)
 
     def _reduce_columns(
@@ -820,26 +863,25 @@ class ChunkedArray:
         msg: str | None,
         dtype: np.dtype[Any] | None,
     ) -> np.ndarray:
+        if op == "var":
+            return self._column_moments(nthreads, msg, collapse=False).variance()
+        if op == "mean":
+            dtype = _mean_accumulator(self.dtype)
+
         def reduce_block(_: int, start: int, end: int) -> NDArray[Any]:
             array = self._materialize_range(start, end)
             if op == "count_nonzero":
                 return np.asarray(np.count_nonzero(array, axis=0))
-            if op == "var":
-                return np.asarray(sum_and_squared_sum(array))
             return np.asarray(array.sum(axis=0, dtype=dtype))
 
-        width = 2 if op == "var" else 1
         total = self._accumulate(
             reduce_block,
             nthreads,
             msg,
-            result_bytes=2 * width * self._n_cols * 8,
+            result_bytes=2 * self._n_cols * 8,
         )
         if op == "mean":
             return np.asarray(total / self._n_rows)
-        if op == "var":
-            mean = total[0] / self._n_rows
-            return np.asarray(total[1] / self._n_rows - np.square(mean))
         return np.asarray(total)
 
     def __repr__(self) -> str:

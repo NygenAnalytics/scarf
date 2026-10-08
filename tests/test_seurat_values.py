@@ -91,3 +91,15 @@ def test_decode_text_values_checks_the_returned_count() -> None:
         decode_text_values(_Blocks(3, ["a", "b"]), object_path="v", max_bytes=1024)
     with pytest.raises(TypeError, match="must be a sequence"):
         decode_text_values("abc", object_path="v", max_bytes=1024)
+
+
+def test_vector_readers_reject_a_mapping_at_its_path() -> None:
+    # Slicing a dict raises KeyError since slices became hashable in Python
+    # 3.12, so the readers must recognize a mapping before they slice it.
+    mapping = {"names": ["a", "b"]}
+    with pytest.raises(MatrixSourceError, match="vector at v is a mapping"):
+        read_window(mapping, 0, 1, object_path="v")
+    with pytest.raises(MatrixSourceError, match="vector at v is a mapping"):
+        scalar_value({"only": 1}, "v")
+    with pytest.raises(MatrixSourceError, match="vector at v is a mapping"):
+        decode_text_values(mapping, object_path="v", max_bytes=1024)

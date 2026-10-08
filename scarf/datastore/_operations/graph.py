@@ -18,6 +18,8 @@ from ...embeddings.reduction import (
 )
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...graph.arguments import (
+    EMBEDDING_INITIALIZATION_ALGORITHM_VERSION,
+    HARMONY_ALGORITHM_VERSION,
     AnnIndexArguments,
     ConnectivityMapArguments,
     CustomReductionArguments,
@@ -35,6 +37,7 @@ from ...graph.distances import (
     validate_integration_source_payload,
 )
 from ...graph.feature_projection import (
+    NATIVE_COORDINATE_KINDS,
     graph_cell_selection,
     resolve_coordinate_inputs,
     resolve_native_graph_inputs,
@@ -42,18 +45,28 @@ from ...graph.feature_projection import (
 from ...graph.kinds import require_graph_kind
 from ...matrix import ChunkedArray
 from ...metadata.rows import apply_missing_mask
+from ...neighbors.index import (
+    ann_index_file_bytes,
+    ann_index_peak_bytes,
+    ann_query_block_bytes,
+)
 from ...neighbors.stages import (
     AnnIndexStage,
     BatchCorrectionStage,
     ChunkedCoordinateStream,
     CoordinateSource,
+    KMeansFitMemory,
     KMeansInitializationStage,
     NeighborQueryStage,
     ReductionTransform,
+    kmeans_fit_memory,
 )
 from ...storage.ann_index import (
+    ANN_INDEX_CHUNK_BYTES,
+    ANN_INDEX_IO_BYTES,
     load_ann_index,
     save_ann_index,
+    validate_ann_index_contract,
 )
 from ...storage.arrays import (
     create_numeric_array,
@@ -77,6 +90,7 @@ from ...storage.artifacts import (
     require_complete_artifact,
 )
 from ...storage.errors import ArtifactResolutionError
+from ...storage.finite_values import FiniteRowWriter, write_finite_array
 from ...storage.copy import (
     copy_zarr_array,
     create_or_open_staged_normed_array,
@@ -102,6 +116,7 @@ from ...storage.selections import (
 from ...utils.arrays import clean_array
 from ...utils.arguments import integer_argument
 from ...utils.logging import logger
+from ...utils.moments import ColumnMoments
 from ...utils.shutdown import shutdown_checkpoint
 
 if TYPE_CHECKING:
@@ -143,6 +158,40 @@ def _row_block(
             "them. Leave batch_size unset to follow the stored layout."
         )
     return resolved
+
+
+def _feature_scaling_statistics(
+    data_group: zarr.Group,
+    normalized_data: ChunkedArray,
+    *,
+    nthreads: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return the mean and population standard deviation of each feature.
+
+    A normalized artifact stores each feature's sum and its sum of squared
+    deviations from the mean (``feature_sum`` and ``feature_m2``), which give
+    both without reading the data. Normalized artifacts of earlier releases
+    store ``feature_squared_sum`` instead of ``feature_m2``; a variance from
+    squared sums loses precision, so their statistics, like those of an
+    artifact without sums, are streamed from the normalized data.
+    """
+    if "feature_sum" in data_group and "feature_m2" in data_group:
+        moments = ColumnMoments(
+            int(normalized_data.shape[0]),
+            np.asarray(
+                as_zarr_array(data_group["feature_sum"], name="feature_sum")[:],
+                dtype=np.float64,
+            ),
+            np.asarray(
+                as_zarr_array(data_group["feature_m2"], name="feature_m2")[:],
+                dtype=np.float64,
+            ),
+        )
+        return moments.mean, np.sqrt(moments.variance())
+    return normalized_data.mean_and_std(
+        nthreads=nthreads,
+        msg="Calculating normalization statistics",
+    )
 
 
 def _streaming_lsi_block_rows(
@@ -188,10 +237,12 @@ def _reduction_write_bytes(
     from ...storage.io_policy import StorageIoPolicy
     from ...storage.sharding import plan_dense_write
 
+    # One block of float64 coordinates, which the checked writer casts into
+    # its float32 band.
     producer_bytes = (
         data._resident_bytes()
         + 3 * data._block_task_bytes()
-        + data.chunksize[0] * dims * 4
+        + data.chunksize[0] * dims * np.dtype(np.float64).itemsize
         + transform_bytes
     )
     writer_plan = plan_dense_write(
@@ -277,6 +328,18 @@ def _read_pca_center(group: zarr.Group) -> np.ndarray:
     return values
 
 
+# The fitted Harmony state that a batch correction stores beside its corrected
+# coordinates, for Symphony reference mapping.
+_HARMONY_FIT_ARRAYS = (
+    "cluster_mass",
+    "raw_centroids",
+    "corrected_centroids",
+    "centroids",
+    "sigma",
+    "ridge",
+)
+
+
 def _sampling_fraction(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be a number")
@@ -309,6 +372,159 @@ def _validated_harmony_request(
         else integer_argument(batch_size, "batch_size", minimum=1)
     )
     return validate_harmony_parameters(harmony_params), requested_batch_size
+
+
+def _require_kmeans_fit_budget(
+    memory: KMeansFitMemory,
+    data: ChunkedArray,
+    resources: ResourceBudget,
+    *,
+    n_cells: int,
+    batch_size: int,
+) -> None:
+    """Raise MemoryError, before any coordinate is read, for a fit over budget.
+
+    The k-means fit holds ``memory.peakBytes`` at most, and the plan of each
+    of its coordinate reads needs ``memory.streamResidentBytes`` beside one
+    block of ``data``. The batch size is part of the result's identity, so a
+    fit over budget is never switched to the other mode.
+    """
+    required = max(
+        memory.peakBytes,
+        memory.streamResidentBytes + data._resident_bytes() + data._block_task_bytes(),
+    )
+    limit = int(resources.memoryBytes)
+    if required <= limit:
+        return
+    if batch_size >= n_cells:
+        raise MemoryError(
+            f"The in-memory k-means fit of {n_cells} cells needs about "
+            f"{required} bytes for their coordinates and the fit, but the "
+            f"operation limit is {limit} bytes. Pass a batch_size below "
+            f"{n_cells} to select the streamed fit, which holds a seeding "
+            "sample of the cells, the label of every cell, and one block of "
+            "coordinates at a time, or raise mem_budget. The batch size is "
+            "part of the result's identity, so the fit does not switch on its "
+            "own."
+        )
+    raise MemoryError(
+        f"The streamed k-means fit of {n_cells} cells needs about {required} "
+        "bytes for its seeding sample, the labels of every cell, and one "
+        f"block of coordinates, but the operation limit is {limit} bytes. "
+        "Lower kmeans_sampling, kmeans_batch_size, or batch_size, or raise "
+        "mem_budget."
+    )
+
+
+def _require_harmony_fit_budget(
+    data: ChunkedArray,
+    resources: ResourceBudget,
+    *,
+    n_cells: int,
+    dims: int,
+    parameters: dict[str, Any],
+    batches: pd.DataFrame,
+    nthreads: int,
+) -> int:
+    """Raise MemoryError, before any coordinate is read, for a fit over budget.
+
+    The fit holds ``harmony_peak_bytes`` of ``scarf.embeddings.harmony.api``
+    at most beside the batch labels, which the operation reads before it
+    admits the fit and holds until the fit ends, and the plan of its
+    coordinate read needs the float64 input matrix that the read fills and
+    the labels beside one block of ``data``. Returns the bytes the operation
+    holds while its coordinates are read.
+    """
+    from ...embeddings.harmony.api import harmony_cluster_count, harmony_peak_bytes
+
+    n_clusters = harmony_cluster_count(n_cells, parameters.get("nclust"))
+    # The levels of each batch column, as fit_harmony encodes them.
+    n_levels = sum(
+        int(batches[column].nunique(dropna=True)) for column in batches.columns
+    )
+    block_size = parameters.get("block_size")
+    peak = harmony_peak_bytes(
+        n_cells,
+        dims,
+        n_clusters,
+        max(1, n_levels),
+        nthreads=nthreads,
+        **({} if block_size is None else {"block_size": block_size}),
+    )
+    # The labels' object arrays and the text objects they point to.
+    labels = int(batches.memory_usage(index=True, deep=True).sum())
+    reading = n_cells * dims * np.dtype(np.float64).itemsize + labels
+    required = max(
+        peak + labels,
+        reading + data._resident_bytes() + data._block_task_bytes(),
+    )
+    limit = int(resources.memoryBytes)
+    if required > limit:
+        raise MemoryError(
+            f"Harmony needs about {required} bytes to correct {n_cells} cells "
+            f"with {dims} dimensions in {n_clusters} clusters over {n_levels} "
+            f"batch levels, {labels} of them for the batch labels, but the "
+            f"operation limit is {limit} bytes. Use fewer clusters (nclust in "
+            "harmony_params) or fewer dimensions, or raise mem_budget."
+        )
+    return reading
+
+
+def _ann_index_transfer_bytes(payload_bytes: int) -> int:
+    """Bytes that copying an ANN index payload through its temporary file holds.
+
+    ``save_ann_index`` and ``load_ann_index`` move the saved index between
+    Zarr and a temporary file in windows of ``ANN_INDEX_IO_BYTES``. A save
+    holds the window it read from the file, Zarr's copies of its chunks, and
+    their encoded bytes; a load holds the window it fills beside the one
+    before it and the chunks Zarr decodes into it. Four windows and four
+    chunks bound both, since Zarr 3.2 holds two more copies of a chunk while
+    saving it than later releases do.
+    """
+    window = min(int(payload_bytes), ANN_INDEX_IO_BYTES)
+    chunk = min(int(payload_bytes), ANN_INDEX_CHUNK_BYTES)
+    return 4 * window + 4 * chunk
+
+
+def _float32_copy_bytes(data: ChunkedArray, dims: int) -> int:
+    """Bytes of the float32 copy hnswlib makes of a block of another dtype."""
+    if np.dtype(data.dtype) == np.dtype(np.float32):
+        return 0
+    return int(data.chunksize[0]) * dims * np.dtype(np.float32).itemsize
+
+
+def _require_ann_index_budget(
+    resources: ResourceBudget,
+    *,
+    required: int,
+    index_bytes: int,
+    work: str,
+    m: int,
+    remedy: str,
+) -> None:
+    """Raise MemoryError, before the index is created or loaded, over budget."""
+    limit = int(resources.memoryBytes)
+    if required <= limit:
+        return
+    raise MemoryError(
+        f"{work} needs about {required} bytes, {index_bytes} of them for the "
+        f"hnswlib index with ann_m={m}, but the operation limit is {limit} "
+        f"bytes. {remedy}"
+    )
+
+
+def _require_integration_budget(
+    resources: ResourceBudget,
+    required: int,
+    description: str,
+) -> None:
+    """Raise MemoryError, before any graph or coordinate is read, over budget."""
+    limit = int(resources.memoryBytes)
+    if required > limit:
+        raise MemoryError(
+            f"{description} needs about {required} bytes in memory, but the "
+            f"operation limit is {limit} bytes. Raise mem_budget."
+        )
 
 
 def _requested_block_rows(
@@ -534,30 +750,71 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
                 shutil.rmtree(cache_base, ignore_errors=True)
 
-    def _coordinate_source(
+    def _coordinate_data(
         self,
         coordinates: ArtifactRef,
         *,
         batch_size: int | None,
-    ) -> tuple[CoordinateSource, int, int]:
-        lineage = resolve_coordinate_inputs(self.zw, coordinates)
-        if lineage.reduction is not None:
-            reduction_status = inspect_artifact(self.zw, lineage.reduction)
-            if reduction_status.operation == "run_pca":
-                _read_pca_center(artifact_group(self.zw, lineage.reduction))
+    ) -> ChunkedArray:
+        """Return the row blocks of a resolved coordinate artifact's data."""
         group = artifact_group(self.zw, coordinates)
         backing = as_zarr_array(group["data"], name="data")
-        data = ChunkedArray(
+        return ChunkedArray(
             backing,
             block_size=_row_block(backing, batch_size),
             nthreads=self.nthreads,
             resources=self.resources,
         )
+
+    def _coordinate_source(
+        self,
+        coordinates: ArtifactRef,
+        *,
+        batch_size: int | None,
+        resident_bytes: int = 0,
+    ) -> tuple[ChunkedCoordinateStream, int, int]:
+        """Validate coordinates and return their stream, cells, and dimensions.
+
+        ``resident_bytes`` are what the caller holds while the stream reads,
+        which the plan of each read pass reserves.
+        """
+        lineage = resolve_coordinate_inputs(self.zw, coordinates)
+        if lineage.reduction is not None:
+            reduction_status = inspect_artifact(self.zw, lineage.reduction)
+            if reduction_status.operation == "run_pca":
+                _read_pca_center(artifact_group(self.zw, lineage.reduction))
+        data = self._coordinate_data(coordinates, batch_size=batch_size)
         return (
-            ChunkedCoordinateStream(data, self.nthreads),
+            ChunkedCoordinateStream(
+                data,
+                self.nthreads,
+                resident_bytes=resident_bytes,
+            ),
             int(data.shape[0]),
             int(data.shape[1]),
         )
+
+    def _wnn_load_plan(
+        self,
+        neighbors: list[ArtifactRef],
+        coordinates: list[ArtifactRef | None],
+    ) -> list[tuple[zarr.Array, ChunkedArray]]:
+        """Return each WNN source's stored neighbor indices and coordinates.
+
+        Nothing is read: the arrays give the sizes that WNN integration
+        admits before it loads them.
+        """
+        plan: list[tuple[zarr.Array, ChunkedArray]] = []
+        for source, coordinate_ref in zip(neighbors, coordinates, strict=True):
+            # Every WNN source is a neighbors artifact with captured coordinates.
+            assert coordinate_ref is not None
+            indices = as_zarr_array(
+                artifact_group(self.zw, source)["indices"], name="indices"
+            )
+            plan.append(
+                (indices, self._coordinate_data(coordinate_ref, batch_size=None))
+            )
+        return plan
 
     def _plan_assay_artifact(
         self,
@@ -612,7 +869,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         renormalize_subset: bool | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Normalize explicit immutable cell and feature selections."""
+        """Normalize explicit immutable cell and feature selections.
+
+        Raises:
+            UnmeasuredCellsError: If the assay did not measure a selected cell.
+        """
         if not isinstance(cell_selection, ArtifactRef):
             raise TypeError("cell_selection must be an ArtifactRef")
         if not isinstance(features, ArtifactRef):
@@ -624,32 +885,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         feature_selection = features
         self._require_complete_artifact(features, "feature_selection", assay=assay_name)
         self._require_complete_artifact(cell_selection, "cell_selection")
-        from ...assay import ATACassay
+        from ...assay.normalization import resolve_normalization_params
 
-        if isinstance(assay, ATACassay):
-            if log_transform is None:
-                log_transform = False
-            elif not isinstance(log_transform, bool | np.bool_):
-                raise TypeError("log_transform must be a boolean")
-            if log_transform:
-                raise ValueError(
-                    "ATAC TF-IDF does not support log_transform; use False"
-                )
-            if renormalize_subset is None:
-                renormalize_subset = False
-            elif not isinstance(renormalize_subset, bool | np.bool_):
-                raise TypeError("renormalize_subset must be a boolean")
-        else:
-            if log_transform is None:
-                log_transform = True
-            elif not isinstance(log_transform, bool | np.bool_):
-                raise TypeError("log_transform must be a boolean")
-            if renormalize_subset is None:
-                renormalize_subset = True
-            elif not isinstance(renormalize_subset, bool | np.bool_):
-                raise TypeError("renormalize_subset must be a boolean")
-        log_transform = bool(log_transform)
-        renormalize_subset = bool(renormalize_subset)
+        flags = resolve_normalization_params(
+            assay,
+            {"log_transform": log_transform, "renormalize_subset": renormalize_subset},
+            caller="run_normalization",
+            default=True,
+        )
+        log_transform = flags["log_transform"]
+        renormalize_subset = flags["renormalize_subset"]
         normalization_method = assay.normMethod
         method_qualname = str(getattr(normalization_method, "__qualname__", ""))
         dynamic = "<locals>" in method_qualname or "<lambda>" in method_qualname
@@ -658,6 +903,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "Dynamic normalization callables must define "
                 "artifact_identity for provenance"
             )
+        self._require_measured_cells(
+            assay_name, cell_selection, operation="run_normalization"
+        )
         raw_size_factor = getattr(assay, "sf", None)
         size_factor = (
             float(cast(int | float, raw_size_factor))
@@ -685,9 +933,17 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         def valid_shape(_ref: ArtifactRef, group: zarr.Group) -> bool:
             data = as_zarr_array(group["data"], name="data")
+            # Normalized artifacts of earlier releases hold feature_squared_sum
+            # instead of feature_m2. They stay reusable, and feature scaling
+            # streams their statistics.
+            summaries = (
+                ("feature_sum", "feature_m2")
+                if "feature_m2" in group
+                else ("feature_sum",)
+            )
             return data.shape == (n_cells, n_features) and all(
                 as_zarr_array(group[name], name=name).shape == (data.shape[1],)
-                for name in ("feature_sum", "feature_squared_sum")
+                for name in summaries
             )
 
         planned = self._plan_assay_artifact(
@@ -701,11 +957,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 ),
                 ArrayRequirement(
                     "feature_sum",
-                    shape=(None,),
-                    dtype=np.float64,
-                ),
-                ArrayRequirement(
-                    "feature_squared_sum",
                     shape=(None,),
                     dtype=np.float64,
                 ),
@@ -969,7 +1220,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if method == "pca":
             required_arrays += (
-                ArrayRequirement("center", shape=(n_features,), dtype=np.float64),
+                ArrayRequirement(
+                    "center",
+                    shape=(n_features,),
+                    dtype=np.float64,
+                ),
             )
         planned = self._plan_assay_artifact(
             assay_name,
@@ -1033,32 +1288,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
             else:
                 if enabled_scaling:
-                    if (
-                        "feature_sum" in data_group
-                        and "feature_squared_sum" in data_group
-                    ):
-                        total = np.asarray(
-                            as_zarr_array(
-                                data_group["feature_sum"],
-                                name="feature_sum",
-                            )[:],
-                            dtype=np.float64,
-                        )
-                        squared_total = np.asarray(
-                            as_zarr_array(
-                                data_group["feature_squared_sum"],
-                                name="feature_squared_sum",
-                            )[:],
-                            dtype=np.float64,
-                        )
-                        mu_raw = total / n_cells
-                        variance = squared_total / n_cells - np.square(mu_raw)
-                        sigma_raw = np.sqrt(np.clip(variance, 0, None))
-                    else:
-                        mu_raw, sigma_raw = normalized_data.mean_and_std(
-                            nthreads=self.nthreads,
-                            msg="Calculating normalization statistics",
-                        )
+                    mu_raw, sigma_raw = _feature_scaling_statistics(
+                        data_group, normalized_data, nthreads=self.nthreads
+                    )
                     mu = clean_array(mu_raw)
                     sigma = clean_array(sigma_raw, 1)
                 else:
@@ -1121,7 +1353,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         "f8",
                         (n_features,),
                     )
-                    center_array[:] = transform.center
+                    write_finite_array(
+                        center_array,
+                        transform.center,
+                        operation=arguments.operation,
+                    )
                 output = create_zarr_dataset(
                     reduction_group,
                     "loadings",
@@ -1129,7 +1365,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "f8",
                     loadings.shape,
                 )
-                output[:, :] = loadings
+                write_finite_array(output, loadings, operation=arguments.operation)
                 scores = create_numeric_array(
                     reduction_group,
                     "data",
@@ -1137,6 +1373,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
 
                 def score_blocks() -> Iterator[np.ndarray]:
+                    # The checked writer casts the coordinates to float32.
                     for block in normalized_data._stream_blocks(
                         nthreads=self.nthreads,
                         msg="Calculating reduced coordinates",
@@ -1146,10 +1383,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         + producer_bytes
                         - normalized_data._block_task_bytes(),
                     ):
-                        yield np.asarray(
-                            transform.transform(block),
-                            dtype=np.float32,
-                        )
+                        yield transform.transform(block)
 
                 write_dense_from_row_batches(
                     scores,
@@ -1159,6 +1393,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     resources=self.resources,
                     io=self.storageIo,
                     producerReserveBytes=producer_bytes,
+                    requireFinite=True,
+                    operation=arguments.operation,
                 )
         if show_elbow_plot and method == "pca":
             from ...plotting import elbow
@@ -1346,7 +1582,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Snapshot live batch columns, then fit or reuse Harmony correction."""
+        """Snapshot live batch columns, then fit or reuse Harmony correction.
+
+        Raises:
+            MemoryError: If the fit exceeds the memory budget.
+        """
         # Validate before the snapshot is written; the fit validates again
         # because the pipeline calls it with its own snapshot.
         self._resolve_harmony_reduction(reduction)
@@ -1374,6 +1614,19 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     ) -> tuple[str, ArtifactRef]:
         if not isinstance(reduction, ArtifactRef):
             raise TypeError("reduction must be an ArtifactRef")
+        if reduction.kind != "reduction":
+            # Normalized values are graph coordinates too, but Harmony
+            # corrects reduced coordinates only.
+            raise ValueError(
+                "Harmony corrects reduction coordinates, such as those of "
+                f"run_pca, but got a {reduction.kind} artifact"
+                + (
+                    "; normalized values cannot be corrected, so run run_pca "
+                    "on them first"
+                    if reduction.kind == "normalized"
+                    else ""
+                )
+            )
         # This validates the reduction and the selections of its normalized
         # input.
         resolve_coordinate_inputs(self.zw, reduction)
@@ -1475,7 +1728,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_snapshot=batch_snapshot,
             batch_columns=tuple(batch_columns),
             harmony_parameters=resolved_harmony_params,
-            algorithm_version="centroid_snapshot_v2",
+            algorithm_version=HARMONY_ALGORITHM_VERSION,
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
         )
@@ -1488,19 +1741,32 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     shape=(n_cells, dims),
                     dtype=np.float32,
                 ),
-                ArrayRequirement("cluster_mass", dtype=np.float64),
-                ArrayRequirement("raw_centroids", dtype=np.float64),
-                ArrayRequirement("corrected_centroids", dtype=np.float64),
-                ArrayRequirement("centroids", dtype=np.float64),
-                ArrayRequirement("sigma", dtype=np.float64),
-                ArrayRequirement("ridge", dtype=np.float64),
+                *(
+                    ArrayRequirement(name, dtype=np.float64)
+                    for name in _HARMONY_FIT_ARRAYS
+                ),
             ),
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
             self._require_writable("run_harmony")
+            # Admit the fit before it reads a coordinate. The read reserves
+            # the float64 input matrix that it fills.
+            reading = _require_harmony_fit_budget(
+                source.data,
+                self.resources,
+                n_cells=n_cells,
+                dims=dims,
+                parameters=resolved_harmony_params,
+                batches=batches,
+                nthreads=self.nthreads,
+            )
             correction = BatchCorrectionStage(
-                stream=source,
+                stream=ChunkedCoordinateStream(
+                    source.data,
+                    self.nthreads,
+                    resident_bytes=reading,
+                ),
                 n_cells=n_cells,
                 dims=dims,
                 batch_size=effective_batch_size,
@@ -1523,6 +1789,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 result.corrected.T,
                 result.assignments,
             )
+            fit_arrays = {
+                "cluster_mass": cluster_mass,
+                "raw_centroids": raw_centroids,
+                "corrected_centroids": corrected_centroids,
+                "centroids": result.centroids,
+                "sigma": result.sigma,
+                "ridge": result.ridge,
+            }
             with artifact_transaction(self.zw, planned) as group:
                 output = create_numeric_array(
                     group,
@@ -1536,23 +1810,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         fill_value=0.0,
                     ),
                 )
-                for start, stop in iter_shard_row_slices(
-                    n_cells,
-                    array_shard_rows(output),
-                ):
-                    shutdown_checkpoint()
-                    output[start:stop, :] = np.asarray(
-                        result.corrected[:, start:stop].T,
-                        dtype=np.float32,
-                    )
-                for name, values in (
-                    ("cluster_mass", cluster_mass),
-                    ("raw_centroids", raw_centroids),
-                    ("corrected_centroids", corrected_centroids),
-                    ("centroids", result.centroids),
-                    ("sigma", result.sigma),
-                    ("ridge", result.ridge),
-                ):
+                with FiniteRowWriter(output, operation=arguments.operation) as rows:
+                    for start, stop in iter_shard_row_slices(
+                        n_cells,
+                        array_shard_rows(output),
+                    ):
+                        shutdown_checkpoint()
+                        # The checked writer casts the rows to float32.
+                        rows.write(result.corrected[:, start:stop].T)
+                for name in _HARMONY_FIT_ARRAYS:
+                    values = fit_arrays[name]
                     result_array = create_zarr_dataset(
                         group,
                         name,
@@ -1560,7 +1827,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         "f8",
                         values.shape,
                     )
-                    result_array[...] = values
+                    write_finite_array(
+                        result_array,
+                        values,
+                        operation=arguments.operation,
+                    )
+                # The levels in the design order of the fit, one list per
+                # batch column, so that they pair with the per-level
+                # parameters and the ridge diagonal. Symphony references copy
+                # this record.
                 group.attrs["batch_levels"] = [
                     list(levels) for levels in result.batch_levels
                 ]
@@ -1580,7 +1855,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool,
         kmeans_sampling: float = 0.1,
         kmeans_batch_size: int = 10_000,
-        algorithm_version: str = "minibatch_kmeans_v3",
     ) -> ArtifactRef:
         if coordinates.assay is None:
             raise ValueError("Coordinate artifact has no assay")
@@ -1626,7 +1900,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=effective_batch_size,
             kmeans_sampling=resolved_kmeans_sampling,
             kmeans_batch_size=effective_kmeans_batch_size,
-            algorithm_version=algorithm_version,
+            algorithm_version=EMBEDDING_INITIALIZATION_ALGORITHM_VERSION,
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
@@ -1648,8 +1922,32 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if not planned.reused:
             self._require_writable("build_embedding_initialization")
+            # Admit the fit before it reads a coordinate. Its reads reserve
+            # what it holds while they run.
+            memory = kmeans_fit_memory(
+                n_rows=n_cells,
+                dims=coordinate_dims,
+                dtype=stream.data.dtype,
+                batch_size=effective_batch_size,
+                n_clusters=effective_clusters,
+                block_rows=int(stream.data.chunksize[0]),
+                nthreads=self.nthreads,
+                kmeans_sampling=resolved_kmeans_sampling,
+                kmeans_batch_size=effective_kmeans_batch_size,
+            )
+            _require_kmeans_fit_budget(
+                memory,
+                stream.data,
+                self.resources,
+                n_cells=n_cells,
+                batch_size=effective_batch_size,
+            )
             initialization = KMeansInitializationStage.fit(
-                stream=stream,
+                stream=ChunkedCoordinateStream(
+                    stream.data,
+                    self.nthreads,
+                    resident_bytes=memory.streamResidentBytes,
+                ),
                 n_rows=n_cells,
                 batch_size=effective_batch_size,
                 n_clusters=effective_clusters,
@@ -1666,7 +1964,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     "f8",
                     initialization.model.cluster_centers_.shape,
                 )
-                centers[:, :] = initialization.model.cluster_centers_
+                write_finite_array(
+                    centers,
+                    initialization.model.cluster_centers_,
+                    operation=arguments.operation,
+                )
                 labels = create_zarr_dataset(
                     group,
                     "cluster_labels",
@@ -1697,7 +1999,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Pass the returned reference explicitly to an embedding operation.
 
         Args:
-            coordinates: Reduction or batch-correction artifact to cluster.
+            coordinates: Coordinate artifact to cluster, such as a reduction.
             n_centroids: Requested number of K-means centroids.
             rand_state: K-means random seed.
             batch_size: Number of cells processed per block.
@@ -1707,6 +2009,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         Returns:
             Reference to the embedding-initialization artifact.
+
+        Raises:
+            MemoryError: If the fit exceeds the memory budget.
         """
         if not isinstance(coordinates, ArtifactRef):
             raise TypeError("coordinates must be an ArtifactRef")
@@ -1733,7 +2038,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Build or reuse an approximate nearest-neighbor index."""
+        """Build or reuse an approximate nearest-neighbor index.
+
+        Raises:
+            MemoryError: If the index exceeds the memory budget.
+        """
         if not isinstance(coordinates, ArtifactRef):
             raise TypeError("coordinates must be an ArtifactRef")
         if coordinates.assay is None:
@@ -1753,13 +2062,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if batch_size is None
             else integer_argument(batch_size, "batch_size", minimum=1)
         )
-        if coordinates.kind not in {
-            "reduction",
-            "batch_correction",
-            "imported_coordinates",
-        }:
+        if coordinates.kind not in NATIVE_COORDINATE_KINDS:
             raise ValueError(
-                "Coordinates must reference reduction, batch_correction, or imported_coordinates"
+                "Coordinates must reference reduction, batch_correction, "
+                "imported_coordinates, or normalized"
             )
         self._ensure_dataset_fingerprint(coordinates.assay)
         coordinate_source, n_cells, dims = self._coordinate_source(
@@ -1771,7 +2077,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             resolved_batch_size,
             n_cells,
         )
-        parallel_threads = self.nthreads if ann_parallel else None
+        index_threads = self.nthreads if ann_parallel else 1
         arguments = AnnIndexArguments(
             coordinates=coordinates,
             ann_metric=ann_metric,
@@ -1780,7 +2086,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ann_m=resolved_ann_m,
             rand_state=resolved_rand_state,
             ann_parallel=ann_parallel,
-            parallel_threads=parallel_threads,
+            parallel_threads=None,
+            nthreads=index_threads,
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
         )
@@ -1789,8 +2096,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             _ref: ArtifactRef,
             group: zarr.Group,
         ) -> bool:
-            from ...storage.ann_index import validate_ann_index_contract
-
             try:
                 validate_ann_index_contract(
                     group,
@@ -1811,8 +2116,37 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if not planned.reused:
             self._require_writable("build_ann_index")
+            # Admit the index before it is created. It is complete while the
+            # last blocks are added and while it is saved through a temporary
+            # file, so the reads reserve all of it.
+            index_bytes = ann_index_peak_bytes(
+                n_cells, dims, resolved_ann_m, nthreads=index_threads
+            )
+            data = coordinate_source.data
+            copy_bytes = _float32_copy_bytes(data, dims)
+            reading = data._resident_bytes() + data._block_task_bytes() + copy_bytes
+            saving = _ann_index_transfer_bytes(
+                ann_index_file_bytes(n_cells, dims, resolved_ann_m)
+            )
+            _require_ann_index_budget(
+                self.resources,
+                required=index_bytes + max(reading, saving),
+                index_bytes=index_bytes,
+                work=(
+                    f"Building the ANN index of {n_cells} cells with {dims} dimensions"
+                ),
+                m=resolved_ann_m,
+                remedy=(
+                    "Lower ann_m, index fewer dimensions, such as a PCA "
+                    "reduction instead of normalized values, or raise mem_budget."
+                ),
+            )
             ann_idx = AnnIndexStage.fit(
-                coordinates=coordinate_source,
+                coordinates=ChunkedCoordinateStream(
+                    data,
+                    self.nthreads,
+                    resident_bytes=index_bytes + copy_bytes,
+                ),
                 metric=ann_metric,
                 dims=dims,
                 n_cells=n_cells,
@@ -1820,7 +2154,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 ef=resolved_ann_ef,
                 m=resolved_ann_m,
                 rand_state=resolved_rand_state,
-                nthreads=(self.nthreads if ann_parallel else 1),
+                nthreads=index_threads,
             )
             with artifact_transaction(self.zw, planned) as group:
                 save_ann_index(
@@ -1844,7 +2178,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None = None,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        """Query an ANN artifact and persist compact neighbor matrices."""
+        """Query an ANN artifact and persist compact neighbor matrices.
+
+        Raises:
+            MemoryError: If the query exceeds the memory budget.
+        """
         if not isinstance(ann_index, ArtifactRef):
             raise TypeError("ann_index must be an ArtifactRef")
         ann_ref = ann_index
@@ -1888,13 +2226,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 "ANN artifact has no valid ann_ef search depth. Re-run build_ann_index."
             )
-        if "parallel_threads" not in ann_parameters:
+        ann_parallel = ann_parameters.get("ann_parallel")
+        if not isinstance(ann_parallel, bool):
             raise ValueError(
-                "ANN artifact has no parallel_threads record. Re-run build_ann_index."
+                "ANN artifact has no ann_parallel record. Re-run build_ann_index."
             )
-        from ...storage.ann_index import validate_ann_index_contract
-
-        validate_ann_index_contract(
+        query_threads = self.nthreads if ann_parallel else 1
+        payload = validate_ann_index_contract(
             artifact_group(self.zw, ann_ref),
             str(ann_metric),
             dims,
@@ -1905,6 +2243,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             coordinates=stored_coordinates,
             k=effective_k,
             distance_metric=str(ann_metric),
+            nthreads=query_threads,
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
         )
@@ -1927,6 +2266,46 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if not planned.reused:
             self._require_writable("query_neighbors")
+            ann_m = ann_parameters.get("ann_m")
+            if isinstance(ann_m, bool) or not isinstance(ann_m, int) or ann_m < 2:
+                raise ValueError(
+                    "ANN artifact has no valid ann_m. Re-run build_ann_index."
+                )
+            # Admit the query before the index is loaded. The index, the
+            # neighbor results, and one block's query results are held while
+            # the coordinates are read, so the reads reserve them.
+            index_bytes = ann_index_peak_bytes(
+                n_cells, dims, ann_m, nthreads=query_threads
+            )
+            data = coordinate_source.data
+            scratch = ann_query_block_bytes(
+                int(data.chunksize[0]), effective_k, ef=ann_ef, nthreads=query_threads
+            ) + _float32_copy_bytes(data, dims)
+            # The uint32 indices and float32 distances of every cell.
+            results = n_cells * effective_k * 8
+            reading = data._resident_bytes() + data._block_task_bytes() + scratch
+            loading = _ann_index_transfer_bytes(int(payload.source.shape[0]))
+            _require_ann_index_budget(
+                self.resources,
+                required=max(
+                    index_bytes + results + max(reading, loading),
+                    # The write, after the index is released, holds the
+                    # results and up to twice their size while Zarr encodes
+                    # them.
+                    3 * results,
+                ),
+                index_bytes=index_bytes,
+                work=(
+                    f"Querying {effective_k} neighbors of {n_cells} cells with "
+                    f"{dims} dimensions"
+                ),
+                m=ann_m,
+                remedy=(
+                    "Raise mem_budget, or build the index on fewer dimensions, "
+                    "such as a PCA reduction instead of normalized values, or "
+                    "with a lower ann_m."
+                ),
+            )
             ann_idx = self._resolve_ann_index(
                 ann_ref,
                 str(ann_metric),
@@ -1936,7 +2315,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ann_idx = AnnIndexStage.configure(
                 ann_idx,
                 ef=ann_ef,
-                threads=int(ann_parameters["parallel_threads"] or 1),
+                threads=query_threads,
             )
             query = NeighborQueryStage(
                 ann_idx,
@@ -1947,14 +2326,20 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             distances = np.empty((n_cells, effective_k), dtype=np.float32)
             start = 0
             missed_self_hits = 0
-            for block in coordinate_source.iter_coordinate_blocks(
-                "Identifying neighbors"
-            ):
+            stream = ChunkedCoordinateStream(
+                data,
+                self.nthreads,
+                resident_bytes=index_bytes + results + scratch,
+            )
+            for block in stream.iter_coordinate_blocks("Identifying neighbors"):
                 stop = start + len(block)
                 result = query.query(
                     block,
                     self_indices=np.arange(start, stop),
                 )
+                # A read plan reserves only the blocks in flight, so no block
+                # is held while the stream reads the next.
+                del block
                 block_indices, block_distances, missed = cast(
                     tuple[np.ndarray, np.ndarray, int],
                     result,
@@ -1965,10 +2350,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 distances[start:stop, :] = block_distances
                 missed_self_hits += missed
                 start = stop
+                del result, block_indices, block_distances
             if start != n_cells:
                 raise ValueError(
                     f"Coordinate source contains {start} rows, expected {n_cells}"
                 )
+            # The index is released before the results are written.
+            del query, ann_idx
             with artifact_transaction(self.zw, planned) as group:
                 array_profile = resolve_storage_profile(group.store)
                 zarr_format = _group_zarr_format(group)
@@ -1996,7 +2384,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     ),
                 )
                 indices_array[:, :] = indices
-                distances_array[:, :] = distances
+                write_finite_array(
+                    distances_array,
+                    distances,
+                    operation=arguments.operation,
+                )
                 group.attrs["n_cells"] = n_cells
                 group.attrs["n_neighbors"] = effective_k
                 group.attrs["self_hit_rate"] = (
@@ -2106,7 +2498,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     ),
                 )
                 edges[:, :] = edge_values
-                weights[:] = weight_values
+                write_finite_array(
+                    weights,
+                    weight_values,
+                    operation=arguments.operation,
+                )
                 output.attrs["n_cells"] = n_cells
                 output.attrs["n_neighbors"] = n_neighbors
         action = "Reused" if planned.reused else "Stored"
@@ -2217,10 +2613,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             Reference to the integrated-graph artifact. Pass it to `run_umap`,
             `run_tsne`, or the clustering methods as their ``graph`` argument.
 
+        Raises:
+            MemoryError: If the integration exceeds the memory budget.
+            UnmeasuredCellsError: If a source assay did not measure a selected cell.
+
         WNN modality weights remain in the returned immutable artifact.
         """
-        from ...neighbors.graph import merge_graphs
-        from ...neighbors.integration import _wnn_integration_many
+        from ...neighbors.graph import merge_graphs, snn_merge_peak_bytes
+        from ...neighbors.integration import _wnn_integration_many, wnn_peak_bytes
 
         sources = list(sources)
         if method not in {"snn", "wnn"}:
@@ -2240,11 +2640,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             n_cells: int,
         ) -> np.ndarray:
             # The blocks are row bands of one stored array, so they share its
-            # width and never exceed its rows.
+            # width and never exceed its rows. A read plan reserves only the
+            # blocks in flight, so no block is held while the next is read.
             coordinates: np.ndarray | None = None
             start = 0
             for values in blocks:
                 block = np.asarray(values)
+                del values
                 if block.ndim != 2:
                     raise ValueError("WNN coordinate blocks must be matrices")
                 if coordinates is None:
@@ -2255,6 +2657,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 stop = start + len(block)
                 coordinates[start:stop] = block
                 start = stop
+                del block
             if coordinates is None or start != n_cells:
                 raise ValueError("WNN coordinate stream did not cover every cell")
             return coordinates
@@ -2290,8 +2693,19 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "reduction",
                 "batch_correction",
             }:
+                # WNN weighs each assay by how well its reduced coordinates
+                # predict a cell; a graph on normalized values, as a pipeline
+                # run with pca_dims=0 builds, has none.
+                built_on = (
+                    "normalized values"
+                    if ancestry.coordinates.kind == "normalized"
+                    else ancestry.coordinates.kind
+                )
                 raise ArtifactResolutionError(
-                    "WNN coordinates must be reduction or batch_correction",
+                    "WNN coordinates must be reduction or batch_correction, but "
+                    f"the {assay_name} neighbors were built on {built_on}; build "
+                    "them on a reduction such as run_pca, or integrate "
+                    "connectivity maps with method='snn'",
                     code="wrong_kind",
                     context={
                         "assay": assay_name,
@@ -2335,6 +2749,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
         if len(set(assays)) != len(assays):
             raise ValueError("Assay integration requires unique assay sources")
+        for assay_name in assays:
+            # Two or more sources share the selection, so it is set.
+            assert shared_selection is not None
+            self._require_measured_cells(
+                assay_name,
+                shared_selection,
+                operation="integrate_assays",
+                remedy="graph",
+            )
         source_inputs["cell_selection"] = shared_selection
         parameters: dict[str, Any] = {"method": method, "assays": assays}
         required_arrays: list[ArrayRequirement] = [
@@ -2365,10 +2788,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if integrated_plan.reused:
             return integrated_plan.ref
         self._require_writable("integrate_assays")
+        # Every source covers the shared selection's cells.
+        assert shared_source_n_cells is not None
+        source_cells = shared_source_n_cells
 
         def load_wnn_inputs(
             index: int,
             assay_name: str,
+            resident_bytes: int,
         ) -> tuple[np.ndarray, NDArray[Any]]:
             neighbors = captured_sources[index]
             coordinates_ref = captured_coordinates[index]
@@ -2381,16 +2808,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     name="indices",
                 )[:]
             )
+            # The read reserves what the integration already holds.
             coordinate_source, n_cells, _ = self._coordinate_source(
                 coordinates_ref,
                 batch_size=None,
+                resident_bytes=resident_bytes,
             )
             coordinates = materialize_coordinate_blocks(
-                (
-                    np.asarray(block)
-                    for block in coordinate_source.iter_coordinate_blocks(
-                        f"Loading {assay_name} coordinates",
-                    )
+                coordinate_source.iter_coordinate_blocks(
+                    f"Loading {assay_name} coordinates",
                 ),
                 n_cells,
             )
@@ -2403,6 +2829,29 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         modality_weights: np.ndarray | None = None
         if method == "snn":
+            neighbor_counts = [
+                self._get_graph_ncells_k(self._graph_location(source))[1]
+                for source in captured_sources
+            ]
+            # Loaded graphs use int32 CSR indices unless their edges or
+            # cells exceed its range.
+            index_itemsize = np.dtype(
+                np.int32
+                if max(neighbor_counts) * source_cells <= np.iinfo(np.int32).max
+                else np.int64
+            ).itemsize
+            _require_integration_budget(
+                self.resources,
+                snn_merge_peak_bytes(
+                    source_cells,
+                    max(neighbor_counts),
+                    len(captured_sources),
+                    index_itemsize=index_itemsize,
+                    weight_itemsize=np.dtype(np.float32).itemsize,
+                ),
+                f"SNN integration of {len(captured_sources)} graphs over "
+                f"{source_cells} cells with {max(neighbor_counts)} neighbors each",
+            )
             graphs = [
                 self._load_graph_artifact(
                     source,
@@ -2413,9 +2862,53 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 for source in captured_sources
             ]
             merged_graph = merge_graphs(graphs)
+            # The sources are released before the integrated graph is written.
+            del graphs
         else:
+            loads = self._wnn_load_plan(captured_sources, captured_coordinates)
+            index_arrays = [indices for indices, _data in loads]
+            coordinate_data = [data for _indices, data in loads]
+            neighbor_counts = [int(indices.shape[1]) for indices in index_arrays]
+            dims = [int(data.shape[1]) for data in coordinate_data]
+            loaded = 0
+            resident: list[int] = []
+            reading = 0
+            for indices, data in loads:
+                # Each read holds the sources loaded before it, this source's
+                # neighbors, and the coordinate matrix it fills.
+                held = (
+                    loaded
+                    + indices.nbytes
+                    + int(data.shape[0]) * int(data.shape[1]) * data.dtype.itemsize
+                )
+                resident.append(held)
+                reading = max(
+                    reading,
+                    held + data._resident_bytes() + data._block_task_bytes(),
+                )
+                loaded = held
+            _require_integration_budget(
+                self.resources,
+                max(
+                    reading,
+                    wnn_peak_bytes(
+                        source_cells,
+                        neighbor_counts,
+                        dims,
+                        index_itemsize=max(
+                            np.dtype(indices.dtype).itemsize for indices in index_arrays
+                        ),
+                        coordinate_itemsize=max(
+                            np.dtype(data.dtype).itemsize for data in coordinate_data
+                        ),
+                    ),
+                ),
+                f"WNN integration of {len(assays)} assays over {source_cells} "
+                f"cells with {neighbor_counts} neighbors and {dims} dimensions",
+            )
+            del loads, index_arrays, coordinate_data
             modalities = [
-                (assay, *load_wnn_inputs(index, assay))
+                (assay, *load_wnn_inputs(index, assay, resident[index]))
                 for index, assay in enumerate(assays)
             ]
             merged_graph, modality_weights = _wnn_integration_many(
@@ -2423,6 +2916,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 self.nthreads,
                 l2_normalize=l2_normalize,
             )
+            # The sources are released before the integrated graph is written.
+            del modalities
         n_cells = merged_graph.shape[0]
         n_neighbors = int(merged_graph.size / n_cells)
 
@@ -2449,7 +2944,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
             zge[:, 0] = merged_graph.row
             zge[:, 1] = merged_graph.col
-            zgw[:] = merged_graph.data
+            write_finite_array(zgw, merged_graph.data, operation="integrate_assays")
             if modality_weights is not None:
                 stored_modality_weights = create_zarr_dataset(
                     store,
@@ -2458,5 +2953,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     np.float32,
                     modality_weights.shape,
                 )
-                stored_modality_weights[:, :] = modality_weights
+                write_finite_array(
+                    stored_modality_weights,
+                    modality_weights,
+                    operation="integrate_assays",
+                )
         return integrated_plan.ref

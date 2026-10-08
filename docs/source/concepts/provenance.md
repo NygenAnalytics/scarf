@@ -29,6 +29,17 @@ flowchart LR
 The branches share counts, selections, and normalization. Their reductions and downstream graphs
 remain distinct because those inputs differ. No branch becomes an implicit current result.
 
+When a Scarf release changes what an operation computes for the same parameters and inputs, it
+gives the operation a new revision, and provenance records it. A stored result of an older revision
+is then never reused: Scarf computes the result again and logs which stored result it replaced and
+why. The older result stays listable, loadable, and traceable, and lineage reports mark it as stale.
+Results built from it keep their own current revision, but once the older result is computed
+again, they have a new input and are computed again too.
+Marker tables of releases before 1.0.0 are the exception: their `fold_change` column held
+sentinels, so `get_markers`, `export_markers_to_csv`, and `marker_heatmap` refuse them and name
+the `run_marker_search` call that recomputes them.
+{doc}`../developers/operation_revisions` explains the policy behind revisions.
+
 Inputs that could change are frozen before a result uses them. Label transfer, for example, copies
 the reference labels it reads into the query datastore, so the saved query labels keep pointing at
 the exact annotations, threshold, and projection that produced them, even after the reference

@@ -3223,6 +3223,7 @@ class SeuratReader:
                     layer=layer_name,
                 )
         placements: list[LayerPlacement] = []
+        selected_positions: list[NDArray[np.int64]] = []
         for layer_name, layer_value in count_layers:
             layer_path = f"{object_path}/layers/{layer_name}"
             if isinstance(layer_value, _CachedLayerSpec):
@@ -3285,6 +3286,26 @@ class SeuratReader:
                     name=layer_name,
                 )
             )
+            selected_positions.append(layer_global_positions)
+        # The assay measures exactly the cells of its selected count layers; a
+        # cell that only an unselected layer holds is not a member.
+        resident_index_bytes += len(self.cellIds) + np.dtype(np.int64).itemsize * min(
+            len(self.cellIds),
+            sum(int(positions.size) for positions in selected_positions),
+        )
+        if resident_index_bytes * 4 > self._maximumIndexBytes:
+            raise _error(
+                "Assay5 stitching indexes exceed their memory budget",
+                object_path=f"{object_path}/layers",
+                code="metadata_index_limit",
+                requiredBytes=resident_index_bytes * 4,
+                maximumBytes=self._maximumIndexBytes,
+            )
+        measured = np.zeros(len(self.cellIds), dtype=np.bool_)
+        for positions in selected_positions:
+            measured[positions] = True
+        member_positions = np.flatnonzero(measured).astype(np.int64, copy=False)
+        del measured, selected_positions
         try:
             stitched = LayerStitchMatrixSource(
                 placements,
@@ -3393,7 +3414,7 @@ class SeuratReader:
             cellIds=self.cellIds,
             cellMembership=SeuratMembership(
                 len(self.cellIds),
-                global_positions,
+                member_positions,
             ),
             featureMetadata=feature_metadata,
             notices=tuple(notices),

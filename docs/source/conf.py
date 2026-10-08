@@ -154,6 +154,7 @@ nitpick_ignore = [
     ("py:class", "numpy.dtype"),
     ("py:class", "pandas.DataFrame"),
     ("py:class", "pandas.Series"),
+    ("py:class", "pandas.api.extensions.ExtensionArray"),
     ("py:class", "pandas.core.frame.DataFrame"),
     ("py:class", "pandas.core.series.Series"),
     ("py:class", "scipy.sparse._csr.csr_matrix"),

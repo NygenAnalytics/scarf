@@ -1,5 +1,5 @@
-import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import numpy as np
 import zarr
@@ -70,7 +70,14 @@ def _copy_metadata_array(
     profile: StorageProfile | None = None,
     row_indices: np.ndarray | None = None,
     missing: zarr.Array | None = None,
+    copy_attributes: bool = True,
 ) -> None:
+    """Stream-copy one metadata column, its rows ``row_indices`` or all.
+
+    With ``copy_attributes``, the attributes in ``COLUMN_METADATA_ATTRIBUTES``
+    that ``src`` carries, such as the role and assay of a membership column,
+    are part of the copy's first metadata write.
+    """
     if src.ndim != 1:
         raise ValueError(
             f"Metadata column {name!r} has {src.ndim} dimensions; metadata columns "
@@ -106,7 +113,12 @@ def _copy_metadata_array(
                 missing=None if mask is None else np.asarray(mask, dtype=bool),
             )
 
-    target = create_streamed_metadata_column(
+    attributes = (
+        {key: src.attrs[key] for key in COLUMN_METADATA_ATTRIBUTES if key in src.attrs}
+        if copy_attributes
+        else {}
+    )
+    create_streamed_metadata_column(
         dst,
         name,
         dtype=dtype,
@@ -116,10 +128,8 @@ def _copy_metadata_array(
         profile=profile,
         blocks=blocks(),
         hasMissing=missing is not None,
+        attributes=attributes or None,
     )
-    for attribute in COLUMN_METADATA_ATTRIBUTES:
-        if attribute in src.attrs:
-            target.attrs[attribute] = src.attrs[attribute]
 
 
 def copy_metadata_array(
@@ -137,11 +147,9 @@ def copy_metadata_array(
         name,
         overwrite=overwrite,
         profile=profile,
+        copy_attributes=False,
     )
-    target = as_zarr_array(dst[name], name=name)
-    for attribute in tuple(target.attrs):
-        del target.attrs[attribute]
-    return target
+    return as_zarr_array(dst[name], name=name)
 
 
 def copy_zarr_group_tree(
@@ -207,12 +215,13 @@ def create_or_open_staged_normed_array(
     shape: tuple[int, int],
 ) -> zarr.Array:
     """Open or create a reusable local normalized-data array."""
-    if os.path.exists(os.path.join(cache_path, "zarr.json")):
-        root = zarr.open_group(cache_path, mode="r+")
+    path = Path(cache_path)
+    if (path / "zarr.json").exists():
+        root = zarr.open_group(path, mode="r+")
         if "data" in root:
             array = as_zarr_array(root["data"], name="data")
             if tuple(array.shape) == tuple(shape):
                 return array
-    root = zarr.open_group(cache_path, mode="w")
+    root = zarr.open_group(path, mode="w")
     spec = normed_array_spec(shape[0], shape[1], profile="fast_local")
     return create_numeric_array(root, "data", spec)

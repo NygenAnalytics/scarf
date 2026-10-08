@@ -25,6 +25,7 @@ from .profiles import (
     StorageProfile,
     ZarrLocation,
     is_remote_zarr_location,
+    local_zarr_path,
     resolve_storage_profile,
 )
 
@@ -185,7 +186,7 @@ def make_store(
             options = {"retry_config": _REMOTE_RETRY_CONFIG, **(storage_options or {})}
             obstore = obstore_from_url(location, **options)
             return ObjectStore(store=obstore, read_only=read_only)  # type: ignore[type-var]
-        return location
+        return local_zarr_path(location)
 
     raise TypeError(
         f"zarr location must be a path string or zarr Store, got {type(location)!r}"
@@ -203,7 +204,10 @@ def open_store(
     ensure_zarr_host_ceiling()
     store = make_store(path, storage_options=storage_options, read_only=(mode == "r"))
     if isinstance(store, str):
-        return zarr.open_group(store, mode=mode)
+        # Zarr reads a string as a URL, which ends a local path at '#', '?',
+        # or ';', so the path that the destination checks read is passed as a
+        # Path, which Zarr opens as it is written.
+        return zarr.open_group(Path(store), mode=mode)
     return zarr.open_group(store=store, mode=mode)
 
 
@@ -245,8 +249,8 @@ def _persistable_location(source: str) -> str:
     return os.path.abspath(source)
 
 
-def _discard_target(target: zarr.Group, at: ZarrLocation) -> None:
-    """Delete a target created by this call so the mount can be retried."""
+def discard_mount_target(target: zarr.Group, at: ZarrLocation) -> None:
+    """Delete a mount target that the mount being made created."""
     from zarr.core.sync import sync
 
     from ..utils.logging import logger
@@ -288,6 +292,7 @@ def create_matrix_source(
     """Create a writable store that mounts count matrices from ``source``."""
     from .arrays import create_metadata_column
     from .copy import copy_zarr_group_tree
+    from .destinations import refuse_pending_assays
 
     if not isinstance(source, str) or not source:
         raise TypeError("Matrix source location must be a non-empty string")
@@ -303,6 +308,7 @@ def create_matrix_source(
         raise ValueError(
             "Mounting a mounted target requires repacking it into a store that owns its counts first"
         )
+    refuse_pending_assays(source_root, operation="mounted")
     assay_names = _list_assay_names(source_root, workspace)
     if not assay_names:
         raise ValueError("No assays found in the matrix source")
@@ -396,7 +402,7 @@ def create_matrix_source(
             "assays": assay_manifest,
         }
     except BaseException:
-        _discard_target(target, at)
+        discard_mount_target(target, at)
         raise
     return target
 

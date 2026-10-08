@@ -103,11 +103,16 @@ result JSON under the run's `runTag`. Expect hours of Modal time and real cost.
   stopped.
 - A stage whose artifact already existed measured a cache lookup and fails. Use `--force` or a
   fresh `runTag`; `--allow-reuse` accepts it knowingly.
-- `storeUriOverride` and `storeUriBySize` are for consume stages only; other stages refuse them,
-  and `createStore` refuses an existing store unless forced.
-- `prepare-fixture` uploads create-only, so it never replaces a prepared sample. Results record
-  the downloaded dataset's ETag and size, and provenance records the digest of the code that ran
-  next to the client's.
+- `storeUriOverride` and `storeUriBySize` are for consume stages only; other stages refuse them.
+  `createStore` refuses a destination that holds anything, read with the shared destination
+  probe, before it downloads the H5AD. A forced `createStore` deletes the store first and logs the
+  `runTag` and size, because writers create a store only at an empty destination and never replace
+  one that a `DataStore` has opened, as `initializeStore` does.
+- `prepare-fixture` uploads create-only, so it never replaces a prepared sample. Fixtures hold
+  `RPL` and `RPS` genes so the default `RNA_percentRibo` filter has a column; fixtures uploaded
+  before that change lack them, so prepare fixtures under a fresh `datasetPrefixUri` instead of
+  reusing an older fixture prefix. Results record the downloaded dataset's ETag and size, and
+  provenance records the digest of the code that ran next to the client's.
 - Change one measured variable at a time and keep workflow seeds fixed.
 - Compare runs only when dataset, code revision, settings, storage conditions, and resource
   envelope are stated.

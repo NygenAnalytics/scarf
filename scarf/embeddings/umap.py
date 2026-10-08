@@ -11,9 +11,10 @@ from ..utils.progress import tqdm_params as default_tqdm_params
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
-# Recorded only by densMAP runs. It separates embeddings that read symmetric
-# neighbor distances from earlier ones that read reverse-only edges as zero.
-DENSMAP_ALGORITHM_VERSION = "symmetric_knn_distances_v2"
+# Local radii whose logarithms span at most this are equal. The KNN distances
+# are float32, with a relative resolution of about 1.2e-7, so such a spread
+# reflects rounding rather than density.
+_EQUAL_LOG_RADIUS_SPAN = 1e-6
 
 
 def densmap_distance_graph(
@@ -56,6 +57,9 @@ def calc_dens_map_params(
 
     Returns:
         Per-cell membership sums and standardized log local radii.
+
+    Raises:
+        ValueError: If a local radius is not finite.
     """
     n_vertices = graph.shape[0]
     head = np.asarray(graph.row)
@@ -77,9 +81,32 @@ def calc_dens_map_params(
     )
 
     epsilon = 1e-8
-    log_ro = np.log(epsilon + (ro / mu_sum))
-    standardized_ro = (log_ro - np.mean(log_ro)) / np.std(log_ro)
+    # A cell without graph edges has radius 0 / 0, which the check below rejects.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ro = np.log(epsilon + (ro / mu_sum))
+    if log_ro.size and np.ptp(log_ro) <= _EQUAL_LOG_RADIUS_SPAN:
+        logger.warning(
+            "densMAP local radii are equal for every cell to float32 resolution, "
+            "so densMAP adds no density term and lays the cells out as UMAP does"
+        )
+        standardized_ro = np.zeros_like(log_ro)
+    else:
+        standardized_ro = (log_ro - np.mean(log_ro)) / np.std(log_ro)
+    if not np.all(np.isfinite(standardized_ro)):
+        raise ValueError(
+            "densMAP local radii are not finite. Every cell needs a graph edge "
+            "with a positive weight and a finite distance."
+        )
     return mu_sum.astype(np.float32), standardized_ro.astype(np.float32)
+
+
+def layout_threads(parallel: bool, nthreads: int) -> int:
+    """Return the number of Numba threads that a UMAP layout runs on."""
+    if not parallel:
+        return 1
+    import numba
+
+    return max(1, min(int(nthreads), int(numba.config.NUMBA_NUM_THREADS)))
 
 
 @restore_numba_threads
@@ -111,9 +138,8 @@ def simplicial_set_embedding(
         .randint(np.iinfo(np.int32).min + 1, np.iinfo(np.int32).max - 1, 3)
         .astype(np.int64)
     )
-    # The calling thread's count may be below the request, so always set it,
-    # capped at the pool size that Numba cannot exceed.
-    numba.set_num_threads(min(nthreads, numba.config.NUMBA_NUM_THREADS))
+    # The calling thread's count may be below the request, so always set it.
+    numba.set_num_threads(layout_threads(parallel, nthreads))
 
     if densmap_kwds != {}:
         with process_thread_limit(nthreads):

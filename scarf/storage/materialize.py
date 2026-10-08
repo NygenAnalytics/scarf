@@ -4,7 +4,7 @@ import numpy as np
 import zarr
 
 from ..utils.compute import controlled_compute
-from ..utils.arrays import sum_and_squared_sum
+from ..utils.moments import ColumnMoments, column_moments
 from .arrays import create_numeric_array, create_zarr_dataset
 from .budget import ResourceBudget, resolve_budget
 from .layout import array_shard_rows, normed_array_spec
@@ -12,29 +12,37 @@ from .profiles import resolve_storage_profile
 from .sharding import write_dense_in_shard_rows
 
 
-def _feature_summary(block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return sum_and_squared_sum(block)
+def feature_summary_bytes(n_features: int) -> int:
+    """Return the bytes that summarizing normalized features holds at most."""
+    return 7 * int(n_features) * np.dtype(np.float64).itemsize
+
+
+def _feature_summary(block: np.ndarray) -> ColumnMoments:
+    return column_moments(block)
 
 
 def _merge_feature_summaries(
-    accumulated: tuple[np.ndarray, np.ndarray],
-    current: tuple[np.ndarray, np.ndarray],
-) -> tuple[np.ndarray, np.ndarray]:
-    accumulated[0][...] += current[0]
-    accumulated[1][...] += current[1]
-    return accumulated
+    accumulated: ColumnMoments,
+    current: ColumnMoments,
+) -> ColumnMoments:
+    return accumulated.merge(current)
 
 
 def _write_feature_summaries(
     group: zarr.Group | None,
-    summary: tuple[np.ndarray, np.ndarray] | None,
+    summary: ColumnMoments | None,
 ) -> None:
+    """Store the sum and ``m2`` of each normalized feature beside its data.
+
+    ``feature_m2`` holds each feature's sum of squared deviations from its
+    mean over the normalized cells, so feature scaling reads the variance
+    ``feature_m2 / n_cells`` without the cancellation of squared sums.
+    """
     if group is None or summary is None:
         return
-    for name, values in zip(
-        ("feature_sum", "feature_squared_sum"),
-        summary,
-        strict=True,
+    for name, values in (
+        ("feature_sum", summary.total),
+        ("feature_m2", summary.m2),
     ):
         output = create_zarr_dataset(
             group,
@@ -55,7 +63,27 @@ def chunked_to_zarr(
     mirror: zarr.Array | None = None,
     resources: ResourceBudget | None = None,
     stats_group: zarr.Group | None = None,
+    *,
+    requireFinite: bool = False,
+    operation: str | None = None,
 ) -> None:
+    """Write a chunked matrix as a float32 array of normalized-data layout.
+
+    Args:
+        data: Chunked matrix to write.
+        root: Group in which the array is created.
+        loc: Path of the new array in ``root``.
+        nthreads: Maximum number of threads for computing and writing.
+        msg: Progress message; by default it names ``loc``.
+        mirror: Second array that receives the same values.
+        resources: Memory and worker budget for the write.
+        stats_group: Group that receives the sum and ``m2`` of each column.
+        requireFinite: Refuse values that are NaN or infinite as float32.
+        operation: Producer of the values, required with ``requireFinite``.
+
+    Raises:
+        ValueError: If ``requireFinite`` is set and a value is not finite.
+    """
     if msg is None:
         msg = f"Writing data to {loc}"
     spec = normed_array_spec(
@@ -81,9 +109,13 @@ def chunked_to_zarr(
         resources=budget,
         residentBytes=data._resident_bytes(),
         producerBytes=producer_bytes,
-        resultBytes=2 * data.shape[1] * 8 if stats_group is not None else 0,
+        resultBytes=(
+            feature_summary_bytes(data.shape[1]) if stats_group is not None else 0
+        ),
         summarize=_feature_summary if stats_group is not None else None,
         merge_summary=(_merge_feature_summaries if stats_group is not None else None),
         io=getattr(data, "_io", None),
+        requireFinite=requireFinite,
+        operation=operation,
     )
     _write_feature_summaries(stats_group, summary)

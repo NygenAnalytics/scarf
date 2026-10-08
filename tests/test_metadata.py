@@ -58,12 +58,19 @@ def test_metadata_grep_preserves_regex_character_classes(dummy_metadata):
 
 
 def test_metadata_insert_encodes_none_as_missing_text(dummy_metadata):
+    from scarf.metadata.rows import metadata_missing_mask
+
     values = np.array(["a", None, "b", "", "a", "b", "a", "b", "a"], dtype=object)
 
     dummy_metadata.insert("group", values)
 
     stored = dummy_metadata.fetch_all("group")
     assert stored.tolist() == ["a", "", "b", "", "a", "b", "a", "b", "a"]
+    # None is missing; the empty text that was supplied is a value.
+    missing = metadata_missing_mask(dummy_metadata, "group")[:]
+    assert np.flatnonzero(missing).tolist() == [1]
+    frame = dummy_metadata.to_pandas_dataframe(["group"])["group"]
+    assert frame.isna().tolist() == [i == 1 for i in range(9)]
 
 
 def test_metadata_active_index(dummy_metadata):
@@ -76,9 +83,10 @@ def test_metadata_partial_float_fill_does_not_cast_uninitialized_values(dummy_me
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        filled = dummy_metadata._fill_to_index(values, np.nan, "I")
+        filled, missing = dummy_metadata._expand_to_rows(values, "I", name="x")
 
     selected = dummy_metadata.fetch_all("I")
     assert filled.dtype == values.dtype
     np.testing.assert_array_equal(filled[selected], values)
     assert np.isnan(filled[~selected]).all()
+    np.testing.assert_array_equal(missing, ~selected)

@@ -1,19 +1,26 @@
-import resource
 import sys
 import threading
 import os
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 
 type _ReadText = Callable[[Path], str]
 type _ListPids = Callable[[Path], Iterable[int]]
 
+# Linux reports resident memory in /proc. macOS and Windows have no /proc, so
+# their RSS readings are unavailable rather than estimated another way.
+_PROC_ROOT = Path("/proc")
+_PROC_UNAVAILABLE_REASON = "process-tree RSS requires the Linux /proc filesystem"
+
 
 def _default_read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    # A process name cut inside a multibyte character is not valid UTF-8; the
+    # parsed keys and amounts are ASCII.
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _default_list_pids(proc_root: Path) -> list[int]:
@@ -60,6 +67,11 @@ def _parse_proc_status(value: str) -> tuple[int | None, int | None]:
             if scale is not None:
                 rss_bytes = amount * scale
     return parent_pid, rss_bytes
+
+
+def _status_rss_bytes(status_path: Path) -> int | None:
+    status = _optional_read(status_path, _default_read_text)
+    return None if status is None else _parse_proc_status(status)[1]
 
 
 def read_process_tree_rss_bytes(
@@ -128,12 +140,28 @@ def sample_process_tree_rss(
     *,
     interval_seconds: float = 0.1,
     root_pid: int | None = None,
-    reader: Callable[[int], int | None] = read_process_tree_rss_bytes,
+    reader: Callable[[int], int | None] | None = None,
 ) -> Iterator[Callable[[], ProcessTreeRssMeasurement]]:
     """Sample process-tree RSS; reported peaks are lower-bound observations."""
 
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
+    sample_reader = reader
+    if sample_reader is None:
+        proc_root = _PROC_ROOT
+        if _status_rss_bytes(proc_root / "self" / "status") is None:
+            unavailable = ProcessTreeRssMeasurement(
+                baseline_bytes=None,
+                peak_bytes=None,
+                incremental_peak_bytes=None,
+                sample_interval_seconds=float(interval_seconds),
+                sample_count=0,
+                sampling_error_count=0,
+                unavailable_reason=_PROC_UNAVAILABLE_REASON,
+            )
+            yield lambda: unavailable
+            return
+        sample_reader = partial(read_process_tree_rss_bytes, proc_root=proc_root)
     pid = os.getpid() if root_pid is None else root_pid
     values: list[int] = []
     sample_count = 0
@@ -144,7 +172,7 @@ def sample_process_tree_rss(
     def sample() -> None:
         nonlocal sample_count, error_count
         try:
-            value = reader(pid)
+            value = sample_reader(pid)
         except Exception:
             value = None
         with lock:
@@ -242,13 +270,13 @@ def suppress_native_output() -> Iterator[None]:
         os.close(null_fd)
 
 
-def process_rss_mb() -> float:
-    """Return this process's resident memory in MiB."""
-    try:
-        with open("/proc/self/status") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024.0
-    except OSError:
-        pass
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+def process_rss_mb() -> float | None:
+    """Return this process's resident memory in MiB, or None where unavailable."""
+    rss_bytes = _status_rss_bytes(_PROC_ROOT / "self" / "status")
+    return None if rss_bytes is None else rss_bytes / 1024**2
+
+
+def rss_text() -> str:
+    """Return this process's resident memory for a log line."""
+    rss_mb = process_rss_mb()
+    return "n/a" if rss_mb is None else f"{rss_mb:.0f} MiB"

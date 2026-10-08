@@ -595,7 +595,7 @@ def test_feature_consume_details_uses_matching_kind_after_later_reports() -> Non
 
 
 def test_pairwise_merge_tree_is_independent_of_completion_order() -> None:
-    from scarf.utils.compute import add_stat_arrays, pairwise_merge_tree
+    from scarf.utils.compute import pairwise_merge_tree
 
     # A merge that records its association shows the fixed tree: neighbours
     # first, then neighbouring pairs, with an odd leftover promoted unchanged.
@@ -609,19 +609,20 @@ def test_pairwise_merge_tree_is_independent_of_completion_order() -> None:
     left = (np.array([1.0, 2.0]), np.array([3.0, 4.0]))
     right = (np.array([5.0, 6.0]), np.array([7.0, 8.0]))
     third = (np.array([9.0, 10.0]), np.array([11.0, 12.0]))
-    merged = pairwise_merge_tree([left, right, third], add_stat_arrays)
+    merged = pairwise_merge_tree(
+        [left, right, third],
+        lambda a, b: tuple(x + y for x, y in zip(a, b, strict=True)),
+    )
     np.testing.assert_array_equal(merged[0], [15.0, 18.0])
     np.testing.assert_array_equal(merged[1], [21.0, 24.0])
 
 
-def test_pairwise_merge_tree_rejects_empty_and_mismatched_stats() -> None:
-    from scarf.utils.compute import add_stat_arrays, pairwise_merge_tree
+def test_pairwise_merge_tree_rejects_empty_input() -> None:
+    from scarf.utils.compute import pairwise_merge_tree
 
     with pytest.raises(ValueError, match="at least one value"):
         pairwise_merge_tree([], lambda left, right: left + right)
     assert pairwise_merge_tree([1, 2, 3], lambda left, right: left + right) == 6
-    with pytest.raises(ValueError, match="same length"):
-        add_stat_arrays((np.ones(2),), (np.ones(2), np.ones(2)))
 
 
 def test_plan_operation_error_and_reason_branches() -> None:

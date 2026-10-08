@@ -32,6 +32,8 @@ _MODEL_REASONS = {
     "algorithm_version",
     "derived",
     "execution",
+    # A constant that keeps the recorded identities of earlier artifacts.
+    "frozen_identity",
     "output",
     "resolved_input",
 }
@@ -60,7 +62,8 @@ _CONTRACTS = (
         DataStore.build_ann_index,
         graph_arguments.AnnIndexArguments,
         model_only={
-            **_classified("derived", "parallel_threads"),
+            **_classified("frozen_identity", "parallel_threads"),
+            **_classified("execution", "nthreads"),
         },
     ),
     OperationContract(
@@ -83,6 +86,7 @@ _CONTRACTS = (
     OperationContract(
         _GraphOperationsMixin._build_embedding_initialization,
         graph_arguments.EmbeddingInitializationArguments,
+        model_only=_classified("algorithm_version", "algorithm_version"),
     ),
     OperationContract(
         _GraphOperationsMixin._run_reduction_artifact_impl,
@@ -125,7 +129,10 @@ _CONTRACTS = (
     OperationContract(
         DataStore.query_neighbors,
         graph_arguments.NeighborQueryArguments,
-        model_only=_classified("derived", "distance_metric"),
+        model_only={
+            **_classified("derived", "distance_metric"),
+            **_classified("execution", "nthreads"),
+        },
     ),
     OperationContract(
         DataStore.run_normalization,
@@ -392,14 +399,12 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_tsne,
         metadata_arguments.TsneArguments,
-        aliases={"nthreads": "parallel_threads"},
     ),
     OperationContract(
         DataStore.run_umap,
         metadata_arguments.UmapArguments,
         constructor=_EmbeddingOperationsMixin._run_umap_artifact,
-        aliases={"nthreads": "parallel_threads"},
-        model_only=_classified("algorithm_version", "densmap_algorithm_version"),
+        model_only=_classified("execution", "layout_threads"),
     ),
     OperationContract(
         DataStore.run_waggr,

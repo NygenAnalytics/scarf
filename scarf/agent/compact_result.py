@@ -2,6 +2,7 @@
 
 import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import zarr
@@ -21,8 +22,10 @@ def _local_root(result: "AnalysisRun", *, writable: bool) -> zarr.Group:
     child = namespace / _run_id(result)
     if namespace.is_symlink() or child.is_symlink():
         raise RecordError("Agent result paths cannot be filesystem symlinks")
+    # A Path, because Zarr reads a string as a URL and would end a local path
+    # at '#', '?', or ';'.
     root = zarr.open_group(
-        str(result.source), mode="r+" if writable else "r", use_consolidated=False
+        Path(result.source), mode="r+" if writable else "r", use_consolidated=False
     )
     if _NAMESPACE not in root:
         if namespace.exists():

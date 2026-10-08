@@ -270,6 +270,43 @@ def _qc_flags(store: Any, active: np.ndarray, assay: str) -> dict[str, Any]:
     return summaries
 
 
+def _require_measured_cell_key(store: Any, assay: str, cell_key: str) -> None:
+    """Ask for a cell key whose cells the RNA assay measured.
+
+    A merged store marks the cells that an assay measured in its membership
+    column ``<assay>_I``; the other cells hold zero counts, which are no
+    measurement. Every stage, the QC flags included, reads the assay over the
+    cells of ``cell_key``, and the pipeline refuses unmeasured cells, so
+    inspection asks for a cell key before any model decision.
+    """
+    from scarf.metadata.membership import (
+        UnmeasuredCellsError,
+        require_measured_cells,
+    )
+
+    try:
+        require_measured_cells(
+            store.cells,
+            assay,
+            cell_key,
+            operation="pipeline.run",
+            remedy="cell_key",
+        )
+    except UnmeasuredCellsError as error:
+        name = f"{assay}_measured"
+        raise NeedsInput(
+            f"RNA assay {assay!r} did not measure {error.unmeasured} of the "
+            f"{error.selected} cells of cellKey {cell_key!r}: its membership "
+            f"column {error.column!r} is False for them, and their zero counts "
+            "are no measurement. Supply as cellKey a boolean cell column that "
+            f"is True only for the cells of {cell_key!r} that it measured, such "
+            f"as {name!r} after `ds.cells.insert({name!r}, "
+            f"ds.cells.fetch_all({cell_key!r}) & "
+            f"ds.cells.fetch_all({error.column!r}))` on a writable DataStore.",
+            field="cellKey",
+        ) from error
+
+
 def _filtering(
     store: Any, study: Study, config: AnalysisConfig, assay: str
 ) -> tuple[Any, np.ndarray, list[str], dict[str, Any]]:
@@ -285,6 +322,8 @@ def _filtering(
         raise NeedsInput(
             "The input selection has no cells. Supply a populated cellKey."
         )
+    # QC flags and every stage read the assay over these cells.
+    _require_measured_cell_key(store, assay, config.cellKey)
     flags = _qc_flags(store, active, assay)
     if config.qcPolicy == "retain":
         return (

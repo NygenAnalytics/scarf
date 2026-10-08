@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -177,11 +178,14 @@ def _bind(
 
     def get_markers(**kwargs: Any) -> pd.DataFrame:
         observed.append(("markers", kwargs))
+        # fold_change is +inf for a feature that no other cell expresses and
+        # NaN where no cell does.
         return pd.DataFrame(
             {
                 "group_id": ["1", "2"],
                 "feature_name": ["CD3D", "GAPDH"],
                 "score": [0.9, 0.1],
+                "fold_change": [np.inf, np.nan],
             }
         )
 
@@ -468,6 +472,10 @@ def test_export_keeps_cell_alignment_and_annotation_identity(
     assert saved["final"]["runId"] == "fixed-final"
     assert saved["exportedCells"] == 3
     assert saved["exportedMarkers"] == 2
+    markers = pd.read_csv(destination / "markers.csv", dtype={"group_id": str})
+    assert markers["feature_name"].tolist() == ["CD3D", "GAPDH"]
+    assert markers["fold_change"].iloc[0] == np.inf
+    assert np.isnan(markers["fold_change"].iloc[1])
     with pytest.raises(FileExistsError):
         AnalysisRun(records.path).export(destination)
 

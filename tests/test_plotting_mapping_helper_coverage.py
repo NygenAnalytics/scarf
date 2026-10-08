@@ -811,7 +811,7 @@ def test_mapping_feature_helper_validation_and_lightweight_methods() -> None:
             ResourceBudget(1_000, 1),
         )
     assay.rawData = SimpleNamespace(shape=(1, 1), dtype=np.dtype("O"))
-    with pytest.raises(TypeError, match="numeric dtype"):
+    with pytest.raises(TypeError, match="must be real numbers"):
         mapping_features.AlignedFeatureStream(
             assay,
             np.array([0]),

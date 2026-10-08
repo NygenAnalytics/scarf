@@ -68,6 +68,16 @@ def sift(
     return np.asarray(selected)
 
 
+def _filter_values(values: Iterable, name: str, kind: str) -> list[Any]:
+    """Return one ``multi_sift`` argument as a list, refusing a bare string."""
+    if isinstance(values, str | bytes):
+        raise TypeError(f"{name} must be a sequence of {kind}, not a string")
+    try:
+        return list(values)
+    except TypeError:
+        raise TypeError(f"{name} must be a sequence of {kind}") from None
+
+
 def multi_sift(
     metadata: _QueryableMetaData,
     columns: list[str],
@@ -76,11 +86,24 @@ def multi_sift(
     keep_bounds: bool = False,
 ) -> np.ndarray:
     """Return rows that satisfy every requested column filter."""
+    column_names = _filter_values(columns, "columns", "column names")
+    low_bounds = _filter_values(lows, "lows", "lower bounds")
+    high_bounds = _filter_values(highs, "highs", "upper bounds")
+    if not column_names:
+        raise ValueError("multi_sift requires at least one column")
+    if not len(column_names) == len(low_bounds) == len(high_bounds):
+        raise ValueError(
+            "multi_sift needs one lower and one upper bound for each column: "
+            f"{len(column_names)} columns, {len(low_bounds)} lows, and "
+            f"{len(high_bounds)} highs"
+        )
     return _all_true(
         np.array(
             [
-                metadata.sift(low_column, low, high, keep_bounds=keep_bounds)
-                for low_column, low, high in zip(columns, lows, highs)
+                metadata.sift(column, low, high, keep_bounds=keep_bounds)
+                for column, low, high in zip(
+                    column_names, low_bounds, high_bounds, strict=True
+                )
             ]
         )
     )

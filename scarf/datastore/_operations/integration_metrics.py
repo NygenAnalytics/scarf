@@ -18,6 +18,7 @@ from ...metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ...metadata.selection import (
+    grouping_value_name,
     require_complete_cluster_labels,
     valid_category_mask,
 )
@@ -94,7 +95,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             table_path="cellData",
         )
 
-        value_name = "values" if clustering.kind == "cluster_labels" else "labels"
+        value_name = grouping_value_name(clustering.kind)
         group = group_at(self.zw, status.path)
         if value_name not in group:
             raise ValueError(f"{name} has no canonical {value_name!r} label array")

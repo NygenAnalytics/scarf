@@ -11,6 +11,7 @@ import zarr
 from scipy.sparse import coo_matrix, csr_matrix
 from zarr.storage import MemoryStore
 
+import scarf.embeddings.sgtsne as sgtsne_module
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.embeddings.imported import write_imported_coordinates
@@ -24,6 +25,7 @@ from scarf.storage.artifacts import (
     make_provenance,
     new_artifact_id,
 )
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import (
     read_stored_selection_mask,
@@ -84,8 +86,12 @@ def _memory_graph_store(
     store.zarr_mode = "r+"
     store._defaultAssay = "RNA"
     store._assay_names = assay_names or []
+    # A cell table without membership columns: every assay measured every
+    # cell, so integration checks no membership.
+    store.cells = SimpleNamespace(columns=())
     store.nthreads = 1
     store.memoryBytes = 64 * 1024**2
+    store.resources = ResourceBudget(store.memoryBytes, 1)
     store.storageProfile = "fast_local"
     return store
 
@@ -800,6 +806,8 @@ def test_run_tsne_orchestration_and_error_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = isolated_toy_datastore
+    # Scarf refuses no platform itself; sgtsnepi decides where t-SNE runs.
+    monkeypatch.setattr(sys, "platform", "darwin")
     graph = csr_matrix(
         np.array(
             [
@@ -837,6 +845,10 @@ def test_run_tsne_orchestration_and_error_paths(
     )
     get_initial = Mock(return_value=initial)
     runner = Mock(return_value=embedding)
+    # The backend check returns sgtsnepi's entry point; the runner stands in
+    # for it, so this test runs on platforms without sgtsnepi.
+    backend = Mock()
+    require_sgtsnepi = sgtsne_module.require_sgtsnepi
     selection_ref = store.snapshot_cell_selection("I")
     monkeypatch.setattr(
         "scarf.datastore._operations.embeddings.graph_cell_selection",
@@ -846,7 +858,8 @@ def test_run_tsne_orchestration_and_error_paths(
     monkeypatch.setattr(store, "_get_graph_ncells_k", lambda _location: (3, 2))
     monkeypatch.setattr(store, "_load_graph_artifact", load_graph)
     monkeypatch.setattr(store, "_get_ini_embed", get_initial)
-    monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
+    monkeypatch.setattr(sgtsne_module, "run_sgtsne", runner)
+    monkeypatch.setattr(sgtsne_module, "require_sgtsnepi", backend)
     metadata_before = _metadata_snapshot(store.cells)
 
     tsne_ref = store.run_tsne(
@@ -854,17 +867,22 @@ def test_run_tsne_orchestration_and_error_paths(
         initialization_ref,
         symmetric_graph=True,
         graph_upper_only=True,
-        parallel=True,
-        nthreads=None,
         max_iter=20,
     )
     get_initial.assert_called_once_with(initialization_ref, graph_ref, 2)
+    backend.assert_called_once_with()
     first_call = runner.call_args
     assert first_call.args[0] is graph
     np.testing.assert_array_equal(first_call.args[1], initial)
-    assert first_call.kwargs["parallel"] is True
-    assert first_call.kwargs["nthreads"] == store.nthreads
-    assert first_call.kwargs["max_iter"] == 20
+    assert first_call.kwargs == {
+        "tsne_dims": 2,
+        "max_iter": 20,
+        "early_iter": 200,
+        "alpha": 10,
+        "lambda_scale": 1.0,
+        "box_h": 0.7,
+        "verbose": True,
+    }
     first_ref = tsne_ref
     assert first_ref.kind == "embedding"
     np.testing.assert_allclose(
@@ -873,15 +891,6 @@ def test_run_tsne_orchestration_and_error_paths(
     )
     _assert_metadata_unchanged(store.cells, metadata_before)
 
-    store.run_tsne(
-        graph_ref,
-        initial,
-        parallel=False,
-        invalidate_cache=True,
-    )
-    assert runner.call_args.kwargs["nthreads"] == 1
-    assert runner.call_args.kwargs["parallel"] is False
-
     with pytest.raises(ValueError, match="invalid shape"):
         store.run_tsne(
             graph_ref,
@@ -889,16 +898,10 @@ def test_run_tsne_orchestration_and_error_paths(
             tsne_dims=2,
         )
 
-    runner.side_effect = FileNotFoundError("sgtsne missing")
-    with pytest.raises(RuntimeError, match="SG-tSNE failed"):
-        store.run_tsne(
-            graph_ref,
-            initial,
-            parallel=True,
-            nthreads=2,
-            invalidate_cache=True,
-        )
-    assert runner.call_args.kwargs["nthreads"] == 2
+    # Backend failures propagate unchanged instead of becoming RuntimeError.
+    runner.side_effect = RuntimeError("sgtsnepi failed")
+    with pytest.raises(RuntimeError, match="^sgtsnepi failed$"):
+        store.run_tsne(graph_ref, initial, invalidate_cache=True)
     with pytest.raises(TypeError, match="initialization must be an ArtifactRef"):
         store.run_tsne(graph_ref, initial.tolist())  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="graph must be an ArtifactRef"):
@@ -907,15 +910,15 @@ def test_run_tsne_orchestration_and_error_paths(
     runner_calls = runner.call_count
     graph_loads = load_graph.call_count
     initial_loads = get_initial.call_count
-    monkeypatch.setattr(sys, "platform", "win32")
+    # Without sgtsnepi an existing embedding is still reused.
+    monkeypatch.setattr(sgtsne_module, "require_sgtsnepi", require_sgtsnepi)
+    monkeypatch.setitem(sys.modules, "sgtsnepi", None)
     assert (
         store.run_tsne(
             graph_ref,
             initialization_ref,
             symmetric_graph=True,
             graph_upper_only=True,
-            parallel=True,
-            nthreads=None,
             max_iter=20,
         )
         == first_ref
@@ -924,10 +927,13 @@ def test_run_tsne_orchestration_and_error_paths(
     # A reused embedding neither loads the graph nor expands its initialization.
     assert load_graph.call_count == graph_loads
     assert get_initial.call_count == initial_loads
-    with pytest.raises(RuntimeError, match="win32 operating system"):
+    # A new embedding names the tsne extra before reading the graph.
+    with pytest.raises(ImportError, match=r"scarf\[tsne\]"):
         store.run_tsne(graph_ref, initial, invalidate_cache=True)
+    assert load_graph.call_count == graph_loads
+    assert runner.call_count == runner_calls
 
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sgtsne_module, "require_sgtsnepi", backend)
     runner.side_effect = None
     runner.return_value = embedding[:1]
     with pytest.raises(ValueError, match="returned an embedding with shape"):
@@ -983,6 +989,10 @@ def test_integrate_assays_snn_writes_and_reuses_exact_sources(
     )
     load_captured = Mock(side_effect=lambda ref, **_kwargs: graphs[ref.assay])
     store._load_graph_artifact = load_captured
+    # The memory admission reads each graph's cells and neighbors before the
+    # graphs load.
+    store._graph_location = Mock(side_effect=lambda ref: ref.artifact_id)
+    store._get_graph_ncells_k = Mock(return_value=(3, 2))
 
     first_ref = store.integrate_assays(
         list(sources.values()),
@@ -1013,6 +1023,8 @@ def test_integrate_assays_snn_writes_and_reuses_exact_sources(
     assert ArtifactRef.from_dict(status.inputs["source_0"]) == sources["RNA"]
     assert ArtifactRef.from_dict(status.inputs["source_1"]) == sources["ADT"]
 
+    # The integrated graph loads through the real lookups.
+    del store._graph_location, store._get_graph_ncells_k
     loaded = GraphDataStore._load_graph_artifact(
         store,
         first_ref,
@@ -1051,7 +1063,8 @@ def test_integrate_assays_persists_exact_sources(
         assert key == "I"
         cell_data.create_array(column, data=np.asarray(values), overwrite=True)
 
-    store.cells = SimpleNamespace(insert=insert_cell_column)
+    # No membership columns: every assay measured every cell.
+    store.cells = SimpleNamespace(insert=insert_cell_column, columns=())
     selection = _add_complete_artifact(store, "cell_selection", assay=None)
     neighbor_indices = np.array(
         [[1, 2], [0, 2], [0, 1]],
@@ -1072,6 +1085,8 @@ def test_integrate_assays_persists_exact_sources(
             store,
             "reduction",
             assay=assay,
+            # WNN admits its memory from the stored coordinate sizes.
+            arrays={"data": np.zeros((3, 2), dtype=np.float32)},
         )
         coordinate_by_source[captured_sources[assay]] = captured_coordinates[assay]
     monkeypatch.setattr(
@@ -1107,6 +1122,8 @@ def test_integrate_assays_persists_exact_sources(
         }
         load_graph = Mock(side_effect=lambda ref, **_kwargs: graphs[ref])
         store._load_graph_artifact = load_graph
+        # SNN admits its memory from each graph's cells and neighbors.
+        store._get_graph_ncells_k = Mock(return_value=(3, 2))
         merge_graphs = Mock(return_value=merged)
         monkeypatch.setattr("scarf.neighbors.graph.merge_graphs", merge_graphs)
     else:
@@ -1119,8 +1136,11 @@ def test_integrate_assays_persists_exact_sources(
             ref: ArtifactRef,
             *,
             batch_size: int | None,
+            resident_bytes: int,
         ) -> tuple[_CoordinateBlocks, int, int]:
             assert batch_size is None
+            # Each read reserves the sources loaded before it.
+            assert resident_bytes > 0
             return _CoordinateBlocks([coordinate_values[ref]]), 3, 2
 
         store._coordinate_source = Mock(side_effect=coordinate_source)
@@ -1307,6 +1327,7 @@ def test_integrate_assays_rejects_corrupt_sources_before_planning(
     [
         ("invalid_index", "ANN query returned an invalid cell index"),
         ("short_stream", "Coordinate source contains 2 rows, expected 3"),
+        ("no_ann_m", "ANN artifact has no valid ann_m"),
     ],
 )
 def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
@@ -1347,13 +1368,18 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
         kind="neighbors",
         artifact_id="b" * 64,
     )
-    blocks = [
-        np.zeros(
-            (3 if failure == "invalid_index" else 2, 2),
-            dtype=np.float32,
-        )
-    ]
-    store._coordinate_source = Mock(return_value=(_CoordinateBlocks(blocks), 3, 2))
+    from scarf.matrix import ChunkedArray
+    from scarf.neighbors.stages import ChunkedCoordinateStream
+
+    # The query admits the index from its recorded ann_m and the stored
+    # coordinates' blocks before it loads the index, and reads them through
+    # a stream that reserves what it holds.
+    stored = ChunkedArray.from_numpy(
+        np.zeros((3 if failure == "invalid_index" else 2, 2), dtype=np.float32)
+    )
+    store._coordinate_source = Mock(
+        return_value=(ChunkedCoordinateStream(stored, 1), 3, 2)
+    )
 
     def require(ref, _kind, **_kwargs):
         if ref == ann:
@@ -1367,7 +1393,9 @@ def test_query_neighbors_guards_ann_indices_and_coordinate_row_count(
                     parameters={
                         "ann_metric": "l2",
                         "ann_ef": 50,
-                        "parallel_threads": 1,
+                        **({} if failure == "no_ann_m" else {"ann_m": 4}),
+                        "ann_parallel": False,
+                        "parallel_threads": None,
                     },
                     inputs={"coordinates": coordinates},
                 ),
@@ -1495,6 +1523,8 @@ def test_wnn_input_helpers_fail_before_integration_compute(
             if failure == "imported" and assay == "RNA"
             else "reduction",
             assay=assay,
+            # WNN admits its memory from the stored coordinate sizes.
+            arrays={"data": np.zeros((3, 2), dtype=np.float32)},
         )
         coordinates_by_assay[assay] = coordinates
         indices = np.array([[1], [0]], dtype=np.uint32)

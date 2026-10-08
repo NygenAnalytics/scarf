@@ -4,11 +4,22 @@ from typing import Any
 
 import numpy as np
 import zarr
+from zarr.errors import ContainsArrayError
 
-from .types import as_zarr_array, as_zarr_group
-from .arrays import create_metadata_column, create_zarr_obj_array
+from .types import as_zarr_array, as_zarr_group, read_fresh_group
+from .arrays import (
+    MetadataBlock,
+    create_metadata_column,
+    create_streamed_metadata_column,
+    create_zarr_obj_array,
+)
 from .count_matrix import CountMatrixPolicy, create_product_counts_array
 from .layout import _group_zarr_format
+from .metadata_keys import (
+    ASSAY_MEMBERSHIP_ROLE,
+    assay_membership_attributes,
+    assay_membership_column,
+)
 from .profiles import StorageProfile, resolve_storage_profile
 from ..utils.logging import logger
 
@@ -37,32 +48,39 @@ def pending_assay_message(
     assay_name: str, workspace: str | None, operation: object
 ) -> str:
     """Explain how to remove a derived assay left pending by an interruption."""
+    place = "" if workspace is None else f" of workspace {workspace!r}"
     store = (
         "a DataStore"
         if workspace is None
         else f"a DataStore opened with workspace={workspace!r}"
     )
     return (
-        f"Assay {assay_name!r} was left incomplete by an interrupted {operation}. "
-        f"Remove it with discard_interrupted_assay({assay_name!r}) on {store}, "
-        "then retry."
+        f"Assay {assay_name!r}{place} is pending: another process may still be "
+        f"running {operation}, or an interrupted {operation} left it. If no "
+        "process is writing it, remove it with "
+        f"discard_interrupted_assay({assay_name!r}) on {store}, then retry."
     )
 
 
 def validate_new_assay(z: zarr.Group, assay_name: str, workspace: str | None) -> None:
-    from .identity import fresh_group
-
+    """Raise ``ValueError`` unless ``assay_name`` can be created in ``workspace``."""
     validate_assay_name(assay_name)
     validate_workspace_name(workspace)
     logical, matrix = _assay_paths(assay_name, workspace)
     physical = logical if matrix is None else matrix
-    manifest = fresh_group(z).attrs.get("matrixSource", {})
+    manifest = read_fresh_group(z).attrs.get("matrixSource", {})
     mounted = manifest.get("assays", {}) if isinstance(manifest, dict) else {}
     existing = z.get(logical)
     if isinstance(existing, zarr.Group):
         operation = existing.attrs.get(PENDING_ASSAY_ATTR)
         if operation is not None:
             raise ValueError(pending_assay_message(assay_name, workspace, operation))
+    if matrix is not None:
+        # Workspaces share matrices/<assay>, and discarding a pending assay
+        # deletes it, so a name pending in any workspace is taken in all.
+        for name, holder, operation in pending_assays(z):
+            if name == assay_name:
+                raise ValueError(pending_assay_message(name, holder, operation))
     if existing is not None or physical in z or assay_name in mounted:
         raise ValueError(
             f"Assay {assay_name!r} already has metadata or a count matrix; choose a new name"
@@ -92,6 +110,7 @@ def discard_pending_assay(
     workspace: str | None,
     *,
     missing_ok: bool = False,
+    keep_matrix: bool = False,
 ) -> bool:
     """Delete a derived assay that an interrupted write left pending.
 
@@ -105,28 +124,72 @@ def discard_pending_assay(
     validate_assay_name(assay_name)
     validate_workspace_name(workspace)
     logical, matrix = _assay_paths(assay_name, workspace)
-    existing = root.get(logical)
-    if not isinstance(existing, zarr.Group) or PENDING_ASSAY_ATTR not in (
-        existing.attrs
-    ):
+    try:
+        existing = read_fresh_group(root, logical, missing_ok=True)
+    except ContainsArrayError:
+        existing = None
+    if existing is None or PENDING_ASSAY_ATTR not in existing.attrs:
         if missing_ok:
             return False
         raise ValueError(
             f"Assay {assay_name!r} is not an interrupted derived assay; "
             "nothing was removed"
         )
-    if matrix is not None and matrix in root:
+    if matrix is not None and not keep_matrix and matrix in root:
         del root[matrix]
-    workspace_root = (
-        root if workspace is None else as_zarr_group(root[workspace], name=workspace)
+    workspace_root = read_fresh_group(root, workspace or "", mode="r+", missing_ok=True)
+    raw_types = (
+        None if workspace_root is None else workspace_root.attrs.get("assayTypes")
     )
-    raw_types = workspace_root.attrs.get("assayTypes")
-    if isinstance(raw_types, dict) and assay_name in raw_types:
+    if (
+        workspace_root is not None
+        and isinstance(raw_types, dict)
+        and assay_name in raw_types
+    ):
         workspace_root.attrs["assayTypes"] = {
             key: value for key, value in raw_types.items() if key != assay_name
         }
+    _discard_membership_column(root, assay_name, workspace)
     del root[logical]
     return True
+
+
+def _discard_membership_column(
+    root: zarr.Group, assay_name: str, workspace: str | None
+) -> None:
+    """Delete ``<assay>_I`` when its stored attributes name ``assay_name``.
+
+    A column of that name without them is not the assay's membership, and is
+    kept.
+    """
+    cells = read_fresh_group(
+        root, _cell_data_path(workspace), mode="r+", missing_ok=True
+    )
+    if cells is None:
+        return
+    name = assay_membership_column(assay_name)
+    column = cells.get(name)
+    if (
+        isinstance(column, zarr.Array)
+        and column.attrs.get("role") == ASSAY_MEMBERSHIP_ROLE
+        and column.attrs.get("assay") == assay_name
+    ):
+        del cells[name]
+
+
+def _require_free_membership_name(
+    root: zarr.Group, assay_name: str, workspace: str | None
+) -> None:
+    """Raise when the cell table holds a column named for a new assay's membership."""
+    name = assay_membership_column(assay_name)
+    cells = root.get(_cell_data_path(workspace))
+    if isinstance(cells, zarr.Group) and name in cells:
+        raise ValueError(
+            f"Cell column {name!r} already exists, and it is the name of the "
+            f"column that records which cells a new assay {assay_name!r} "
+            f"measures. Drop the column with cells.drop({name!r}), or choose "
+            "another assay name."
+        )
 
 
 class DerivedAssayTransaction:
@@ -143,12 +206,18 @@ class DerivedAssayTransaction:
         assay_name: str,
         workspace: str | None,
         operation: str,
+        membership: str | None = None,
     ) -> None:
         self.root = root
         self.assay_name = assay_name
         self.workspace = workspace
         self.operation = operation
-        self._logical, _ = _assay_paths(assay_name, workspace)
+        self.membership = membership
+        self._logical, self._matrix = _assay_paths(assay_name, workspace)
+        # Set right after each create_group, so cleanup deletes only the
+        # groups that this call created.
+        self._created_group = False
+        self._created_matrix = False
         self._counts: zarr.Array | None = None
 
     @property
@@ -167,25 +236,69 @@ class DerivedAssayTransaction:
         policy: CountMatrixPolicy | None = None,
     ) -> zarr.Array:
         """Create the pending assay with incomplete counts in ``dtype``."""
-        if self._counts is not None:
+        if self._created_group:
             raise RuntimeError("The derived assay counts were already created")
-        self._counts = create_zarr_count_assay(
-            self.root,
-            self.assay_name,
-            self.workspace,
+        _validate_dimensions(n_cells, len(feat_ids))
+        # These raise before this call creates anything, so its cleanup never
+        # touches an assay that another writer created.
+        validate_new_assay(self.root, self.assay_name, self.workspace)
+        _require_free_membership_name(self.root, self.assay_name, self.workspace)
+        group = self.root.create_group(
+            self._logical,
+            attributes={
+                PENDING_ASSAY_ATTR: self.operation,
+                "prepared": False,
+                "misc": {},
+            },
+        )
+        self._created_group = True
+        matrix_group = group
+        if self._matrix is not None:
+            matrix_group = self.root.create_group(self._matrix)
+            self._created_matrix = True
+        counts, feature_group, resolved_profile = _create_assay_counts(
+            group,
+            matrix_group,
             n_cells,
-            feat_ids,
-            feat_names,
+            len(feat_ids),
             dtype,
             profile=profile,
             policy=policy,
-            pending_operation=self.operation,
         )
-        return self._counts
+        self._counts = counts
+        _write_feature_columns(feature_group, feat_ids, feat_names, resolved_profile)
+        if self.membership is not None:
+            self._write_membership(self.membership, n_cells, resolved_profile)
+        return counts
 
-    def _publish(self) -> None:
-        from .identity import fresh_group
+    def _write_membership(
+        self, source: str, n_cells: int, profile: StorageProfile
+    ) -> None:
+        """Copy cell column ``source`` into the pending assay's membership column."""
+        cells = as_zarr_group(
+            self.root[_cell_data_path(self.workspace)], name="cellData"
+        )
+        values = as_zarr_array(cells[source], name=source)
+        rows = max(1, int(values.chunks[0]))
+        # The copy streams one source chunk at a time and never replaces a
+        # column.
+        create_streamed_metadata_column(
+            cells,
+            assay_membership_column(self.assay_name),
+            shape=n_cells,
+            dtype=bool,
+            blocks=(
+                MetadataBlock(start, np.asarray(values[start : start + rows]))
+                for start in range(0, n_cells, rows)
+            ),
+            overwrite=False,
+            chunkSize=rows,
+            profile=profile,
+            attributes=assay_membership_attributes(self.assay_name),
+        )
 
+    def _ready_group(self) -> zarr.Group:
+        """Return the stored pending group once its counts can be published."""
         if self._counts is None:
             raise RuntimeError("The derived assay has no counts to publish")
         counts = zarr.open_array(
@@ -198,16 +311,25 @@ class DerivedAssayTransaction:
             raise RuntimeError(
                 f"Derived assay {self.assay_name!r} counts were not finalized"
             )
-        group = fresh_group(self.group)
-        attributes = dict(group.attrs)
-        attributes.pop(PENDING_ASSAY_ATTR, None)
-        # One attribute write swaps the pending marker for the assay marker.
-        group.attrs.put({**attributes, "is_assay": True})
+        return read_fresh_group(self.root, self._logical)
 
-    def _discard(self) -> None:
+    def _discard(self, error: BaseException) -> None:
+        if not self._created_group:
+            # This call created nothing, so it deletes nothing.
+            return
+        if not isinstance(error, Exception):
+            # An interrupted write may still land, so the pending assay stays.
+            logger.warning(
+                pending_assay_message(self.assay_name, self.workspace, self.operation)
+            )
+            return
         try:
             discard_pending_assay(
-                self.root, self.assay_name, self.workspace, missing_ok=True
+                self.root,
+                self.assay_name,
+                self.workspace,
+                missing_ok=True,
+                keep_matrix=not self._created_matrix,
             )
         except Exception as exc:
             logger.warning(
@@ -223,28 +345,40 @@ def derived_assay_transaction(
     workspace: str | None,
     *,
     operation: str,
+    membership: str | None = None,
 ) -> Iterator[DerivedAssayTransaction]:
     """Create a derived assay atomically with respect to assay scans.
 
     The body creates counts with :meth:`DerivedAssayTransaction.create_counts`,
     writes and finalizes them, and records provenance on ``group``. A normal
-    exit publishes the ``is_assay`` marker last. Any exception, including
-    ``KeyboardInterrupt``, deletes the pending assay before it propagates.
+    exit publishes the ``is_assay`` marker last. An exception before that
+    deletes the groups this call created; an interruption, such as
+    ``KeyboardInterrupt``, keeps the pending assay and logs how to remove it.
 
     Args:
         root: Root Zarr group of the store.
         assay_name: Name of the assay to create.
         workspace: Workspace name. None uses the legacy layout.
         operation: Name of the operation recorded in the pending marker.
+        membership: Optional name of the boolean cell column that marks the
+            cells the new assay measured.
     """
     validate_new_assay(root, assay_name, workspace)
-    transaction = DerivedAssayTransaction(root, assay_name, workspace, operation)
+    _require_free_membership_name(root, assay_name, workspace)
+    transaction = DerivedAssayTransaction(
+        root, assay_name, workspace, operation, membership=membership
+    )
     try:
         yield transaction
-        transaction._publish()
-    except BaseException:
-        transaction._discard()
+        group = transaction._ready_group()
+    except BaseException as error:
+        transaction._discard(error)
         raise
+    # The publication write follows the try, so nothing is deleted once it is
+    # issued. One attribute write swaps the pending marker for the assay marker.
+    attributes = dict(group.attrs)
+    attributes.pop(PENDING_ASSAY_ATTR, None)
+    group.attrs.put({**attributes, "is_assay": True})
 
 
 def validate_assay_name(assay_name: str) -> None:
@@ -280,31 +414,28 @@ def validate_workspace_name(workspace: str | None) -> None:
         )
 
 
-def _create_count_assay(
-    z: zarr.Group,
-    assay_name: str,
-    workspace: str | None,
+def _validate_dimensions(n_cells: int, n_features: int) -> None:
+    if n_cells < 0 or n_features < 0:
+        raise ValueError("Assay dimensions must be non-negative")
+
+
+def _create_assay_counts(
+    group: zarr.Group,
+    matrix_group: zarr.Group,
     n_cells: int,
     n_features: int,
     dtype: Any,
     *,
     profile: StorageProfile | None,
     policy: CountMatrixPolicy | None,
-    marker: dict[str, Any],
 ) -> tuple[zarr.Array, zarr.Group, StorageProfile]:
-    """Create an assay group, its feature group, and incomplete paired counts."""
-    validate_new_assay(z, assay_name, workspace)
-    if n_cells < 0 or n_features < 0:
-        raise ValueError("Assay dimensions must be non-negative")
-    group = z.create_group(
-        assay_name if workspace is None else f"{workspace}/{assay_name}",
-        attributes={**marker, "prepared": False, "misc": {}},
-    )
+    """Create the feature group of a new assay group and incomplete counts.
+
+    ``matrix_group`` holds the counts: the assay group itself in the legacy
+    layout, or its ``matrices/<assay>`` group in a workspace layout.
+    """
     resolved_profile = profile or resolve_storage_profile(group.store)
     feature_group = group.create_group("featureData")
-    matrix_group = (
-        group if workspace is None else z.create_group(f"matrices/{assay_name}")
-    )
     counts = create_product_counts_array(
         matrix_group,
         n_cells,
@@ -318,6 +449,51 @@ def _create_count_assay(
     return counts, feature_group, resolved_profile
 
 
+def _create_count_assay(
+    z: zarr.Group,
+    assay_name: str,
+    workspace: str | None,
+    n_cells: int,
+    n_features: int,
+    dtype: Any,
+    *,
+    profile: StorageProfile | None,
+    policy: CountMatrixPolicy | None,
+) -> tuple[zarr.Array, zarr.Group, StorageProfile]:
+    """Create a complete-marked assay group with incomplete paired counts."""
+    validate_new_assay(z, assay_name, workspace)
+    _validate_dimensions(n_cells, n_features)
+    logical, matrix = _assay_paths(assay_name, workspace)
+    group = z.create_group(
+        logical, attributes={"is_assay": True, "prepared": False, "misc": {}}
+    )
+    return _create_assay_counts(
+        group,
+        group if matrix is None else z.create_group(matrix),
+        n_cells,
+        n_features,
+        dtype,
+        profile=profile,
+        policy=policy,
+    )
+
+
+def _write_feature_columns(
+    feature_group: zarr.Group,
+    feat_ids: np.ndarray | list[str],
+    feat_names: np.ndarray | list[str],
+    profile: StorageProfile,
+) -> None:
+    for name, values, column_dtype in (
+        ("ids", feat_ids, None),
+        ("names", feat_names, None),
+        ("I", np.ones(len(feat_ids), dtype=bool), "bool"),
+    ):
+        create_zarr_obj_array(
+            feature_group, name, values, column_dtype, profile=profile
+        )
+
+
 def create_zarr_count_assay(
     z: zarr.Group,
     assay_name: str,
@@ -329,16 +505,14 @@ def create_zarr_count_assay(
     *,
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
-    pending_operation: str | None = None,
 ) -> zarr.Array:
     """Create an assay group and its incomplete ``counts`` array in ``dtype``.
 
     Import writers pass the dtype that
     :func:`~scarf.storage.count_dtype.count_storage_dtype` resolves. The
     counts carry ``complete=False`` until the writer calls
-    ``finalize_counts``. With ``pending_operation``, the group carries the
-    pending marker instead of ``is_assay``; use
-    :func:`derived_assay_transaction` rather than passing it directly.
+    ``finalize_counts``. Derived assays use :func:`derived_assay_transaction`
+    instead.
     """
     counts, feature_group, resolved_profile = _create_count_assay(
         z,
@@ -349,20 +523,8 @@ def create_zarr_count_assay(
         dtype,
         profile=profile,
         policy=policy,
-        marker=(
-            {"is_assay": True}
-            if pending_operation is None
-            else {PENDING_ASSAY_ATTR: pending_operation}
-        ),
     )
-    for name, values, column_dtype in (
-        ("ids", feat_ids, None),
-        ("names", feat_names, None),
-        ("I", np.ones(len(feat_ids), dtype=bool), "bool"),
-    ):
-        create_zarr_obj_array(
-            feature_group, name, values, column_dtype, profile=resolved_profile
-        )
+    _write_feature_columns(feature_group, feat_ids, feat_names, resolved_profile)
     return counts
 
 
@@ -389,7 +551,6 @@ def create_empty_zarr_count_assay(
         dtype,
         profile=profile,
         policy=policy,
-        marker={"is_assay": True},
     )
     _create_empty_columns(
         feature_group,

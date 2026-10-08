@@ -288,6 +288,22 @@ def test_streamed_doublets_match_materialized_mapping(
             **(options | {"resources": ResourceBudget(1_000_000, 1)}),
         )
 
+    # Pair generation is admitted before any pair is drawn.
+    def unadmitted(*_args, **_kwargs):
+        raise AssertionError("doublet pairs were drawn before their admission")
+
+    monkeypatch.setattr(doublets, "simulate_doublet_pairs", unadmitted)
+    many = {"simulation_ratio": 1e4, "resources": ResourceBudget(1_000_000, 1)}
+    with pytest.raises(MemoryError, match="operation limit is 1000000 bytes"):
+        doublets.score_synthetic_doublets(
+            store.RNA,
+            reference,
+            np.arange(len(counts)),
+            labels,
+            feature_indices,
+            **(options | many),
+        )
+
 
 def test_doublets_without_selected_feature_counts_are_scored(tmp_path, monkeypatch):
     from scarf.mapping.features import normalize_reference_counts
@@ -364,6 +380,7 @@ def test_doublets_without_selected_feature_counts_are_scored(tmp_path, monkeypat
             np.zeros((1, len(feature_indices))),
             size_factor=parameters["size_factor"],
             log_transform=parameters["log_transform"],
+            source="The doublet simulation of RNA",
         ),
         reference.model,
     )

@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import re
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,10 @@ from scarf.embeddings.imported import (
     write_imported_embedding,
 )
 from scarf.embeddings.imported_storage import validate_imported_coordinates_artifact
+from scarf.neighbors.index import ann_index_peak_bytes
+from scarf.neighbors.stages import ChunkedCoordinateStream, kmeans_fit_memory
+from scarf.storage.budget import ResourceBudget
+from scarf.storage.execution import ExecutionReport, execution_report_scope
 from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.artifacts import (
     artifact_group,
@@ -32,13 +37,14 @@ def _root_with_selection(
     mask: np.ndarray | None = None,
     *,
     store: Any | None = None,
+    n_cells: int = 8,
 ) -> tuple[zarr.Group, ArtifactRef, np.ndarray, np.ndarray]:
     root = zarr.open_group(
         store=MemoryStore() if store is None else store,
         mode="w",
     )
     root.create_group("RNA")
-    cell_ids = np.array([f"cell_{index}" for index in range(8)])
+    cell_ids = np.array([f"cell_{index}" for index in range(n_cells)])
     selection = (
         np.ones(len(cell_ids), dtype=bool)
         if mask is None
@@ -448,10 +454,11 @@ def test_imported_embedding_writes_values_without_metadata_columns() -> None:
     assert set(root["cellData"].array_keys()) == {"I", "ids", "names"}
 
 
-def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_ann_and_neighbor_query_accept_detached_imported_coordinates(dtype) -> None:
     root, selection, cell_ids, mask = _root_with_selection()
     rng = np.random.default_rng(42)
-    coordinates = rng.normal(size=(8, 3)).astype(np.float32)
+    coordinates = rng.normal(size=(8, 3)).astype(dtype)
     imported = write_imported_coordinates(
         root,
         assay="RNA",
@@ -465,12 +472,18 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
     )
     store = _graph_store(root)
 
-    ann = store.build_ann_index(
-        imported,
-        ann_efc=10,
-        ann_ef=10,
-        ann_m=4,
-    )
+    with execution_report_scope() as reports:
+        ann = store.build_ann_index(
+            imported,
+            ann_efc=10,
+            ann_ef=10,
+            ann_m=4,
+        )
+    # The read reserves the index and, for another dtype, the float32 copy
+    # of a block that hnswlib makes.
+    copy = 0 if dtype == np.float32 else 8 * 3 * 4
+    (read,) = _row_block_reads(reports)
+    assert read.plan.residentBytes == ann_index_peak_bytes(8, 3, 4) + copy
 
     neighbors = store.query_neighbors(ann, k=3)
     group = artifact_group(root, neighbors)
@@ -488,6 +501,123 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
         np.take_along_axis(exact, group["indices"][:].astype(np.intp), axis=1),
         rtol=1e-5,
     )
+
+
+def _banded_coordinate_store(
+    n_cells: int, dims: int, band: int
+) -> tuple[DataStore, ArtifactRef]:
+    root, selection, cell_ids, mask = _root_with_selection(n_cells=n_cells)
+    coordinates = (
+        np.random.default_rng(3).normal(size=(n_cells, dims)).astype(np.float32)
+    )
+    ref = write_imported_coordinates(
+        root,
+        assay="RNA",
+        dimreduc_key="pca",
+        role="pca",
+        coordinates=coordinates,
+        source_digest=_SOURCE_DIGEST,
+        payload_fingerprints={"data": fingerprint_array(coordinates)},
+        source_cell_ids=cell_ids[mask],
+        cell_selection=selection,
+        block_rows=band,
+    )
+    return _graph_store(root), ref
+
+
+def _row_block_reads(reports: list[ExecutionReport]) -> list[ExecutionReport]:
+    return [report for report in reports if report.unitKind == "countsRowBlock"]
+
+
+def test_in_memory_initialization_reads_its_coordinates_in_one_block() -> None:
+    store, ref = _banded_coordinate_store(n_cells=2_000, dims=10, band=200)
+
+    with execution_report_scope() as reports:
+        store.build_embedding_initialization(ref, n_centroids=50, batch_size=2_000)
+
+    # A batch size that covers every cell reads the coordinates in one block,
+    # and the plan of that read reserves what the fit holds meanwhile.
+    (read,) = _row_block_reads(reports)
+    assert read.unitsCompleted == 1
+    memory = kmeans_fit_memory(
+        n_rows=2_000,
+        dims=10,
+        dtype=np.float32,
+        batch_size=2_000,
+        n_clusters=50,
+        block_rows=2_000,
+        nthreads=1,
+    )
+    assert read.plan.residentBytes == memory.streamResidentBytes
+
+
+def test_embedding_initialization_admits_its_fit_before_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ref = _banded_coordinate_store(n_cells=20_000, dims=10, band=2_000)
+    passes: list[str] = []
+    iter_coordinate_blocks = ChunkedCoordinateStream.iter_coordinate_blocks
+
+    def recorded(self, message: str):
+        passes.append(message)
+        yield from iter_coordinate_blocks(self, message)
+
+    monkeypatch.setattr(ChunkedCoordinateStream, "iter_coordinate_blocks", recorded)
+    # The gathered coordinates alone take 800,000 bytes.
+    store.resources = ResourceBudget(1_000_000, 1)
+
+    with pytest.raises(MemoryError) as caught:
+        store.build_embedding_initialization(
+            ref, n_centroids=50, kmeans_batch_size=1_000, batch_size=20_000
+        )
+
+    message = str(caught.value)
+    required = re.search(r"needs about (\d+) bytes", message)
+    assert required is not None and int(required.group(1)) > 1_000_000
+    assert "20000 cells" in message
+    assert "operation limit is 1000000 bytes" in message
+    assert "batch_size below 20000" in message
+    assert passes == []
+    assert store.list_artifacts(kind="embedding_initialization", from_assay="RNA") == []
+
+    # The streamed fit is admitted before it reads too, counting the seeding
+    # of half the cells, which none of its reads reserves.
+    store.resources = ResourceBudget(1_300_000, 1)
+    with pytest.raises(MemoryError, match="streamed k-means fit of 20000 cells"):
+        store.build_embedding_initialization(
+            ref, n_centroids=50, kmeans_sampling=0.5, kmeans_batch_size=1_000
+        )
+    assert passes == []
+    store.resources = ResourceBudget(1_000_000, 1)
+
+    # By default the fit streams the stored bands, which holds a sample of the
+    # cells, their labels, and one band at a time, so it fits the budget.
+    with execution_report_scope() as reports:
+        streamed = store.build_embedding_initialization(
+            ref, n_centroids=50, kmeans_batch_size=1_000
+        )
+
+    assert store.inspect_artifact(streamed).complete
+    assert store.inspect_artifact(streamed).parameters["batch_size"] == 2_000
+    assert len(passes) == 3
+    reads = _row_block_reads(reports)
+    assert [read.unitsCompleted for read in reads] == [10, 10, 10]
+    # Each read plan reserves what the fit holds while it reads, at least the
+    # labels of every cell and the seeding sample of 2,000 cells.
+    for read in reads:
+        assert read.plan.residentBytes >= max(20_000 * 4, 2_000 * 10 * 4)
+
+
+def test_query_admission_counts_the_write_of_many_neighbors() -> None:
+    store, ref = _banded_coordinate_store(n_cells=1_000, dims=5, band=100)
+    ann = store.build_ann_index(ref, ann_efc=100, ann_ef=1_000, ann_m=16)
+    # Writing 999 neighbors of every cell holds the results and up to twice
+    # their size while Zarr encodes them, more than the index and one block.
+    results = 1_000 * 999 * 8
+    store.resources = ResourceBudget(3 * results - 1, 1)
+
+    with pytest.raises(MemoryError, match=f"needs about {3 * results} bytes"):
+        store.query_neighbors(ann, k=999, batch_size=100)
 
 
 def test_imported_coordinates_kind_is_assay_scoped() -> None:

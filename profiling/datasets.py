@@ -1202,6 +1202,21 @@ def prepare_local_datasets(
     )
 
 
+def _fixture_feature_name(index: int) -> str:
+    """Name fixture features so every default percentage filter has genes.
+
+    Each block of 50 features starts with a mitochondrial gene and a ribosomal
+    gene, alternating RPL and RPS, so every fixture with at least two features
+    has genes for the default ``percentMito`` and ``percentRibo`` columns.
+    """
+    position = index % 50
+    if position == 0:
+        return "MT-ND1"
+    if position == 1:
+        return f"RPL{index}" if (index // 50) % 2 == 0 else f"RPS{index}"
+    return f"GENE{index}"
+
+
 def write_fixture_h5ad(
     destinationPath: str | Path,
     *,
@@ -1248,7 +1263,7 @@ def write_fixture_h5ad(
         dtype=object,
     )
     feature_names = np.asarray(
-        ["MT-ND1" if i % 50 == 0 else f"GENE{i}" for i in range(nColumns)],
+        [_fixture_feature_name(i) for i in range(nColumns)],
         dtype=object,
     )
     cell_ids = np.asarray([f"cell-{i}" for i in range(nRows)], dtype=object)

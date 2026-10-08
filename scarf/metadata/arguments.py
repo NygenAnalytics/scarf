@@ -11,6 +11,15 @@ from ..graph.arguments import (
 )
 from ..storage.artifacts import ArtifactRef
 
+# The algorithm_version that every membership-strength and smart-label
+# artifact records, frozen recorded constants (see "Legacy version parameters"
+# in docs/source/developers/operation_revisions.md). Artifacts of earlier
+# releases record them too, so an earlier membership strength differs from a
+# request only in the operation revision, and an earlier smart label of the
+# same inputs is reused.
+MEMBERSHIP_STRENGTH_ALGORITHM_VERSION = 2
+SMART_LABEL_ALGORITHM_VERSION = 3
+
 
 @dataclass(frozen=True, slots=True)
 class UmapArguments(OperationArguments):
@@ -19,8 +28,8 @@ class UmapArguments(OperationArguments):
 
     graph: ArtifactRef = artifact_input()
     initialization: Any = artifact_input()
-    symmetric_graph: bool | None = parameter()
-    graph_upper_only: bool | None = parameter()
+    symmetric_graph: bool = parameter()
+    graph_upper_only: bool = parameter()
     umap_dims: int = parameter()
     spread: float = parameter()
     min_dist: float = parameter()
@@ -33,18 +42,14 @@ class UmapArguments(OperationArguments):
     dens_frac: float = parameter()
     dens_var_shift: float = parameter()
     random_seed: int = parameter()
+    # A parallel layout on several threads is not reproducible at any thread
+    # count, so only the flag identifies an embedding. The requested thread
+    # count and the Numba threads that the layout runs on depend on the
+    # machine.
     parallel: bool = parameter()
-    parallel_threads: int | None = parameter()
+    nthreads: int = execution()
+    layout_threads: int = execution()
     invalidate_cache: bool = execution()
-    # Only densMAP records carry its algorithm revision.
-    densmap_algorithm_version: str | None = parameter(None, omit_if_none=True)
-
-    def __post_init__(self) -> None:
-        if self.use_density_map != (self.densmap_algorithm_version is not None):
-            raise ValueError(
-                "densmap_algorithm_version must be set exactly when "
-                "use_density_map is True"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +67,6 @@ class TsneArguments(OperationArguments):
     early_iter: int = parameter()
     alpha: int = parameter()
     box_h: float = parameter()
-    parallel: bool = parameter()
-    parallel_threads: int = parameter()
-    temp_file_loc: str = execution()
     verbose: bool = execution()
     invalidate_cache: bool = execution()
 
@@ -311,6 +313,7 @@ class MembershipStrengthArguments(OperationArguments):
     connectivity_map: ArtifactRef = artifact_input()
     clusters: ArtifactRef = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
+    # Always MEMBERSHIP_STRENGTH_ALGORITHM_VERSION.
     algorithm_version: int = parameter()
     decimals: int = parameter()
     invalidate_cache: bool = execution()
@@ -324,6 +327,7 @@ class SmartLabelArguments(OperationArguments):
     values: ArtifactRef = artifact_input()
     base_labels: ArtifactRef = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
+    # Always SMART_LABEL_ALGORITHM_VERSION.
     algorithm_version: int = parameter()
     suffix_style: str = parameter()
     invalidate_cache: bool = execution()

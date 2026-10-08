@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 import zarr
 
+from ..metadata.encoding import missing_rows, stored_values
 from ..storage.arrays import (
     MISSING_MASK_PREFIX,
     create_zarr_dataset as _create_zarr_dataset,
@@ -29,6 +30,8 @@ def keyed_metadata_columns[T](
     columns: Iterable[tuple[str, T]],
     keys: Mapping[str, str],
     axis: str,
+    *,
+    membership: Mapping[str, str] | None = None,
 ) -> Iterator[tuple[str, T]]:
     """Yield source metadata columns under the keys planned for them.
 
@@ -44,6 +47,7 @@ def keyed_metadata_columns[T](
         columns: Pairs of source column name and payload, in source order.
         keys: Destination key of each source name to write.
         axis: Table description used in warnings, such as ``cell``.
+        membership: Assay of each reserved membership column, used in warnings.
 
     Yields:
         Pairs of destination key and payload.
@@ -59,7 +63,7 @@ def keyed_metadata_columns[T](
         seen.add(name)
         key = keys.get(name)
         if key is None:
-            logger.warning(_skipped_column_reason(name, axis))
+            logger.warning(_skipped_column_reason(name, axis, membership or {}))
             continue
         if key != name:
             base = metadata_column_key(name)
@@ -71,7 +75,13 @@ def keyed_metadata_columns[T](
         yield key, payload
 
 
-def _skipped_column_reason(name: str, axis: str) -> str:
+def _skipped_column_reason(name: str, axis: str, membership: Mapping[str, str]) -> str:
+    if name in membership:
+        return (
+            f"Skipped source {axis} metadata column {name!r} because Scarf "
+            "reserves it for the membership of the imported assay "
+            f"{membership[name]!r}"
+        )
     if is_reserved_metadata_name(metadata_column_key(name)):
         return (
             f"Skipped source {axis} metadata column {name!r} because Scarf "
@@ -101,57 +111,6 @@ def decode_text(value: Any) -> str:
     raise TypeError(f"Expected text, found {type(value).__name__}")
 
 
-def _is_missing_value(value: Any) -> bool:
-    return value is None or (
-        isinstance(value, float | np.floating) and bool(np.isnan(value))
-    )
-
-
-def _stored_values(values: np.ndarray, missing: np.ndarray) -> np.ndarray:
-    """Return a typed column whose masked rows hold a placeholder."""
-    if values.dtype.kind == "O":
-        present = values[~missing]
-        if present.size and all(isinstance(v, bool | np.bool_) for v in present):
-            dtype: Any = np.dtype(bool)
-        elif present.size and all(
-            isinstance(v, int | np.integer) and not isinstance(v, bool | np.bool_)
-            for v in present
-        ):
-            dtype = np.dtype(np.int64)
-        elif present.size and all(
-            isinstance(v, int | float | np.number)
-            and not isinstance(v, bool | np.bool_)
-            for v in present
-        ):
-            dtype = np.dtype(np.float64)
-        else:
-            text = [
-                ""
-                if absent
-                else (
-                    decode_text(value)
-                    if isinstance(value, bytes | np.bytes_ | str | np.str_)
-                    else str(value)
-                )
-                for value, absent in zip(values, missing, strict=True)
-            ]
-            width = max((len(value) for value in text), default=1)
-            return np.asarray(text, dtype=f"U{max(width, 1)}")
-        stored = np.zeros(values.shape, dtype=dtype)
-        stored[~missing] = np.asarray(present.tolist(), dtype=dtype)
-        return stored
-    if values.dtype.kind in "SU":
-        text = [
-            "" if absent else decode_text(value)
-            for value, absent in zip(values, missing, strict=True)
-        ]
-        width = max((len(value) for value in text), default=1)
-        return np.asarray(text, dtype=f"U{max(width, 1)}")
-    stored = values.copy()
-    stored[missing] = np.nan if values.dtype.kind in "fc" else 0
-    return stored
-
-
 def write_metadata_column(
     group: zarr.Group,
     name: str,
@@ -166,8 +125,8 @@ def write_metadata_column(
         group: Destination metadata group.
         name: Column name.
         values: One value per row.
-        missing: Rows to flag as missing. When None, ``None`` and NaN entries
-            of an object array are missing.
+        missing: Rows to flag as missing. When None, ``None``, NaN, ``pd.NA``,
+            and NaT entries of an object array are missing.
         profile: Zarr encoding profile. When None, chosen from the store.
 
     Raises:
@@ -184,21 +143,14 @@ def write_metadata_column(
             f"Metadata column {name!r} must hold one value per row; "
             f"found shape {array.shape}"
         )
-    if missing is not None:
-        mask = np.asarray(missing, dtype=bool)
-    elif array.dtype.kind == "O":
-        mask = np.fromiter(
-            (_is_missing_value(value) for value in array),
-            dtype=bool,
-            count=array.size,
-        )
-    else:
-        mask = np.zeros(array.shape, dtype=bool)
+    mask = missing_rows(array) if missing is None else np.asarray(missing, dtype=bool)
     if mask.shape != array.shape:
         raise ValueError(f"Metadata column {name!r} has a misaligned missing mask")
     has_missing = bool(mask.any())
     stored = (
-        _stored_values(array, mask) if has_missing or array.dtype.kind == "O" else array
+        stored_values(array, mask, name=name)
+        if has_missing or array.dtype.kind == "O"
+        else array
     )
     if not has_missing:
         _create_zarr_obj_array(group, name, stored, stored.dtype, profile=profile)
@@ -212,6 +164,37 @@ def write_metadata_column(
         chunkSize=min(100_000, max(1, int(array.size))),
         hasMissing=True,
         profile=profile,
+    )
+
+
+def write_membership_column(
+    group: zarr.Group,
+    assay: str,
+    values: np.ndarray,
+    *,
+    profile: StorageProfile | None = None,
+) -> None:
+    """Write the cell column that records which cells ``assay`` measured."""
+    from ..metadata.membership import membership_attributes
+    from ..storage.arrays import create_metadata_column
+    from ..storage.metadata_keys import assay_membership_column
+
+    name = assay_membership_column(assay)
+    validate_metadata_column_name(name)
+    members = np.asarray(values, dtype=bool)
+    if members.ndim != 1:
+        raise ValueError(
+            f"Membership column {name!r} must hold one value per cell; "
+            f"found shape {members.shape}"
+        )
+    create_metadata_column(
+        group,
+        name,
+        data=members,
+        dtype=bool,
+        chunkSize=100_000,
+        profile=profile,
+        attributes=membership_attributes(assay),
     )
 
 

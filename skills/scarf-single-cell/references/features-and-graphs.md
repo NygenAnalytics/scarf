@@ -25,9 +25,26 @@ chain of artifacts, then branch or subcluster it safely. Docs: <https://scarf.re
   Changing cells or features invalidates every downstream stage.
 - `ds.pipeline.run(hvg_count=, pca_dims=, neighbors_k=)` forwards to `select_hvgs(top_n=)`,
   `run_pca(dims=)` and `query_neighbors(k=)`. Explicit calls with the same arguments return the
-  very refs in `run[...]`. `pca_dims=0` skips PCA and builds the graph on normalized HVG values.
+  very refs in `run[...]`. `pca_dims=0` skips PCA and builds the graph on the normalized HVG
+  values, `run["normalized"]`, which needs `doublets=False` and no Harmony (both need PCA).
+  `ds.build_ann_index(normalized)` does the same outside the pipeline; WNN, mapping references
+  and doublet scoring reject such graphs, SNN integrates them. Memory and time then scale with
+  the HVG count, not the PCA dims: the ANN index holds about `4 * dims + 8 * ann_m + 130` bytes per
+  cell (8.5 GB at 1M cells and 2,000 HVGs), the default embedding initialization holds every cell's
+  coordinates in memory (pass `params={"embedding_initialization": {"batch_size": ...}}` below the
+  cell count for the streamed fit), and cluster selection decodes most of the normalized matrix to
+  read its 10,000-cell sample.
+- `build_ann_index` and `query_neighbors` check the index against `mem_budget` before they create
+  or load it and raise `MemoryError` naming the bytes, cells, dimensions and limit; the index moves
+  through a temporary file of about `4 * dims + 8 * ann_m + 20` bytes per cell in `TMPDIR`.
 - RNA normalization: counts scaled to 1000 over the selected features, then `log1p`. PCA
   standardizes features. HVGs are an artifact, not a feature column; the chain writes no metadata.
+- Every path applies the assay's configured `normMethod`. `log_transform=True` is `log1p` of that
+  normalizer's own output. `norm_lib_size`, `norm_dummy`, and custom RNA, ADT, and generic
+  normalizers take it, and defaults turn it on only for `norm_lib_size`, whose scale Scarf knows.
+  ADT CLR, ATAC TF-IDF, and `norm_lib_size_log` raise `ValueError` for `log_transform=True`;
+  `renormalize_subset` applies only to RNA library-size and custom normalizers and to ATAC TF-IDF
+  and custom normalizers. Recorded flags are the resolved ones.
 - Count passes: a new cell selection costs one pass for the feature summary (`select_hvgs`,
   `select_detected_features`) and one per `run_normalization`; later stages read local artifacts.
 
@@ -238,7 +255,7 @@ cytotoxic and FOXP3/CTLA4 groups, with ARI 0.94 at 2,000 HVGs. The parent had no
 | `select_hvgs(top_n=)` / `hvg_count` | `1000` | Weak or rare populations (raise); noisy programs dominate (lower). |
 | `select_hvgs(blacklist=)` | `DEFAULT_HVG_BLACKLIST` | A family dominates the HVGs or is the question; what to add: `gene-blacklists.md`. |
 | `select_hvgs(min_cells=, max_cells=)` | `20`, `None` (= selected cells - 20) | Tiny subsets; `max_cells=np.inf` keeps ubiquitous genes. |
-| `run_pca(dims=)` / `pca_dims` | `21` | After a variance and stability check; `0` in the pipeline means no PCA. |
+| `run_pca(dims=)` / `pca_dims` | `21` | After a variance and stability check; `0` in the pipeline means no PCA (graph on normalized values; pass `doublets=False`; memory and time scale with the HVG count). |
 | `run_pca(pca_cell_selection=)` | `None` | Fit on a subset (for example one batch) and project all cells. |
 | `query_neighbors(k=)` / `neighbors_k` | `11` (clamped to cells - 1) | Larger data or smoother graphs (15 to 30); smaller to resolve rare groups. |
 | `load_graph(symmetric=, use_k=)` | `False`, all `k` | `True` for degree and connectivity checks; `use_k` to thin edges. |
